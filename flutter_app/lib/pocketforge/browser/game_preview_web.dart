@@ -124,13 +124,16 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
 
   @override
   Future<Object?> invoke(String method, Map<String, Object?> payload) async {
-    if (!_attached || _nonce.isEmpty) {
+    final target = _frame.contentWindow;
+    if (!_attached || _nonce.isEmpty || target == null) {
       throw StateError('Run the game preview first.');
     }
     final id = '${++_sequence}';
     final pending = Completer<Object?>();
     _requests[id] = pending;
-    _frame.contentWindow!.postMessage(
+    // Avoid a null assertion on an opaque WindowProxy: dart2js can implement
+    // it with a forbidden cross-origin property access.
+    target.postMessage(
       {
         'channel': 'pocketforge-game',
         'nonce': _nonce,

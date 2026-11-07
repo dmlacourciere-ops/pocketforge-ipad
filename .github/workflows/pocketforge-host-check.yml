@@ -1,0 +1,15 @@
+name: PocketForge Mac host diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  host:
+    runs-on: macos-15
+    timeout-minutes: 5
+    steps:
+      - name: Verify Apple SDK availability without third-party actions
+        run: |
+          uname -a
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
