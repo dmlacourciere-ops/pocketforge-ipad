@@ -1,14 +1,14 @@
-# Optional private Mac build with Codemagic
+# Mac build with Codemagic
 
-Prepared November 7, 2026. These files are a fallback configuration for review. No Codemagic account, GitHub integration, build, or Apple signing operation has been performed. Bash/YAML checks do not establish that the Apple build succeeds.
+Updated November 7, 2026. The owner authorized Codemagic's free personal builder, then separately authorized making PocketForge public. The application now reads the public Git URL; no GitHub App or private-repository token was granted. Build 1 compiled and opened the native simulator app, then stopped on a native command-output test. No release IPA or Apple signing operation has completed. See [the current evidence](../../BUILD_STATUS_POCKETFORGE.md).
 
 Codemagic advertises **500 free macOS M2 minutes per month for a personal account**, one parallel build, and 30-day artifact retention. Teams do not receive that allowance. Use the personal free account with billing disabled; this workflow selects `mac_mini_m2` and stops after 75 minutes. Check your account's remaining allowance before starting it. [Official pricing](https://codemagic.io/pricing/), [personal plan details](https://docs.codemagic.io/billing/pricing/).
 
-## Connect this private repository
+## Current public-repository setup
 
 1. Sign up at [codemagic.io/signup](https://codemagic.io/signup) using GitHub or email. GitHub signup authenticates your identity; repository access is a separate installation. Select **Personal account**, rather than creating a Team. Leave billing disabled. Paid billing enrollment is a separate action that requests card details. [Signup](https://docs.codemagic.io/getting-started/signup/), [billing enrollment](https://docs.codemagic.io/billing/billing/).
-2. Choose **Add application → GitHub → Authorize integration**, then **Install GitHub App**. This is the approval needed to share private source with another build provider. Install **Codemagic CI/CD** under the GitHub account that owns the repository, `dmlacourciere-ops`.
-3. Choose **Only selected repositories** and select **pocketforge-ipad**. Review the displayed permission list and approve only if you want Codemagic to access that repository. The repository can remain private. A personal GitHub token, access to all repositories, Apple credentials, and provider API keys are not needed for this unsigned build. [Official GitHub/private-repository setup](https://docs.codemagic.io/getting-started/adding-apps/).
+2. Choose **Add application → Other** and supply `https://github.com/dmlacourciere-ops/pocketforge-ipad.git` as a public repository. No private-source authorization is needed for the current setup.
+3. Select Flutter as the project type. A GitHub token, access to other repositories, Apple credentials, and provider API keys are not needed for this unsigned build. The existing [PocketForge application](https://codemagic.io/app/6aef36b344beb3179939831d/settings) already has this configuration. [Official repository setup](https://docs.codemagic.io/getting-started/adding-apps/).
 4. Select the repository and **Flutter** as the project type, then finish adding the application. Use the `codemagic.yaml` from the repository root. Its script handles the `flutter_app` subdirectory.
 5. Select the source branch and manually start **PocketForge unsigned iOS and native iPad simulator checks** (`pocketforge-ios-unsigned`). This configuration has no push/PR/scheduled trigger or publishing section. Adding it to a repository alone does not start a build. [YAML configuration and manual build setup](https://docs.codemagic.io/yaml-basic-configuration/yaml-getting-started/).
 

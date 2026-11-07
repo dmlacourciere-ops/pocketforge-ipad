@@ -20,6 +20,11 @@ task_rust="${POCKETFORGE_RUST_TOOLCHAIN:-1.91.1}"
 task_features="wasmi,wasi"
 
 rustup toolchain install "$task_rust" --profile minimal
+# Exercise the production byte-capture/replay implementation on the Mac host
+# before spending time on device and simulator cross-compilation.
+rustc "+$task_rust" --edition=2021 --test "$task_native/src/stdio.rs" \
+  -o "$task_stage/stdio-tests"
+"$task_stage/stdio-tests"
 rustup target add --toolchain "$task_rust" aarch64-apple-ios aarch64-apple-ios-sim
 for task_target in aarch64-apple-ios aarch64-apple-ios-sim; do
   cargo "+$task_rust" build --manifest-path "$task_native/Cargo.toml" \

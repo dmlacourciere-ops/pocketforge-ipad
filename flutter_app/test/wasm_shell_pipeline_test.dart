@@ -67,6 +67,7 @@ class _ScriptedInstance extends Fake implements WasmInstance {
 
   Completer<void>? gate;
   Object? startError;
+  void Function()? afterStart;
 
   @override
   Stream<Uint8List> get stdout => out.stream;
@@ -78,6 +79,7 @@ class _ScriptedInstance extends Fake implements WasmInstance {
     final gate = this.gate;
     if (gate != null) await gate.future;
     final error = startError;
+    afterStart?.call();
     if (error != null) throw error;
   }
 
@@ -338,6 +340,35 @@ void main() {
       expect(r.valueOrNull!.stderr, 'boo');
       expect(r.valueOrNull!.exitCode, 0);
     });
+
+    test(
+      'fast WASI exit keeps queued stdout and stderr in callbacks and result',
+      () async {
+        final stdout = StringBuffer();
+        final stderr = StringBuffer();
+        final instance = _ScriptedInstance()
+          ..startError = Exception('Exited with i32 exit status 2');
+        instance.afterStart = () {
+          Timer(const Duration(milliseconds: 20), () {
+            instance.out.add(utf8.encode('partial output\n'));
+            instance.err.add(utf8.encode('invalid option\n'));
+          });
+        };
+        rec.next = instance;
+        final result = (await shell().exec(
+          'tail x',
+          options: ShellExecOptions(
+            onStdout: stdout.write,
+            onStderr: stderr.write,
+          ),
+        )).getOrThrow();
+        expect(result.exitCode, 2);
+        expect(result.stdout, 'partial output\n');
+        expect(result.stderr, 'invalid option\n');
+        expect(stdout.toString(), result.stdout);
+        expect(stderr.toString(), result.stderr);
+      },
+    );
 
     test('I32Exit traps map to the stage exit code', () async {
       final instance = _ScriptedInstance()

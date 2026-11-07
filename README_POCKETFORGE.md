@@ -2,7 +2,7 @@
 
 PocketForge is an experimental game-building app based on [Flutter Agent Harness (Fa)](https://github.com/IstiN/flutter_agent_harness). The agent loop, project files, sandbox tools, and game preview run on the current device. **DeepSeek supplies the model through its remote API.**
 
-This is a separate product entrypoint, not an OpenCode port or an upstream Fa release. The upstream README is retained in the build distribution. Current verification and unfinished work are recorded in [BUILD_STATUS_POCKETFORGE.md](BUILD_STATUS_POCKETFORGE.md). The development repository is [pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad) (private).
+This is a separate product entrypoint, not an OpenCode port or an upstream Fa release. The upstream README is retained in the build distribution. Current verification and unfinished work are recorded in [BUILD_STATUS_POCKETFORGE.md](BUILD_STATUS_POCKETFORGE.md). The development repository is [pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad) (public, by its owner's explicit authorization).
 
 ## What it does
 
@@ -60,7 +60,7 @@ The native Flutter app is a conventional iOS project. Its build route does not r
 
 The installed native app bundles its assets and runs independently of Windows. The free Apple account route normally requires weekly signing renewal through the Windows PC. DeepSeek still requires an internet connection to its API.
 
-If GitHub's account admission remains blocked, the optional [Codemagic private build route](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md) is prepared for review. Its personal free M2 allowance can be used with billing disabled. Connecting that service to this private repository requires explicit approval; nothing has been connected or run there yet.
+GitHub's account admission is currently blocked by an account billing lock even for public jobs. The authorized [Codemagic build route](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md) uses its personal M2 allowance with paid billing disabled. It reads this public repository without a private-repository grant. Its first build compiled and launched the iPad simulator app, then caught a native command-output regression before release packaging.
 
 ## Limits of this version
 
@@ -83,7 +83,7 @@ The product entrypoint is `flutter_app/lib/main_pocketforge.dart`; runtime, stor
 
 Independent JavaScript checks are under `tools/pocketforge`: run `npm ci`, `npx playwright install webkit`, then `npm test`. For the complete controlled-provider UI check, serve the compiled web bundle on `127.0.0.1:8768`, then run `npm run test:web`; set `POCKETFORGE_BROWSER=webkit` for portrait WebKit. Chrome is the default and requires installed Google Chrome. These checks use fixture model replies and do not spend API credits.
 
-Current scoped checks pass: **27 Flutter tests**, **6 JavaScript/WebKit tests**, and **4 iOS-preparer tests**. A compiled Chrome end-to-end run completed seven controlled-provider requests, exercised a failing game assertion followed by a passing repair, and reported no browser errors. Those provider responses were deterministic test input, not live AI output. Native iOS and physical-iPad verification remain pending.
+The first Mac build passed **24 scoped Flutter tests** and **5 iOS-preparer tests**. Local JavaScript/WebKit checks passed **6 tests**. A compiled Chrome end-to-end run completed seven controlled-provider requests, exercised a failing game assertion followed by a passing repair, and reported no browser errors. Those provider responses were deterministic test input, not live AI output. Native verification caught a command-output regression; native game checks, release packaging, signing, and physical-iPad verification remain pending.
 
 ## License and attribution
 

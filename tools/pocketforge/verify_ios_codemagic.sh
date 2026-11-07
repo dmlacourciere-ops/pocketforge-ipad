@@ -77,6 +77,9 @@ bash tools/pocketforge/build_wasm_ios.sh 2>&1 | tee artifacts/logs/wasm-ios-buil
 (cd flutter_app && flutter analyze --no-pub lib/main_pocketforge.dart lib/pocketforge test/pocketforge) \
   2>&1 | tee artifacts/logs/pocketforge-analyze.txt
 (cd flutter_app && flutter test --no-pub test/pocketforge) 2>&1 | tee artifacts/logs/pocketforge-tests.txt
+(cd flutter_app && flutter test --no-pub test/wasm_shell_pipeline_test.dart \
+  --plain-name 'fast WASI exit keeps queued stdout and stderr in callbacks and result') \
+  2>&1 | tee artifacts/logs/wasm-stdio-regression.txt
 
 # The committed goldens were captured on Windows. Preserve Mac differences as
 # diagnostics without using font drift to hide the native runtime/build result.

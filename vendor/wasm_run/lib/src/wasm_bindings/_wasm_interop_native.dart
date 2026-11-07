@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert' show utf8;
 import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'dart:typed_data' show Uint8List;
@@ -541,6 +540,7 @@ class _Instance extends WasmInstance {
 
   Stream<Uint8List>? _stderr;
   Stream<Uint8List>? _stdout;
+  bool _disposed = false;
 
   _Instance(this.instance, this.builder) {
     final d = instance.exports();
@@ -720,7 +720,13 @@ class _Instance extends WasmInstance {
 
   @override
   void dispose() {
-    // TODO: dispose
+    if (_disposed) return;
+    _disposed = true;
+    // Each builder owns a native Store/instance and its captured output sinks.
+    // The public API is synchronous, while FRB removes the native Store
+    // asynchronously. Close it once without leaking teardown errors into a
+    // caller whose WASI command has already finished.
+    unawaited(builder.mod.dispose().catchError((Object _) {}));
   }
 }
 

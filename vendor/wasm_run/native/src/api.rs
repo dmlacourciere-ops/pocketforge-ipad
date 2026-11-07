@@ -2,6 +2,7 @@ pub use crate::atomics::*;
 use crate::bridge_generated::{wire_list_wasm_val, Wire2Api};
 use crate::config::*;
 pub use crate::external::WFunc;
+use crate::stdio::{CapturedOutput, OutputSink};
 use crate::types::*;
 use anyhow::{Ok, Result};
 use flutter_rust_bridge::{
@@ -10,7 +11,10 @@ use flutter_rust_bridge::{
 use once_cell::sync::Lazy;
 use std::io::Write;
 pub use std::sync::RwLock;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 #[cfg(feature = "wasi")]
 use wasi_common::pipe::WritePipe;
 use wasmi::core::Trap;
@@ -38,8 +42,8 @@ struct WasmiModuleImpl {
 struct StoreState {
     #[cfg(feature = "wasi")]
     wasi_ctx: Option<wasi_common::WasiCtx>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: Arc<Mutex<CapturedOutput>>,
+    stderr: Arc<Mutex<CapturedOutput>>,
     stack: CallStack,
     // TODO: add to stdin?
 }
@@ -60,8 +64,9 @@ pub struct CallStack(Arc<RwLock<Vec<RwLock<StoreContextMut<'static, StoreState>>
 pub struct WasmRunInstanceId(pub u32);
 
 fn make_wasi_ctx(
-    id: &WasmRunModuleId,
     wasi_config: &Option<WasiConfigNative>,
+    stdout: &Arc<Mutex<CapturedOutput>>,
+    stderr: &Arc<Mutex<CapturedOutput>>,
 ) -> Result<Option<wasi_common::WasiCtx>> {
     let mut wasi_ctx = None;
     if let Some(wasi_config) = wasi_config {
@@ -69,15 +74,13 @@ fn make_wasi_ctx(
 
         if wasi_config.capture_stdout {
             let stdout_handler = ModuleIOWriter {
-                id: id.clone(),
-                is_stdout: true,
+                output: stdout.clone(),
             };
             wasi.set_stdout(Box::new(WritePipe::new(stdout_handler)));
         }
         if wasi_config.capture_stderr {
             let stderr_handler = ModuleIOWriter {
-                id: id.clone(),
-                is_stdout: false,
+                output: stderr.clone(),
             };
             wasi.set_stderr(Box::new(WritePipe::new(stderr_handler)));
         }
@@ -114,9 +117,11 @@ pub fn module_builder(
 
     let stack: CallStack = Default::default();
     let module_id = WasmRunModuleId(id, RustOpaque::new(stack.clone()));
+    let stdout = Arc::new(Mutex::new(CapturedOutput::default()));
+    let stderr = Arc::new(Mutex::new(CapturedOutput::default()));
 
     #[cfg(feature = "wasi")]
-    let wasi_ctx = make_wasi_ctx(&module_id, &wasi_config)?;
+    let wasi_ctx = make_wasi_ctx(&wasi_config, &stdout, &stderr)?;
     #[cfg(feature = "wasi")]
     if wasi_ctx.is_some() {
         wasmi_wasi::add_to_linker(&mut linker, |ctx| ctx.wasi_ctx.as_mut().unwrap())?;
@@ -127,8 +132,8 @@ pub fn module_builder(
         StoreState {
             #[cfg(feature = "wasi")]
             wasi_ctx,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
+            stdout,
+            stderr,
             stack,
         },
     );
@@ -144,22 +149,22 @@ pub fn module_builder(
 }
 
 struct ModuleIOWriter {
-    id: WasmRunModuleId,
-    is_stdout: bool,
+    output: Arc<Mutex<CapturedOutput>>,
+}
+
+impl OutputSink for StreamSink<Vec<u8>> {
+    fn add(&self, bytes: Vec<u8>) -> bool {
+        StreamSink::add(self, bytes)
+    }
+    fn close(&self) {
+        StreamSink::close(self);
+    }
 }
 
 impl Write for ModuleIOWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.id.with_module_mut(|mut store| {
-            let data = store.data_mut();
-            let target = if self.is_stdout {
-                &mut data.stdout
-            } else {
-                &mut data.stderr
-            };
-            target.extend_from_slice(buf);
-            std::io::Result::Ok(buf.len())
-        })
+        self.output.lock().unwrap().write(buf);
+        std::io::Result::Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -209,27 +214,38 @@ impl WasmRunModuleId {
         Ok(SyncReturn(()))
     }
 
-    pub fn stdio_stream(&self, _sink: StreamSink<Vec<u8>>, _kind: StdIOKind) -> Result<()> {
-        // stdout/stderr are buffered in StoreState; streaming is not used.
+    fn captured_output(&self, kind: StdIOKind) -> Result<Arc<Mutex<CapturedOutput>>> {
+        // Stream registration runs on an FRB worker and must not use the
+        // callback re-entry StoreContext stack while another thread runs a guest.
+        let modules = ARRAY.read().unwrap();
+        let module = modules
+            .map
+            .get(&self.0)
+            .ok_or_else(|| anyhow::anyhow!("WASM instance was disposed"))?;
+        Ok(match kind {
+            StdIOKind::stdout => module.store.data().stdout.clone(),
+            StdIOKind::stderr => module.store.data().stderr.clone(),
+        })
+    }
+
+    pub fn stdio_stream(&self, sink: StreamSink<Vec<u8>>, kind: StdIOKind) -> Result<()> {
+        self.captured_output(kind)?
+            .lock()
+            .unwrap()
+            .subscribe(Box::new(sink));
         Ok(())
     }
 
-    pub fn captured_stdout(
-        &self,
-    ) -> Result<SyncReturn<String>> {
-        self.with_module(|store| {
-            let data = store.data();
-            Ok(SyncReturn(String::from_utf8_lossy(&data.stdout).to_string()))
-        })
+    pub fn captured_stdout(&self) -> Result<SyncReturn<String>> {
+        let output = self.captured_output(StdIOKind::stdout)?;
+        let text = String::from_utf8_lossy(output.lock().unwrap().bytes()).to_string();
+        Ok(SyncReturn(text))
     }
 
-    pub fn captured_stderr(
-        &self,
-    ) -> Result<SyncReturn<String>> {
-        self.with_module(|store| {
-            let data = store.data();
-            Ok(SyncReturn(String::from_utf8_lossy(&data.stderr).to_string()))
-        })
+    pub fn captured_stderr(&self) -> Result<SyncReturn<String>> {
+        let output = self.captured_output(StdIOKind::stderr)?;
+        let text = String::from_utf8_lossy(output.lock().unwrap().bytes()).to_string();
+        Ok(SyncReturn(text))
     }
 
     pub fn dispose(&self) -> Result<()> {

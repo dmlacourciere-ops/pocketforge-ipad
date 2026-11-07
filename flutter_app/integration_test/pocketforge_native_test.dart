@@ -13,6 +13,8 @@ import 'package:fa/pocketforge/ui/pocketforge_workbench.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show ShellExecOptions;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
@@ -118,12 +120,44 @@ void main() {
           final source = await session.readFile('game.js');
           expect('this.shield -= 1;'.allMatches(source), hasLength(1));
 
-          final shell = (await session.env.exec('rg --version')).getOrThrow();
+          final liveStdout = StringBuffer();
+          final shell = (await session.env.exec(
+            'rg --version',
+            options: ShellExecOptions(onStdout: liveStdout.write),
+          )).getOrThrow();
           expect(shell.exitCode, 0, reason: shell.stderr);
           expect(
             shell.stdout.toLowerCase(),
             contains('ripgrep'),
             reason: 'This must execute the bundled rg.wasm through Wasmi/WASI.',
+          );
+          expect(
+            liveStdout.toString(),
+            shell.stdout,
+            reason: 'Native bytes must reach the callback and captured result.',
+          );
+          expect(
+            RegExp(r'^ripgrep ', multiLine: true).allMatches(shell.stdout),
+            hasLength(1),
+            reason:
+                'A late native subscription must replay output exactly once.',
+          );
+          final liveStderr = StringBuffer();
+          final rejected = (await session.env.exec(
+            'rg --pocketforge-no-such-option',
+            options: ShellExecOptions(onStderr: liveStderr.write),
+          )).getOrThrow();
+          expect(rejected.exitCode, isNot(0));
+          expect(rejected.stderr, contains('pocketforge-no-such-option'));
+          expect(liveStderr.toString(), rejected.stderr);
+          final piped = (await session.env.exec(
+            'rg --version | tr a-z A-Z',
+          )).getOrThrow();
+          expect(piped.exitCode, 0, reason: piped.stderr);
+          expect(
+            piped.stdout,
+            contains('RIPGREP'),
+            reason: 'WASI stdout must also feed the next shell stage.',
           );
 
           await _native(tester, () => session.game.preview());
@@ -237,6 +271,10 @@ void main() {
           binding.reportData = {
             'runtime': reopened.runtimeLabel,
             'wasiCommand': shell.stdout.trim(),
+            'wasiStdoutCallbackMatched': liveStdout.toString() == shell.stdout,
+            'wasiStderrCallbackMatched':
+                liveStderr.toString() == rejected.stderr,
+            'wasiPipelinePassed': piped.stdout.contains('RIPGREP'),
             'baselinePassed': baseline.passed,
             'injectedBugDetected': !broken.passed,
             'repairedPassed': repaired.passed,

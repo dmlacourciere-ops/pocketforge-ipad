@@ -15,7 +15,7 @@ Updated November 7, 2026. This records the Fa-based implementation, separate fro
 | Session/storage and browser unit tests | 9 session/storage + 8 browser tests passed | A real disk restart test verifies persistence with the interpreter unavailable; with 6 UI and 5 golden tests, the scoped Flutter suite totals **28 passed, 1 skipped**. Windows lacks symlink-creation privileges; that check runs on macOS |
 | JavaScript/game runtime checks | 6 passed | 3 actual desktop WebKit checks plus 3 simulation checks; neither runs iOS WebKit |
 | iOS build-preparer checks | 5 passed | Includes quoted SDK-specific signing identities and explicit development preparation; does not compile or sign the iOS app |
-| Native iPad integration test | Authored; analyzer passed; Apple execution pending | Boots production main, requires WASI and Keychain, runs rg.wasm, actual WebKit collision failure/repair, Stop/reload, PNG capture, and session recreation |
+| Native iPad integration test | Compiled and launched; failed at native command stdout | Production main opened in the iPad simulator, WASI and Keychain initialized, InAppWebView mounted, and rg.wasm exited 0. Its stdout was empty; later game, screenshot, and recreation assertions were not reached |
 | Browser release build | Compiled and booted | Actual Flutter web entrypoint loaded in a desktop browser |
 | Compiled browser tool flow | Passed in Chrome and desktop WebKit | Seven controlled-provider requests per engine drove the compiled app through a failing game assertion, repair, and passing rerun; portrait layout, project persistence across reload, session-only key removal, and no browser errors were verified |
 
@@ -35,13 +35,15 @@ Full log in the development workspace: `test-results/pocketforge-full-goldens.lo
 
 ## Native iOS verification still required
 
-[PocketForge unsigned iOS verification](.github/workflows/pocketforge-verify.yml) is prepared as a manual workflow. It has **not yet produced a successful iOS build**. Its planned unsigned IPA requires a separate signing step and is not directly installable.
+[PocketForge unsigned iOS verification](.github/workflows/pocketforge-verify.yml) is prepared as a manual workflow. **An iPad simulator app has compiled and launched; a release IPA has not yet been produced.** An unsigned IPA requires a separate signing step and is not directly installable.
 
-The private development repository is [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). Both Mac and Linux control jobs were rejected before starting. On November 7 the signed-in GitHub run page identified an account billing/admission block. This is independent of the app source and runner label; workflow validation with actionlint passed. Account resolution or an explicitly authorized source-publication decision is needed before cloud compilation can proceed. No Apple compilation result is claimed.
+The development repository is [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). The owner explicitly authorized making only this repository public. GitHub still rejected the public control job with an account-wide billing lock. Workflow validation with actionlint passed; compilation now uses the separately authorized Codemagic route.
 
 The native workflow now includes an actual iPad simulator test before packaging. Its preview PNG and JSON report become build artifacts only after successful native execution. Native source assets are bundled, and project/session storage uses the app's disk independently of the optional WASI interpreter. Normal native use needs no Windows server. The user selected free Apple account installation with weekly Windows signing renewal; no Apple credentials, certificate creation or installation have been performed.
 
-An optional private Codemagic build configuration is prepared in `codemagic.yaml`, with a personal M2 runner and 75-minute limit. YAML, Bash and embedded Python syntax checks passed. No Codemagic account or repository grant exists yet; that requires the user's approval. See [the private build setup](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md). It produces an unsigned IPA only after native verification; signing is still a separate Windows/Apple-account step.
+The owner authorized Codemagic's free personal builder. `codemagic.yaml` uses a personal M2 runner and 75-minute limit, with no publishing or paid billing enabled. Codemagic reads the public repository through its URL; no GitHub App or private-repository token was granted. See [the build setup](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md).
+
+[Codemagic build 1](https://codemagic.io/app/6aef36b344beb3179939831d/build/6aef36da24e1ec2375573076) used source `d89ee0f`, Flutter 3.47.9, and Xcode 26.6. Source-built wasmi/WASI device and simulator libraries passed compilation, as did the scoped analyzer, 24 app tests, and 5 preparer tests. The simulator app compiled and opened. Native smoke testing stopped when `rg.wasm --version` exited successfully without delivering stdout. The vendored native stdio subscription was a no-op; a buffered/live stream repair is being verified. Native game tests and release packaging were not reached. Five Windows-captured golden comparisons differed on Mac and remain retained diagnostics, not a claimed pass.
 
 The remaining checks include:
 

@@ -7,13 +7,21 @@ You do not need to own a Mac for this route. CI performs the Apple build; your W
 ## Direct route: Sideloadly
 
 1. Download the successful CI run's artifact on Windows. Extract the artifact ZIP and locate **`PocketForge-unsigned.ipa`**. Keep the IPA intact.
-2. Get Sideloadly from **[sideloadly.io](https://sideloadly.io/)**. Its current Windows instructions require Apple's **web/non-Microsoft-Store iTunes and iCloud**; use the prerequisite links on that official page. Review those instructions before changing an existing Apple software installation.
-3. Connect the iPad by USB, unlock it, and accept **Trust This Computer**. Confirm the iPad appears in iTunes/Sideloadly. [Official device-detection guidance](https://sideloadly.io/faq).
-4. Select the iPad in Sideloadly, load the IPA, and follow its Apple-account sign-in/installation flow. Enter your own credentials and any verification code **in the signing tool locally**, not in this chat. The official flow is download → load IPA → Apple ID → sideload. [Official installation outline](https://sideloadly.io/#how-it-works).
+2. Get the current **[official Sideloadly installer for 64-bit Windows](https://sideloadly.io/SideloadlySetup64.exe)**, linked from [sideloadly.io](https://sideloadly.io/). If **Apple Devices** is already installed, keep that setup and try device detection before adding more Apple software. This is a minimal first attempt; Sideloadly does not explicitly document Apple Devices as a supported substitute for its listed prerequisites.
+3. Connect the iPad by USB, unlock it, and accept **Trust This Computer**. If Apple Devices is present, confirm it can see the iPad, then check Sideloadly's device list. Pairing does not require enabling media or cloud synchronization. [Apple's trust/pairing guidance](https://support.apple.com/en-us/109054), [Sideloadly device-detection guidance](https://sideloadly.io/faq).
+4. Select the iPad in Sideloadly, load the IPA, and follow its Apple-account sign-in/installation flow. Enter your own credentials and any verification code **in the signing tool locally**, not in this chat. For a free account, follow its normal Apple login and two-factor verification; the FAQ's app-specific-password option applies only to particular paid-account configurations. [Official installation outline](https://sideloadly.io/#how-it-works), [sign-in FAQ](https://sideloadly.io/faq).
 5. If requested, trust the developer under **Settings → General → VPN & Device Management**, and enable **Settings → Privacy & Security → Developer Mode**. Follow the iPad's confirmation/restart prompts. [Sideloadly device guidance](https://sideloadly.io/faq), [Apple Developer Mode documentation](https://developer.apple.com/documentation/xcode/enabling-developer-mode-on-a-device).
 6. Open PocketForge from its Home Screen icon. Test the included game first; then enter your DeepSeek key inside PocketForge's settings.
 
 No software installation, Apple-account sign-in, certificate creation, or device pairing has been performed by this project on your behalf.
+
+## If Sideloadly reports missing Apple components
+
+The official documentation currently has a mismatch: the homepage's **Before you install** section still lists web/non-Microsoft-Store **iTunes and iCloud**, while its newer changelog says **v0.71.0 adds Fake Anisette on Windows**, with iTunes Anisette taking priority, and **v0.60.0 supports two-factor authentication without iTunes on Windows**. Authentication support alone does not prove that an existing Apple Devices installation supplies every library Sideloadly needs. [Official prerequisite notice](https://sideloadly.io/), [official changelog](https://sideloadly.io/changelog).
+
+Try the current version's available authentication setup first. If it reports a missing Apple component or cannot detect the paired iPad, use the prerequisite links on the official homepage and the exact diagnostic to choose the next step. The links checked for this guide are [web iTunes 64-bit](https://www.apple.com/itunes/download/win64) and [Apple's web iCloud installer](https://updates.cdn-apple.com/2020/windows/001-39935-20200911-1A70AA56-F448-11EA-8CC0-99D41950005E/iCloudSetup.exe). These are fallback components, not a claim that both are necessary on every Windows 11 setup.
+
+Do not remove a working Apple Devices installation merely to follow older iTunes instructions. The reviewed Sideloadly instructions do not require turning on iCloud Photos, Drive, Passwords, cloud backups, or library syncing. No such settings changes are part of this installation route.
 
 ## Free-account renewal
 
