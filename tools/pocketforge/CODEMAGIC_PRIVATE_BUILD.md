@@ -1,6 +1,6 @@
 # Mac build with Codemagic
 
-Updated November 7, 2026. The owner authorized Codemagic's free personal builder, then separately authorized making PocketForge public. The application now reads the public Git URL; no GitHub App or private-repository token was granted. Build 1 compiled and opened the native simulator app, then stopped on a native command-output test. No release IPA or Apple signing operation has completed. See [the current evidence](../../BUILD_STATUS_POCKETFORGE.md).
+Updated November 7, 2026. The owner authorized Codemagic's free personal builder, then separately authorized making PocketForge public. The application reads the public Git URL; no GitHub App or private-repository token was granted. [Build 2](https://codemagic.io/app/6aef36b344beb3179939831d/build/6aef43da24e1ec237557344e) passed native checks on the iPad mini (A17 Pro) simulator and produced `PocketForge-unsigned.ipa` from source `0125d16231b6be9d206379c05d34994c6820b228`. This package still needs signing and physical-device verification. See [the current evidence](../../BUILD_STATUS_POCKETFORGE.md).
 
 Codemagic advertises **500 free macOS M2 minutes per month for a personal account**, one parallel build, and 30-day artifact retention. Teams do not receive that allowance. Use the personal free account with billing disabled; this workflow selects `mac_mini_m2` and stops after 75 minutes. Check your account's remaining allowance before starting it. [Official pricing](https://codemagic.io/pricing/), [personal plan details](https://docs.codemagic.io/billing/pricing/).
 

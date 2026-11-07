@@ -60,7 +60,7 @@ The native Flutter app is a conventional iOS project. Its build route does not r
 
 The installed native app bundles its assets and runs independently of Windows. The free Apple account route normally requires weekly signing renewal through the Windows PC. DeepSeek still requires an internet connection to its API.
 
-GitHub's account admission is currently blocked by an account billing lock even for public jobs. The authorized [Codemagic build route](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md) uses its personal M2 allowance with paid billing disabled. It reads this public repository without a private-repository grant. Its first build compiled and launched the iPad simulator app, then caught a native command-output regression before release packaging.
+GitHub's account admission is currently blocked by an account billing lock even for public jobs. The authorized [Codemagic build route](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md) uses its personal M2 allowance with paid billing disabled and reads this public repository without a private-repository grant. [Build 2](https://codemagic.io/app/6aef36b344beb3179939831d/build/6aef43da24e1ec237557344e) passed the native iPad mini (A17 Pro) simulator checks and produced **`PocketForge-unsigned.ipa`**. Download it from that build's Artifacts section, then follow the Windows signing instructions. Signing and physical-device verification remain separate steps.
 
 ## Limits of this version
 
@@ -68,7 +68,7 @@ GitHub's account admission is currently blocked by an account billing lock even 
 - Preview tools operate on the embedded local game. They do not control Safari, other apps, or an unrestricted external browser.
 - The preview bundles local assets and restricts remote resources, forms, and popups. Use browser-ready source without an npm build step; not every browser API works in the isolated preview.
 - Screenshot capture is implemented for the native preview and remains unverified on iPad hardware. The web build explicitly reports screenshots as unsupported. A model must accept image input before screenshot capture can support visual reasoning.
-- Live DeepSeek/account behavior, native Keychain persistence, native WASI startup, iOS WebKit, signing, and device behavior still require their own verification. A passing mock-provider test is not a live API test.
+- Native WASI output, WebKit game checks/screenshots, cancellation/reload, Keychain availability, and project persistence after reopening passed in the iPad simulator. Live DeepSeek/account behavior, Keychain credential persistence, signing, installation, and physical-device behavior still require their own verification. A passing controlled-provider test is not a live API test.
 
 ## Checks and source map
 
@@ -83,7 +83,7 @@ The product entrypoint is `flutter_app/lib/main_pocketforge.dart`; runtime, stor
 
 Independent JavaScript checks are under `tools/pocketforge`: run `npm ci`, `npx playwright install webkit`, then `npm test`. For the complete controlled-provider UI check, serve the compiled web bundle on `127.0.0.1:8768`, then run `npm run test:web`; set `POCKETFORGE_BROWSER=webkit` for portrait WebKit. Chrome is the default and requires installed Google Chrome. These checks use fixture model replies and do not spend API credits.
 
-The first Mac build passed **24 scoped Flutter tests** and **5 iOS-preparer tests**. Local JavaScript/WebKit checks passed **6 tests**. A compiled Chrome end-to-end run completed seven controlled-provider requests, exercised a failing game assertion followed by a passing repair, and reported no browser errors. Those provider responses were deterministic test input, not live AI output. Native verification caught a command-output regression; native game checks, release packaging, signing, and physical-iPad verification remain pending.
+Mac build 2 passed **24 scoped Flutter tests**, **5 iOS-preparer tests**, **3 Rust output tests**, one focused Dart output regression, and the native iPad integration test before packaging the release IPA. The native check detected a deliberately injected game bug, verified the source repair, captured a real WebKit PNG, and reopened persisted project data; it made zero model requests. Local JavaScript/WebKit checks passed **6 tests**. The compiled Chrome and desktop WebKit flows each completed seven controlled-provider requests through a failing game assertion and passing repair. Five Windows-captured visual comparisons differed on Mac and remain diagnostics. Signing, physical-iPad verification, and live DeepSeek testing remain pending; see [the full evidence](BUILD_STATUS_POCKETFORGE.md).
 
 ## License and attribution
 
