@@ -63,6 +63,9 @@ class PrepareIOSTests(unittest.TestCase):
         self.assertIn('DEVELOPMENT_TEAM = "";', project)
         self.assertIn('PROVISIONING_PROFILE_SPECIFIER = "";', project)
         self.assertIn('CODE_SIGN_IDENTITY = "";', project)
+        sdk_identities = re.findall(r'"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = ([^;]*);', project)
+        self.assertTrue(sdk_identities)
+        self.assertEqual(set(sdk_identities), {'""'})
         self.assertNotIn("target = FA51AC0300000000000000A1;", project)
         definitions = set(re.findall(r"(?m)^\s*([A-F0-9]{24})(?: /\*[^\n]*?\*/)? = ", project))
         references = set(re.findall(r"\b[A-F0-9]{24}\b", project))
@@ -81,7 +84,7 @@ class PrepareIOSTests(unittest.TestCase):
         self.assertEqual(module.prepare_ios(self.repo, check=True), [])
 
     def test_optional_team_is_explicit_and_invalid_identifiers_are_rejected_before_writes(self):
-        for arguments in [{"team": "author-team"}, {"bundle_id": "bad; injected"}, {"bundle_id": "two.parts"}]:
+        for arguments in [{"team": "author-team"}, {"bundle_id": "bad; injected"}, {"bundle_id": "two.parts"}, {"signing": "development"}, {"signing": "invalid"}]:
             with self.assertRaises(ValueError):
                 module.prepare_ios(self.repo, **arguments)
         self.assertEqual((self.repo / "flutter_app/ios/Runner/Info.plist").read_bytes(), self.before["flutter_app/ios/Runner/Info.plist"])
@@ -89,6 +92,17 @@ class PrepareIOSTests(unittest.TestCase):
         text = (self.repo / "flutter_app/ios/Runner.xcodeproj/project.pbxproj").read_text()
         self.assertIn('DEVELOPMENT_TEAM = "ABCDEFGHIJ";', text)
         self.assertNotIn("YP9HC3USZ3", text)
+
+    def test_development_preparation_is_explicit_idempotent_and_preserves_linker_settings(self):
+        module.prepare_ios(self.repo, team="ABCDEFGHIJ", signing="development")
+        text = (self.repo / "flutter_app/ios/Runner.xcodeproj/project.pbxproj").read_text()
+        identities = re.findall(r'\bCODE_SIGN_IDENTITY(?:\[[^\]]+\])?"?\s*=\s*([^;]*);', text)
+        self.assertTrue(identities)
+        self.assertEqual(set(identities), {'"Apple Development"'})
+        self.assertIn('PROVISIONING_PROFILE_SPECIFIER = "";', text)
+        self.assertNotIn("CODE_SIGN_STYLE = Manual;", text)
+        self.assertEqual(module.prepare_ios(self.repo, team="ABCDEFGHIJ", signing="development", check=True), [])
+        self.assertEqual((self.repo / "flutter_app/ios/Podfile").read_bytes(), self.before["flutter_app/ios/Podfile"])
 
 
 if __name__ == "__main__":

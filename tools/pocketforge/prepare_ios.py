@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a disposable checkout for PocketForge's unsigned iOS build.
+"""Prepare a disposable checkout for PocketForge's iOS build.
 
 This does not sign, upload, publish, install, or contact Apple. Invoke it
 explicitly in the CI checkout; the upstream iOS files remain unchanged until then.
@@ -23,7 +23,7 @@ def _plist(data: dict) -> bytes:
     return plistlib.dumps(data, sort_keys=False)
 
 
-def _project(text: str, bundle_id: str, team: str) -> str:
+def _project(text: str, bundle_id: str, team: str, signing: str) -> str:
     """Remove the inactive upstream extension and telemetry build operations.
 
     Match complete top-level PBX objects; quoted shell-script braces never
@@ -60,7 +60,13 @@ def _project(text: str, bundle_id: str, team: str) -> str:
         text = re.sub(rf"(?m)^\t{{5}}{target} = \{{\n[\s\S]*?^\t{{5}}\}};\n", "", text)
     text = re.sub(r"\bdev\.fa1\.app\b", bundle_id, text)
     text = re.sub(r"(?m)(\bDEVELOPMENT_TEAM = )[^;]*;", lambda match: match[1] + f'"{team}";', text)
-    text = re.sub(r"(?m)(\bCODE_SIGN_IDENTITY(?:\[[^\]]+\])? = )[^;]*;", r'\1"";', text)
+    # SDK-qualified build-setting keys are quoted in a .pbxproj file. Include
+    # the closing quote in the prefix so these cannot retain a stale identity.
+    identity = "Apple Development" if signing == "development" else ""
+    text = re.sub(
+        r'(?m)(\bCODE_SIGN_IDENTITY(?:\[[^\]]+\])?"?\s*=\s*)[^;]*;',
+        lambda match: match[1] + f'"{identity}";', text,
+    )
     text = re.sub(r"(?m)(\bPROVISIONING_PROFILE(?:_SPECIFIER)? = )[^;]*;", r'\1"";', text)
     text = re.sub(r"(?m)(\bCODE_SIGN_STYLE = )[^;]*;", r"\1Automatic;", text)
     if "YP9HC3USZ3" in text or "Uladzimir Klyshevich" in text:
@@ -84,11 +90,15 @@ def _delegate(text: str, bundle_id: str) -> str:
     return text
 
 
-def prepare_ios(repo: Path, *, bundle_id: str = "com.pocketforge.ipad", team: str = "", check: bool = False) -> list[str]:
+def prepare_ios(repo: Path, *, bundle_id: str = "com.pocketforge.ipad", team: str = "", signing: str = "unsigned", check: bool = False) -> list[str]:
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9-]*(?:\.[A-Za-z][A-Za-z0-9-]*){2,}", bundle_id):
         raise ValueError("Use a reverse-DNS Apple bundle ID with at least three components.")
     if team and not re.fullmatch(r"[A-Z0-9]{10}", team):
         raise ValueError("An optional Apple team identifier must contain 10 uppercase letters/digits.")
+    if signing not in {"unsigned", "development"}:
+        raise ValueError("Signing preparation must be unsigned or development.")
+    if signing == "development" and not team:
+        raise ValueError("Development-signing preparation requires an explicit Apple team identifier.")
     repo = repo.resolve(strict=True)
     ios = repo / "flutter_app/ios"
     paths = {
@@ -115,7 +125,7 @@ def prepare_ios(repo: Path, *, bundle_id: str = "com.pocketforge.ipad", team: st
     # upstream local-network/background/device-integration services.
     info.pop("NSAppTransportSecurity", None)
     updated = {
-        "project": _project(original["project"].decode("utf-8"), bundle_id, team).encode("utf-8"),
+        "project": _project(original["project"].decode("utf-8"), bundle_id, team, signing).encode("utf-8"),
         "delegate": _delegate(original["delegate"].decode("utf-8"), bundle_id).encode("utf-8"),
         "info": _plist(info),
         "entitlements": _plist({}),
@@ -143,11 +153,13 @@ def main() -> None:
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--bundle-id", default="com.pocketforge.ipad")
     parser.add_argument("--team", default="", help="Optional team for a later signing workflow; empty for unsigned CI.")
+    parser.add_argument("--signing", choices=["unsigned", "development"], default="unsigned",
+        help="Prepare build settings only. Development requires --team and a separately authorized Apple signing setup.")
     parser.add_argument("--check", action="store_true", help="Read-only verification that preparation was already applied.")
     args = parser.parse_args()
-    changed = prepare_ios(args.repo, bundle_id=args.bundle_id, team=args.team, check=args.check)
+    changed = prepare_ios(args.repo, bundle_id=args.bundle_id, team=args.team, signing=args.signing, check=args.check)
     print(json.dumps({"bundleId": args.bundle_id, "team": args.team or None,
-        "codesigning": "not performed", "changed": changed}, indent=2))
+        "signingPreparation": args.signing, "codesigning": "not performed", "changed": changed}, indent=2))
 
 
 if __name__ == "__main__":

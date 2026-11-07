@@ -97,6 +97,31 @@ jobs:
           set -euo pipefail
           (cd flutter_app && flutter test --no-pub test/golden/pocketforge_golden_test.dart) 2>&1 | tee artifacts/logs/pocketforge-goldens.txt
 
+      - name: Exercise the native iPad runtime and WebKit before packaging
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available --json > artifacts/logs/simulator-devices.json
+          simulator_id=$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('artifacts/logs/simulator-devices.json').read_text())
+          devices = [device for group in data['devices'].values() for device in group
+                     if device.get('isAvailable') and 'iPad' in device.get('name', '')]
+          devices.sort(key=lambda device: ('A17 Pro' not in device['name'], device['name']))
+          if not devices:
+              raise SystemExit('No available iPad simulator runtime on this Mac runner.')
+          print(devices[0]['udid'])
+          PY
+          )
+          trap 'xcrun simctl shutdown "$simulator_id" >/dev/null 2>&1 || true' EXIT
+          xcrun simctl boot "$simulator_id"
+          xcrun simctl bootstatus "$simulator_id" -b
+          (cd flutter_app && flutter test --no-pub integration_test/pocketforge_native_test.dart \
+            --device-id "$simulator_id" --timeout 15m) 2>&1 | tee artifacts/logs/native-ipad-smoke.txt
+          app_data=$(xcrun simctl get_app_container "$simulator_id" com.pocketforge.ipad data)
+          cp "$app_data/Documents/fah_sandbox/pocketforge-state/native-smoke-report.json" artifacts/
+          cp "$app_data/Documents/fah_sandbox/pocketforge-state/native-smoke-preview.png" artifacts/
+
       - name: Compile actual unsigned iOS release
         run: |
           set -euo pipefail

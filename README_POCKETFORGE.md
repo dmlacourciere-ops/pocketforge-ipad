@@ -32,7 +32,7 @@ Prompts, selected file contents, and tool results go to DeepSeek. Model inferenc
 
 Where native Keychain is available, the key is stored there. Where secure storage is unavailable, the key remains in session memory; the settings screen says so. Keys are not saved to browser local storage, generated game source, or plaintext settings. Generated preview code has no credential or general filesystem bridge.
 
-Projects, sessions, and checkpoints use Fa's platform storage. The browser's project state uses IndexedDB; its API key does not. File limits are 500 files, 512 KiB per file, and 20 MiB per project. Eight checkpoints are retained.
+Native projects, sessions, and checkpoints use the app's persistent Documents storage even when WASI is unavailable. The browser's project state uses IndexedDB; its API key does not. File limits are 500 files, 512 KiB per file, and 20 MiB per project. Eight checkpoints are retained.
 
 ## Run from source
 
@@ -56,7 +56,9 @@ Use an empty `flutter_app/.env` when the upstream asset declaration requires tha
 
 The native Flutter app is a conventional iOS project. Its build route does not require Swift Playground. Building it still requires an Apple SDK/Mac build environment, and installation on a physical iPad requires a separate authorized signing/provisioning or sideloading workflow.
 
-[The manual verification workflow](.github/workflows/pocketforge-verify.yml) prepares an independent bundle ID, builds the Wasm interpreter from vendored Rust source, runs scoped checks, and attempts an **unsigned** iOS release build. GitHub rejected startup before any job ran, including a minimal Mac host diagnostic; the detailed page error is still needed. It does not publish, sign, install, or upload to TestFlight. Any resulting unsigned IPA is a build artifact, not a tap-to-install app. See the [Windows signing route](tools/pocketforge/INSTALL_WINDOWS.md) and the separate [browser test route](tools/pocketforge/TRY_BROWSER_WINDOWS.md).
+[The manual verification workflow](.github/workflows/pocketforge-verify.yml) prepares an independent bundle ID, builds the Wasm interpreter from vendored Rust source, runs scoped checks and a real iPad simulator smoke test, and attempts an **unsigned** iOS release build. GitHub currently blocks all runner startup because of account billing/admission. It does not publish, sign, install, or upload to TestFlight. Any resulting unsigned IPA still needs signing. See the [Windows signing route](tools/pocketforge/INSTALL_WINDOWS.md) and the separate [browser test route](tools/pocketforge/TRY_BROWSER_WINDOWS.md).
+
+The installed native app bundles its assets and runs independently of Windows. The free Apple account route normally requires weekly signing renewal through the Windows PC. DeepSeek still requires an internet connection to its API.
 
 ## Limits of this version
 

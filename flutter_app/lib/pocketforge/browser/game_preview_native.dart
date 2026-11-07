@@ -48,10 +48,15 @@ class _NativeGamePreviewBackend extends GamePreviewBackend {
     _status = 'Loading game…';
     notifyListeners();
     try {
+      // Attach the readiness error listener before awaiting the platform
+      // request: Stop/onReceivedError may complete it while loadData is pending.
       await _gate.run(
-        web.loadData(data: html, mimeType: 'text/html', encoding: 'utf-8'),
+        Future.wait<void>([
+          loaded.future,
+          web.loadData(data: html, mimeType: 'text/html', encoding: 'utf-8'),
+        ], eagerError: true),
+        timeout: const Duration(seconds: 30),
       );
-      await _gate.run(loaded.future, timeout: const Duration(seconds: 30));
       _status = 'Game running in WebKit.';
     } catch (error) {
       _status = 'Preview failed: $error';
@@ -99,11 +104,20 @@ class _NativeGamePreviewBackend extends GamePreviewBackend {
     }
     final old = _web;
     _web = null;
-    if (old != null) unawaited(old.stopLoading());
+    if (old != null) unawaited(_stopDetachedView(old));
     _viewGeneration++;
     _loading = false;
     _status = 'Stopped. Reload the preview to run again.';
     if (!_disposed) notifyListeners();
+  }
+
+  Future<void> _stopDetachedView(InAppWebViewController web) async {
+    try {
+      await web.stopLoading();
+    } on Object {
+      // Cancel/dispose has already detached this platform view. Its channel
+      // may be gone; cleanup must not produce an unhandled asynchronous error.
+    }
   }
 
   @override

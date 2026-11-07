@@ -45,6 +45,10 @@ final class PocketForgeStore {
     _closeShell = null;
   }
 
+  static Future<ExecutionEnv?> createDurableNativeStorage({
+    String? directoryPath,
+  }) => native.createNativeStorage(directoryPath: directoryPath);
+
   static Future<PocketForgeStore> create(
     ExecutionEnv storage, {
     bool useNativeRuntime = true,

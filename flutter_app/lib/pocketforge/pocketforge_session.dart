@@ -102,7 +102,10 @@ final class PocketForgeSession extends PocketForgeModel {
         /* factory reports fallback */
       }
     }
-    final storage = baseEnv ?? await createPlatformEnv();
+    final storage =
+        baseEnv ??
+        await PocketForgeStore.createDurableNativeStorage() ??
+        await createPlatformEnv();
     final store = await PocketForgeStore.create(
       storage,
       useNativeRuntime: useNativeRuntime,

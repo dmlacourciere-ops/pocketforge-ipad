@@ -12,9 +12,10 @@ Updated November 7, 2026. This records the Fa-based implementation, separate fro
 | Product UI behavior | 6 tests passed | Input/send, Stop, dirty-edit protection, preview focus, secure-key field behavior, and clean-file refresh after agent edits |
 | Product visual snapshots | 5 passed on comparison | Full frames at desktop, phone, and iPad portrait sizes; real bundled fonts; every new snapshot visually inspected |
 | Product golden coverage/localization guards | Passed | New widget files registered; English-only product copy uses the repository's explicit exemption |
-| Session/storage and browser unit tests | 8 session + 8 browser tests passed | Fake provider/backend checks exercise local contracts; with the 6 UI and 5 golden tests, the scoped Flutter suite totals **27 passed** |
+| Session/storage and browser unit tests | 9 session/storage + 8 browser tests passed | A real disk restart test verifies persistence with the interpreter unavailable; with 6 UI and 5 golden tests, the scoped Flutter suite totals **28 passed, 1 skipped**. Windows lacks symlink-creation privileges; that check runs on macOS |
 | JavaScript/game runtime checks | 6 passed | 3 actual desktop WebKit checks plus 3 simulation checks; neither runs iOS WebKit |
-| iOS build-preparer checks | 4 passed | Tests the source preparation script; does not compile the iOS app |
+| iOS build-preparer checks | 5 passed | Includes quoted SDK-specific signing identities and explicit development preparation; does not compile or sign the iOS app |
+| Native iPad integration test | Authored; analyzer passed; Apple execution pending | Boots production main, requires WASI and Keychain, runs rg.wasm, actual WebKit collision failure/repair, Stop/reload, PNG capture, and session recreation |
 | Browser release build | Compiled and booted | Actual Flutter web entrypoint loaded in a desktop browser |
 | Compiled browser tool flow | Passed in Chrome and desktop WebKit | Seven controlled-provider requests per engine drove the compiled app through a failing game assertion, repair, and passing rerun; portrait layout, project persistence across reload, session-only key removal, and no browser errors were verified |
 
@@ -36,7 +37,9 @@ Full log in the development workspace: `test-results/pocketforge-full-goldens.lo
 
 [PocketForge unsigned iOS verification](.github/workflows/pocketforge-verify.yml) is prepared as a manual workflow. It has **not yet produced a successful iOS build**. Its planned unsigned IPA requires a separate signing step and is not directly installable.
 
-The private development repository is [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). GitHub reported `startup_failure` before creating any jobs for the [native workflow](https://github.com/dmlacourciere-ops/pocketforge-ipad/actions/runs/42341866801). A separate [minimal Mac host diagnostic](https://github.com/dmlacourciere-ops/pocketforge-ipad/actions/runs/42342461554), with no checkout or third-party actions, also reported `startup_failure`. The REST API supplied no explanatory annotation or job log. Workflow validation with actionlint passed. The detailed GitHub page error is needed to diagnose this; no Apple compilation result is claimed.
+The private development repository is [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). Both Mac and Linux control jobs were rejected before starting. On November 7 the signed-in GitHub run page identified an account billing/admission block. This is independent of the app source and runner label; workflow validation with actionlint passed. Account resolution or an explicitly authorized source-publication decision is needed before cloud compilation can proceed. No Apple compilation result is claimed.
+
+The native workflow now includes an actual iPad simulator test before packaging. Its preview PNG and JSON report become build artifacts only after successful native execution. Native source assets are bundled, and project/session storage uses the app's disk independently of the optional WASI interpreter. Normal native use needs no Windows server. The user selected free Apple account installation with weekly Windows signing renewal; no Apple credentials, certificate creation or installation have been performed.
 
 The remaining checks include:
 
