@@ -1,15 +1,28 @@
-name: PocketForge Mac host diagnostic
+name: PocketForge build host diagnostic
 on:
   workflow_dispatch:
+    inputs:
+      host:
+        description: Standard runner to check before a full native build
+        type: choice
+        required: true
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - macos-15
+          - macos-15-intel
 permissions:
   contents: read
 jobs:
   host:
-    runs-on: macos-15
+    runs-on: ${{ inputs.host }}
     timeout-minutes: 5
     steps:
-      - name: Verify Apple SDK availability without third-party actions
+      - name: Verify host admission without third-party actions
         run: |
+          set -euo pipefail
           uname -a
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+          fi
