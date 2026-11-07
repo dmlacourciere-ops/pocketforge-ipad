@@ -330,8 +330,9 @@ void main() {
       }) {
         requests++;
         if (requests == 1) return _reply(model, [_call(1, 'game_preview', {})]);
-        if (requests == 2)
+        if (requests == 2) {
           return _reply(model, [_call(2, 'game_screenshot', {})]);
+        }
         rawContextBytes = utf8
             .encode(
               jsonEncode(

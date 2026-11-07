@@ -2,7 +2,7 @@
 
 PocketForge is an experimental game-building app based on [Flutter Agent Harness (Fa)](https://github.com/IstiN/flutter_agent_harness). The agent loop, project files, sandbox tools, and game preview run on the current device. **DeepSeek supplies the model through its remote API.**
 
-This is a separate product entrypoint, not an OpenCode port or an upstream Fa release. The original [README](README.md) is retained. Current verification and unfinished work are recorded in [BUILD_STATUS_POCKETFORGE.md](BUILD_STATUS_POCKETFORGE.md).
+This is a separate product entrypoint, not an OpenCode port or an upstream Fa release. The upstream README is retained in the build distribution. Current verification and unfinished work are recorded in [BUILD_STATUS_POCKETFORGE.md](BUILD_STATUS_POCKETFORGE.md). The development repository is [pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad) (private).
 
 ## What it does
 
@@ -76,6 +76,8 @@ flutter test --no-pub test/golden/pocketforge_golden_test.dart
 ```
 
 The product entrypoint is `flutter_app/lib/main_pocketforge.dart`; runtime, storage, browser tools, and UI are under `flutter_app/lib/pocketforge/`. Agent instructions live in `flutter_app/prompts/pocketforge_game.md` and are generated through the repository's prompt generator.
+
+Current scoped checks pass: **27 Flutter tests**, **6 JavaScript/WebKit tests**, and **4 iOS-preparer tests**. A compiled Chrome end-to-end run completed seven controlled-provider requests, exercised a failing game assertion followed by a passing repair, and reported no browser errors. Those provider responses were deterministic test input, not live AI output. Native iOS and physical-iPad verification remain pending.
 
 ## License and attribution
 

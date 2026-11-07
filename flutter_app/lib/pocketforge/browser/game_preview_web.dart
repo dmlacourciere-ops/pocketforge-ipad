@@ -1,15 +1,11 @@
-// This conditional adapter follows the existing app's iframe platform-view
-// implementation. It is excluded from native builds.
-// ignore_for_file: deprecated_member_use, avoid_web_libraries_in_flutter
-
 import 'dart:async';
-import 'dart:html' as html;
-import 'dart:js_util' as js_util;
+import 'dart:js_interop';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui_web' as ui_web;
 
 import 'package:flutter/widgets.dart';
+import 'package:web/web.dart' as web;
 
 import 'game_preview_backend.dart';
 
@@ -17,20 +13,29 @@ GamePreviewBackend createGamePreviewBackend() => _WebGamePreviewBackend();
 
 int _nextGameFrame = 0;
 
+// Compare the actual WindowProxy JavaScript objects. Dart-side cross-frame
+// wrappers are not a reliable identity check; Object.is also works in Wasm.
+@JS('Object.is')
+external bool _sameJavaScriptObject(JSAny? left, JSAny? right);
+
 class _WebGamePreviewBackend extends GamePreviewBackend {
   _WebGamePreviewBackend() {
     ui_web.platformViewRegistry.registerViewFactory(_viewType, (_) => _frame);
-    _messages = html.window.onMessage.listen(_onMessage);
-    _loads = _frame.onLoad.listen((_) {
+    _messages = ((web.Event event) => _onMessage(
+      event as web.MessageEvent,
+    )).toJS;
+    web.window.addEventListener('message', _messages);
+    _loads = ((web.Event event) {
       _attached = true;
       final pending = _loaded;
       if (pending != null && !pending.isCompleted) pending.complete();
       if (!_disposed) notifyListeners();
-    });
+    }).toJS;
+    _frame.addEventListener('load', _loads);
   }
 
   final String _viewType = 'pocket-game-${_nextGameFrame++}';
-  final html.IFrameElement _frame = html.IFrameElement()
+  final web.HTMLIFrameElement _frame = web.HTMLIFrameElement()
     ..style.border = '0'
     ..style.width = '100%'
     ..style.height = '100%'
@@ -38,8 +43,8 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
     ..setAttribute('title', 'PocketForge game preview');
   final _gate = GameOperationGate();
   final Map<String, Completer<Object?>> _requests = {};
-  late final StreamSubscription<html.MessageEvent> _messages;
-  late final StreamSubscription<html.Event> _loads;
+  late final JSFunction _messages;
+  late final JSFunction _loads;
   Completer<void>? _loaded;
   String _nonce = '';
   int _sequence = 0;
@@ -55,15 +60,18 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
   @override
   String get status => _status;
 
-  void _onMessage(html.MessageEvent event) {
-    // dart:html creates a fresh cross-frame Window wrapper for each access.
-    // Compare the raw JS WindowProxy identities, retaining the source check.
-    final source = js_util.getProperty<Object?>(event, 'source');
-    final expected = js_util.getProperty<Object?>(_frame, 'contentWindow');
-    if (_disposed || !identical(source, expected)) return;
+  void _onMessage(web.MessageEvent event) {
+    final source = event.source;
+    final expected = _frame.contentWindow;
+    if (_disposed ||
+        source == null ||
+        expected == null ||
+        !_sameJavaScriptObject(source, expected)) {
+      return;
+    }
     // Structured-clone replies are JavaScript objects, not Dart Maps in the
     // compiled web app. Convert before checking the protocol envelope.
-    final data = js_util.dartify(js_util.getProperty<Object?>(event, 'data'));
+    final data = event.data.dartify();
     if (data is! Map ||
         data['channel'] != 'pocketforge-game' ||
         data['nonce'] != _nonce ||
@@ -95,10 +103,12 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
     // Only page-operations are bridged. The frame has an opaque origin and
     // cannot reach the Flutter app's IndexedDB, provider keys, or DOM.
     final quotedNonce = '"$_nonce"';
-    _frame.srcdoc = document.replaceFirst(
-      '/*POCKETFORGE_RPC*/',
-      'window.__pocketGame.installRpc($quotedNonce);',
-    );
+    _frame.srcdoc = document
+        .replaceFirst(
+          '/*POCKETFORGE_RPC*/',
+          'window.__pocketGame.installRpc($quotedNonce);',
+        )
+        .toJS;
     try {
       await _gate.run(loaded.future, timeout: const Duration(seconds: 30));
       _status = 'Game running in an isolated browser frame.';
@@ -120,14 +130,17 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
     final id = '${++_sequence}';
     final pending = Completer<Object?>();
     _requests[id] = pending;
-    _frame.contentWindow!.postMessage({
-      'channel': 'pocketforge-game',
-      'nonce': _nonce,
-      'kind': 'request',
-      'id': id,
-      'method': method,
-      'payload': payload,
-    }, '*');
+    _frame.contentWindow!.postMessage(
+      {
+        'channel': 'pocketforge-game',
+        'nonce': _nonce,
+        'kind': 'request',
+        'id': id,
+        'method': method,
+        'payload': payload,
+      }.jsify(),
+      '*'.toJS,
+    );
     try {
       return await _gate.run(pending.future);
     } finally {
@@ -162,7 +175,8 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
     }
     _nonce = '';
     _frame.srcdoc =
-        '<!doctype html><html><body>Preview stopped. Run it again to reload.</body></html>';
+        '<!doctype html><html><body>Preview stopped. Run it again to reload.</body></html>'
+            .toJS;
     _loading = false;
     _status = 'Stopped. Reload the preview to run again.';
     if (!_disposed) notifyListeners();
@@ -175,8 +189,8 @@ class _WebGamePreviewBackend extends GamePreviewBackend {
   void dispose() {
     _disposed = true;
     cancel();
-    _messages.cancel();
-    _loads.cancel();
+    web.window.removeEventListener('message', _messages);
+    _frame.removeEventListener('load', _loads);
     _gate.dispose();
     super.dispose();
   }

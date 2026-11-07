@@ -12,11 +12,15 @@ Updated November 7, 2026. This records the Fa-based implementation, separate fro
 | Product UI behavior | 6 tests passed | Input/send, Stop, dirty-edit protection, preview focus, secure-key field behavior, and clean-file refresh after agent edits |
 | Product visual snapshots | 5 passed on comparison | Full frames at desktop, phone, and iPad portrait sizes; real bundled fonts; every new snapshot visually inspected |
 | Product golden coverage/localization guards | Passed | New widget files registered; English-only product copy uses the repository's explicit exemption |
-| Session/storage and browser unit tests | Targeted tests passed | Fake provider/backend checks exercise local contracts; no paid model calls or iPad execution implied |
+| Session/storage and browser unit tests | 8 session + 8 browser tests passed | Fake provider/backend checks exercise local contracts; with the 6 UI and 5 golden tests, the scoped Flutter suite totals **27 passed** |
+| JavaScript/game runtime checks | 6 passed | 3 actual desktop WebKit checks plus 3 simulation checks; neither runs iOS WebKit |
+| iOS build-preparer checks | 4 passed | Tests the source preparation script; does not compile the iOS app |
 | Browser release build | Compiled and booted | Actual Flutter web entrypoint loaded in a desktop browser |
-| Compiled browser tool flow | Retest pending | The interactive end-to-end run found a JavaScript structured-clone reply conversion bug. The bridge was corrected; the complete flow must pass the follow-up run before it is marked verified |
+| Compiled browser tool flow | Passed in Chrome | Seven controlled-provider requests drove the actual compiled app through tool execution, a failing game assertion, a repair, and a passing rerun; no browser errors were reported |
 
 Golden previews use an explicit fake browser backend, so they validate the real Flutter shell and result/status widgets without claiming that a native WebKit engine ran. Browser unit tests, JavaScript runtime tests, and a compiled browser interaction run provide different evidence and must be reported separately.
+
+The compiled browser run exposed two bridge problems: JavaScript structured-clone replies needed conversion into Dart values, and message-source checks needed the raw JavaScript Window identity. Both were corrected before the successful rerun. The end-to-end provider was controlled test input, **not a live DeepSeek model**, so this establishes tool/UI integration rather than model quality or account compatibility.
 
 ## Full upstream visual suite
 
@@ -31,6 +35,8 @@ Full log in the development workspace: `test-results/pocketforge-full-goldens.lo
 ## Native iOS verification still required
 
 [PocketForge unsigned iOS verification](.github/workflows/pocketforge-verify.yml) is prepared as a manual workflow. It has **not yet produced a successful iOS build**. Its planned unsigned IPA requires a separate signing step and is not directly installable.
+
+The private development repository has been created at [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). No CI run has started as of this update.
 
 The remaining checks include:
 
