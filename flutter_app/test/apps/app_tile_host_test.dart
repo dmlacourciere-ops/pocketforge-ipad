@@ -1,0 +1,367 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:async';
+
+import 'package:fa/apps/app_icon.dart';
+import 'package:fa/apps/app_tile_host.dart';
+import 'package:fa/apps/apps_store.dart';
+import 'package:fa/apps/js_app_engine.dart';
+import 'package:fa/ui/app_theme.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+/// Fake tile engine emitting a fixed tree — the [AppTileHost] tests stay
+/// deterministic (no JavaScriptCore boot) via the engine-factory seam.
+final class _FakeTileEngine extends JsAppEngine {
+  _FakeTileEngine({
+    required super.app,
+    required super.env,
+    required super.permissions,
+    super.initialTheme,
+    required this.fixedTree,
+    this.stalled = false,
+  });
+
+  final Map<String, dynamic> fixedTree;
+
+  /// gh-1336: the boot resolves but the eval never renders — the exact
+  /// spinner shape, with the watchdog verdict pre-recorded.
+  final bool stalled;
+  final receivedEvents = <String>[];
+  final hostPayloads = <String, Map<String, dynamic>>{};
+  var startCount = 0;
+  var disposeCount = 0;
+
+  /// When set, the next [callEvent] hangs on this completer — tests drive
+  /// the in-flight-refresh drain.
+  Completer<void>? callEventGate;
+
+  @override
+  Future<void> start() async {
+    startCount++;
+    if (stalled) {
+      bootError.value =
+          "widget 'weather' (apps/weather/widget_tile.js) produced no UI "
+          'tree within 10s of engine start — the app source likely fails '
+          'to parse (syntax error); fix the widget source and retry';
+      return;
+    }
+    tree.value = fixedTree;
+  }
+
+  @override
+  Future<void> callEvent(
+    String actionId, [
+    Map<String, dynamic>? payload,
+  ]) async {
+    receivedEvents.add(actionId);
+    await callEventGate?.future;
+  }
+
+  @override
+  void dispatchHostEvent(String target, Map<String, dynamic> payload) {
+    hostPayloads[target] = payload;
+  }
+
+  @override
+  Future<void> dispose() async {
+    disposeCount++;
+    await super.dispose();
+  }
+
+  @override
+  Future<void> updateTheme(Map<String, dynamic> theme) async {}
+}
+
+const _tree = <String, dynamic>{
+  'type': 'container',
+  'alignment': 'center',
+  'child': {
+    'type': 'column',
+    'mainAxisSize': 'min',
+    'crossAxisAlignment': 'center',
+    'children': [
+      {
+        'type': 'text',
+        'data': '21°',
+        'style': {'fontSize': 26, 'fontWeight': 'w700'},
+      },
+      {
+        'type': 'text',
+        'data': 'Minsk',
+        'style': {'fontSize': 11},
+      },
+      {
+        'type': 'inkWell',
+        'onTap': 'tap',
+        'child': {
+          'type': 'text',
+          'data': 'Open',
+          'style': {'fontSize': 10},
+        },
+      },
+      {
+        'type': 'gestureDetector',
+        'onPanUpdate': 'panMove',
+        'child': {
+          'type': 'sizedBox',
+          'width': 60,
+          'height': 24,
+          'child': {
+            'type': 'text',
+            'data': 'DragZone',
+            'style': {'fontSize': 10},
+          },
+        },
+      },
+    ],
+  },
+};
+
+JsAppInfo _app({int? refreshSeconds, bool interactive = false}) =>
+    JsAppInfo.fromManifest(
+      {
+        'id': 'weather',
+        'name': 'Weather',
+        'widget': {
+          'entry': 'widget_tile.js',
+          'refreshSeconds': ?refreshSeconds,
+          if (interactive) 'interactive': true,
+        },
+      },
+      bundled: false,
+      fallbackId: 'weather',
+    );
+
+class _Harness {
+  _Harness(this.env, this.engines);
+
+  final MemoryExecutionEnv env;
+  final List<_FakeTileEngine> engines;
+
+  int opened = 0;
+
+  TileEngineFactory get factory =>
+      ({
+        required JsAppInfo app,
+        required ExecutionEnv env,
+        required AppPermissions permissions,
+        required Map<String, dynamic> initialTheme,
+      }) {
+        final engine = _FakeTileEngine(
+          app: app,
+          env: env,
+          permissions: permissions,
+          initialTheme: initialTheme,
+          fixedTree: _tree,
+          stalled: stalled,
+        );
+        engines.add(engine);
+        return engine;
+      };
+
+  bool stalled = false;
+}
+
+Future<_Harness> _pumpHost(
+  WidgetTester tester, {
+  int? refreshSeconds,
+  bool interactive = false,
+  ValueNotifier<int>? fsRevision,
+  bool stalled = false,
+}) async {
+  final harness = _Harness(MemoryExecutionEnv(), [])..stalled = stalled;
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: buildFahTheme(),
+      home: Scaffold(
+        body: Center(
+          child: SizedBox(
+            width: 120,
+            height: 120,
+            child: AppTileHost(
+              app: _app(
+                refreshSeconds: refreshSeconds,
+                interactive: interactive,
+              ),
+              env: harness.env,
+              fsRevision: fsRevision,
+              engineFactory: harness.factory,
+              onOpen: () => harness.opened++,
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+  return harness;
+}
+
+void main() {
+  group('AppTileHost', () {
+    testWidgets('renders the tree the tile engine emits', (tester) async {
+      await _pumpHost(tester);
+      expect(find.text('21°'), findsOneWidget);
+      expect(find.text('Minsk'), findsOneWidget);
+    });
+
+    testWidgets('a booted engine that never renders shows the icon '
+        'fallback, not a spinner (gh-1336)', (tester) async {
+      await _pumpHost(tester, stalled: true);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expect(find.byType(AppIcon), findsOneWidget);
+    });
+
+    testWidgets('reports the tile size as a viewport host event', (
+      tester,
+    ) async {
+      final harness = await _pumpHost(tester);
+      final engine = harness.engines.single;
+      // The tile is pumped inside a 120x120 SizedBox; the render surface
+      // sits inside the tile's 1px frame, so 118x118 is the allotted size.
+      expect(engine.hostPayloads['viewport'], {
+        'width': 118.0,
+        'height': 118.0,
+      });
+    });
+
+    testWidgets('any UI event from the tile opens the full app', (
+      tester,
+    ) async {
+      final harness = await _pumpHost(tester);
+      await tester.tap(find.text('Open'));
+      await tester.pumpAndSettle();
+      expect(harness.opened, 1);
+      expect(harness.engines.single.receivedEvents, isEmpty);
+    });
+
+    test('the widget manifest parses interactive (default false)', () {
+      expect(_app().tileWidget!.interactive, isFalse);
+      expect(_app(interactive: true).tileWidget!.interactive, isTrue);
+    });
+
+    testWidgets('an interactive tile routes UI events to the tile engine', (
+      tester,
+    ) async {
+      final harness = await _pumpHost(tester, interactive: true);
+      await tester.tap(find.text('Open'));
+      await tester.pumpAndSettle();
+      // The tap goes to the widget's jsr.onEvent — the app does NOT open.
+      expect(harness.opened, 0);
+      expect(harness.engines.single.receivedEvents, ['tap']);
+    });
+
+    testWidgets(
+      'an interactive tile routes onPanUpdate via dispatchHostEvent(gesture:...) '
+      'instead of callEvent (gh-1784)',
+      (tester) async {
+        final harness = await _pumpHost(tester, interactive: true);
+        final engine = harness.engines.single;
+        await tester.drag(find.text('DragZone'), const Offset(20, 10));
+        await tester.pumpAndSettle();
+        expect(harness.opened, 0);
+        // Pan updates bypass callEvent and land on the fire-and-forget
+        // host-event lane (`gesture:panMove`).
+        expect(engine.receivedEvents, isNot(contains('panMove')));
+        expect(engine.hostPayloads, contains('gesture:panMove'));
+        expect(engine.hostPayloads['gesture:panMove']!['dx'], isNotNull);
+      },
+    );
+
+    testWidgets('refreshSeconds fires tile.refresh on the cadence', (
+      tester,
+    ) async {
+      final harness = await _pumpHost(tester, refreshSeconds: 60);
+      final engine = harness.engines.single;
+      expect(engine.receivedEvents, isEmpty);
+      await tester.pump(const Duration(seconds: 61));
+      expect(engine.receivedEvents, ['tile.refresh']);
+      // Unmount to cancel the periodic timer before the test ends.
+      await tester.pumpWidget(const SizedBox.shrink());
+    });
+
+    testWidgets('unmount disposes the engine immediately', (tester) async {
+      final harness = await _pumpHost(tester, refreshSeconds: 60);
+      final engine = harness.engines.single;
+      // An evaluation in flight (gated) must NOT delay disposal: queued
+      // evaluations are guarded inside the runtime (`_isLive`), and a
+      // LATE native release is what actually crashed production
+      // (freed-then-reused context address).
+      final gate = Completer<void>();
+      engine.callEventGate = gate;
+      await tester.pump(const Duration(seconds: 61));
+      expect(engine.receivedEvents, ['tile.refresh']);
+
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      expect(engine.disposeCount, 1);
+      gate.complete();
+    });
+
+    testWidgets('a restart disposes the old engine and boots a fresh one', (
+      tester,
+    ) async {
+      final fsRevision = ValueNotifier(0);
+      addTearDown(fsRevision.dispose);
+      final harness = await _pumpHost(tester, fsRevision: fsRevision);
+      final old = harness.engines.single;
+
+      // Restart requires the APP's files to have changed (the signature
+      // guard against needless engine churn) — write a new tile entry.
+      await harness.env.writeFile('apps/weather/widget_tile.js', '// v2');
+      fsRevision.value++;
+      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pumpAndSettle();
+      expect(old.disposeCount, 1);
+      expect(harness.engines, hasLength(2));
+      expect(harness.engines.last.startCount, 1);
+    });
+
+    testWidgets('an fsRevision bump WITHOUT app changes keeps the engine', (
+      tester,
+    ) async {
+      final fsRevision = ValueNotifier(0);
+      addTearDown(fsRevision.dispose);
+      final harness = await _pumpHost(tester, fsRevision: fsRevision);
+
+      // An unrelated write bumped fsRevision — the tile's app is
+      // untouched, so the engine must NOT restart (the churn guard).
+      fsRevision.value++;
+      await tester.pump(const Duration(milliseconds: 700));
+      await tester.pumpAndSettle();
+      expect(harness.engines.single.startCount, 1);
+      expect(harness.engines.single.disposeCount, 0);
+    });
+
+    testWidgets('no refreshSeconds → no periodic timer', (tester) async {
+      final harness = await _pumpHost(tester);
+      await tester.pump(const Duration(minutes: 5));
+      expect(harness.engines.single.receivedEvents, isEmpty);
+    });
+
+    testWidgets('an fsRevision bump restarts the engine (debounced)', (
+      tester,
+    ) async {
+      final fsRevision = ValueNotifier(0);
+      addTearDown(fsRevision.dispose);
+      final harness = await _pumpHost(tester, fsRevision: fsRevision);
+      expect(harness.engines, hasLength(1));
+
+      // Restart requires the APP's files to have changed.
+      await harness.env.writeFile('apps/weather/widget_tile.js', '// v2');
+      fsRevision.value++;
+      // The 600 ms debounce has not elapsed yet — still one engine.
+      await tester.pump(const Duration(milliseconds: 300));
+      expect(harness.engines, hasLength(1));
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pumpAndSettle();
+      expect(harness.engines, hasLength(2));
+      expect(harness.engines.last.startCount, 1);
+      expect(find.text('21°'), findsOneWidget);
+    });
+  });
+}

@@ -1,0 +1,88 @@
+platform :osx, '14.0'
+
+# CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', {
+  'Debug' => :debug,
+  'Profile' => :release,
+  'Release' => :release,
+}
+
+def flutter_root
+  generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'ephemeral', 'Flutter-Generated.xcconfig'), __FILE__)
+  unless File.exist?(generated_xcode_build_settings_path)
+    raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure \"flutter pub get\" is executed first"
+  end
+
+  File.foreach(generated_xcode_build_settings_path) do |line|
+    matches = line.match(/FLUTTER_ROOT\=(.*)/)
+    return matches[1].strip if matches
+  end
+  raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Flutter-Generated.xcconfig, then run \"flutter pub get\""
+end
+
+require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+flutter_macos_podfile_setup
+
+target 'Runner' do
+  use_frameworks!
+
+  flutter_install_all_macos_pods File.dirname(File.realpath(__FILE__))
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    flutter_additional_macos_build_settings(target)
+  end
+
+  # wasm_run FFI symbols live in a static library inside WasmRun.xcframework.
+  # They are referenced only from Dart via dlsym (DynamicLibrary.executable()),
+  # so the linker never pulls them in: force_load alone is not enough because
+  # DEAD_CODE_STRIPPING=YES (Release default) still discards the unreferenced
+  # code, and dlsym only sees exported symbols. Exporting a symbol makes it
+  # both dlsym-visible AND a dead-strip root, so export every C-ABI symbol the
+  # Dart bindings look up (wire_*/new_*/drop_*/…), derived from the archive
+  # itself so the list stays in sync with the vendored package. Without this
+  # the Release/TestFlight binary boots to a white screen. SRCROOT is the
+  # macos/ directory, so ../../ walks up to the repo root where vendor/ lives.
+  macos_slice = '$(SRCROOT)/../../vendor/wasm_run_flutter/macos/Frameworks/WasmRun.xcframework/macos-arm64_x86_64/libwasm_run_dart.a'
+  macos_archive = File.expand_path('../../vendor/wasm_run_flutter/macos/Frameworks/WasmRun.xcframework/macos-arm64_x86_64/libwasm_run_dart.a', __dir__)
+  ffi_symbols = `nm -gU -arch arm64 #{macos_archive}`.lines
+    .map(&:split)
+    .select { |cols| %w[T D S].include?(cols[1]) && cols[2] }
+    .map { |cols| cols[2] }
+    .uniq
+    .grep(/^_(wire|new|drop|free|get|store|init|inflate|share)_/)
+    .sort
+  raise "no wasm_run FFI symbols found in #{macos_archive}" if ffi_symbols.empty?
+  export_flags = ffi_symbols.map { |s| "-Wl,-exported_symbol,#{s}" }
+  installer.aggregate_targets.each do |aggregate_target|
+    aggregate_target.user_project.targets.each do |target|
+      next unless target.name == 'Runner'
+      target.build_configurations.each do |config|
+        # Archive/install builds run `strip` per STRIP_STYLE. The default
+        # "all" removes the dyld exports trie entirely, which kills the
+        # dlsym-based wasm_run lookups at runtime — TestFlight white screen.
+        # "non-global" (strip -x) keeps the trie intact.
+        config.build_settings['STRIP_STYLE'] = 'non-global'
+        ldflags = Array(config.build_settings['OTHER_LDFLAGS'] || ['$(inherited)']).dup
+        # Drop stale wasm_run flags from earlier pod installs.
+        ldflags.reject! { |f| f == '-force_load' || f.include?('wasm_run_dart.a') || f.start_with?('-Wl,-exported_symbol,') }
+        ldflags << "-Wl,-force_load,#{macos_slice}"
+        # Debug must NOT get -exported_symbol flags: giving any flips ld
+        # into "export only these" mode, which hides the JIT entry point
+        # (main) from the debug host — abort_could_not_find_entry_point
+        # at launch. Debug exports all globals by default, so dlsym finds
+        # the wire_* symbols without any flags.
+        ldflags.concat(export_flags) unless config.name == 'Debug'
+        config.build_settings['OTHER_LDFLAGS'] = ldflags
+      end
+    end
+    aggregate_target.user_project.save
+  end
+end

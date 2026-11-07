@@ -1,0 +1,249 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:fa_hub_client/fa_hub_client.dart';
+import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show JsonlSessionRepo, SessionMetadata;
+import 'package:flutter_agent_harness/io.dart' show LocalExecutionEnv;
+
+import 'package:fa/services/dap_home.dart';
+import 'package:fa/services/sessions_root.dart';
+
+import 'dap_service.dart';
+
+/// The real [DapHubService] (IO platforms): reads/writes the same
+/// machine-shared `~/.dap` config the CLI agents use, via the
+/// `fah_hub_client` package's own loader/persister — no second config
+/// format.
+final class IoDapHubService implements DapHubService {
+  IoDapHubService({
+    Map<String, String>? environment,
+    String? home,
+    this.probeTimeout = const Duration(seconds: 5),
+  }) : environment = environment ?? Platform.environment,
+       _injectedHome = home;
+
+  /// Injected environment (defaults to `Platform.environment`; test seam —
+  /// pointing `HOME` at a temp dir keeps tests off the real `~/.dap`).
+  final Map<String, String> environment;
+
+  /// The constructor's `home:` argument (the test seam). Not an
+  /// initializing formal on purpose: the named parameter must stay the
+  /// public `home:` (private named parameters are not allowed), and the
+  /// effective home is [resolveDapHome]'s precedence over it — naming the
+  /// field `_home` would trip `prefer_initializing_formals` (gh-1730
+  /// review).
+  final String? _injectedHome;
+
+  /// Home directory for the `~/.dap` layout: the injected test seam, else the
+  /// mobile sandbox ([dapHomeOverride] — `/` is read-only on Android/iOS),
+  /// else null (the package's `$HOME`).
+  String? get home => resolveDapHome(_injectedHome);
+
+  /// How long the live probe waits for the hub's welcome before reporting
+  /// unreachable — the client keeps reconnecting forever otherwise.
+  final Duration probeTimeout;
+
+  /// The effective settings with the documented precedence (docs/dap.md
+  /// §9.1): env (`DAP_HUB_URL`/`DAP_AGENT_NAME`) > `~/.dap/config.json` >
+  /// zero-config defaults — env merged exactly like `HubPlugin.register`.
+  DapSettings get _settings {
+    final config = HubConfig.fromMap(
+      readDapConfig(defaultDapConfigFile(home, environment)),
+      environment,
+    );
+    return resolveDapSettings(
+      config: config,
+      environment: environment,
+      home: home,
+    );
+  }
+
+  @override
+  Future<DapHubSnapshot> load() async {
+    final settings = _settings;
+    // Created 0600 on first use — the same first-use semantics as the CLI.
+    final identity = await HubIdentity.load(settings.keyPath);
+    final channels = (await loadChannelKeys(
+      settings.channelsFile,
+    )).keys.toList()..sort();
+    final binding = _readBinding();
+    return DapHubSnapshot(
+      supported: true,
+      url: settings.url,
+      name: settings.name,
+      agentId: identity.agentId,
+      channels: channels,
+      envLocked:
+          environment.containsKey(HubConfig.envUrl) ||
+          environment.containsKey(HubConfig.envName),
+      connected: null,
+      inboundMode: binding.$1,
+      boundSessionId: binding.$2,
+      boundSessionTitle: binding.$3,
+    );
+  }
+
+  /// The `boundSession` block of the raw config (`{mode, sessionId?,
+  /// title?}`) — readDapConfig returns the full map, so app-only keys
+  /// ride along untouched by the package's persist helpers.
+  (DapInboundMode, String?, String?) _readBinding() {
+    final raw = readDapConfig(defaultDapConfigFile(home, environment));
+    final bound = raw['boundSession'];
+    if (bound is! Map) return (DapInboundMode.currentSession, null, null);
+    final mode = switch ('${bound['mode'] ?? ''}') {
+      'dedicated' => DapInboundMode.dedicated,
+      'named' => DapInboundMode.named,
+      _ => DapInboundMode.currentSession,
+    };
+    final title = '${bound['title'] ?? ''}'.trim();
+    final id = '${bound['sessionId'] ?? ''}'.trim();
+    return (mode, id.isEmpty ? null : id, title.isEmpty ? null : title);
+  }
+
+  @override
+  Future<void> saveConnection({
+    required String url,
+    required String name,
+    String? secret,
+  }) {
+    final trimmed = name.trim();
+    final password = (secret ?? '').trim();
+    return persistDapConfig(
+      url: normalizeDapHost(url.trim()),
+      name: trimmed.isEmpty ? null : trimmed,
+      // The master password dials directly (the hub accepts it as a
+      // credential); an empty field keeps whatever is stored.
+      clientSecret: password.isEmpty ? null : password,
+      file: defaultDapConfigFile(home, environment),
+    );
+  }
+
+  @override
+  Future<void> saveBinding(
+    DapInboundMode mode, {
+    String? sessionId,
+    String? sessionTitle,
+  }) async {
+    final path = defaultDapConfigFile(home, environment);
+    final next = Map<String, dynamic>.of(readDapConfig(path));
+    if (mode == DapInboundMode.currentSession) {
+      next.remove('boundSession');
+    } else {
+      next['boundSession'] = <String, dynamic>{
+        'mode': mode.name,
+        if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+        if (sessionTitle != null && sessionTitle.isNotEmpty)
+          'title': sessionTitle,
+      };
+    }
+    final target = File(path);
+    if (!await target.parent.exists()) {
+      await target.parent.create(recursive: true);
+    }
+    await target.writeAsString(
+      '${const JsonEncoder.withIndent('  ').convert(next)}\n',
+    );
+  }
+
+  @override
+  Future<List<DapBindableSession>> listBindableSessions() async {
+    // The app's own sessions: every candidate root (the shared App Group
+    // container + the ~/.fah fallback on macOS), newest activity first.
+    final env = LocalExecutionEnv();
+    final out = <DapBindableSession>[];
+    for (final root in allSessionRoots(
+      defaultSessionsRoot(Directory.current.path),
+    )) {
+      out.addAll(await _sessionsInRoot(env, root));
+    }
+    return _dedupeBindableSessions(out);
+  }
+
+  /// Every session in one candidate root; an unreadable root lists empty
+  /// so the other roots still contribute.
+  Future<List<DapBindableSession>> _sessionsInRoot(
+    LocalExecutionEnv env,
+    String root,
+  ) async {
+    final repo = JsonlSessionRepo(fs: env, sessionsRoot: root);
+    try {
+      final metas = await repo.list();
+      return [
+        for (final meta in metas) (id: meta.id, title: sessionTitle(meta)),
+      ];
+    } on Object {
+      // Unreadable root — other roots still list.
+      return const [];
+    }
+  }
+
+  /// Dedup by id (a session visible from two roots lists once), capped at
+  /// the newest 50.
+  List<DapBindableSession> _dedupeBindableSessions(
+    List<DapBindableSession> sessions,
+  ) {
+    final seen = <String>{};
+    return [
+      for (final entry in sessions)
+        if (seen.add(entry.id)) entry,
+    ].take(50).toList();
+  }
+
+  /// Display label for the picker: the app-written title/name metadata,
+  /// else a short id. Exposed for tests.
+  @visibleForTesting
+  static String sessionTitle(SessionMetadata meta) =>
+      preferredLabel(meta.metadata) ?? shortSessionId(meta.id);
+
+  /// The first non-blank of `title`, `name`, `displayName`, else null.
+  static String? preferredLabel(Map<String, dynamic>? raw) {
+    for (final key in const ['title', 'name', 'displayName']) {
+      final value = raw?[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+    }
+    return null;
+  }
+
+  /// `session <first-8-chars>` — the whole id when shorter.
+  static String shortSessionId(String id) =>
+      'session ${id.length > 8 ? id.substring(0, 8) : id}';
+
+  @override
+  Future<DapHubSnapshot> probe() async {
+    final snapshot = await load();
+    final plugin = HubPlugin(environment: environment, home: home);
+    final started = plugin.start();
+    var connected = false;
+    try {
+      await started.timeout(probeTimeout);
+      connected = (await plugin.status()).connected;
+    } on Object {
+      // Timeout (hub not answering) or hub rejection: honest "unreachable".
+    } finally {
+      await plugin.dispose();
+      // fah_hub_client 0.2.5 (verified in hub_plugin.dart): dispose()
+      // neither cancels nor awaits an in-flight start() — it only tears
+      // down the fields it sees. Two interleavings matter: dispose after
+      // start() assigned _repository makes start() die on a null
+      // assertion (`_repository!`) — marked handled here, after dispose,
+      // so anything dispose induces is covered; dispose before start()
+      // touches its fields is a no-op that leaves start() running.
+      started.ignore();
+      // ponytail: residual ceiling — start() has no cancel API, so a
+      // timeout that lands before start() assigns its fields leaves the
+      // socket + reconnect loop alive with no owner. Upgrade path: a
+      // close()-style API in the package, then await it here.
+    }
+    return snapshot.withProbe(connected);
+  }
+}
+
+/// Creates the platform [DapHubService] (IO platforms).
+DapHubService createDapHubService() => IoDapHubService();

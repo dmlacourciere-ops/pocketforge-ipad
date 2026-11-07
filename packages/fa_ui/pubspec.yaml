@@ -1,0 +1,80 @@
+name: fa_ui
+description: >-
+  Reusable UI for apps embedding the Fa agent: the Fa brand theme (dark +
+  light, customizable via FaUiTheme), and ready-made provider/model settings
+  widgets (provider presets, custom-provider registry, media model slots)
+  with host-overridable strings.
+version: 0.0.1
+publish_to: none
+
+environment:
+  sdk: ^3.12.2
+  flutter: ">=1.17.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # The local flutter_agent_harness package (pure Dart core): ExecutionEnv
+  # for the persisted stores, AgentConfig for the connect flow, and the
+  # shared /models endpoint parser.
+  flutter_agent_harness:
+    path: ../../
+
+  # ChatTheme for the flutter_chat_ui theme builders.
+  flutter_chat_core: ^2.9.0
+
+  # The chat transcript UI (chat/): markdown rendering and the chat surface.
+  flutter_markdown: ^0.7.7+1
+  flutter_chat_ui: ^2.11.1
+
+  # Inline playback of sandbox-generated media (chat/media_player.dart):
+  # audio plays from in-memory bytes, video from a temp file staged via
+  # path_provider (video is not supported in the web build).
+  audioplayers: ^6.8.1
+  video_player: ^2.13.0
+  path_provider: ^2.1.6
+
+  # The /models endpoint fetch behind the model quick select.
+  http: ^1.6.0
+
+  # OS drag-and-drop onto the chat surface (issue #465): files/images
+  # dropped over the transcript or the composer stage as attachment chips.
+  desktop_drop: ^0.8.4
+  # XFile in the public drop-bridge API (FaChatDropHandler).
+  cross_file: ^0.3.5+5
+
+  # Opens the OpenRouter OAuth authorization page in the system browser.
+  url_launcher: ^6.3.1
+
+  # Brand SVG marks (provider tiles, see providers/provider_marks.dart).
+  flutter_svg: ^2.3.0
+
+  # Shared LLM abstractions. fa_ui stays UI-only for presets/config, but
+  # exposes helpers that map its connection config onto the fa_llm types
+  # hosts use to build providers.
+  fa_llm:
+    path: ../fa_llm
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_localizations:
+    sdk: flutter
+
+dependency_overrides:
+  # (meta override removed with Flutter 3.47.4: the SDK declares
+  # meta ^1.18.3 and dart_tui 2.x declares ^1.19.0, so meta 1.19.0
+  # resolves for both without an override.)
+  # flutter_agent_memory (hosted, ^0.0.4) depends on the hosted fa_llm
+  # ^0.1.0 while this package pins the path version — force the path one.
+  fa_llm:
+    path: ../fa_llm
+  # The composer (lib/src/cli/fa_tui.dart) uses LineEditor, which only
+  # exists in the vendored dart_tui — the hosted 2.x predates it.
+  dart_tui:
+    path: ../../vendor/dart_tui
+
+flutter:
+  uses-material-design: true

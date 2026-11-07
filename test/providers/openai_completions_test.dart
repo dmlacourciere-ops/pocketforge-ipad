@@ -1,0 +1,2784 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart' as http_testing;
+import 'package:test/test.dart';
+
+const okSse =
+    'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"ok"}}]}\n\n'
+    'data: {"id":"chatcmpl-1","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+    'data: [DONE]\n\n';
+
+String sseChunk(Map<String, dynamic> json) => 'data: ${jsonEncode(json)}\n\n';
+
+/// Concatenates SSE body parts: [Map]s are encoded as chunks, [String]s are
+/// used verbatim (e.g. the terminating `data: [DONE]`).
+String sseBody(List<Object> parts) {
+  return parts
+      .map(
+        (part) =>
+            part is String ? part : sseChunk(part as Map<String, dynamic>),
+      )
+      .join();
+}
+
+http.Client sseClient(String body) {
+  return http_testing.MockClient.streaming(
+    (request, requestBody) async => http.StreamedResponse(
+      Stream.value(utf8.encode(body)),
+      200,
+      headers: {'content-type': 'text/event-stream'},
+    ),
+  );
+}
+
+final testModel = Model(
+  id: 'gpt-4o-mini',
+  name: 'GPT-4o mini',
+  api: 'openai-completions',
+  provider: 'openai',
+  baseUrl: 'https://api.openai.com/v1',
+  input: const ['text', 'image'],
+  contextWindow: 128000,
+  maxTokens: 16384,
+  cost: const ModelCost(input: 0.15, output: 0.6, cacheRead: 0.075),
+);
+
+final openRouterModel = Model(
+  id: 'anthropic/claude-sonnet-4',
+  api: 'openai-completions',
+  provider: 'openrouter',
+  baseUrl: 'https://openrouter.ai/api/v1',
+  reasoning: true,
+  contextWindow: 200000,
+  maxTokens: 64000,
+);
+
+Context simpleContext() =>
+    Context(messages: [UserMessage.text('hi', timestamp: DateTime.utc(2026))]);
+
+/// Streams [reasoningChunks] as `reasoning` deltas and returns the final
+/// thinking text (gh-1655 stuttering-relay fixtures).
+Future<String> reasoningThinkingOf(List<String> reasoningChunks) async {
+  final client = sseClient(
+    sseBody([
+      for (final text in reasoningChunks)
+        {
+          'choices': [
+            {
+              'delta': {'reasoning': text},
+            },
+          ],
+        },
+      {
+        'choices': [
+          {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+        ],
+      },
+      'data: [DONE]\n\n',
+    ]),
+  );
+  final stream = streamOpenAICompletions(
+    openRouterModel,
+    simpleContext(),
+    const OpenAICompletionsOptions(apiKey: '[REDACTED:Sensitive-Value]'),
+    client,
+  );
+  final events = await stream.toList();
+  return events.whereType<ThinkingEndEvent>().single.content;
+}
+
+void main() {
+  group('streamOpenAICompletions', () {
+    test('streams text with live partial accumulation', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'id': 'chatcmpl-9',
+            'choices': [
+              {
+                'delta': {'content': 'Hel'},
+              },
+            ],
+          },
+          {
+            'id': 'chatcmpl-9',
+            'choices': [
+              {
+                'delta': {'content': 'lo'},
+              },
+            ],
+          },
+          {
+            'id': 'chatcmpl-9',
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 2},
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(events.first, isA<StartEvent>());
+
+      final deltas = events.whereType<TextDeltaEvent>().toList();
+      expect(deltas, hasLength(2));
+      expect(deltas[0].delta, 'Hel');
+      expect((deltas[0].partial.content.single as TextContent).text, 'Hel');
+      expect(deltas[1].delta, 'lo');
+      expect((deltas[1].partial.content.single as TextContent).text, 'Hello');
+      expect(events.whereType<TextStartEvent>(), hasLength(1));
+      expect(events.whereType<TextEndEvent>().single.content, 'Hello');
+
+      final done = events.last as DoneEvent;
+      expect(done.reason, StopReason.stop);
+      expect(done.message.responseId, 'chatcmpl-9');
+      expect(done.message.usage.input, 10);
+      expect(done.message.usage.output, 2);
+      expect(done.message.usage.cost.total, greaterThan(0));
+
+      expect(await stream.result, same(done.message));
+    });
+
+    test('streams tool calls with partial JSON arguments', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {
+                  'tool_calls': [
+                    {
+                      'index': 0,
+                      'id': 'call_1',
+                      'function': {'name': 'get_weather', 'arguments': '{"loc'},
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {
+                  'tool_calls': [
+                    {
+                      'index': 0,
+                      'function': {'arguments': 'ation":"Paris"}'},
+                    },
+                  ],
+                  'reasoning_details': [
+                    {
+                      'type': 'reasoning.encrypted',
+                      'id': 'call_1',
+                      'data': 'sig-data',
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'tool_calls'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(events.whereType<ToolCallStartEvent>(), hasLength(1));
+
+      final deltas = events.whereType<ToolCallDeltaEvent>().toList();
+      expect(deltas, hasLength(2));
+      expect(deltas[0].delta, '{"loc');
+      final firstPartial = deltas[0].partial.content.single as ToolCall;
+      expect(firstPartial.partialArguments, '{"loc');
+      expect(firstPartial.arguments, isEmpty);
+
+      final end = events.whereType<ToolCallEndEvent>().single;
+      expect(end.toolCall.id, 'call_1');
+      expect(end.toolCall.name, 'get_weather');
+      expect(end.toolCall.arguments, {'location': 'Paris'});
+      expect(end.toolCall.partialArguments, isNull);
+      expect(
+        end.toolCall.thoughtSignature,
+        jsonEncode({
+          'type': 'reasoning.encrypted',
+          'id': 'call_1',
+          'data': 'sig-data',
+        }),
+      );
+
+      final done = events.last as DoneEvent;
+      expect(done.reason, StopReason.toolUse);
+      expect(done.message.content.single, isA<ToolCall>());
+    });
+
+    test(
+      'a re-sent tool-call frame with a fresh id merges, never re-executes',
+      () async {
+        // gh-1655: stuttering relays re-send a call frame under a freshly
+        // generated id — the id/index lookup misses and a second identical
+        // block spawns, so the command executes twice in one turn.
+        final client = sseClient(
+          sseBody([
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'tool_calls': [
+                      {
+                        'id': 'chatcmpl-tool-bd624c1dd04fbbc9',
+                        'function': {
+                          'name': 'bash',
+                          'arguments': '{"command":"js hello.js"}',
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'tool_calls': [
+                      {
+                        'id': 'chatcmpl-tool-9b456367dc7027d2',
+                        'function': {
+                          'name': 'bash',
+                          'arguments': '{"command":"js hello.js"}',
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {'delta': <String, dynamic>{}, 'finish_reason': 'tool_calls'},
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: '[REDACTED:Sensitive-Value]'),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(events.whereType<ToolCallStartEvent>(), hasLength(1));
+
+        final end = events.whereType<ToolCallEndEvent>().single;
+        // The re-sent frame's newer id is adopted only when the old one is
+        // empty — the original id stays.
+        expect(end.toolCall.id, 'chatcmpl-tool-bd624c1dd04fbbc9');
+        expect(end.toolCall.name, 'bash');
+        // The repeated arguments must not be appended twice.
+        expect(end.toolCall.arguments, {'command': 'js hello.js'});
+        expect(events.last as DoneEvent, isA<DoneEvent>());
+        expect((events.last as DoneEvent).reason, StopReason.toolUse);
+      },
+    );
+
+    test(
+      'two genuinely different calls in one message stay two blocks',
+      () async {
+        final client = sseClient(
+          sseBody([
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'tool_calls': [
+                      {
+                        'index': 0,
+                        'id': 'call_a',
+                        'function': {'name': 'bash', 'arguments': '{"command'},
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'tool_calls': [
+                      {
+                        'index': 0,
+                        'function': {'arguments': '":"ls"}'},
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'tool_calls': [
+                      {
+                        'index': 1,
+                        'id': 'call_b',
+                        'function': {
+                          'name': 'bash',
+                          'arguments': '{"command":"pwd"}',
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {'delta': <String, dynamic>{}, 'finish_reason': 'tool_calls'},
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: '[REDACTED:Sensitive-Value]'),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(events.whereType<ToolCallStartEvent>(), hasLength(2));
+        final ends = events.whereType<ToolCallEndEvent>().toList();
+        expect(ends, hasLength(2));
+        expect(ends[0].toolCall.id, 'call_a');
+        expect(ends[0].toolCall.arguments, {'command': 'ls'});
+        expect(ends[1].toolCall.id, 'call_b');
+        expect(ends[1].toolCall.arguments, {'command': 'pwd'});
+      },
+    );
+
+    test('dedupes cumulative and overlapping reasoning chunks', () async {
+      List<Map<String, dynamic>> chunks(Iterable<String> texts) => [
+        for (final text in texts)
+          {
+            'choices': [
+              {
+                'delta': {'reasoning': text},
+              },
+            ],
+          },
+      ];
+
+      Future<String> thinkingOf(Iterable<String> texts) async {
+        final client = sseClient(
+          sseBody([
+            ...chunks(texts),
+            {
+              'choices': [
+                {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+        final stream = streamOpenAICompletions(
+          openRouterModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+        final events = await stream.toList();
+        final end = events.whereType<ThinkingEndEvent>().single;
+        return end.content;
+      }
+
+      // Full-snapshot relays: every chunk repeats everything so far.
+      expect(await thinkingOf(['при', 'прив', 'привет']), 'привет');
+      // Sliding-window relays: every chunk overlaps the previous tail.
+      // gh-1655: the 1-char 'ж' stutter heading 'жаем' is trimmed too now,
+      // so the doubled seam no longer survives ('Продолжжжжаем' before).
+      expect(
+        await thinkingOf(['Прод', 'родол', 'олжжж', 'жаем']),
+        'Продолжжжаем',
+      );
+      // Clean incremental deltas pass through untouched.
+      expect(await thinkingOf(['let me ', 'think']), 'let me think');
+    });
+
+    test(
+      'a 1-char punctuation stutter in reasoning deltas is trimmed',
+      () async {
+        // gh-1655: stuttering relays re-send standalone punctuation tokens —
+        // a 1-char overlap below the old k >= 2 floor survived the dedupe,
+        // doubling every sentence-punctuation char in the thinking text.
+        expect(
+          await reasoningThinkingOf(['greeting', '.', '.', ' I should']),
+          'greeting. I should',
+        );
+        expect(await reasoningThinkingOf(["I'm Fa", ',', ',']), "I'm Fa,");
+      },
+    );
+
+    test(
+      'an ellipsis split across reasoning deltas survives untrimmed',
+      () async {
+        // The second delta repeats the tail char INSIDE itself — a legit "…"
+        // continuation, not a seam, so the 1-char trim must not fire.
+        expect(
+          await reasoningThinkingOf(['hmm', '.', '..', ' done']),
+          'hmm... done',
+        );
+      },
+    );
+
+    test('streams reasoning deltas as thinking blocks', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {'reasoning_content': 'let me '},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {'reasoning_content': 'think'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {'content': 'answer'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        openRouterModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(events.whereType<ThinkingStartEvent>(), hasLength(1));
+      final thinkingDeltas = events.whereType<ThinkingDeltaEvent>().toList();
+      expect(thinkingDeltas, hasLength(2));
+      final thinkingPartial =
+          thinkingDeltas[1].partial.content.first as ThinkingContent;
+      expect(thinkingPartial.thinking, 'let me think');
+      expect(thinkingPartial.thinkingSignature, 'reasoning_content');
+      expect(
+        events.whereType<ThinkingEndEvent>().single.content,
+        'let me think',
+      );
+      expect(events.last, isA<DoneEvent>());
+    });
+
+    test(
+      'extracts inline <think> tags from content into a thinking block',
+      () async {
+        // Endpoints without a reasoning field (kimi k3 via openai-completions)
+        // send thinking as inline <think>…</think> tags in the content stream.
+        final client = sseClient(
+          sseBody([
+            {
+              'choices': [
+                {
+                  'delta': {'content': '<think>let me '},
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {'content': 'verify</think>the answer'},
+                },
+              ],
+            },
+            {
+              'choices': [
+                {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+
+        final stream = streamOpenAICompletions(
+          openRouterModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(events.whereType<ThinkingStartEvent>(), hasLength(1));
+        final thinking = events
+            .whereType<ThinkingDeltaEvent>()
+            .map((e) => e.delta)
+            .join();
+        expect(thinking, 'let me verify');
+        final text = events
+            .whereType<TextDeltaEvent>()
+            .map((e) => e.delta)
+            .join();
+        expect(text, 'the answer');
+        // The tags themselves never leak into either channel.
+        expect(thinking, isNot(contains('<think>')));
+        expect(text, isNot(contains('think>')));
+        expect(events.last, isA<DoneEvent>());
+      },
+    );
+
+    test('inline <think> tags split across deltas are reassembled', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {'content': '<thi'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {'content': 'nk>rea'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {'content': 'son</thi'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {'content': 'nk>done'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        openRouterModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(
+        events.whereType<ThinkingDeltaEvent>().map((e) => e.delta).join(),
+        'reason',
+      );
+      expect(
+        events.whereType<TextDeltaEvent>().map((e) => e.delta).join(),
+        'done',
+      );
+    });
+
+    test('an unclosed inline <think> at stream end stays thinking (no tag '
+        'leak)', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {'content': '<think>still reason'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        openRouterModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(
+        events.whereType<ThinkingDeltaEvent>().map((e) => e.delta).join(),
+        'still reason',
+      );
+      expect(events.whereType<TextDeltaEvent>(), isEmpty);
+    });
+
+    test(
+      'plain content without a think tag passes through untouched',
+      () async {
+        final client = sseClient(
+          sseBody([
+            {
+              'choices': [
+                {
+                  'delta': {'content': 'just an answer'},
+                },
+              ],
+            },
+            {
+              'choices': [
+                {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+
+        final stream = streamOpenAICompletions(
+          openRouterModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(events.whereType<ThinkingStartEvent>(), isEmpty);
+        expect(
+          events.whereType<TextDeltaEvent>().map((e) => e.delta).join(),
+          'just an answer',
+        );
+      },
+    );
+
+    test('streams reasoning_details text entries as thinking blocks', () async {
+      // OpenRouter routes some models' reasoning (e.g. NVIDIA nemotron) as
+      // reasoning_details text entries instead of a `reasoning` delta field.
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {
+                  'reasoning_details': [
+                    {'type': 'reasoning.text', 'text': 'let me ', 'index': 0},
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {
+                  'reasoning_details': [
+                    {'type': 'reasoning.text', 'text': 'think', 'index': 0},
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            'choices': [
+              {
+                'delta': {'content': 'answer'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        openRouterModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(events.whereType<ThinkingStartEvent>(), hasLength(1));
+      final thinkingDeltas = events.whereType<ThinkingDeltaEvent>().toList();
+      expect(thinkingDeltas, hasLength(2));
+      final thinkingPartial =
+          thinkingDeltas[1].partial.content.first as ThinkingContent;
+      expect(thinkingPartial.thinking, 'let me think');
+      expect(events.last, isA<DoneEvent>());
+    });
+
+    test(
+      'dedupes the reasoning field against reasoning_details text (gemini)',
+      () async {
+        // Gemini via OpenRouter sends BOTH: a `reasoning` delta field AND
+        // reasoning_details text entries with the same content (as cumulative
+        // snapshots). Writing both stutters ("The The user user…") — the
+        // overlap dedupe must collapse the second channel.
+        final client = sseClient(
+          sseBody([
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'reasoning': 'The',
+                    'reasoning_details': [
+                      {'type': 'reasoning.text', 'text': 'The', 'index': 0},
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'reasoning': ' user',
+                    'reasoning_details': [
+                      {
+                        'type': 'reasoning.text',
+                        'text': 'The user',
+                        'index': 0,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {
+                    'reasoning': ' asks',
+                    'reasoning_details': [
+                      {
+                        'type': 'reasoning.text',
+                        'text': 'The user asks',
+                        'index': 0,
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': {'content': 'answer'},
+                },
+              ],
+            },
+            {
+              'choices': [
+                {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+
+        final stream = streamOpenAICompletions(
+          openRouterModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(events.whereType<ThinkingStartEvent>(), hasLength(1));
+        final thinkingDeltas = events.whereType<ThinkingDeltaEvent>().toList();
+        final thinkingPartial =
+            thinkingDeltas.last.partial.content.first as ThinkingContent;
+        expect(thinkingPartial.thinking, 'The user asks');
+        expect(events.last, isA<DoneEvent>());
+      },
+    );
+
+    test('parses usage incl. cached tokens and OpenRouter cost', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {'content': 'hi'},
+              },
+            ],
+          },
+          {
+            'usage': {
+              'prompt_tokens': 100,
+              'completion_tokens': 20,
+              'prompt_tokens_details': {
+                'cached_tokens': 40,
+                'cache_write_tokens': 10,
+              },
+              'completion_tokens_details': {'reasoning_tokens': 5},
+              'cost': 0.00123,
+            },
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        openRouterModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final message = await stream.result;
+      expect(message.usage.input, 50);
+      expect(message.usage.output, 20);
+      expect(message.usage.cacheRead, 40);
+      expect(message.usage.cacheWrite, 10);
+      expect(message.usage.reasoning, 5);
+      expect(message.usage.totalTokens, 120);
+      // OpenRouter's billed cost wins over the rate-based estimate.
+      expect(message.usage.cost.total, closeTo(0.00123, 1e-9));
+    });
+
+    test('429 becomes an error event, never an exception', () async {
+      final client = http_testing.MockClient(
+        (request) async =>
+            http.Response('{"error":{"message":"Rate limit exceeded"}}', 429),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      final error = events.single as ErrorEvent;
+      expect(error.reason, StopReason.error);
+      expect(error.error.stopReason, StopReason.error);
+      // Issue #867: the 429 speaks human — the payload rides the
+      // structured info, never the rendered line.
+      final message = error.error.errorMessage!;
+      expect(message, contains('429'));
+      expect(message, contains('Rate limit reached'));
+      expect(message.contains('{'), isFalse);
+      expect(
+        error.error.rateLimit?.rawBody,
+        '{"error":{"message":"Rate limit exceeded"}}',
+      );
+      expect(error.retryAfter, isNull);
+      expect(await stream.result, same(error.error));
+    });
+
+    test(
+      '200 with an HTML body (expired SSO session) errors, not empty',
+      () async {
+        // The transparent redirect to the login portal is followed silently
+        // (fetch / dart:io), so a dead CodeMie session arrives as 200 +
+        // text/html. Without the guard the SSE consumer would see no data:
+        // lines and the turn would finish with an EMPTY assistant message.
+        final client = http_testing.MockClient.streaming(
+          (request, requestBody) async => http.StreamedResponse(
+            Stream.value(
+              utf8.encode('<!DOCTYPE html><html><body>Sign in</body></html>'),
+            ),
+            200,
+            headers: {'content-type': 'text/html; charset=utf-8'},
+          ),
+        );
+
+        final codemieModel = Model(
+          id: 'gpt-4o',
+          api: 'openai-completions',
+          provider: 'codemie',
+          baseUrl: 'https://codemie.lab.epam.com/code-assistant-api/v1',
+          contextWindow: 128000,
+          maxTokens: 8192,
+        );
+        final stream = streamOpenAICompletions(
+          codemieModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(),
+          client,
+        );
+
+        final events = await stream.toList();
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.error);
+        expect(error.error.errorMessage, contains('CodeMie'));
+        expect(error.error.errorMessage, contains('expired'));
+        // No raw login-page HTML in the transcript.
+        expect(error.error.errorMessage, isNot(contains('<html>')));
+        // The machine-readable marker lets UIs render a re-authorize card.
+        expect(authExpiredProvider(error.error.errorMessage ?? ''), 'codemie');
+      },
+    );
+
+    test(
+      '200 with a JSON body (gateway error object) surfaces the body',
+      () async {
+        // A gateway that rejects the request without proper status codes
+        // answers 200 + application/json — previously consumed as an empty
+        // SSE stream and rendered as "(empty response — try again)".
+        final client = http_testing.MockClient.streaming(
+          (request, requestBody) async => http.StreamedResponse(
+            Stream.value(
+              utf8.encode('{"error":{"message":"Unknown deployment: m1"}}'),
+            ),
+            200,
+            headers: {'content-type': 'application/json'},
+          ),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: '[REDACTED:Sensitive-Value]'),
+          client,
+        );
+
+        final events = await stream.toList();
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.error);
+        expect(error.error.errorMessage, contains('Unknown deployment: m1'));
+      },
+    );
+
+    test(
+      'an empty event stream (no data lines) becomes an error event',
+      () async {
+        // The gateway accepted the request and sent nothing — previously a
+        // silent empty done ("(empty response — try again)").
+        final client = http_testing.MockClient.streaming(
+          (request, requestBody) async => http.StreamedResponse(
+            Stream.value(utf8.encode('data: [DONE]\n\n')),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          ),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: '[REDACTED:Sensitive-Value]'),
+          client,
+        );
+
+        final events = await stream.toList();
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.error);
+        expect(error.error.errorMessage, contains('EMPTY event stream'));
+        expect(error.error.errorMessage, contains(testModel.id));
+      },
+    );
+
+    test(
+      'a silent endpoint errors on the idle watchdog instead of hanging',
+      () async {
+        final client = http_testing.MockClient.streaming(
+          (request, requestBody) async => http.StreamedResponse(
+            // Never emits a byte and never closes — the wedged-endpoint case.
+            StreamController<List<int>>().stream,
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          ),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(
+            apiKey: 'test-key',
+            idleTimeout: Duration(milliseconds: 200),
+          ),
+          client,
+        );
+
+        final events = await stream.toList().timeout(
+          const Duration(seconds: 10),
+        );
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.error);
+        expect(error.error.errorMessage, contains('idle timeout'));
+      },
+    );
+
+    test('429 with Retry-After header surfaces the parsed duration', () async {
+      final client = http_testing.MockClient(
+        (request) async => http.Response(
+          '{"error":{"message":"Rate limit exceeded"}}',
+          429,
+          headers: {'retry-after': '30'},
+        ),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final error = (await stream.toList()).single as ErrorEvent;
+      expect(error.reason, StopReason.error);
+      expect(error.retryAfter, const Duration(seconds: 30));
+    });
+
+    test('429 with HTTP-date Retry-After header surfaces the delta', () async {
+      final retryDate = DateTime.now().toUtc().add(const Duration(seconds: 45));
+      const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      const months = [
+        'Jan',
+        'Feb',
+        'Mar',
+        'Apr',
+        'May',
+        'Jun',
+        'Jul',
+        'Aug',
+        'Sep',
+        'Oct',
+        'Nov',
+        'Dec',
+      ];
+      String two(int value) => value.toString().padLeft(2, '0');
+      // IMF-fixdate (RFC 9110): "Wed, 21 Oct 2015 07:28:00 GMT".
+      final httpDate =
+          '${weekdays[retryDate.weekday - 1]}, ${two(retryDate.day)} '
+          '${months[retryDate.month - 1]} ${retryDate.year} '
+          '${two(retryDate.hour)}:${two(retryDate.minute)}:'
+          '${two(retryDate.second)} GMT';
+      final client = http_testing.MockClient(
+        (request) async => http.Response(
+          '{"error":{"message":"Rate limit exceeded"}}',
+          429,
+          headers: {'retry-after': httpDate},
+        ),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final error = (await stream.toList()).single as ErrorEvent;
+      expect(error.retryAfter, isNotNull);
+      expect(error.retryAfter!.inSeconds, greaterThan(0));
+      expect(error.retryAfter!.inSeconds, lessThanOrEqualTo(45));
+    });
+
+    test(
+      'malformed SSE data becomes an error event, not an exception',
+      () async {
+        final client = sseClient('data: {not valid json\n\n');
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.error);
+        expect(error.error.errorMessage, isNotNull);
+      },
+    );
+
+    test('network failure becomes an error event', () async {
+      final client = http_testing.MockClient(
+        (request) async => throw http.ClientException('connection reset'),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      final error = events.last as ErrorEvent;
+      expect(error.reason, StopReason.error);
+      expect(error.error.errorMessage, contains('connection reset'));
+    });
+
+    test('content_filter finish reason becomes an error event', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {'content': 'partial'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'content_filter'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      final error = events.last as ErrorEvent;
+      expect(error.reason, StopReason.error);
+      expect(error.error.errorMessage, contains('content_filter'));
+      // The partial content is still attached to the error message.
+      expect((error.error.content.single as TextContent).text, 'partial');
+    });
+
+    test(
+      'unmapped finish reason is a provider error with the raw value',
+      () async {
+        final client = sseClient(
+          sseBody([
+            {
+              'choices': [
+                {
+                  'delta': {'content': 'partial'},
+                },
+              ],
+            },
+            {
+              'choices': [
+                {
+                  'delta': <String, dynamic>{},
+                  'finish_reason': 'some_new_reason',
+                },
+              ],
+            },
+            'data: [DONE]\n\n',
+          ]),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.error);
+        expect(error.error.stopReason, StopReason.error);
+        expect(error.error.rawStopReason, 'some_new_reason');
+        expect(error.error.errorMessage, contains('some_new_reason'));
+      },
+    );
+
+    test('mapped finish reason is preserved as rawStopReason', () async {
+      final client = sseClient(
+        sseBody([
+          {
+            'choices': [
+              {
+                'delta': {'content': 'done'},
+              },
+            ],
+          },
+          {
+            'choices': [
+              {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+            ],
+          },
+          'data: [DONE]\n\n',
+        ]),
+      );
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final done = (await stream.toList()).last as DoneEvent;
+      expect(done.reason, StopReason.stop);
+      expect(done.message.rawStopReason, 'stop');
+    });
+
+    test(
+      'stream ending without finish_reason completes with a natural stop',
+      () async {
+        // Some providers (seen on OpenRouter free-tier models) close the SSE
+        // stream without a final finish_reason chunk; the accumulated content
+        // is treated as complete instead of failing the turn.
+        final client = sseClient(
+          sseChunk({
+            'choices': [
+              {
+                'delta': {'content': 'cut off'},
+              },
+            ],
+          }),
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        final done = events.last as DoneEvent;
+        expect(done.reason, StopReason.stop);
+        expect((done.message.content.single as TextContent).text, 'cut off');
+      },
+    );
+
+    group('finish_reason classification (issue #312)', () {
+      late Future<bool> Function(Duration, CancelToken?) savedSleeper;
+      late void Function(String)? savedUnknownHook;
+
+      setUp(() {
+        savedSleeper = transientRetrySleeper;
+        savedUnknownHook = onUnknownFinishReason;
+        transientRetrySleeper = (delay, token) async => true;
+        onUnknownFinishReason = null;
+      });
+      tearDown(() {
+        transientRetrySleeper = savedSleeper;
+        onUnknownFinishReason = savedUnknownHook;
+      });
+
+      /// Streams the adapter through the #290 retry wrapper — the wrap the
+      /// provider catalog applies to every real call.
+      AssistantMessageEventStream wrappedCall(http.Client client) {
+        return transientRetryStreamFunction(
+          (model, context, {cancelToken}) => streamOpenAICompletions(
+            model,
+            context,
+            const OpenAICompletionsOptions(apiKey: 'test-key'),
+            client,
+          ),
+        )(testModel, simpleContext());
+      }
+
+      const unexpectedStateSse =
+          'data: {"id":"chatcmpl-1","choices":[{"delta":{},'
+          '"finish_reason":"unexpected_state"}]}\n\n'
+          'data: [DONE]\n\n';
+
+      test('AC1: unexpected_state retries in place, turn completes', () async {
+        // Verbatim incident shape (pr_review session, k3-256k): the Kimi
+        // gateway ends the stream with its vendor transient word.
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(calls == 1 ? unexpectedStateSse : okSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+
+        final message = await wrappedCall(client).result;
+
+        expect(calls, 2, reason: 'a transient finish_reason replays');
+        expect(message.stopReason, StopReason.stop);
+        expect(message.content.whereType<TextContent>().single.text, 'ok');
+      });
+
+      test(
+        'AC2: network_error finish_reason gets the same treatment',
+        () async {
+          const networkErrorSse =
+              'data: {"id":"chatcmpl-1","choices":[{"delta":{},'
+              '"finish_reason":"network_error"}]}\n\n'
+              'data: [DONE]\n\n';
+          var calls = 0;
+          final client = http_testing.MockClient.streaming((
+            request,
+            body,
+          ) async {
+            calls++;
+            return http.StreamedResponse(
+              Stream.value(utf8.encode(calls == 1 ? networkErrorSse : okSse)),
+              200,
+              headers: {'content-type': 'text/event-stream'},
+            );
+          });
+
+          final message = await wrappedCall(client).result;
+
+          expect(calls, 2);
+          expect(message.stopReason, StopReason.stop);
+        },
+      );
+
+      test('AC2: a stream cut without finish_reason (nothing committed) '
+          'is transport and replays', () async {
+        const cutSse =
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{}}]}\n\n'
+            'data: [DONE]\n\n';
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(calls == 1 ? cutSse : okSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+
+        final message = await wrappedCall(client).result;
+
+        expect(calls, 2, reason: 'a cut stream is transport, not a stop');
+        expect(message.stopReason, StopReason.stop);
+        expect(message.content.whereType<TextContent>().single.text, 'ok');
+      });
+
+      test('AC3: content_filter stays terminal — zero retries, partial '
+          'text preserved verbatim', () async {
+        const contentFilterSse =
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"par'
+            'tial"}}]}\n\n'
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{},'
+            '"finish_reason":"content_filter"}]}\n\n'
+            'data: [DONE]\n\n';
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(contentFilterSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+
+        final events = await wrappedCall(client).toList();
+        final error = events.last as ErrorEvent;
+
+        expect(calls, 1, reason: 'retrying a filter is a safety bug');
+        expect(error.reason, StopReason.error);
+        expect(
+          error.error.errorMessage,
+          'Provider finish_reason: content_filter',
+          reason:
+              'a TERMINAL verdict keeps its verbatim story — '
+              'no mid-answer hygiene wrap',
+        );
+        expect(
+          error.error.content.whereType<TextContent>().single.text,
+          'partial',
+        );
+      });
+
+      test('AC3: pre-commit content_filter is vetoed by the verdict, not '
+          'the text nets', () async {
+        // No committed content: the only thing standing between the
+        // filter word and an in-place replay is the classification.
+        const contentFilterSse =
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{},'
+            '"finish_reason":"content_filter"}]}\n\n'
+            'data: [DONE]\n\n';
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(contentFilterSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+
+        final events = await wrappedCall(client).toList();
+        final error = events.last as ErrorEvent;
+
+        expect(calls, 1, reason: 'retrying a filter is a safety bug');
+        expect(error.reason, StopReason.error);
+        expect(
+          error.error.errorMessage,
+          'Provider finish_reason: content_filter',
+        );
+      });
+
+      test('AC4: an unknown vendor reason defaults transient and is '
+          'loud-logged', () async {
+        const unknownSse =
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{},'
+            '"finish_reason":"upstream_restarted"}]}\n\n'
+            'data: [DONE]\n\n';
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(calls == 1 ? unknownSse : okSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+        final logged = <String>[];
+        onUnknownFinishReason = logged.add;
+
+        final message = await wrappedCall(client).result;
+
+        expect(calls, 2, reason: 'unknown words degrade to transient');
+        expect(message.stopReason, StopReason.stop);
+        expect(logged, ['upstream_restarted']);
+      });
+
+      test('AC5: exhaustion surfaces the verbatim reason after the full '
+          'budget', () async {
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(unexpectedStateSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+
+        final message = await wrappedCall(client).result;
+
+        expect(calls, 3, reason: 'the default attempt budget');
+        expect(message.stopReason, StopReason.error);
+        expect(message.errorMessage, contains('unexpected_state'));
+      });
+
+      test('E1: unexpected_state after completed text resumes within the '
+          'budget (issue #1168)', () async {
+        const postContentSse =
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"par'
+            'tial"}}]}\n\n'
+            'data: {"id":"chatcmpl-1","choices":[{"delta":{},'
+            '"finish_reason":"unexpected_state"}]}\n\n'
+            'data: [DONE]\n\n';
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(postContentSse)),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+
+        final events = await wrappedCall(client).toList();
+        final error = events.last as ErrorEvent;
+
+        // Issue #1168: the adapter finalizes the open text block when
+        // the finish_reason arrives, so the failure lands AFTER a
+        // completed block - the vendor-transient class resumes from
+        // that prefix under the standard budget instead of standing
+        // (#312 AC4's unconditional stand-rule is retired for
+        // resumable failures).
+        expect(calls, 3, reason: 'the default attempt budget');
+        expect(error.reason, StopReason.error);
+        expect(error.error.rawStopReason, 'unexpected_state');
+        expect(error.error.errorMessage, contains('unexpected_state'));
+      });
+    });
+
+    test(
+      'CancelToken abort mid-stream ends with aborted stop reason',
+      () async {
+        final controller = StreamController<List<int>>();
+        var connectionClosed = false;
+        controller.onCancel = () => connectionClosed = true;
+        final client = http_testing.MockClient.streaming(
+          (request, body) async => http.StreamedResponse(
+            controller.stream,
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          ),
+        );
+
+        final source = CancelTokenSource();
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          OpenAICompletionsOptions(
+            apiKey: 'test-key',
+            cancelToken: source.token,
+          ),
+          client,
+        );
+
+        final events = <AssistantMessageEvent>[];
+        final consumed = stream.forEach(events.add);
+
+        controller.add(
+          utf8.encode(
+            sseChunk({
+              'choices': [
+                {
+                  'delta': {'content': 'partial'},
+                },
+              ],
+            }),
+          ),
+        );
+        await pumpEventQueue();
+        source.cancel();
+        await consumed;
+        unawaited(controller.close());
+        // Let the subscription-cancellation propagation settle.
+        await pumpEventQueue();
+
+        expect(connectionClosed, isTrue);
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.aborted);
+        expect(error.error.stopReason, StopReason.aborted);
+        expect(error.error.errorMessage, contains('aborted'));
+        expect((error.error.content.single as TextContent).text, 'partial');
+        expect(await stream.result, same(error.error));
+      },
+    );
+
+    test('mid-stream network error becomes an error event', () async {
+      final controller = StreamController<List<int>>();
+      final client = http_testing.MockClient.streaming(
+        (request, body) async => http.StreamedResponse(
+          controller.stream,
+          200,
+          headers: {'content-type': 'text/event-stream'},
+        ),
+      );
+
+      final source = CancelTokenSource();
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        OpenAICompletionsOptions(apiKey: 'test-key', cancelToken: source.token),
+        client,
+      );
+
+      final events = <AssistantMessageEvent>[];
+      final consumed = stream.forEach(events.add);
+      controller.add(
+        utf8.encode(
+          sseChunk({
+            'choices': [
+              {
+                'delta': {'content': 'partial'},
+              },
+            ],
+          }),
+        ),
+      );
+      await pumpEventQueue();
+      controller.addError(http.ClientException('connection reset'));
+      await consumed;
+      unawaited(controller.close());
+
+      // The token is not cancelled, so the error propagates to the adapter's
+      // try/catch and surfaces as a regular error event.
+      final error = events.last as ErrorEvent;
+      expect(error.reason, StopReason.error);
+      expect(error.error.errorMessage, contains('connection reset'));
+      expect((error.error.content.single as TextContent).text, 'partial');
+    });
+
+    test('post-abort connection teardown error is swallowed', () async {
+      final controller = StreamController<List<int>>();
+      final client = http_testing.MockClient.streaming(
+        (request, body) async => http.StreamedResponse(
+          controller.stream,
+          200,
+          headers: {'content-type': 'text/event-stream'},
+        ),
+      );
+
+      final source = CancelTokenSource();
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        OpenAICompletionsOptions(apiKey: 'test-key', cancelToken: source.token),
+        client,
+      );
+
+      final events = <AssistantMessageEvent>[];
+      final consumed = stream.forEach(events.add);
+      controller.add(
+        utf8.encode(
+          sseChunk({
+            'choices': [
+              {
+                'delta': {'content': 'partial'},
+              },
+            ],
+          }),
+        ),
+      );
+      await pumpEventQueue();
+      source.cancel();
+      await consumed;
+
+      // Cancellation through the async* SseDecoder is lazy, so the response
+      // subscription is still active here. Mirrors what force-closing the
+      // owned HTTP client injects into the dying connection on a real abort
+      // (seen live against OpenRouter): it must not escape as an unhandled
+      // async error.
+      controller.addError(
+        http.ClientException('Connection closed while receiving data'),
+      );
+      await pumpEventQueue();
+      unawaited(controller.close());
+
+      final error = events.last as ErrorEvent;
+      expect(error.reason, StopReason.aborted);
+    });
+
+    test(
+      'CancelToken abort before sending ends with aborted stop reason',
+      () async {
+        var requestSent = false;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          requestSent = true;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final source = CancelTokenSource()..cancel();
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          OpenAICompletionsOptions(
+            apiKey: 'test-key',
+            cancelToken: source.token,
+          ),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(requestSent, isFalse);
+        final error = events.last as ErrorEvent;
+        expect(error.reason, StopReason.aborted);
+      },
+    );
+
+    test('baseUrl swap routes the request to the given base URL', () async {
+      Uri? capturedUrl;
+      final client = http_testing.MockClient.streaming((request, body) async {
+        capturedUrl = request.url;
+        return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+      });
+
+      final stream = streamOpenAICompletions(
+        openRouterModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+      await stream.result;
+
+      expect(
+        capturedUrl.toString(),
+        'https://openrouter.ai/api/v1/chat/completions',
+      );
+    });
+
+    test('headers and auth are merged with null suppression', () async {
+      Map<String, String>? capturedHeaders;
+      final client = http_testing.MockClient.streaming((request, body) async {
+        capturedHeaders = request.headers;
+        return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+      });
+
+      final model = Model(
+        id: 'gpt-4o-mini',
+        api: 'openai-completions',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        contextWindow: 128000,
+        maxTokens: 16384,
+        headers: const {'x-model': 'model-default', 'x-keep': 'keep'},
+      );
+
+      final stream = streamOpenAICompletions(
+        model,
+        simpleContext(),
+        const OpenAICompletionsOptions(
+          apiKey: 'test-key',
+          headers: {'x-custom': 'custom', 'x-model': null},
+        ),
+        client,
+      );
+      await stream.result;
+
+      expect(capturedHeaders!['authorization'], 'Bearer test-key');
+      expect(capturedHeaders!['content-type'], 'application/json');
+      expect(capturedHeaders!['x-keep'], 'keep');
+      expect(capturedHeaders!['x-custom'], 'custom');
+      expect(capturedHeaders!.containsKey('x-model'), isFalse);
+    });
+
+    test('missing API key sends no Authorization header', () async {
+      Map<String, String>? capturedHeaders;
+      final client = http_testing.MockClient.streaming((request, body) async {
+        capturedHeaders = request.headers;
+        return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+      });
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(),
+        client,
+      );
+      await stream.result;
+
+      // Keyless local servers (llama.cpp, Ollama, LM Studio) must not get a
+      // bogus `Bearer ` header — some reject it.
+      expect(capturedHeaders!.containsKey('authorization'), isFalse);
+      expect(capturedHeaders!['content-type'], 'application/json');
+    });
+
+    test('empty API key sends no Authorization header', () async {
+      Map<String, String>? capturedHeaders;
+      final client = http_testing.MockClient.streaming((request, body) async {
+        capturedHeaders = request.headers;
+        return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+      });
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        simpleContext(),
+        const OpenAICompletionsOptions(apiKey: ''),
+        client,
+      );
+      await stream.result;
+
+      expect(capturedHeaders!.containsKey('authorization'), isFalse);
+    });
+
+    test(
+      'authHeader sends the raw named header, no Bearer (issue #964)',
+      () async {
+        Map<String, String>? capturedHeaders;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedHeaders = request.headers;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        // An AWS API Gateway fronting Bedrock rejects `Authorization: Bearer`
+        // and requires `x-api-key` (issue #964).
+        final model = Model(
+          id: 'gpt-4o-mini',
+          api: 'openai-completions',
+          provider: 'openai',
+          baseUrl: 'https://gateway.example.com/v1',
+          contextWindow: 128000,
+          maxTokens: 16384,
+          authHeader: 'x-api-key',
+        );
+
+        final stream = streamOpenAICompletions(
+          model,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'gw-key'),
+          client,
+        );
+        await stream.result;
+
+        expect(capturedHeaders!['x-api-key'], 'gw-key');
+        expect(capturedHeaders!.containsKey('authorization'), isFalse);
+      },
+    );
+
+    test(
+      'authHeader without a key still sends no auth header (issue #964)',
+      () async {
+        Map<String, String>? capturedHeaders;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedHeaders = request.headers;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final model = Model(
+          id: 'gpt-4o-mini',
+          api: 'openai-completions',
+          provider: 'openai',
+          baseUrl: 'https://gateway.example.com/v1',
+          contextWindow: 128000,
+          maxTokens: 16384,
+          authHeader: 'x-api-key',
+        );
+
+        final stream = streamOpenAICompletions(
+          model,
+          simpleContext(),
+          const OpenAICompletionsOptions(),
+          client,
+        );
+        await stream.result;
+
+        expect(capturedHeaders!.containsKey('x-api-key'), isFalse);
+        expect(capturedHeaders!.containsKey('authorization'), isFalse);
+      },
+    );
+
+    test(
+      'an explicit authorization header applies without an API key',
+      () async {
+        Map<String, String>? capturedHeaders;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedHeaders = request.headers;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(
+            headers: {'authorization': 'Bearer explicit'},
+          ),
+          client,
+        );
+        await stream.result;
+
+        expect(capturedHeaders!['authorization'], 'Bearer explicit');
+      },
+    );
+
+    test(
+      'builds the request payload from context, tools, and options',
+      () async {
+        Map<String, dynamic>? capturedBody;
+        var onPayloadSeen = false;
+        var onResponseSeen = false;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedBody =
+              jsonDecode(await body.bytesToString()) as Map<String, dynamic>;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final timestamp = DateTime.utc(2026);
+        final context = Context(
+          systemPrompt: 'You are helpful.',
+          messages: [
+            UserMessage.text('What is the weather?', timestamp: timestamp),
+            AssistantMessage(
+              content: const [
+                TextContent(text: 'Let me check.'),
+                ToolCall(
+                  id: 'call_1',
+                  name: 'get_weather',
+                  arguments: {'location': 'Paris'},
+                ),
+              ],
+              api: 'openai-completions',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              usage: Usage.zero,
+              stopReason: StopReason.toolUse,
+              timestamp: timestamp,
+            ),
+            ToolResultMessage(
+              toolCallId: 'call_1',
+              toolName: 'get_weather',
+              content: const [TextContent(text: 'Sunny, 21C')],
+              isError: false,
+              timestamp: timestamp,
+            ),
+            UserMessage(
+              content: const [
+                TextContent(text: 'And here is a picture:'),
+                ImageContent(data: 'aGk=', mimeType: 'image/png'),
+              ],
+              timestamp: timestamp,
+            ),
+          ],
+          tools: const [
+            Tool(
+              name: 'get_weather',
+              description: 'Get the weather',
+              parameters: {
+                'type': 'object',
+                'properties': {
+                  'location': {'type': 'string'},
+                },
+              },
+            ),
+          ],
+        );
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          context,
+          OpenAICompletionsOptions(
+            apiKey: 'test-key',
+            temperature: 0.2,
+            maxTokens: 512,
+            toolChoice: 'auto',
+            onPayload: (payload, model) {
+              onPayloadSeen = true;
+              return null;
+            },
+            onResponse: (statusCode, headers, model) {
+              onResponseSeen = true;
+              expect(statusCode, 200);
+            },
+          ),
+          client,
+        );
+        await stream.result;
+
+        expect(onPayloadSeen, isTrue);
+        expect(onResponseSeen, isTrue);
+        final body = capturedBody!;
+        expect(body['model'], 'gpt-4o-mini');
+        expect(body['stream'], isTrue);
+        expect(body['stream_options'], {'include_usage': true});
+        expect(body['max_completion_tokens'], 512);
+        expect(body['temperature'], 0.2);
+        expect(body['tool_choice'], 'auto');
+
+        final messages = body['messages'] as List;
+        expect(messages[0], {'role': 'system', 'content': 'You are helpful.'});
+        expect(messages[1], {
+          'role': 'user',
+          'content': 'What is the weather?',
+        });
+        expect(messages[2], {
+          'role': 'assistant',
+          'content': 'Let me check.',
+          'tool_calls': [
+            {
+              'id': 'call_1',
+              'type': 'function',
+              'function': {
+                'name': 'get_weather',
+                'arguments': '{"location":"Paris"}',
+              },
+            },
+          ],
+        });
+        expect(messages[3], {
+          'role': 'tool',
+          'content': 'Sunny, 21C',
+          'tool_call_id': 'call_1',
+        });
+        expect(messages[4], {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'And here is a picture:'},
+            {
+              'type': 'image_url',
+              'image_url': {'url': 'data:image/png;base64,aGk='},
+            },
+          ],
+        });
+
+        expect(body['tools'], [
+          {
+            'type': 'function',
+            'function': {
+              'name': 'get_weather',
+              'description': 'Get the weather',
+              'parameters': {
+                'type': 'object',
+                'properties': {
+                  'location': {'type': 'string'},
+                },
+              },
+            },
+            'strict': false,
+          },
+        ]);
+      },
+    );
+
+    test(
+      'non-vision model gets explicit placeholders instead of images',
+      () async {
+        Map<String, dynamic>? capturedBody;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedBody =
+              jsonDecode(await body.bytesToString()) as Map<String, dynamic>;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final textOnlyModel = Model(
+          id: 'gpt-text-only',
+          api: 'openai-completions',
+          provider: 'openai',
+          baseUrl: 'https://api.openai.com/v1',
+          contextWindow: 128000,
+          maxTokens: 16384,
+        );
+        final context = Context(
+          messages: [
+            ToolResultMessage(
+              toolCallId: 'call_1',
+              toolName: 'screenshot',
+              content: const [
+                TextContent(text: 'done'),
+                ImageContent(data: 'aGk=', mimeType: 'image/png'),
+              ],
+              isError: false,
+              timestamp: DateTime.utc(2026),
+            ),
+            UserMessage(
+              content: const [
+                TextContent(text: 'look:'),
+                ImageContent(data: 'aGk=', mimeType: 'image/png'),
+                ImageContent(data: 'aGk=', mimeType: 'image/png'),
+              ],
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        );
+
+        final stream = streamOpenAICompletions(
+          textOnlyModel,
+          context,
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+        await stream.result;
+
+        final messages = capturedBody!['messages'] as List;
+        // Tool result: image replaced with the explicit tool placeholder;
+        // no trailing "Attached image(s)" user turn is emitted.
+        expect(messages[0], {
+          'role': 'tool',
+          'content':
+              'done\n(tool image omitted: model does not support images)',
+          'tool_call_id': 'call_1',
+        });
+        // User message: consecutive images collapse into ONE placeholder.
+        expect(messages[1], {
+          'role': 'user',
+          'content': [
+            {'type': 'text', 'text': 'look:'},
+            {
+              'type': 'text',
+              'text': '(image omitted: model does not support images)',
+            },
+          ],
+        });
+        expect(messages, hasLength(2));
+      },
+    );
+
+    test(
+      'a declared-vision model keeps image parts (issue #638 AC1)',
+      () async {
+        Map<String, dynamic>? capturedBody;
+        final dropNotices = <int>[];
+        textOnlyImageDropNotice = dropNotices.add;
+        addTearDown(() => textOnlyImageDropNotice = null);
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedBody =
+              jsonDecode(await body.bytesToString()) as Map<String, dynamic>;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        // The shape an `input: ["text","image"]` env preconfig boots:
+        // same endpoint family the catalog calls text-only, explicit
+        // declaration wins.
+        final declaredVision = Model(
+          id: 'glm-5.3-flash',
+          api: 'openai-completions',
+          provider: 'zai',
+          baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+          input: const ['text', 'image'],
+          contextWindow: 128000,
+          maxTokens: 16384,
+        );
+        final context = Context(
+          messages: [
+            UserMessage(
+              content: const [
+                TextContent(text: 'look:'),
+                ImageContent(data: 'aGk=', mimeType: 'image/png'),
+              ],
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        );
+
+        final stream = streamOpenAICompletions(
+          declaredVision,
+          context,
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+        await stream.result;
+
+        final messages = capturedBody!['messages'] as List;
+        expect(messages.single['content'], [
+          {'type': 'text', 'text': 'look:'},
+          {
+            'type': 'image_url',
+            'image_url': {'url': 'data:image/png;base64,aGk='},
+          },
+        ]);
+        expect(dropNotices, isEmpty);
+      },
+    );
+
+    test(
+      'stripping a text-only model announces the drop (issue #638 AC1)',
+      () async {
+        Map<String, dynamic>? capturedBody;
+        final dropNotices = <int>[];
+        textOnlyImageDropNotice = dropNotices.add;
+        addTearDown(() => textOnlyImageDropNotice = null);
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedBody =
+              jsonDecode(await body.bytesToString()) as Map<String, dynamic>;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final textOnlyModel = Model(
+          id: 'glm-5.3',
+          api: 'openai-completions',
+          provider: 'zai',
+          baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+          input: const ['text'],
+          contextWindow: 128000,
+          maxTokens: 16384,
+        );
+        final context = Context(
+          messages: [
+            UserMessage(
+              content: const [
+                TextContent(text: 'look:'),
+                ImageContent(data: 'aGk=', mimeType: 'image/png'),
+              ],
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        );
+
+        final stream = streamOpenAICompletions(
+          textOnlyModel,
+          context,
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+        await stream.result;
+
+        expect(dropNotices, [1]);
+        final messages = capturedBody!['messages'] as List;
+        expect(
+          jsonEncode(messages),
+          isNot(contains('image_url')),
+          reason: 'the strip still fires',
+        );
+      },
+    );
+
+    test(
+      'sends OpenRouter-style reasoning object for reasoning models',
+      () async {
+        Map<String, dynamic>? capturedBody;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          capturedBody =
+              jsonDecode(await body.bytesToString()) as Map<String, dynamic>;
+          return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+        });
+
+        final stream = streamOpenAICompletions(
+          openRouterModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(
+            apiKey: 'test-key',
+            reasoningEffort: 'high',
+          ),
+          client,
+        );
+        await stream.result;
+
+        expect(capturedBody!['reasoning'], {'effort': 'high'});
+        expect(capturedBody!.containsKey('reasoning_effort'), isFalse);
+      },
+    );
+  });
+
+  group('serialization round-trip', () {
+    test('context types survive JSON round-trip', () {
+      final timestamp = DateTime.fromMillisecondsSinceEpoch(1767225600000);
+      final context = Context(
+        systemPrompt: 'sys',
+        messages: [
+          UserMessage.text('plain text', timestamp: timestamp),
+          UserMessage(
+            content: const [
+              TextContent(text: 'with image'),
+              ImageContent(data: 'aGk=', mimeType: 'image/png'),
+            ],
+            timestamp: timestamp,
+          ),
+          AssistantMessage(
+            content: const [
+              TextContent(text: 'answer', textSignature: 'sig'),
+              ThinkingContent(
+                thinking: 'hmm',
+                thinkingSignature: 'rs_1',
+                redacted: true,
+              ),
+              ToolCall(
+                id: 'call_1',
+                name: 'tool',
+                arguments: {'a': 1},
+                thoughtSignature: 'ts',
+              ),
+            ],
+            api: 'openai-completions',
+            provider: 'openai',
+            model: 'gpt-4o-mini',
+            responseModel: 'gpt-4o-mini-2024',
+            responseId: 'chatcmpl-1',
+            usage: const Usage(
+              input: 1,
+              output: 2,
+              cacheRead: 3,
+              cacheWrite: 4,
+              cacheWrite1h: 1,
+              reasoning: 1,
+              totalTokens: 10,
+              cost: UsageCost(
+                input: 0.1,
+                output: 0.2,
+                cacheRead: 0.3,
+                cacheWrite: 0.4,
+                total: 1.0,
+              ),
+            ),
+            stopReason: StopReason.toolUse,
+            errorMessage: 'oops',
+            timestamp: timestamp,
+          ),
+          ToolResultMessage(
+            toolCallId: 'call_1',
+            toolName: 'tool',
+            content: const [
+              TextContent(text: 'result'),
+              ImageContent(data: 'aGk=', mimeType: 'image/png'),
+            ],
+            isError: true,
+            timestamp: timestamp,
+          ),
+        ],
+        tools: const [
+          Tool(
+            name: 'tool',
+            description: 'desc',
+            parameters: {'type': 'object'},
+          ),
+        ],
+      );
+
+      final roundTripped = Context.fromJson(
+        jsonDecode(jsonEncode(context.toJson())) as Map<String, dynamic>,
+      );
+      expect(jsonEncode(roundTripped.toJson()), jsonEncode(context.toJson()));
+    });
+  });
+
+  group('message conversion', () {
+    /// Streams [context] through a capturing client and returns the decoded
+    /// request body.
+    Future<Map<String, dynamic>> sentBody(Model model, Context context) async {
+      Map<String, dynamic>? body;
+      final client = http_testing.MockClient.streaming((
+        request,
+        requestBody,
+      ) async {
+        body =
+            jsonDecode(await requestBody.bytesToString())
+                as Map<String, dynamic>;
+        return http.StreamedResponse(Stream.value(utf8.encode(okSse)), 200);
+      });
+      final stream = streamOpenAICompletions(
+        model,
+        context,
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+      await stream.result;
+      return body!;
+    }
+
+    List<dynamic> messagesOf(Map<String, dynamic> body) =>
+        body['messages'] as List<dynamic>;
+
+    test('pipe-separated tool call ids reduce to the call id part', () async {
+      final body = await sentBody(
+        testModel,
+        Context(
+          messages: [
+            AssistantMessage(
+              content: const [
+                ToolCall(id: 'call_abc|rest', name: 'read', arguments: {}),
+              ],
+              api: 'openai-completions',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              usage: Usage.zero,
+              stopReason: StopReason.toolUse,
+              timestamp: DateTime.utc(2026),
+            ),
+            ToolResultMessage(
+              toolCallId: 'call_abc|rest',
+              toolName: 'read',
+              content: const [TextContent(text: 'done')],
+              isError: false,
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        ),
+      );
+      final messages = messagesOf(body);
+      final toolCalls =
+          (messages[0] as Map<String, dynamic>)['tool_calls'] as List<dynamic>;
+      expect((toolCalls.single as Map<String, dynamic>)['id'], 'call_abc');
+      expect((messages[1] as Map<String, dynamic>)['tool_call_id'], 'call_abc');
+    });
+
+    test('LiteLLM __thought__ ids survive the 40-char truncation', () async {
+      // LiteLLM front-ends (e.g. CodeMie) embed Gemini thought signatures in
+      // the tool call id; truncating to 40 chars cuts the signature and
+      // Vertex rejects the replay with a thought_signature base64 400.
+      const id =
+          'call_1__thought__AY89a1/iNNoNrbr00Ol855b2afwvdIggWYS82e7HyYKw/'
+          'NAl9qdHlXg22FbsngPcjZ4seDHxawOwWiN+1YqczTxWpFtyn8j1X4Hji5Y9';
+      final body = await sentBody(
+        testModel,
+        Context(
+          messages: [
+            AssistantMessage(
+              content: const [ToolCall(id: id, name: 'read', arguments: {})],
+              api: 'openai-completions',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              usage: Usage.zero,
+              stopReason: StopReason.toolUse,
+              timestamp: DateTime.utc(2026),
+            ),
+            ToolResultMessage(
+              toolCallId: id,
+              toolName: 'read',
+              content: const [TextContent(text: 'done')],
+              isError: false,
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        ),
+      );
+      final messages = messagesOf(body);
+      final toolCalls =
+          (messages[0] as Map<String, dynamic>)['tool_calls'] as List<dynamic>;
+      expect((toolCalls.single as Map<String, dynamic>)['id'], id);
+      expect((messages[1] as Map<String, dynamic>)['tool_call_id'], id);
+    });
+
+    test(
+      'thinking and tool call blocks are skipped in user messages',
+      () async {
+        final body = await sentBody(
+          testModel,
+          Context(
+            messages: [
+              UserMessage(
+                content: const [
+                  TextContent(text: 'hi'),
+                  ThinkingContent(thinking: 'not valid here'),
+                  ToolCall(id: 'c1', name: 'read', arguments: {}),
+                ],
+                timestamp: DateTime.utc(2026),
+              ),
+            ],
+          ),
+        );
+        expect(messagesOf(body), [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'hi'},
+            ],
+          },
+        ]);
+      },
+    );
+
+    test('assistant thinking is sent under the signature key', () async {
+      final body = await sentBody(
+        testModel,
+        Context(
+          messages: [
+            AssistantMessage(
+              content: const [
+                TextContent(text: 'answer'),
+                ThinkingContent(
+                  thinking: 'hmm',
+                  thinkingSignature: 'reasoning_content',
+                ),
+              ],
+              api: 'openai-completions',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              usage: Usage.zero,
+              stopReason: StopReason.stop,
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        ),
+      );
+      final assistant = messagesOf(body).single as Map<String, dynamic>;
+      expect(assistant['content'], 'answer');
+      expect(assistant['reasoning_content'], 'hmm');
+    });
+
+    test('decodable thought signatures add reasoning_details', () async {
+      final body = await sentBody(
+        testModel,
+        Context(
+          messages: [
+            AssistantMessage(
+              content: const [
+                ToolCall(
+                  id: 'c1',
+                  name: 'read',
+                  arguments: {},
+                  thoughtSignature: '{"type":"reasoning.text"}',
+                ),
+              ],
+              api: 'openai-completions',
+              provider: 'openai',
+              model: 'gpt-4o-mini',
+              usage: Usage.zero,
+              stopReason: StopReason.toolUse,
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        ),
+      );
+      final assistant = messagesOf(body).single as Map<String, dynamic>;
+      expect(assistant['reasoning_details'], [
+        {'type': 'reasoning.text'},
+      ]);
+    });
+
+    test(
+      'an assistant message with neither content nor tool calls is skipped',
+      () async {
+        final body = await sentBody(
+          testModel,
+          Context(
+            messages: [
+              UserMessage.text('hi', timestamp: DateTime.utc(2026)),
+              AssistantMessage(
+                content: const [ThinkingContent(thinking: 'unsigned')],
+                api: 'openai-completions',
+                provider: 'openai',
+                model: 'gpt-4o-mini',
+                usage: Usage.zero,
+                stopReason: StopReason.stop,
+                timestamp: DateTime.utc(2026),
+              ),
+            ],
+          ),
+        );
+        expect(messagesOf(body), [
+          {'role': 'user', 'content': 'hi'},
+        ]);
+      },
+    );
+
+    test(
+      'an image-only tool result attaches the image for vision models',
+      () async {
+        final body = await sentBody(
+          testModel,
+          Context(
+            messages: [
+              ToolResultMessage(
+                toolCallId: 'c1',
+                toolName: 'read',
+                content: const [
+                  ImageContent(data: 'aGk=', mimeType: 'image/png'),
+                ],
+                isError: false,
+                timestamp: DateTime.utc(2026),
+              ),
+            ],
+          ),
+        );
+        final messages = messagesOf(body);
+        expect(
+          (messages[0] as Map<String, dynamic>)['content'],
+          '(see attached image)',
+        );
+        final followUp = messages[1] as Map<String, dynamic>;
+        expect(followUp['role'], 'user');
+        expect(followUp['content'], [
+          {'type': 'text', 'text': 'Attached image(s) from tool result:'},
+          {
+            'type': 'image_url',
+            'image_url': {'url': 'data:image/png;base64,aGk='},
+          },
+        ]);
+      },
+    );
+
+    test('compat requiresToolResultName adds the tool name', () async {
+      final namedModel = Model(
+        id: 'gpt-4o-mini',
+        api: 'openai-completions',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        contextWindow: 128000,
+        maxTokens: 16384,
+        compat: const OpenAICompletionsCompat(requiresToolResultName: true),
+      );
+      final body = await sentBody(
+        namedModel,
+        Context(
+          messages: [
+            ToolResultMessage(
+              toolCallId: 'c1',
+              toolName: 'read',
+              content: const [TextContent(text: 'done')],
+              isError: false,
+              timestamp: DateTime.utc(2026),
+            ),
+          ],
+        ),
+      );
+      final tool = messagesOf(body).single as Map<String, dynamic>;
+      expect(tool['name'], 'read');
+    });
+
+    test('google endpoint skips the OpenAI-only strict field', () async {
+      final googleModel = Model(
+        id: 'gemini-2.0-flash',
+        api: 'openai-completions',
+        provider: 'google',
+        baseUrl: 'https://generativelanguage.googleapis.com/v1',
+        contextWindow: 1000000,
+        maxTokens: 8192,
+      );
+      final body = await sentBody(
+        googleModel,
+        Context(
+          messages: [
+            UserMessage(content: 'hello', timestamp: DateTime.utc(2026)),
+          ],
+          tools: [
+            Tool(
+              name: 'get_weather',
+              description: 'Get the weather',
+              parameters: {
+                'type': 'object',
+                'properties': {
+                  'location': {'type': 'string'},
+                },
+              },
+            ),
+          ],
+        ),
+      );
+      final tools = body['tools'] as List;
+      expect(tools, hasLength(1));
+      final tool = tools.single as Map<String, dynamic>;
+      expect(
+        tool.containsKey('strict'),
+        isFalse,
+        reason: 'Gemini rejects the OpenAI-only strict field with 400',
+      );
+    });
+  });
+
+  group('text-only endpoint rejects image content (issue #42)', () {
+    // The verbatim z.ai glm-5.3 rejection: image/mixed history replayed to
+    // a text-only chat endpoint.
+    const content400 =
+        '{"error":{"code":"1211","message":"'
+        "messages.content.type is invalid, allowed values: ['text']\"}}";
+
+    Context imageContext() => Context(
+      messages: [
+        UserMessage(
+          content: const [
+            TextContent(text: 'what is on this image?'),
+            ImageContent(data: 'aGk=', mimeType: 'image/png'),
+          ],
+          timestamp: DateTime.utc(2026),
+        ),
+      ],
+    );
+
+    test('retries once with images downgraded to placeholders', () async {
+      final bodies = <String>[];
+      var calls = 0;
+      final client = http_testing.MockClient.streaming((request, body) async {
+        calls++;
+        bodies.add(await body.bytesToString());
+        if (calls == 1) {
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(content400)),
+            400,
+          );
+        }
+        return http.StreamedResponse(
+          Stream.value(
+            utf8.encode(
+              sseBody([
+                {
+                  'choices': [
+                    {
+                      'delta': {'content': 'no image seen'},
+                    },
+                  ],
+                },
+                {
+                  'choices': [
+                    {'delta': <String, dynamic>{}, 'finish_reason': 'stop'},
+                  ],
+                },
+                'data: [DONE]\n\n',
+              ]),
+            ),
+          ),
+          200,
+          headers: {'content-type': 'text/event-stream'},
+        );
+      });
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        imageContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(events.whereType<ErrorEvent>(), isEmpty);
+      final done = events.last as DoneEvent;
+      expect(done.reason, StopReason.stop);
+      expect(
+        done.message.content.whereType<TextContent>().map((b) => b.text).join(),
+        contains('no image seen'),
+      );
+
+      expect(calls, 2);
+      // First attempt carried the image part; the retry must not.
+      expect(bodies[0], contains('image_url'));
+      expect(bodies[1], isNot(contains('image_url')));
+      expect(bodies[1], contains('image omitted'));
+    });
+
+    test('an unrelated 400 does not retry', () async {
+      var calls = 0;
+      final client = http_testing.MockClient.streaming((request, body) async {
+        calls++;
+        return http.StreamedResponse(
+          Stream.value(utf8.encode('{"error":{"message":"bad request"}}')),
+          400,
+        );
+      });
+
+      final stream = streamOpenAICompletions(
+        testModel,
+        imageContext(),
+        const OpenAICompletionsOptions(apiKey: 'test-key'),
+        client,
+      );
+
+      final events = await stream.toList();
+      expect(calls, 1);
+      expect(events.whereType<ErrorEvent>(), isNotEmpty);
+    });
+
+    test(
+      'an image-content 400 without images in the request does not retry',
+      () async {
+        var calls = 0;
+        final client = http_testing.MockClient.streaming((request, body) async {
+          calls++;
+          return http.StreamedResponse(
+            Stream.value(utf8.encode(content400)),
+            400,
+          );
+        });
+
+        final stream = streamOpenAICompletions(
+          testModel,
+          simpleContext(),
+          const OpenAICompletionsOptions(apiKey: 'test-key'),
+          client,
+        );
+
+        final events = await stream.toList();
+        expect(calls, 1);
+        expect(events.whereType<ErrorEvent>(), isNotEmpty);
+      },
+    );
+  });
+}

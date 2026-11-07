@@ -1,0 +1,540 @@
+/// The portability boundary of the harness: filesystem and shell capabilities
+/// behind abstract interfaces, plus a [Result] type so file operations encode
+/// failures in their return value instead of throwing.
+///
+/// Ported from pi-mono `packages/agent/src/harness/types.ts` (`FileSystem`,
+/// `Shell`, `ExecutionEnv`, `Result`). The default `dart:io`-backed
+/// implementation lives in `lib/io.dart`; the core library stays pure Dart so
+/// it compiles to web, where a browser-storage-backed implementation can be
+/// substituted behind the same interfaces.
+library;
+
+import 'dart:typed_data';
+
+import '../cancel_token.dart';
+import 'job_log_redaction.dart';
+
+/// Result of a fallible operation. Expected failures are returned as [Err]
+/// instead of thrown — [FileSystem] operations must never throw.
+///
+/// Ported from pi's `Result<TValue, TError>` union.
+sealed class Result<T, E> {
+  const Result();
+
+  /// Whether this is an [Ok] result.
+  bool get isOk => this is Ok<T, E>;
+
+  /// Whether this is an [Err] result.
+  bool get isErr => this is Err<T, E>;
+
+  /// The success value, or `null` when this is an [Err].
+  T? get valueOrNull => switch (this) {
+    Ok<T, E>(:final value) => value,
+    Err<T, E>() => null,
+  };
+
+  /// The failure error, or `null` when this is an [Ok].
+  E? get errorOrNull => switch (this) {
+    Ok<T, E>() => null,
+    Err<T, E>(:final error) => error,
+  };
+
+  /// Returns the success value or throws the failure error. Intended for
+  /// tests and explicit adapter boundaries (mirrors pi's `getOrThrow`).
+  T getOrThrow() => switch (this) {
+    Ok<T, E>(:final value) => value,
+    Err<T, E>(:final error) => throw error as Object,
+  };
+}
+
+/// A successful [Result].
+final class Ok<T, E> extends Result<T, E> {
+  /// Creates an [Ok] wrapping [value].
+  const Ok(this.value);
+
+  /// The success value.
+  final T value;
+}
+
+/// A failed [Result].
+final class Err<T, E> extends Result<T, E> {
+  /// Creates an [Err] wrapping [error].
+  const Err(this.error);
+
+  /// The failure error.
+  final E error;
+}
+
+/// Kind of filesystem object addressed by a [FileSystem].
+///
+/// Ported from pi's `FileKind` union. Symlinks are not followed
+/// automatically.
+enum FileKind {
+  /// A regular file.
+  file,
+
+  /// A directory.
+  directory,
+
+  /// A symbolic link.
+  symlink,
+}
+
+/// Stable, backend-independent error codes returned by [FileSystem]
+/// operations.
+///
+/// Ported from pi's `FileErrorCode` union.
+enum FileErrorCode {
+  /// The operation was aborted.
+  aborted,
+
+  /// The addressed path does not exist.
+  notFound,
+
+  /// The operation was denied by the platform.
+  permissionDenied,
+
+  /// A path component that must be a directory is not one.
+  notDirectory,
+
+  /// The addressed path is a directory but a file was required.
+  isDirectory,
+
+  /// The operation is invalid for the addressed path.
+  invalid,
+
+  /// The backend does not support the operation.
+  notSupported,
+
+  /// Any other backend failure.
+  unknown,
+}
+
+/// Error returned by [FileSystem] operations.
+///
+/// Ported from pi's `FileError`.
+final class FileError implements Exception {
+  /// Creates a [FileError] with a [code] and [message].
+  const FileError(this.code, this.message, {this.path, this.cause});
+
+  /// Backend-independent error code.
+  final FileErrorCode code;
+
+  /// Human-readable description of the failure.
+  final String message;
+
+  /// The addressed path associated with the failure, when available.
+  final String? path;
+
+  /// The original backend error, when available.
+  final Object? cause;
+
+  @override
+  String toString() =>
+      'FileError(${code.name}${path != null ? ', $path' : ''}): $message';
+}
+
+/// Metadata for one filesystem object.
+///
+/// Ported from pi's `FileInfo`.
+final class FileInfo {
+  /// Creates a [FileInfo].
+  const FileInfo({
+    required this.name,
+    required this.path,
+    required this.kind,
+    required this.size,
+    required this.mtimeMs,
+  });
+
+  /// Basename of [path].
+  final String name;
+
+  /// Absolute, normalized addressed path. Symlinks are not followed.
+  final String path;
+
+  /// Object kind.
+  final FileKind kind;
+
+  /// Size in bytes (0 for directories).
+  final int size;
+
+  /// Modification time as milliseconds since the Unix epoch.
+  final int mtimeMs;
+}
+
+/// Filesystem capability used by the harness.
+///
+/// Ported from pi's `FileSystem` interface, reduced to the operations the
+/// session layer needs. Paths may be absolute or relative to [cwd].
+///
+/// **Invariant: operations must never throw.** All filesystem failures,
+/// including unexpected backend failures, are encoded in the returned
+/// [Result]. Implementations must preserve this invariant.
+abstract interface class FileSystem {
+  /// Current working directory for relative paths.
+  String get cwd;
+
+  /// Returns an absolute addressed path without requiring it to exist and
+  /// without resolving symlinks.
+  Future<Result<String, FileError>> absolutePath(String path);
+
+  /// Joins path segments in the filesystem namespace without requiring the
+  /// result to exist.
+  Future<Result<String, FileError>> joinPath(List<String> parts);
+
+  /// Reads a UTF-8 text file.
+  Future<Result<String, FileError>> readTextFile(String path);
+
+  /// Reads the file as raw bytes.
+  Future<Result<Uint8List, FileError>> readBinaryFile(String path);
+
+  /// Reads UTF-8 text lines. Implementations should stop once [maxLines]
+  /// lines have been read.
+  Future<Result<List<String>, FileError>> readTextLines(
+    String path, {
+    int? maxLines,
+  });
+
+  /// Writes raw bytes to a file, creating parent directories.
+  Future<Result<void, FileError>> writeBinaryFile(
+    String path,
+    Uint8List content,
+  );
+
+  /// Creates or overwrites a file, creating parent directories.
+  Future<Result<void, FileError>> writeFile(String path, String content);
+
+  /// Creates or appends to a file, creating parent directories.
+  Future<Result<void, FileError>> appendFile(String path, String content);
+
+  /// Returns metadata for the addressed path without following symlinks.
+  Future<Result<FileInfo, FileError>> fileInfo(String path);
+
+  /// Lists the direct children of a directory.
+  Future<Result<List<FileInfo>, FileError>> listDir(String path);
+
+  /// Returns `false` for missing paths; other errors surface as [Err].
+  Future<Result<bool, FileError>> exists(String path);
+
+  /// Creates a directory. When [recursive] is true (the default), missing
+  /// parents are created too.
+  Future<Result<void, FileError>> createDir(
+    String path, {
+    bool recursive = true,
+  });
+
+  /// Removes a file or directory. With [force], a missing path is not an
+  /// error.
+  Future<Result<void, FileError>> remove(
+    String path, {
+    bool recursive = false,
+    bool force = false,
+  });
+}
+
+/// Optional [FileSystem] capability: atomic same-filesystem rename.
+///
+/// Powers the session-ownership lease (#428): the `_owner.json` sidecar
+/// publishes with temp + rename so a concurrent reader never sees a
+/// partial claim (E5 — exactly one acquirer wins). Backends without an
+/// atomic rename (pure web stores) do not implement it — the lease store
+/// probes with `is RenamableFileSystem` and degrades to unenforced
+/// ownership. Decorators forward to their delegate so wrapping an env
+/// never hides the capability.
+abstract interface class RenamableFileSystem {
+  /// Atomically renames/moves [from] to [to] (overwrites an existing
+  /// [to], POSIX semantics).
+  Future<Result<void, FileError>> renamePath(String from, String to);
+}
+
+/// Optional [FileSystem] capability: byte-range reads.
+///
+/// Powers windowed session loading (`SessionChunkReader`): the app reads
+/// only the tail of a JSONL session file instead of materializing it whole.
+/// Backends that cannot seek (pure web stores in v1) simply do not
+/// implement it — callers probe with `is RangedReadFileSystem` and fall
+/// back to the full-load path. Decorators forward to their delegate so
+/// wrapping an env never hides the capability.
+abstract interface class RangedReadFileSystem {
+  /// Reads the bytes of [path] in the half-open range [start, end).
+  ///
+  /// Never throws: failures come back as [Err]. An [end] past EOF reads to
+  /// EOF; a [start] at or past EOF yields an empty list.
+  Future<Result<Uint8List, FileError>> readRange(
+    String path,
+    int start,
+    int end,
+  );
+}
+
+/// Stable, backend-independent error codes returned by [Shell.exec].
+///
+/// Ported from pi's `ExecutionErrorCode` union.
+enum ExecutionErrorCode {
+  /// The command was aborted via [ShellExecOptions.cancelToken].
+  aborted,
+
+  /// The command exceeded [ShellExecOptions.timeout].
+  timeout,
+
+  /// No shell is available in this environment (e.g. web).
+  shellUnavailable,
+
+  /// The process could not be spawned.
+  spawnError,
+
+  /// An output callback threw.
+  callbackError,
+
+  /// Any other failure.
+  unknown,
+}
+
+/// Error returned by [Shell.exec].
+///
+/// Ported from pi's `ExecutionError`.
+final class ExecutionError implements Exception {
+  /// Creates an [ExecutionError] with a [code] and [message].
+  ///
+  /// [stdout]/[stderr] carry the captured partial output when the command
+  /// was killed mid-run (timeout/cancel, gh-1053): the bounded return must
+  /// deliver the evidence of WHERE the call stalled, not just the fact.
+  /// Empty for every other failure class.
+  const ExecutionError(
+    this.code,
+    this.message, {
+    this.cause,
+    this.stdout = '',
+    this.stderr = '',
+  });
+
+  /// Backend-independent error code.
+  final ExecutionErrorCode code;
+
+  /// Human-readable description of the failure.
+  final String message;
+
+  /// The original backend error, when available.
+  final Object? cause;
+
+  /// Captured partial stdout of a killed run (timeout/cancel), empty
+  /// otherwise. Tail-capped at the source to the last 64 KiB
+  /// (`LocalShell._captureMax`) — renderers may truncate further, but no
+  /// consumer inherits an unbounded retention.
+  final String stdout;
+
+  /// Captured partial stderr of a killed run (timeout/cancel), empty
+  /// otherwise. Tail-capped at the source to the last 64 KiB — see
+  /// [stdout].
+  final String stderr;
+
+  @override
+  String toString() => 'ExecutionError(${code.name}): $message';
+}
+
+/// A live stdin write channel for a RUNNING process (issue #367): the
+/// caller creates the channel, passes it in [ShellExecOptions.liveStdin],
+/// and the shell implementation binds it to the spawned process's stdin.
+/// While bound, the process's stdin pipe stays OPEN for the process's
+/// lifetime (the password ask may arrive long after launch) instead of the
+/// default close-right-after-start.
+final class LiveStdinChannel {
+  /// The sink the shell implementation bound; null until (and after) the
+  /// process ends.
+  void Function(String data)? _sink;
+
+  /// Whether a process stdin is currently bound.
+  bool get isBound => _sink != null;
+
+  /// Called by the shell implementation once the process is spawned.
+  void bind(void Function(String data) sink) => _sink = sink;
+
+  /// Writes [data] to the running process's stdin. Returns false when no
+  /// process is bound or the write failed (the process is already gone) —
+  /// never throws.
+  bool write(String data) {
+    final sink = _sink;
+    if (sink == null) return false;
+    try {
+      sink(data);
+      return true;
+    } on Object {
+      return false;
+    }
+  }
+}
+
+/// Options for [Shell.exec].
+final class ShellExecOptions {
+  /// Creates [ShellExecOptions].
+  const ShellExecOptions({
+    this.cwd,
+    this.env,
+    this.timeout,
+    this.cancelToken,
+    this.onStdout,
+    this.onStderr,
+    this.stdinData,
+    this.liveStdin,
+    this.jobLogMaxBytes,
+    this.onJobLogWarning,
+    this.jobLogRedactor,
+  });
+
+  /// Working directory for the command. Defaults to [FileSystem.cwd].
+  final String? cwd;
+
+  /// Additional environment variables; values override the defaults.
+  final Map<String, String>? env;
+
+  /// Timeout for the command. Implementations should return a
+  /// [ExecutionErrorCode.timeout] error when exceeded.
+  final Duration? timeout;
+
+  /// Token used to terminate the command early.
+  final CancelToken? cancelToken;
+
+  /// Called with stdout chunks as they are produced.
+  final void Function(String chunk)? onStdout;
+
+  /// Called with stderr chunks as they are produced.
+  final void Function(String chunk)? onStderr;
+
+  /// Optional data written to the command's stdin before the pipe closes
+  /// (a password/passphrase answer, a `y\n` confirmation). Null keeps the
+  /// old behavior: stdin closes immediately.
+  final String? stdinData;
+
+  /// Optional live stdin write channel (issue #367). When attached, the
+  /// implementation binds the channel to the spawned process's stdin and
+  /// keeps the pipe open for the process's lifetime — a password ask that
+  /// arrives mid-run can be answered through [LiveStdinChannel.write].
+  /// Null keeps the old behavior: stdin closes right after start.
+  final LiveStdinChannel? liveStdin;
+
+  /// Size ceiling for a detached job's log in bytes (issue #919). Only
+  /// honored by [BackgroundShell.startShellJob]; null means the shell's
+  /// default ([defaultJobLogMaxBytes]). Foreground execs ignore it.
+  final int? jobLogMaxBytes;
+
+  /// Fired at most once per detached job when the low-disk guard stops log
+  /// writes (issue #919). Only honored by [BackgroundShell.startShellJob];
+  /// foreground execs ignore it.
+  final void Function(String message)? onJobLogWarning;
+
+  /// Line-buffered redaction applied to a detached job's log writes at
+  /// rest (issue #1408 AC2): secret-shaped chunks become
+  /// `[REDACTED:<kind>]` markers in the log FILE, so `.fah/bash_jobs/`
+  /// never stores raw secret values. Only honored by
+  /// [BackgroundShell.startShellJob]; foreground execs ignore it.
+  final JobLogRedactor? jobLogRedactor;
+}
+
+/// Outcome of a completed [Shell.exec] invocation.
+final class ShellExecResult {
+  /// Creates a [ShellExecResult].
+  const ShellExecResult({
+    required this.stdout,
+    required this.stderr,
+    required this.exitCode,
+  });
+
+  /// Captured standard output.
+  final String stdout;
+
+  /// Captured standard error.
+  final String stderr;
+
+  /// Process exit code.
+  final int exitCode;
+}
+
+/// Shell execution capability used by the harness.
+///
+/// Ported from pi's `Shell` interface. Implementations that cannot spawn
+/// processes (e.g. web) should return [ExecutionErrorCode.shellUnavailable].
+abstract interface class Shell {
+  /// Executes a shell command. Must never throw: all failures are encoded in
+  /// the returned [Result].
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  });
+}
+
+/// A detached shell job: a process that keeps running after the tool call
+/// that started it has returned. Output is appended to the job's log file
+/// (the path is chosen by the caller of [BackgroundShell.startShellJob]).
+abstract interface class ShellJob {
+  /// Registry-unique job id.
+  String get id;
+
+  /// The command line being executed.
+  String get command;
+
+  /// The log file receiving the job's stdout and stderr.
+  String get logPath;
+
+  /// The job's root process id, when the platform exposes one (null on
+  /// sandboxed shells). Persisted in the cross-run job manifest so a later
+  /// boot can sweep the job's leftover process group (issue #517).
+  int? get pid;
+
+  /// Whether the process is still running.
+  bool get isRunning;
+
+  /// The process exit code, or null while [isRunning].
+  int? get exitCode;
+
+  /// Completes when the process exits (naturally, killed, or timed out).
+  Future<void> get settled;
+
+  /// Why the job was stopped early: 'timeout' ([ShellExecOptions.timeout])
+  /// or 'cancelled' ([ShellExecOptions.cancelToken]); null when the process
+  /// exited on its own (or is still running).
+  String? get stopReason;
+
+  /// Live decoded output (stdout + stderr interleaved) as it is produced,
+  /// in addition to the log file. Broadcast: any number of listeners; no
+  /// buffering for listeners that attach after a chunk was emitted.
+  Stream<String> get output;
+
+  /// Writes [data] to the job's stdin (issue #367: answering a detected
+  /// password ask). Returns false when the stdin pipe is closed (the
+  /// default: stdin closes right after start) or the process is already
+  /// gone — never throws.
+  bool writeStdin(String data);
+
+  /// Terminates the process. No-op when it already exited.
+  Future<void> stop();
+}
+
+/// Optional [Shell] capability: detached, log-file-backed jobs that outlive
+/// the initiating tool call. Implemented by process-backed environments
+/// (local shell); sandboxed/web environments simply do not implement it and
+/// callers answer a clean "not supported here" note instead.
+abstract interface class BackgroundShell {
+  /// Whether [startShellJob] actually works here. Decorators forward their
+  /// delegate's answer, so wrapping an env never fakes the capability.
+  bool get backgroundJobsSupported;
+
+  /// Starts [command] detached: stdout/stderr append to [logPath] and the
+  /// returned [ShellJob] keeps running until it exits or is stopped.
+  /// [ShellExecOptions.timeout] and [ShellExecOptions.cancelToken] still
+  /// apply (both stop the job).
+  Future<Result<ShellJob, ExecutionError>> startShellJob(
+    String command, {
+    required String id,
+    required String logPath,
+    ShellExecOptions? options,
+  });
+}
+
+/// Filesystem and process execution environment used by the harness.
+///
+/// Ported from pi's `ExecutionEnv` (`interface ExecutionEnv extends
+/// FileSystem, Shell`). The `dart:io`-backed implementation is exported only
+/// from `lib/io.dart`; the core library exports [MemoryExecutionEnv] for
+/// tests and web consumers.
+abstract interface class ExecutionEnv implements FileSystem, Shell {}

@@ -1,0 +1,831 @@
+import 'dart:io';
+
+import 'package:flutter_agent_harness/src/cli/ansi_markdown.dart';
+import 'package:flutter_agent_harness/src/cli/system_notice_render.dart';
+import 'package:flutter_agent_harness/src/cli/tool_row_content.dart'
+    show settledCallCardRows, transcriptExpandDetails;
+import 'package:flutter_agent_harness/src/cli/tool_rows.dart';
+import 'package:flutter_agent_harness/src/cli/tui_chrome.dart'
+    show tuiChromeEnabled;
+import 'package:flutter_agent_harness/src/cli/tui_replay.dart';
+import 'package:flutter_agent_harness/src/cli/tui_text_width.dart';
+import 'package:flutter_agent_harness/src/cli/tui_theme.dart';
+import 'package:flutter_agent_harness/src/context.dart';
+import 'package:flutter_agent_harness/src/session/session_tree.dart'
+    show
+        branchSummaryPrefix,
+        branchSummarySuffix,
+        compactionSummaryPrefix,
+        compactionSummarySuffix;
+import 'package:flutter_agent_harness/src/types.dart';
+import 'package:test/test.dart';
+
+void main() {
+  String dim(String text) => '<d>$text</d>';
+
+  AssistantMessage assistant(List<ContentBlock> content) => AssistantMessage(
+    content: content,
+    api: 'test-api',
+    provider: 'test-provider',
+    model: 'test-model',
+    usage: Usage.zero,
+    stopReason: StopReason.stop,
+    timestamp: DateTime.utc(2026),
+  );
+
+  ToolResultMessage okResult(String callId, String text) => ToolResultMessage(
+    toolCallId: callId,
+    toolName: 'bash',
+    content: [TextContent(text: text)],
+    isError: false,
+    timestamp: DateTime.utc(2026),
+  );
+
+  /// The live end row for [call] — the legacy `_onToolExecutionEnd` paint
+  /// (the [tuiChromeEnabled] kill-switch path and line mode), minus the live
+  /// duration (replay shows the honest `—`). The replay row must equal this
+  /// byte for byte in those modes.
+  String liveEndRow(
+    ToolCall call,
+    ToolResultMessage? result, {
+    int width = 80,
+  }) {
+    final failed = result == null || result.isError;
+    var detail = toolRowDetail(call.name, call.arguments);
+    var glyphPaint = tuiAccentSoft;
+    var detailPaint = tuiDim;
+    if (result != null && result.isError) {
+      glyphPaint = tuiError;
+      detailPaint = (s) => s;
+      detail = result.content
+          .whereType<TextContent>()
+          .map((b) => b.text)
+          .join()
+          .split('\n')
+          .first;
+    }
+    return layoutToolRow(
+      ToolRowSegments(
+        glyph: failed ? '✗' : '✓',
+        label: call.name,
+        detail: detail,
+        elapsed: '—',
+      ),
+      width,
+    ).style(glyph: glyphPaint, label: tuiAccent2, dim: detailPaint);
+  }
+
+  /// The live SETTLED CARD for [call] — the SAME [settledCallCardRows]
+  /// derivation `_onToolExecutionEnd` and [replayToolRow] render through
+  /// (issue #807 chrome, #916 parity by construction, gh-1933 v2
+  /// content), minus the live duration (the right zone carries the honest
+  /// `—`). The replayed TUI tool row must equal this byte for byte.
+  String liveEndCard(
+    ToolCall call,
+    ToolResultMessage? result, {
+    int width = 80,
+  }) {
+    return settledCallCardRows(
+      toolName: call.name,
+      args: call.arguments,
+      resultContent: result?.content ?? const [],
+      isError: result != null && result.isError,
+      width: width,
+      interrupted: result == null,
+      // The one permitted live/replay difference: no live duration.
+      elapsed: '—',
+    ).join('\n');
+  }
+
+  group('replay tool rows (issue #446 AC2, #916 chrome parity)', () {
+    final call = ToolCall(
+      id: 'c1',
+      name: 'bash',
+      arguments: {'command': 'git status --short'},
+    );
+
+    test('a persisted call with its result renders the live SETTLED CARD '
+        'grammar (issue #916) — never an [name] marker', () {
+      final result = okResult('c1', 'M lib/a.dart\n');
+      final lines = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+        results: {'c1': result},
+      );
+      // Byte-parity with the live `_onToolExecutionEnd` card paint: the
+      // replayed transcript shows what the user saw live, not the pre-#807
+      // row grammar.
+      expect(lines, [liveEndCard(call, result)]);
+      expect(lines.join(), isNot(contains('[bash]')));
+      expect(lines.single, contains('✔'));
+      expect(lines.single, contains('bash'));
+      // Honest lossy bit: the meta zone shows no live duration.
+      expect(lines.single, contains('—'));
+      // The legacy row grammar never leaks through chrome mode.
+      expect(lines.join(), isNot(contains('✓ bash')));
+    });
+
+    test('chrome kill switch keeps the legacy painted row, byte-pinned — '
+        'success, error, and interrupted', () {
+      addTearDown(() => tuiChromeEnabled = true);
+      tuiChromeEnabled = false;
+      final result = okResult('c1', 'M lib/a.dart\n');
+      final error = ToolResultMessage(
+        toolCallId: 'c1',
+        toolName: 'bash',
+        content: [TextContent(text: 'fatal: not a repo\nstack')],
+        isError: true,
+        timestamp: DateTime.utc(2026),
+      );
+      final success = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+        results: {'c1': result},
+      );
+      expect(success, [liveEndRow(call, result)]);
+      expect(success.single, contains('✓'));
+      final failed = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+        results: {'c1': error},
+      );
+      expect(failed, [liveEndRow(call, error)]);
+      expect(failed.single, contains('✗'));
+      expect(failed.single, contains('fatal: not a repo'));
+      final interrupted = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+      );
+      expect(interrupted, [liveEndRow(call, null)]);
+      expect(interrupted.single, contains('✗'));
+    });
+
+    test('the args preview is the human detail (command text), not JSON', () {
+      final lines = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+        results: {'c1': okResult('c1', 'ok')},
+      );
+      expect(lines.single, contains('git status --short'));
+      expect(lines.single, isNot(contains('{')));
+    });
+
+    test('an error result renders the ✘ card with the failure first line', () {
+      final result = ToolResultMessage(
+        toolCallId: 'c1',
+        toolName: 'bash',
+        content: [TextContent(text: 'fatal: not a repo\nstack')],
+        isError: true,
+        timestamp: DateTime.utc(2026),
+      );
+      final lines = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+        results: {'c1': result},
+      );
+      expect(lines, [liveEndCard(call, result)]);
+      expect(lines.single, contains('✘'));
+      expect(lines.single, contains('fatal: not a repo'));
+    });
+
+    test('E1: a call missing its result renders interrupted — never bare', () {
+      final lines = replayLinesTui(assistant([call]), width: 80, dim: dim);
+      expect(lines, [liveEndCard(call, null)]);
+      expect(lines.single, contains('✘'));
+      expect(lines.join(), isNot(contains('[bash]')));
+    });
+
+    test('line mode renders the same grammar unpainted', () {
+      final lines = replayLines(
+        assistant([call]),
+        maxRows: 0,
+        results: {'c1': okResult('c1', 'ok')},
+      );
+      expect(lines, hasLength(1));
+      expect(lines.single, startsWith('fa:  '));
+      expect(lines.single, contains('✓ bash'));
+      expect(lines.single, contains('git status --short'));
+      expect(lines.join(), isNot(contains('[bash]')));
+    });
+  });
+
+  group('replay system rows (issue #446 AC3)', () {
+    const settleNotice =
+        '<system-notice>\n'
+        'Background shell job sh-32-hlrc finished with exit code 0.\n'
+        'Command: git commit -m "fix(provider): entry-name status label\n'
+        '  plus a very long multi-line commit body full of noise"\n'
+        'Log: /tmp/x/.fah/bash_jobs/sh-32-hlrc.log\n'
+        'Check the result with bash_job (action: output) or by reading the\n'
+        'log file, and act on it when the result was awaited.\n'
+        '</system-notice>';
+
+    test('a settled background-job notice replays through the system-row '
+        'renderer, exactly the live blockquote shape', () {
+      final lines = replayLinesTui(
+        UserMessage.text(settleNotice),
+        width: 80,
+        dim: dim,
+      );
+      expect(lines, renderSystemNoticeLines(settleNotice));
+    });
+
+    test(
+      'zero literal ⚙-prefixed raw lines — every gear rides a blockquote',
+      () {
+        final lines = replayLinesTui(
+          UserMessage.text(settleNotice),
+          width: 80,
+          dim: dim,
+        );
+        expect(lines.join('\n'), contains('⚙'));
+        for (final line in lines) {
+          if (line.replaceAll('\x1b[0m', '').contains('⚙')) {
+            expect(
+              line.trimLeft().startsWith('>'),
+              isTrue,
+              reason: 'raw gear line leaked: $line',
+            );
+          }
+        }
+      },
+    );
+
+    test('line mode rides the same renderer', () {
+      final lines = replayLines(UserMessage.text(settleNotice), maxRows: 0);
+      expect(lines, renderSystemNoticeLines(settleNotice));
+    });
+
+    test('mixed content replays verbatim (not a notice)', () {
+      final lines = replayLinesTui(
+        UserMessage.text('look: <system-notice>x</system-notice>'),
+        width: 80,
+        dim: dim,
+      );
+      expect(lines.join(), contains('look:'));
+    });
+  });
+
+  group('restoredInputHistory', () {
+    test('collects plain user messages, skipping commands and chrome', () {
+      final messages = [
+        UserMessage.text('first question'),
+        assistant([TextContent(text: 'the answer')]),
+        UserMessage.text('/resume'),
+        UserMessage.text('!ls -la'),
+        UserMessage.text('   '),
+        assistant([ToolCall(id: 't1', name: 'read', arguments: {})]),
+        UserMessage.text('duplicated'),
+        UserMessage.text('duplicated'),
+      ];
+      expect(restoredInputHistory(messages), ['first question', 'duplicated']);
+    });
+
+    test('system notices and compaction summaries are not history', () {
+      const notice = '<system-notice>job sh-1 finished</system-notice>';
+      final messages = [
+        UserMessage.text(notice),
+        UserMessage.text('$compactionSummaryPrefix<span>summary</span>'),
+        UserMessage.text('a real message'),
+      ];
+      expect(restoredInputHistory(messages), ['a real message']);
+    });
+
+    test('keeps only the last 100 entries', () {
+      final messages = [for (var i = 0; i < 120; i++) UserMessage.text('m$i')];
+      final history = restoredInputHistory(messages);
+      expect(history, hasLength(100));
+      expect(history.first, 'm20');
+      expect(history.last, 'm119');
+    });
+  });
+
+  group('replayLinesTui', () {
+    test('a plain-text user message renders as the background echo box', () {
+      // Both kill-switch modes are pinned (D1): chrome bubble band AND
+      // the legacy rule + bare backgrounded rows (issue #807 round-2).
+      for (final chrome in [true, false]) {
+        addTearDown(() => tuiChromeEnabled = true);
+        tuiChromeEnabled = chrome;
+        final lines = replayLinesTui(
+          UserMessage.text('hello\nworld'),
+          width: 10,
+          dim: dim,
+        );
+        if (chrome) {
+          // Issue #807 chrome: the same bubble band rows the live echo
+          // emits (blank top, leading-space content rows, blank bottom,
+          // trailing blank).
+          const fg = '\x1b[38;2;232;238;247m';
+          const bg = '\x1b[48;2;30;34;42m';
+          expect(lines, [
+            '$bg$fg\x1b[0m',
+            '$bg$fg hello\x1b[0m',
+            '$bg$fg world\x1b[0m',
+            '$bg$fg\x1b[0m',
+            '',
+          ]);
+        } else {
+          // Kill switch (D1): the legacy rule + bare backgrounded rows,
+          // byte-pinned so the off-path stays provable.
+          expect(lines, [
+            dim('─' * 10),
+            '${tuiUserMessageBgSgr()}hello\x1b[0m',
+            '${tuiUserMessageBgSgr()}world\x1b[0m',
+            '',
+          ]);
+        }
+      }
+    });
+
+    test('an empty user message renders nothing', () {
+      expect(
+        replayLinesTui(UserMessage.text('   '), width: 10, dim: dim),
+        isEmpty,
+      );
+    });
+
+    test('markdown parity (AC4): replayed text is the same raw markdown the '
+        'live stream buffers — the view styles both identically', () {
+      const text =
+          'intro\n\n# Title\n\n- a\n2. two\n\n**bold** and '
+          '`code`';
+      final replayRows = replayLinesTui(
+        assistant([TextContent(text: text)]),
+        width: 80,
+        dim: dim,
+      );
+      final liveRows = [
+        '${assistantStreamPrefix()}intro',
+        '',
+        '# Title',
+        '',
+        '- a',
+        '2. two',
+        '',
+        '**bold** and `code`',
+      ];
+      // Identical raw rows: whatever AnsiMarkdown does to one it does to
+      // the other — same styled segments, same structure, zero dim SGR on
+      // text rows (dim rides thinking only, exactly like live).
+      expect(replayRows, liveRows);
+      expect(replayRows.join('\n'), isNot(contains('\x1b[2m')));
+      final styledReplay = AnsiMarkdown(width: 80);
+      final styledLive = AnsiMarkdown(width: 80);
+      final replayOut = [
+        for (final row in replayRows) styledReplay.formatLine(row),
+      ].join('\n');
+      final liveOut = [
+        for (final row in liveRows) styledLive.formatLine(row),
+      ].join('\n');
+      expect(replayOut, liveOut);
+      expect(replayOut, contains('Title')); // heading marker consumed
+      expect(replayOut, isNot(contains('# Title')));
+      expect(replayOut, contains('\x1b[1mbold\x1b[0m'));
+    });
+
+    test('thinking collapses to ONE `> Thought for Ns` row (gh-1933 AC4) — '
+        'dim rides it, never assistant text', () {
+      final rows = replayLinesTui(
+        assistant([
+          ThinkingContent(thinking: 'reasoning hard\nline two'),
+          TextContent(text: 'the answer'),
+        ]),
+        width: 80,
+        dim: dim,
+      );
+      expect(rows, [
+        dim('> Thought for —'),
+        '${assistantStreamPrefix()}the answer',
+      ]);
+    });
+
+    test('expanded thinking renders the persisted text dim under the '
+        'label (gh-1933 AC4/AC5 — nothing today\'s replay showed is lost)', () {
+      // Review thread PRRT_kwDOTXdlLc6w5WFF: the `/transcript expand all`
+      // global is the ONE expansion channel — no parallel parameter.
+      transcriptExpandDetails = true;
+      addTearDown(() => transcriptExpandDetails = false);
+      final rows = replayLinesTui(
+        assistant([
+          ThinkingContent(thinking: 'reasoning hard\nline two'),
+          TextContent(text: 'the answer'),
+        ]),
+        width: 80,
+        dim: dim,
+      );
+      expect(rows, [
+        dim('> Thought for —'),
+        dim('reasoning hard'),
+        dim('line two'),
+        '${assistantStreamPrefix()}the answer',
+      ]);
+      // Collapsing back restores the one-row default.
+      transcriptExpandDetails = false;
+      final collapsed = replayLinesTui(
+        assistant([ThinkingContent(thinking: 'deep thought')]),
+        width: 80,
+        dim: dim,
+      );
+      expect(collapsed, [dim('> Thought for —')]);
+    });
+
+    test('the `>_Fa ` prefix lands on the first text row only', () {
+      final rows = replayLinesTui(
+        assistant([TextContent(text: 'one\ntwo')]),
+        width: 80,
+        dim: dim,
+      );
+      expect(rows.first, contains('>_'));
+      expect(rows.first, contains('Fa'));
+      expect(rows.first, contains('one'));
+      expect(rows[1], 'two');
+      expect(rows.skip(1).join(), isNot(contains('Fa ')));
+    });
+
+    test('assistant text replays IN FULL — no per-message head cap', () {
+      final text = [for (var i = 1; i <= 25; i++) 'row $i'].join('\n');
+      final lines = replayLinesTui(
+        assistant([TextContent(text: text)]),
+        width: 10,
+        dim: dim,
+      );
+      // Every row survives the restore; nothing is hidden behind ' …'.
+      expect(lines, hasLength(25));
+      expect(lines.last, 'row 25');
+      expect(lines.join('\n'), isNot(contains('…')));
+    });
+
+    test('an assistant message without text renders its tool rows only', () {
+      final call = ToolCall(
+        id: 'c1',
+        name: 'read',
+        arguments: {'path': '/tmp/a.dart'},
+      );
+      final lines = replayLinesTui(
+        assistant([call]),
+        width: 80,
+        dim: dim,
+        results: {'c1': okResult('c1', 'ok')},
+      );
+      expect(lines, [liveEndCard(call, okResult('c1', 'ok'))]);
+    });
+
+    test('tool results never render standalone', () {
+      expect(
+        replayLinesTui(
+          ToolResultMessage(
+            toolCallId: '1',
+            toolName: 'read',
+            content: const [],
+            isError: false,
+            timestamp: DateTime.utc(2026),
+          ),
+          width: 10,
+          dim: dim,
+        ),
+        isEmpty,
+      );
+    });
+
+    test('a compaction summary renders as one compact marker row', () {
+      final summary =
+          '$compactionSummaryPrefix'
+          'Implemented the login flow and fixed the token refresh.\n\n'
+          '<read-files>\n/a.dart\n/b.dart\n</read-files>'
+          '$compactionSummarySuffix';
+      final lines = replayLinesTui(
+        UserMessage.text(summary),
+        width: 80,
+        dim: dim,
+      );
+      expect(lines, hasLength(3));
+      expect(lines[1], contains('context compacted into a summary'));
+      expect(lines[1], contains('Implemented the login flow'));
+      // The raw XML-ish block never leaks into the history.
+      expect(lines.join('\n'), isNot(contains('<read-files>')));
+      expect(lines.join('\n'), isNot(contains('</summary>')));
+    });
+
+    test('a branch summary renders compact too', () {
+      final summary =
+          '$branchSummaryPrefix'
+          'The detour explored X.\n'
+          '$branchSummarySuffix';
+      final lines = replayLinesTui(
+        UserMessage.text(summary),
+        width: 80,
+        dim: dim,
+      );
+      expect(lines[1], contains('summary of the detour branch'));
+      expect(lines[1], contains('The detour explored X.'));
+    });
+
+    test('the marker row is truncated to the terminal width', () {
+      final summary =
+          '$compactionSummaryPrefix'
+          '${'very long line ' * 20}'
+          '$compactionSummarySuffix';
+      final lines = replayLinesTui(
+        UserMessage.text(summary),
+        width: 40,
+        dim: dim,
+      );
+      // dim() wraps in <d></d>; the visible text stays within 40 cols.
+      final visible = lines[1].replaceAll('<d>', '').replaceAll('</d>', '');
+      expect(visible.length, 40);
+      expect(visible, endsWith('…'));
+    });
+
+    test('a long fenced message replays intact, fence balanced', () {
+      final body = [
+        'intro',
+        '```dart',
+        for (var i = 0; i < 22; i++) 'line $i',
+        '```',
+        'after',
+      ].join('\n');
+      final lines = replayLinesTui(
+        assistant([TextContent(text: body)]),
+        width: 40,
+        dim: dim,
+      );
+      expect(lines, hasLength(26));
+      expect(lines.last, 'after');
+    });
+
+    test('a budget cut starting mid-fence prepends a balancing fence', () {
+      final messages = [
+        assistant([TextContent(text: '```\ncode\n```\nafter')]),
+        assistant([TextContent(text: 'recent answer')]),
+      ];
+      // Budget admits only the last entry: the kept region is fence-balanced
+      // here (no synthetic fence needed).
+      var (entries, _) = buildReplayEntries(
+        messages,
+        tui: true,
+        width: 40,
+        dim: dim,
+        rowBudget: 10,
+      );
+      expect(entries.first, isNot(['```']));
+
+      // Now the fence OPENS in the dropped head and closes inside the kept
+      // region: without the synthetic opener the closer would toggle state
+      // ON and swallow the rest.
+      final midCut = [
+        assistant([TextContent(text: '```\nlong code block')]),
+        assistant([TextContent(text: '```\nafter the block')]),
+      ];
+      (entries, _) = buildReplayEntries(
+        midCut,
+        tui: true,
+        width: 40,
+        dim: dim,
+        rowBudget: 2,
+      );
+      expect(entries.first, ['```']);
+    });
+
+    test('a budget cut keeps whole messages and renders tool rows', () {
+      final call = ToolCall(
+        id: 'c9',
+        name: 'bash',
+        arguments: {'command': 'echo hi'},
+      );
+      final old = [
+        UserMessage.text('old question'),
+        assistant([TextContent(text: 'old answer')]),
+      ];
+      final recent = [
+        UserMessage.text('new question'),
+        assistant([call, TextContent(text: 'new answer')]),
+        okResult('c9', 'hi'),
+      ];
+      final (entries, firstIndex) = buildReplayEntries(
+        [...old, ...recent],
+        tui: true,
+        width: 80,
+        dim: dim,
+        rowBudget: 4,
+      );
+      expect(entries.join('\n'), contains('new answer'));
+      expect(entries.join('\n'), contains('echo hi'));
+      expect(entries.join('\n'), isNot(contains('old question')));
+      expect(entries.join('\n'), isNot(contains('old answer')));
+      expect(entries.join('\n'), isNot(contains('new question')));
+      expect(firstIndex, 3);
+    });
+  });
+
+  group('gh-1933 v2 content on replayed rows (AC1/AC2/AC3)', () {
+    String strip(String s) => s.replaceAll(AnsiMarkdown.ansiSgrPattern, '');
+
+    test('AC1: a replayed read row shows path + selector + lines-read', () {
+      final call = ToolCall(
+        id: 'r1',
+        name: 'read',
+        arguments: {'path': 'sm.yml:90-140'},
+      );
+      final row = strip(
+        replayToolRow(call, okResult('r1', 'a\nb\nc'), width: 100),
+      );
+      expect(row, contains('sm.yml:90-140'));
+      expect(row, contains('3 lines read'));
+      expect(row, contains('—'), reason: 'the honest replay duration');
+    });
+
+    test('AC2: a replayed edit row shows the applied diffstat +N −M', () {
+      final call = ToolCall(
+        id: 'e1',
+        name: 'edit',
+        arguments: {
+          'path': 'a.yml',
+          'oldText': 'x: 1\ny: 2',
+          'newText': 'x: 9',
+        },
+      );
+      final row = strip(
+        replayToolRow(call, okResult('e1', 'Edited a.yml.'), width: 100),
+      );
+      expect(row, contains('a.yml'));
+      expect(row, contains('+1 −2'));
+    });
+
+    test('AC2: a rejected hashline patch renders the error summary, not a '
+        'diffstat', () {
+      final call = ToolCall(
+        id: 'e2',
+        name: 'edit',
+        arguments: {'patch': '[a.yml#DEAD]\nSWAP 1.=1:\n+nope'},
+      );
+      final row = strip(
+        replayToolRow(
+          call,
+          ToolResultMessage(
+            toolCallId: 'e2',
+            toolName: 'edit',
+            content: [
+              TextContent(
+                text: 'tag DEAD does not match a.yml (drifted lines 1-3)',
+              ),
+            ],
+            isError: true,
+            timestamp: DateTime.utc(2026),
+          ),
+          width: 100,
+        ),
+      );
+      expect(row, contains('✘'));
+      expect(row, contains('does not match a.yml'));
+      expect(row, isNot(contains('+')));
+    });
+
+    test('AC3: a replayed bash row shows intent label, output-lines count, '
+        'RIGHT-ALIGNED elapsed zone, and the dim command preview row', () {
+      final call = ToolCall(
+        id: 'b1',
+        name: 'bash',
+        arguments: {'command': 'cd /work && flutter test --coverage'},
+      );
+      final rows = replayToolRow(
+        call,
+        okResult('b1', 'line1\nline2\nline3'),
+        width: 60,
+      ).split('\n');
+      final header = strip(rows.first);
+      expect(rows, hasLength(2), reason: 'the preview rides its own row');
+      expect(header, contains('flutter test --coverage'));
+      expect(header, contains('3 lines'));
+      // Right-aligned: the `—` zone ends at the row edge.
+      expect(header.trim(), endsWith('—'));
+      expect(tuiTextWidth(header), lessThanOrEqualTo(60));
+      // The preview row: dim-painted (the toolOutput role), padded to the
+      // width by the card band.
+      final preview = strip(rows.last).trim();
+      expect(preview, 'flutter test --coverage');
+      expect(rows.last, contains('\x1b['));
+    });
+
+    test('AC3 failure branch: an error bash row leads with the failure '
+        'line and carries no counts', () {
+      final call = ToolCall(
+        id: 'b2',
+        name: 'bash',
+        arguments: {'command': 'cargo build'},
+      );
+      final row = strip(
+        replayToolRow(
+          call,
+          ToolResultMessage(
+            toolCallId: 'b2',
+            toolName: 'bash',
+            content: [
+              TextContent(text: 'Command exited with code 101\npartial'),
+            ],
+            isError: true,
+            timestamp: DateTime.utc(2026),
+          ),
+          width: 100,
+        ),
+      );
+      expect(row, contains('✘'));
+      expect(row, contains('Command exited with code 101'));
+      expect(row, isNot(contains('lines')));
+    });
+
+    test('AC5 REG: line mode renders thinking NEVER — the #36 legacy row '
+        'and the plain text stream stay byte-shaped', () {
+      final call = ToolCall(
+        id: 'l1',
+        name: 'bash',
+        arguments: {'command': 'echo hi'},
+      );
+      final lines = replayLines(
+        assistant([
+          ThinkingContent(thinking: 'secret reasoning'),
+          TextContent(text: 'answer'),
+          call,
+        ]),
+        maxRows: 0,
+        results: {'l1': okResult('l1', 'hi')},
+      );
+      final joined = lines.join('\n');
+      expect(joined, isNot(contains('secret reasoning')));
+      expect(joined, contains('answer'));
+      expect(joined, contains('✓ bash · echo hi —'));
+      // Headless stdout contract (#1931 AC3): one full single-copy line.
+      expect(lines.where((l) => l.contains('echo hi')), hasLength(1));
+    });
+  });
+
+  group('resume golden (issue #446 AC5)', () {
+    test('the restored transcript pins the unified pipeline, shared with the '
+        'live builder fixtures', () {
+      final call = ToolCall(
+        id: 'g1',
+        name: 'bash',
+        arguments: {'command': 'gh run cancel 123'},
+      );
+      final read = ToolCall(
+        id: 'g2',
+        name: 'read',
+        arguments: {'path': 'lib/a.dart'},
+      );
+      const notice =
+          '<system-notice>\n'
+          'Background shell job sh-9 finished with exit code 0.\n'
+          '</system-notice>';
+      final results = {
+        'g1': okResult('g1', 'cancelled'),
+        'g2': okResult('g2', 'contents'),
+      };
+      final messages = [
+        UserMessage.text('ship it'),
+        assistant([
+          TextContent(text: '# Plan\n\n- cancel the run\n- **verify**'),
+          call,
+          read,
+        ]),
+        okResult('g1', 'cancelled'),
+        okResult('g2', 'contents'),
+        UserMessage.text(notice),
+        assistant([TextContent(text: 'done — the run is cancelled')]),
+      ];
+      final (entries, _) = buildReplayEntries(
+        messages,
+        tui: true,
+        width: 80,
+        dim: dim,
+      );
+      // SGR-stripped transcript: pins the grammar, not the palette.
+      String strip(String s) => s.replaceAll(AnsiMarkdown.ansiSgrPattern, '');
+      final transcript = [
+        for (final entry in entries) ...[for (final line in entry) strip(line)],
+      ];
+      // The live builder produces the very same rows for the same records.
+      expect(transcript, contains(strip(liveEndCard(call, results['g1']!))));
+      expect(transcript, contains(strip(liveEndCard(read, results['g2']!))));
+      expect(
+        transcript,
+        containsAll(renderSystemNoticeLines(notice).map(strip)),
+      );
+      expect(transcript.join('\n'), isNot(contains('[bash]')));
+      expect(transcript.join('\n'), isNot(contains('[read]')));
+
+      final file = File('test/cli/goldens/tui_resume.ans');
+      final rendered = '${transcript.join('\n')}\n';
+      if (Platform.environment.containsKey('FA_UPDATE_RESUME_GOLDENS')) {
+        file.writeAsStringSync(rendered);
+        return;
+      }
+      expect(rendered, file.readAsStringSync());
+    });
+  });
+}

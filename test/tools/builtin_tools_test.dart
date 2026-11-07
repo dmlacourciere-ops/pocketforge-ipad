@@ -1,0 +1,2135 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_agent_harness/src/tools/builtin_tools.dart' as bt;
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart' as http_testing;
+import 'package:image/image.dart';
+import 'package:test/test.dart';
+
+String _text(ToolExecutionResult result) {
+  return result.content.whereType<TextContent>().map((b) => b.text).join();
+}
+
+/// A [Shell] returning a scripted result and recording its invocations.
+class _FakeShell implements Shell {
+  _FakeShell(this.result);
+
+  Result<ShellExecResult, ExecutionError> result;
+
+  /// Queue of outcomes consumed per exec call: entries replace [result]
+  /// one at a time (used by the bash retry tests). An [Object] entry is
+  /// thrown instead of returned.
+  final queue = <Object>[];
+  int calls = 0;
+  String? lastCommand;
+  ShellExecOptions? lastOptions;
+
+  @override
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  }) async {
+    calls++;
+    lastCommand = command;
+    lastOptions = options;
+    if (queue.isNotEmpty) {
+      final entry = queue.removeAt(0);
+      if (entry is Result<ShellExecResult, ExecutionError>) return entry;
+      throw entry;
+    }
+    return result;
+  }
+}
+
+void main() {
+  group('builtinTools', () {
+    test('creates the pi-shaped tools', () {
+      final tools = builtinTools(MemoryExecutionEnv());
+      expect(tools.map((t) => t.name), ['read', 'write', 'edit', 'ls', 'bash']);
+      for (final tool in tools) {
+        expect(tool.description, isNotEmpty);
+        expect(tool.parameters['type'], 'object');
+      }
+    });
+  });
+
+  group('readFileTool', () {
+    late MemoryExecutionEnv env;
+    late AgentTool tool;
+
+    setUp(() {
+      env = MemoryExecutionEnv(cwd: '/work');
+      tool = readFileTool(env);
+    });
+
+    test('reads a whole small file', () async {
+      await env.writeFile('notes.txt', 'line one\nline two\n');
+      final result = await tool.execute({'path': 'notes.txt'}, null, null);
+      expect(_text(result), 'line one\nline two\n');
+    });
+
+    test('honors offset and limit with a continuation notice', () async {
+      await env.writeFile('f.txt', 'a\nb\nc\nd\ne');
+      final result = await tool.execute(
+        {'path': 'f.txt', 'offset': 2, 'limit': 2},
+        null,
+        null,
+      );
+      expect(
+        _text(result),
+        'b\nc\n\n[2 more lines in file. Use offset=4 to continue.]',
+      );
+    });
+
+    test('reads the tail without a notice when limit reaches EOF', () async {
+      await env.writeFile('f.txt', 'a\nb\nc');
+      final result = await tool.execute(
+        {'path': 'f.txt', 'offset': 2, 'limit': 10},
+        null,
+        null,
+      );
+      expect(_text(result), 'b\nc');
+    });
+
+    test('throws when the offset is beyond end of file', () async {
+      await env.writeFile('f.txt', 'a\nb');
+      expect(
+        tool.execute({'path': 'f.txt', 'offset': 5}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('Offset 5 is beyond end of file (2 lines total)'),
+          ),
+        ),
+      );
+    });
+
+    test('throws for a missing file', () async {
+      expect(
+        tool.execute({'path': 'nope.txt'}, null, null),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('truncates at 2000 lines with a continuation notice', () async {
+      final content = List.generate(2001, (i) => 'l${i + 1}').join('\n');
+      await env.writeFile('big.txt', content);
+      final result = await tool.execute({'path': 'big.txt'}, null, null);
+      final text = _text(result);
+      expect(text, contains('l1\n'));
+      expect(text, isNot(contains('l2001')));
+      expect(
+        text,
+        endsWith(
+          '\n\n[Showing lines 1-2000 of 2001. Use offset=2001 to continue.]',
+        ),
+      );
+    });
+
+    test('truncates at 50KB with a byte-limit notice', () async {
+      final line = 'x' * 30000;
+      await env.writeFile('big.txt', '$line\n$line\n$line');
+      final result = await tool.execute({'path': 'big.txt'}, null, null);
+      expect(
+        _text(result),
+        endsWith(
+          '\n\n[Showing lines 1-1 of 3 (50.0KB limit). '
+          'Use offset=2 to continue.]',
+        ),
+      );
+    });
+
+    test('reports a first line that alone exceeds the byte limit', () async {
+      await env.writeFile('big.txt', 'x' * 60000);
+      final result = await tool.execute({'path': 'big.txt'}, null, null);
+      expect(
+        _text(result),
+        "[Line 1 is 58.6KB, exceeds 50.0KB limit. "
+        "Use bash: sed -n '1p' big.txt | head -c 51200]",
+      );
+    });
+
+    test('throws when the cancel token is already cancelled', () {
+      final source = CancelTokenSource()..cancel();
+      expect(
+        tool.execute({'path': 'f.txt'}, source.token, null),
+        throwsA(isA<CancelledException>()),
+      );
+    });
+
+    test('validates arguments through the registry', () async {
+      final registry = ToolRegistry([tool]);
+      expect(
+        registry.executor(
+          ToolCall(id: '1', name: 'read', arguments: const {}),
+          null,
+          null,
+        ),
+        throwsA(isA<ToolValidationException>()),
+      );
+      await env.writeFile('f.txt', 'a\nb\nc');
+      // 'offset' arrives as a string and is coerced to an integer.
+      final ok = await registry.executor(
+        ToolCall(
+          id: '2',
+          name: 'read',
+          arguments: const {'path': 'f.txt', 'offset': '2'},
+        ),
+        null,
+        null,
+      );
+      expect(_text(ok), 'b\nc');
+    });
+  });
+
+  group('writeFileTool', () {
+    late MemoryExecutionEnv env;
+    late AgentTool tool;
+
+    setUp(() {
+      env = MemoryExecutionEnv(cwd: '/work');
+      tool = writeFileTool(env);
+    });
+
+    test('writes content, creating parent directories', () async {
+      final result = await tool.execute(
+        {'path': 'a/b/c.txt', 'content': 'hello'},
+        null,
+        null,
+      );
+      expect(_text(result), 'Successfully wrote 5 bytes to a/b/c.txt');
+      expect((await env.readTextFile('/work/a/b/c.txt')).valueOrNull, 'hello');
+    });
+
+    test('counts UTF-8 bytes, not characters', () async {
+      final result = await tool.execute(
+        {'path': 'u.txt', 'content': 'héllo'},
+        null,
+        null,
+      );
+      expect(_text(result), 'Successfully wrote 6 bytes to u.txt');
+    });
+
+    test('requires path and content', () async {
+      final registry = ToolRegistry([tool]);
+      expect(
+        registry.executor(
+          ToolCall(id: '1', name: 'write', arguments: const {'path': 'x.txt'}),
+          null,
+          null,
+        ),
+        throwsA(isA<ToolValidationException>()),
+      );
+    });
+  });
+
+  group('editFileTool', () {
+    late MemoryExecutionEnv env;
+    late AgentTool tool;
+
+    setUp(() async {
+      env = MemoryExecutionEnv(cwd: '/work');
+      tool = editFileTool(env);
+      await env.writeFile('main.dart', 'void main() {\n  print("hello");\n}\n');
+    });
+
+    test('replaces a unique occurrence', () async {
+      final result = await tool.execute(
+        {
+          'path': 'main.dart',
+          'oldText': 'print("hello");',
+          'newText': 'print("world");',
+        },
+        null,
+        null,
+      );
+      expect(_text(result), contains('Edited main.dart'));
+      expect(
+        (await env.readTextFile('/work/main.dart')).valueOrNull,
+        'void main() {\n  print("world");\n}\n',
+      );
+    });
+
+    test('replaces a multiline block exactly once', () async {
+      final result = await tool.execute(
+        {
+          'path': 'main.dart',
+          'oldText': 'void main() {\n  print("hello");\n}',
+          'newText': 'void main() {\n  print("a");\n  print("b");\n}',
+        },
+        null,
+        null,
+      );
+      expect(_text(result), contains('Edited main.dart'));
+      expect(
+        (await env.readTextFile('/work/main.dart')).valueOrNull,
+        'void main() {\n  print("a");\n  print("b");\n}\n',
+      );
+    });
+
+    test('errors when the text is missing, with an actionable message', () {
+      expect(
+        tool.execute(
+          {'path': 'main.dart', 'oldText': 'print("nope");', 'newText': 'x'},
+          null,
+          null,
+        ),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('No exact match found'),
+          ),
+        ),
+      );
+    });
+
+    test('errors when the text is ambiguous', () async {
+      await env.writeFile('dup.txt', 'x\nx\n');
+      expect(
+        tool.execute(
+          {'path': 'dup.txt', 'oldText': 'x', 'newText': 'y'},
+          null,
+          null,
+        ),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('ambiguous'),
+          ),
+        ),
+      );
+    });
+
+    test('errors for a missing file', () {
+      expect(
+        tool.execute(
+          {'path': 'missing.txt', 'oldText': 'a', 'newText': 'b'},
+          null,
+          null,
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('deletes text when newText is empty', () async {
+      final result = await tool.execute(
+        {'path': 'main.dart', 'oldText': '  print("hello");\n', 'newText': ''},
+        null,
+        null,
+      );
+      expect(_text(result), contains('Edited main.dart'));
+      expect(
+        (await env.readTextFile('/work/main.dart')).valueOrNull,
+        'void main() {\n}\n',
+      );
+    });
+
+    test('throws when the cancel token is already cancelled', () {
+      final source = CancelTokenSource()..cancel();
+      expect(
+        tool.execute(
+          {'path': 'main.dart', 'oldText': 'hello', 'newText': 'bye'},
+          source.token,
+          null,
+        ),
+        throwsA(anything),
+      );
+    });
+  });
+
+  group('readFileTool hashline mode', () {
+    late MemoryExecutionEnv env;
+    late HashlineSnapshotStore store;
+    late AgentTool tool;
+
+    setUp(() async {
+      env = MemoryExecutionEnv(cwd: '/work');
+      store = HashlineSnapshotStore();
+      tool = readFileTool(env, snapshots: store);
+      await env.writeFile('notes.txt', 'one\ntwo\nthree\n');
+    });
+
+    test('prefixes lines and prepends the [path#TAG] header', () async {
+      final result = await tool.execute(
+        {'path': 'notes.txt', 'hashline': true},
+        null,
+        null,
+      );
+      final tag = computeFileHash('one\ntwo\nthree\n');
+      expect(_text(result), '[notes.txt#$tag]\n1:one\n2:two\n3:three\n4:');
+    });
+
+    test('legacy output is unchanged when the flag is off', () async {
+      final result = await tool.execute({'path': 'notes.txt'}, null, null);
+      expect(_text(result), 'one\ntwo\nthree\n');
+      expect(store.head('/work/notes.txt'), isNull);
+    });
+
+    test('records the full file text plus displayed lines', () async {
+      await tool.execute(
+        {'path': 'notes.txt', 'hashline': true, 'offset': 2, 'limit': 2},
+        null,
+        null,
+      );
+      final snapshot = store.head('/work/notes.txt');
+      expect(snapshot, isNotNull);
+      expect(snapshot!.text, 'one\ntwo\nthree\n');
+      expect(snapshot.seenLines, {2, 3});
+    });
+
+    test('offset/limit numbering stays 1-indexed to the file', () async {
+      final result = await tool.execute(
+        {'path': 'notes.txt', 'hashline': true, 'offset': 2, 'limit': 2},
+        null,
+        null,
+      );
+      expect(_text(result), contains('2:two\n3:three'));
+    });
+
+    test('a full read marks every line as seen', () async {
+      await tool.execute({'path': 'notes.txt', 'hashline': true}, null, null);
+      expect(store.head('/work/notes.txt')!.seenLines, {1, 2, 3, 4});
+    });
+
+    test('re-reading identical content fuses onto one tag', () async {
+      final first = await tool.execute(
+        {'path': 'notes.txt', 'hashline': true, 'limit': 1},
+        null,
+        null,
+      );
+      final second = await tool.execute(
+        {'path': 'notes.txt', 'hashline': true, 'offset': 2},
+        null,
+        null,
+      );
+      final headerLine = _text(first).split('\n').first;
+      expect(_text(second).split('\n').first, headerLine);
+      expect(store.head('/work/notes.txt')!.seenLines, {1, 2, 3, 4});
+    });
+  });
+
+  group('editFileTool hashline mode', () {
+    late MemoryExecutionEnv env;
+    late HashlineSnapshotStore store;
+    late AgentTool readTool;
+    late AgentTool editTool;
+
+    setUp(() async {
+      env = MemoryExecutionEnv(cwd: '/work');
+      store = HashlineSnapshotStore();
+      readTool = readFileTool(env, snapshots: store);
+      editTool = editFileTool(env, snapshots: store);
+      await env.writeFile('main.dart', 'void main() {\n  print("hello");\n}\n');
+    });
+
+    /// Reads [path] in hashline mode and returns the `[path#TAG]` header the
+    /// model would cite.
+    Future<String> readHeader(String path) async {
+      final result = await readTool.execute(
+        {'path': path, 'hashline': true},
+        null,
+        null,
+      );
+      return _text(result).split('\n').first;
+    }
+
+    test('applies a patch and answers with the fresh header', () async {
+      final header = await readHeader('main.dart');
+      final result = await editTool.execute(
+        {'patch': '$header\nSWAP 2.=2:\n+  print("world");'},
+        null,
+        null,
+      );
+      expect(_text(result), startsWith('[main.dart#'));
+      expect(_text(result), contains('First change at line 2.'));
+      expect(
+        (await env.readTextFile('main.dart')).valueOrNull,
+        'void main() {\n  print("world");\n}\n',
+      );
+    });
+
+    test(
+      'the response tag chains into the next edit without a re-read',
+      () async {
+        final header = await readHeader('main.dart');
+        final first = await editTool.execute(
+          {'patch': '$header\nSWAP 2.=2:\n+  print("a");'},
+          null,
+          null,
+        );
+        final secondHeader = _text(first).split('\n').first;
+        final second = await editTool.execute(
+          {'patch': '$secondHeader\nINS.TAIL:\n+// done'},
+          null,
+          null,
+        );
+        expect(_text(second), startsWith('[main.dart#'));
+        expect(
+          (await env.readTextFile('main.dart')).valueOrNull,
+          'void main() {\n  print("a");\n}\n// done\n',
+        );
+      },
+    );
+
+    test('path is optional in hashline mode (header carries it)', () async {
+      final header = await readHeader('main.dart');
+      expect(
+        editTool.execute({'patch': '$header\nDEL 1'}, null, null),
+        completes,
+      );
+    });
+
+    test('coerces a valid patch + complete exact-match payload: patch '
+        'applies, notice names the ignored payload (issue #862 AC1)', () async {
+      final header = await readHeader('main.dart');
+      final result = await editTool.execute(
+        {
+          'path': 'main.dart',
+          'patch': '$header\nSWAP 2.=2:\n+  print("patched");',
+          'oldText': 'void main() {',
+          'newText': 'void main() { /* exact */',
+        },
+        null,
+        null,
+      );
+      // The patch won; the exact-match payload was ignored with a notice.
+      expect(_text(result), contains('First change at line 2.'));
+      expect(_text(result), contains('IGNORED'));
+      expect(_text(result), contains('oldText/newText'));
+      expect(
+        (await env.readTextFile('main.dart')).valueOrNull,
+        'void main() {\n  print("patched");\n}\n',
+      );
+    });
+
+    test(
+      'coerces a malformed patch + complete exact-match payload: '
+      'exact-match applies with the same notice shape (issue #862 AC2)',
+      () async {
+        final result = await editTool.execute(
+          {
+            'path': 'main.dart',
+            'patch': 'definitely not a hashline patch',
+            'oldText': '  print("hello");',
+            'newText': '  print("exact");',
+          },
+          null,
+          null,
+        );
+        expect(_text(result), contains('IGNORED'));
+        expect(_text(result), contains('patch'));
+        expect(
+          (await env.readTextFile('main.dart')).valueOrNull,
+          'void main() {\n  print("exact");\n}\n',
+        );
+      },
+    );
+
+    test('rejects calls with neither mode fully specified, with a remedy '
+        'example (issue #862 AC3)', () {
+      expect(
+        editTool.execute({'path': 'main.dart'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('Missing arguments'),
+              contains('Example:'),
+              contains('oldText'),
+              contains('patch'),
+            ),
+          ),
+        ),
+      );
+      expect(
+        editTool.execute({'path': 'main.dart', 'oldText': 'a'}, null, null),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('a stale tag rejects the edit with drift context', () async {
+      final header = await readHeader('main.dart');
+      await env.writeFile('main.dart', 'void main() {\n  print("drift");\n}\n');
+      expect(
+        editTool.execute({'patch': '$header\nDEL 2'}, null, null),
+        throwsA(
+          isA<HashlineMismatchError>().having(
+            (e) => e.toString(),
+            'message',
+            allOf(
+              contains('file changed between read and edit'),
+              contains('*2:  print("drift");'),
+            ),
+          ),
+        ),
+      );
+      // Nothing was written by the rejected edit.
+      expect(
+        (await env.readTextFile('main.dart')).valueOrNull,
+        'void main() {\n  print("drift");\n}\n',
+      );
+    });
+
+    test('a byte-identical body returns the no-change diagnostic', () async {
+      final header = await readHeader('main.dart');
+      final result = await editTool.execute(
+        {'patch': '$header\nSWAP 2.=2:\n+  print("hello");'},
+        null,
+        null,
+      );
+      expect(_text(result), contains('produced no change'));
+      expect(
+        (await env.readTextFile('main.dart')).valueOrNull,
+        'void main() {\n  print("hello");\n}\n',
+      );
+    });
+
+    test('unsupported ops surface a focused error', () {
+      expect(
+        editTool.execute({'patch': '[main.dart#1A2B]\nREM'}, null, null),
+        throwsA(
+          isA<HashlineFormatException>().having(
+            (e) => e.message,
+            'message',
+            contains('not supported'),
+          ),
+        ),
+      );
+    });
+
+    test('malformed patches with no rescue surface the parse error plus '
+        'the remedy example (issue #862)', () {
+      expect(
+        editTool.execute({'patch': 'DEL 1'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('[PATH#HASH]'), contains('Example:')),
+          ),
+        ),
+      );
+    });
+
+    test('multi-section patches apply all-or-nothing', () async {
+      await env.writeFile('other.dart', 'one\ntwo\n');
+      final headerA = await readHeader('main.dart');
+      final headerB = await readHeader('other.dart');
+      final result = await editTool.execute(
+        {'patch': '$headerA\nDEL 1\n$headerB\nSWAP 1.=1:\n+ONE'},
+        null,
+        null,
+      );
+      expect(_text(result), contains('[main.dart#'));
+      expect(_text(result), contains('[other.dart#'));
+      expect(
+        (await env.readTextFile('main.dart')).valueOrNull,
+        '  print("hello");\n}\n',
+      );
+      expect((await env.readTextFile('other.dart')).valueOrNull, 'ONE\ntwo\n');
+    });
+
+    test(
+      'edits on lines a partial read never displayed are rejected',
+      () async {
+        await readTool.execute(
+          {'path': 'main.dart', 'hashline': true, 'limit': 1},
+          null,
+          null,
+        );
+        final header = await readHeader('main.dart');
+        // Re-read only line 1 so lines 2+ are unseen under the CURRENT tag...
+        // (the full readHeader above re-fused; craft the seen set directly.)
+        final tag = header.substring(
+          header.indexOf('#') + 1,
+          header.indexOf(']'),
+        );
+        store.head('/work/main.dart')!.seenLines!
+          ..clear()
+          ..add(1);
+        expect(
+          editTool.execute({'patch': '[main.dart#$tag]\nDEL 3'}, null, null),
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              contains('never displayed'),
+            ),
+          ),
+        );
+      },
+    );
+  });
+
+  group('hashline round-trip', () {
+    late MemoryExecutionEnv env;
+    late List<AgentTool> tools;
+
+    setUp(() {
+      env = MemoryExecutionEnv(cwd: '/work');
+      tools = builtinTools(env);
+    });
+
+    AgentTool toolNamed(String name) => tools.firstWhere((t) => t.name == name);
+
+    test('read with hashes → edit by anchors → content correct', () async {
+      await env.writeFile(
+        'greet.py',
+        'def greet(name):\n'
+            '    msg = "Hello, " + name\n'
+            '    print(msg)\n'
+            'greet("world")\n',
+      );
+      final read = toolNamed('read');
+      final edit = toolNamed('edit');
+
+      final readResult = await read.execute(
+        {'path': 'greet.py', 'hashline': true},
+        null,
+        null,
+      );
+      final output = _text(readResult);
+      final header = output.split('\n').first;
+      expect(header, matches(RegExp(r'^\[greet\.py#[0-9A-F]{4}\]$')));
+      expect(output, contains('2:    msg = "Hello, " + name'));
+
+      // The model anchors on the numbered lines it just saw.
+      final editResult = await edit.execute(
+        {
+          'patch':
+              '$header\n'
+              'INS.POST 1:\n'
+              '+    if not name: name = "stranger"\n'
+              'SWAP 2.=2:\n'
+              '+    greeting = "Hi"\n'
+              '+    msg = f"{greeting}, {name}"\n'
+              'DEL 4',
+        },
+        null,
+        null,
+      );
+      expect(_text(editResult), startsWith('[greet.py#'));
+      expect(
+        (await env.readTextFile('greet.py')).valueOrNull,
+        'def greet(name):\n'
+        '    if not name: name = "stranger"\n'
+        '    greeting = "Hi"\n'
+        '    msg = f"{greeting}, {name}"\n'
+        '    print(msg)\n',
+      );
+    });
+
+    test(
+      'header-less patch with a path still applies through the patcher',
+      () async {
+        // Round-1 policy review (issue #862): a header-less but
+        // recognizable section list + path is PATCH mode, not exact-match
+        // fallback. Tool-level pin: the call reaches the patcher and fails
+        // with the apply-time diagnostic (missing snapshot tag) — NOT the
+        // gate-level "not a valid hashline patch" rejection.
+        await env.writeFile('f.txt', 'a\nb\nc\nd\n');
+        final read = toolNamed('read');
+        final edit = toolNamed('edit');
+        await read.execute({'path': 'f.txt', 'hashline': true}, null, null);
+
+        await expectLater(
+          edit.execute({'path': 'f.txt', 'patch': 'DEL 2'}, null, null),
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              allOf(
+                contains('Missing hashline snapshot tag for f.txt'),
+                isNot(contains('not a valid hashline patch')),
+              ),
+            ),
+          ),
+        );
+        // Nothing was applied.
+        expect((await env.readTextFile('f.txt')).valueOrNull, 'a\nb\nc\nd\n');
+      },
+    );
+
+    test(
+      'external drift between read and edit reports the stale lines',
+      () async {
+        await env.writeFile('doc.md', 'alpha\nbeta\ngamma\n');
+        final read = toolNamed('read');
+        final edit = toolNamed('edit');
+        final readResult = await read.execute(
+          {'path': 'doc.md', 'hashline': true},
+          null,
+          null,
+        );
+        final header = _text(readResult).split('\n').first;
+
+        await env.writeFile('doc.md', 'alpha\nCHANGED\ngamma\n');
+        expect(
+          edit.execute({'patch': '$header\nSWAP 2.=2:\n+BETA'}, null, null),
+          throwsA(
+            isA<HashlineMismatchError>().having(
+              (e) => e.toString(),
+              'message',
+              allOf(
+                contains('file changed between read and edit'),
+                contains('*2:CHANGED'),
+              ),
+            ),
+          ),
+        );
+        expect(
+          (await env.readTextFile('doc.md')).valueOrNull,
+          'alpha\nCHANGED\ngamma\n',
+        );
+      },
+    );
+
+    test(
+      'the tools created by builtinTools share one snapshot store',
+      () async {
+        await env.writeFile('a.txt', 'x\ny\n');
+        final read = toolNamed('read');
+        final edit = toolNamed('edit');
+        final readResult = await read.execute(
+          {'path': 'a.txt', 'hashline': true},
+          null,
+          null,
+        );
+        final header = _text(readResult).split('\n').first;
+        // If read and edit did not share a store, this anchored edit would
+        // still pass the content check — so verify the store path too: a
+        // second tag for DIFFERENT content minted by edit must be resolvable.
+        final editResult = await edit.execute(
+          {'patch': '$header\nSWAP 1.=1:\n+X'},
+          null,
+          null,
+        );
+        final newHeader = _text(editResult).split('\n').first;
+        expect(newHeader, isNot(header));
+        // Chained edit against the edit-minted tag works out of the box.
+        final second = await edit.execute(
+          {'patch': '$newHeader\nDEL 2'},
+          null,
+          null,
+        );
+        expect(_text(second), startsWith('[a.txt#'));
+        expect((await env.readTextFile('a.txt')).valueOrNull, 'X\n');
+      },
+    );
+  });
+
+  group('listDirTool', () {
+    late MemoryExecutionEnv env;
+    late AgentTool tool;
+
+    setUp(() {
+      env = MemoryExecutionEnv(cwd: '/work');
+      tool = listDirTool(env);
+    });
+
+    test('lists entries sorted, directories suffixed with /', () async {
+      await env.writeFile('b.txt', '');
+      await env.writeFile('sub/inner.txt', '');
+      await env.writeFile('a.txt', '');
+      final result = await tool.execute({}, null, null);
+      expect(_text(result), 'a.txt\nb.txt\nsub/');
+    });
+
+    test('lists an explicit subdirectory', () async {
+      await env.writeFile('sub/inner.txt', '');
+      final result = await tool.execute({'path': 'sub'}, null, null);
+      expect(_text(result), 'inner.txt');
+    });
+
+    test('caps entries at the limit with a notice', () async {
+      for (var i = 0; i < 5; i++) {
+        await env.writeFile('f$i.txt', '');
+      }
+      final result = await tool.execute({'limit': 3}, null, null);
+      expect(
+        _text(result),
+        'f0.txt\nf1.txt\nf2.txt\n\n'
+        '[3 entries limit reached. Use limit=6 for more]',
+      );
+    });
+
+    test('reports an empty directory', () async {
+      await env.createDir('empty');
+      final result = await tool.execute({'path': 'empty'}, null, null);
+      expect(_text(result), '(empty directory)');
+    });
+
+    test('returns the file name when the path is a file', () async {
+      await env.writeFile('f.txt', '');
+      final result = await tool.execute({'path': 'f.txt'}, null, null);
+      expect(_text(result), 'f.txt');
+    });
+
+    test('throws for a missing path', () async {
+      expect(
+        tool.execute({'path': 'nope'}, null, null),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
+
+  group('shellTool', () {
+    late _FakeShell shell;
+    late MemoryExecutionEnv env;
+    late AgentTool tool;
+
+    setUp(() {
+      shell = _FakeShell(
+        const Ok(ShellExecResult(stdout: 'out', stderr: '', exitCode: 0)),
+      );
+      env = MemoryExecutionEnv(cwd: '/work', shell: shell);
+      tool = shellTool(env, retryBackoff: Duration.zero);
+    });
+
+    test('returns stdout of a successful command', () async {
+      final result = await tool.execute({'command': 'ls'}, null, null);
+      expect(_text(result), 'out');
+      expect(shell.lastCommand, 'ls');
+    });
+
+    test(
+      'forwards cwd: env.cwd so write/read/ls and bash share the root',
+      () async {
+        // The agent loop's write/read/ls operate inside [ExecutionEnv.cwd]
+        // (the sandbox root). Without the bash tool forwarding that same cwd
+        // to ShellExecOptions, the spawned process inherits its parent's
+        // cwd (often the `flutter run` directory on macOS), and a relative
+        // path like `qjs apps/<id>/widget.js` resolves in a totally different
+        // tree — the agent reports 'no such file' even though `write` just
+        // succeeded. See the game-2048 session where the assistant wrote
+        // `apps/game-2048/...` via write then `qjs apps/game-2048/...`
+        // failed: the two tools had different cwd roots. The same fix
+        // applies to the two `jobs.start` branches (background + yield-
+        // aware foreground); they're covered by the inline assertion below
+        // and the source code change at the bash tool's other call sites.
+        shell.result = const Ok(
+          ShellExecResult(stdout: '', stderr: '', exitCode: 0),
+        );
+        await tool.execute({'command': 'pwd'}, null, null);
+        expect(shell.lastOptions?.cwd, '/work');
+      },
+    );
+
+    test('appends stderr after stdout', () async {
+      shell.result = const Ok(
+        ShellExecResult(stdout: 'out', stderr: 'err', exitCode: 0),
+      );
+      final result = await tool.execute({'command': 'x'}, null, null);
+      expect(_text(result), 'out\nerr');
+    });
+
+    test('reports (no output) for silent success', () async {
+      shell.result = const Ok(
+        ShellExecResult(stdout: '', stderr: '', exitCode: 0),
+      );
+      final result = await tool.execute({'command': 'x'}, null, null);
+      expect(_text(result), '(no output)');
+    });
+
+    test('throws with output and exit code on failure', () async {
+      shell.result = const Ok(
+        ShellExecResult(stdout: 'partial', stderr: '', exitCode: 3),
+      );
+      expect(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            'partial\n\nCommand exited with code 3',
+          ),
+        ),
+      );
+    });
+
+    test('throws a timeout message when the shell times out', () {
+      shell.result = const Err(
+        ExecutionError(ExecutionErrorCode.timeout, 'killed'),
+      );
+      expect(
+        tool.execute({'command': 'x', 'timeout': 5}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('Command timed out after 5 seconds'),
+          ),
+        ),
+      );
+    });
+
+    // gh-1444 AC5: with NO model timeout argument the honest text comes
+    // from the shell's effective cap (parsed from the timeout error
+    // message) — the old "unknown seconds" lie is gone.
+    test('a shell-default timeout names its real seconds (gh-1444 AC5)', () {
+      shell.result = const Err(
+        ExecutionError(ExecutionErrorCode.timeout, 'timeout: 0:00:30'),
+      );
+      expect(
+        tool.execute({'command': 'find /'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('Command timed out after 30 seconds'),
+              isNot(contains('unknown')),
+            ),
+          ),
+        ),
+      );
+    });
+
+    // Review rework (PR #1058): the shell's timeout/abort errors carry the
+    // partial capture — the inline bash path must render it so the model
+    // sees WHERE a hung call stalled, not just the timeout fact.
+    test('timeout error surfaces the shell-captured partial output', () {
+      shell.result = const Err(
+        ExecutionError(
+          ExecutionErrorCode.timeout,
+          'killed',
+          stdout: 'evidence-stdout-tail',
+          stderr: 'evidence-stderr-tail',
+        ),
+      );
+      expect(
+        tool.execute({'command': 'x', 'timeout': 5}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('Command timed out after 5 seconds'),
+              contains('evidence-stdout-tail'),
+              contains('evidence-stderr-tail'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('abort error surfaces the shell-captured partial output', () async {
+      // The abort-with-capture error is what the SHELL returns after its
+      // own cancel path killed the tree — no pre-cancelled token here (the
+      // tool short-circuits those before consulting the shell).
+      shell.result = const Err(
+        ExecutionError(
+          ExecutionErrorCode.aborted,
+          'aborted',
+          stdout: 'abort-evidence-tail',
+        ),
+      );
+      await expectLater(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('Command aborted'), contains('abort-evidence-tail')),
+          ),
+        ),
+      );
+    });
+
+    test('retries a timed-out command and succeeds on attempt 2', () async {
+      // Queue semantics: attempt 1 consumes the timeout error, attempt 2
+      // consumes the recovery.
+      shell.queue.add(
+        const Err<ShellExecResult, ExecutionError>(
+          ExecutionError(ExecutionErrorCode.timeout, 'killed'),
+        ),
+      );
+      shell.queue.add(
+        const Ok<ShellExecResult, ExecutionError>(
+          ShellExecResult(stdout: 'recovered', stderr: '', exitCode: 0),
+        ),
+      );
+      shell.result = const Err(
+        ExecutionError(ExecutionErrorCode.timeout, 'killed'),
+      );
+      final result = await tool.execute(
+        {'command': 'x', 'timeout': 5},
+        null,
+        null,
+      );
+      expect(shell.calls, 2);
+      expect(
+        _text(result),
+        startsWith('[bash attempt 1/3 timed out after 5s — retrying]'),
+      );
+      expect(_text(result), contains('recovered'));
+    });
+
+    test('retries on a thrown TimeoutException (outer future cap)', () async {
+      shell.queue.add(TimeoutException('Future not completed'));
+      shell.queue.add(TimeoutException('Future not completed'));
+      shell.result = const Ok(
+        ShellExecResult(stdout: 'finally', stderr: '', exitCode: 0),
+      );
+      final result = await tool.execute({'command': 'x'}, null, null);
+      expect(shell.calls, 3);
+      expect(_text(result), contains('[bash attempt 1/3 hung — retrying]'));
+      expect(_text(result), contains('[bash attempt 2/3 hung — retrying]'));
+      expect(_text(result), endsWith('finally'));
+    });
+
+    test('exhausted retries surface the timeout error with notices', () async {
+      shell.result = const Err(
+        ExecutionError(ExecutionErrorCode.timeout, 'killed'),
+      );
+      await expectLater(
+        tool.execute({'command': 'x', 'timeout': 5}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('[bash attempt 1/3 timed out after 5s — retrying]'),
+              contains('[bash attempt 2/3 timed out after 5s — retrying]'),
+              contains('Command timed out after 5 seconds'),
+            ),
+          ),
+        ),
+      );
+      expect(shell.calls, 3);
+    });
+
+    test('never retries aborted commands', () async {
+      shell.result = const Err(
+        ExecutionError(ExecutionErrorCode.aborted, 'killed'),
+      );
+      await expectLater(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(isA<StateError>()),
+      );
+      expect(shell.calls, 1);
+    });
+
+    test('never retries real command failures (non-zero exit)', () async {
+      shell.result = const Ok(
+        ShellExecResult(stdout: 'partial', stderr: '', exitCode: 3),
+      );
+      await expectLater(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(isA<StateError>()),
+      );
+      expect(shell.calls, 1);
+    });
+
+    test('never retries shell-unavailable errors', () async {
+      shell.result = const Err(
+        ExecutionError(
+          ExecutionErrorCode.shellUnavailable,
+          'No shell is available in this environment',
+        ),
+      );
+      await expectLater(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(isA<StateError>()),
+      );
+      expect(shell.calls, 1);
+    });
+
+    test('throws an aborted message when the shell is cancelled', () {
+      shell.result = const Err(
+        ExecutionError(ExecutionErrorCode.aborted, 'killed'),
+      );
+      expect(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('Command aborted'),
+          ),
+        ),
+      );
+    });
+
+    test('surfaces shell-unavailable errors', () {
+      shell.result = const Err(
+        ExecutionError(
+          ExecutionErrorCode.shellUnavailable,
+          'No shell is available in this environment',
+        ),
+      );
+      expect(
+        tool.execute({'command': 'x'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('No shell is available'),
+          ),
+        ),
+      );
+    });
+
+    test('passes timeout and cancel token to the shell', () async {
+      final source = CancelTokenSource();
+      await tool.execute({'command': 'x', 'timeout': 2.5}, source.token, null);
+      expect(shell.lastOptions?.timeout, const Duration(milliseconds: 2500));
+      expect(shell.lastOptions?.cancelToken, source.token);
+    });
+
+    test('rejects non-positive timeouts', () {
+      expect(
+        tool.execute({'command': 'x', 'timeout': 0}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('Invalid timeout'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects timeouts above the maximum', () {
+      expect(
+        tool.execute({'command': 'x', 'timeout': 999999999}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('Invalid timeout: maximum is 2147483.647 seconds'),
+          ),
+        ),
+      );
+    });
+
+    test('keeps the last 2000 lines of long output', () async {
+      final stdout = List.generate(2001, (i) => 'o${i + 1}').join('\n');
+      shell.result = Ok(
+        ShellExecResult(stdout: stdout, stderr: '', exitCode: 0),
+      );
+      final result = await tool.execute({'command': 'x'}, null, null);
+      final text = _text(result);
+      expect(text, isNot(contains('o1\n')));
+      expect(text, contains('o2001'));
+      expect(text, endsWith('\n\n[Showing lines 2-2001 of 2001.]'));
+    });
+
+    // Issue #1349: a bare long UNBOUNDED foreground sleep parks the whole
+    // turn — steering and cancel cannot reach the agent while the call
+    // stays open. This env has no job registry, so the denial's escape
+    // advice is the explicit-timeout fallback, not background: true.
+    test(
+      'denies a bare long foreground sleep with the instructive message',
+      () async {
+        final result = await tool.execute({'command': 'sleep 300'}, null, null);
+        final text = _text(result);
+        expect(text, contains('Denied: a bare foreground sleep of 300s'));
+        expect(text, contains('not supported in this environment'));
+        expect(text, contains('explicit timeout'));
+        expect(text, contains('Never poll in the foreground'));
+        // Validation, not execution: the shell never saw the command.
+        expect(shell.lastCommand, isNull);
+      },
+    );
+
+    // The review rework: an explicit `timeout` is a deliberate bail cap —
+    // the call unwinds there (steering/cancel reach the agent), so a
+    // bounded sleep is not the parked-turn class and must NOT be denied.
+    test('a timeout-bounded long sleep is allowed to run', () async {
+      final result = await tool.execute(
+        {'command': 'sleep 300', 'timeout': 45},
+        null,
+        null,
+      );
+      expect(_text(result), isNot(contains('Denied')));
+      expect(shell.lastCommand, 'sleep 300');
+      expect(shell.lastOptions?.timeout, const Duration(seconds: 45));
+    });
+
+    test(
+      'fractional seconds: 60.5 denied, 90.5 labeled with the fraction',
+      () async {
+        final atBoundary = await tool.execute(
+          {'command': 'sleep 60.5'},
+          null,
+          null,
+        );
+        expect(_text(atBoundary), contains('Denied'));
+        final labeled = await tool.execute(
+          {'command': 'sleep 90.5'},
+          null,
+          null,
+        );
+        expect(
+          _text(labeled),
+          contains('Denied: a bare foreground sleep of 90.5s'),
+        );
+      },
+    );
+
+    test('the sleep deny threshold allows sleep 60, denies sleep 61', () async {
+      await tool.execute({'command': 'sleep 60'}, null, null);
+      expect(shell.lastCommand, 'sleep 60');
+      final result = await tool.execute({'command': 'sleep 61'}, null, null);
+      expect(_text(result), contains('Denied'));
+    });
+
+    test(
+      'GNU sleep suffixes are measured (sleep 2m denied, sleep 1m allowed)',
+      () async {
+        await tool.execute({'command': 'sleep 1m'}, null, null);
+        expect(shell.lastCommand, 'sleep 1m');
+        final result = await tool.execute({'command': 'sleep 2m'}, null, null);
+        expect(
+          _text(result),
+          contains('Denied: a bare foreground sleep of 120s'),
+        );
+      },
+    );
+
+    test(
+      'a sleep wrapped in shell constructs is NOT denied (phase 2 scope)',
+      () async {
+        await tool.execute({'command': 'sleep 300 && echo done'}, null, null);
+        expect(shell.lastCommand, 'sleep 300 && echo done');
+      },
+    );
+
+    test('a long quiet legit command is NOT denied', () async {
+      await tool.execute({'command': 'make release'}, null, null);
+      expect(shell.lastCommand, 'make release');
+    });
+  });
+
+  group('Image support in readFileTool', () {
+    late MemoryExecutionEnv env;
+    late ToolRegistry registry;
+
+    setUp(() {
+      env = MemoryExecutionEnv();
+      registry = ToolRegistry()
+        ..registerAll([readFileTool(env), writeFileTool(env)]);
+    });
+
+    Uint8List makePng(int width, int height) {
+      final img = Image(width: width, height: height)..getPixel(0, 0).r = 255;
+      return Uint8List.fromList(encodePng(img));
+    }
+
+    /// Deterministic noise: barely compressible, so the PNG blows past the
+    /// 4.5MB base64 budget even after the dimension clamp.
+    Uint8List makeNoisyPng(int width, int height) {
+      final img = Image(width: width, height: height);
+      var seed = 42;
+      for (final pixel in img) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        pixel
+          ..r = seed & 0xFF
+          ..g = (seed >> 8) & 0xFF
+          ..b = (seed >> 16) & 0xFF;
+      }
+      return Uint8List.fromList(encodePng(img));
+    }
+
+    test('returns ImageContent for a PNG and resizes large images', () async {
+      await env.writeBinaryFile('/work/huge.png', makePng(3000, 2000));
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute({'path': '/work/huge.png'}, null, null);
+      final note = _text(result);
+      expect(note, contains('3000x2000'));
+      expect(note, contains('resized to 2000x1333'));
+      final images = result.content.whereType<ImageContent>().toList();
+      expect(images, hasLength(1));
+      expect(images.first.mimeType, 'image/png');
+      expect(images.first.data, isNotEmpty);
+      expect(base64Decode(images.first.data), isNotEmpty);
+    });
+
+    test('resize hint carries the coordinate scale factor', () async {
+      await env.writeBinaryFile('/work/huge.png', makePng(3000, 2000));
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute({'path': '/work/huge.png'}, null, null);
+      final note = _text(result);
+      expect(
+        note,
+        contains(
+          '[Image: original 3000x2000, displayed at 2000x1333. '
+          'Multiply coordinates by 1.50 to map to original image.]',
+        ),
+      );
+    });
+
+    test('huge noisy PNG is degraded below the 4.5MB base64 budget', () async {
+      final noisy = makeNoisyPng(2100, 1600);
+      // Sanity: the fixture itself exceeds the budget.
+      expect(base64Encode(noisy).length, greaterThan(4718592));
+      await env.writeBinaryFile('/work/noisy.png', noisy);
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute(
+        {'path': '/work/noisy.png'},
+        null,
+        null,
+      );
+      final images = result.content.whereType<ImageContent>().toList();
+      expect(images, hasLength(1));
+      expect(images.first.data.length, lessThan(4718592));
+      final note = _text(result);
+      expect(note, contains('Multiply coordinates by'));
+      // The payload still decodes, at or below the dimension clamp.
+      final decoded = decodeImage(base64Decode(images.first.data))!;
+      expect(decoded.width, lessThanOrEqualTo(2000));
+      expect(decoded.height, lessThanOrEqualTo(2000));
+    });
+
+    test('returns ImageContent unchanged for a small image', () async {
+      final png = makePng(100, 50);
+      await env.writeBinaryFile('/work/small.png', png);
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute(
+        {'path': '/work/small.png'},
+        null,
+        null,
+      );
+      final note = _text(result);
+      expect(note, contains('100x50'));
+      expect(note, isNot(contains('resized')));
+      final images = result.content.whereType<ImageContent>().toList();
+      expect(images, hasLength(1));
+      expect(images.first.mimeType, 'image/png');
+      // Pass-through: the original bytes are sent untouched.
+      expect(images.first.data, base64Encode(png));
+    });
+
+    test('passes small JPEG and GIF originals through untouched', () async {
+      final jpg = Uint8List.fromList(encodeJpg(Image(width: 80, height: 60)));
+      final gif = Uint8List.fromList(encodeGif(Image(width: 40, height: 30)));
+      await env.writeBinaryFile('/work/small.jpg', jpg);
+      await env.writeBinaryFile('/work/small.gif', gif);
+      final tool = registry.lookup('read')!;
+
+      final jpgResult = await tool.execute(
+        {'path': '/work/small.jpg'},
+        null,
+        null,
+      );
+      final jpgImage = jpgResult.content.whereType<ImageContent>().single;
+      expect(jpgImage.mimeType, 'image/jpeg');
+      expect(jpgImage.data, base64Encode(jpg));
+
+      final gifResult = await tool.execute(
+        {'path': '/work/small.gif'},
+        null,
+        null,
+      );
+      final gifImage = gifResult.content.whereType<ImageContent>().single;
+      expect(gifImage.mimeType, 'image/gif');
+      expect(gifImage.data, base64Encode(gif));
+    });
+
+    test('bakes EXIF orientation before measuring and resizing', () async {
+      // Stored as 200x3000 (WxH) with orientation 6 (rotate 90° CW for
+      // display): the displayed image is 3000x200.
+      final stored = Image(width: 200, height: 3000)
+        ..exif.imageIfd.orientation = 6;
+      await env.writeBinaryFile(
+        '/work/rotated.jpg',
+        Uint8List.fromList(encodeJpg(stored, quality: 80)),
+      );
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute(
+        {'path': '/work/rotated.jpg'},
+        null,
+        null,
+      );
+      final note = _text(result);
+      // Dims are reported AFTER orientation baking (a 133x2000 portrait
+      // resize would mean the flag was ignored).
+      expect(note, contains('3000x200'));
+      expect(note, contains('resized to 2000x133'));
+    });
+
+    test('converts BMP to an inline format with a conversion hint', () async {
+      final bmp = Uint8List.fromList(encodeBmp(Image(width: 30, height: 20)));
+      await env.writeBinaryFile('/work/pic.bmp', bmp);
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute({'path': '/work/pic.bmp'}, null, null);
+      final note = _text(result);
+      expect(note, contains('[Image converted from image/bmp to image/png.]'));
+      expect(note, isNot(contains('resized')));
+      final images = result.content.whereType<ImageContent>().toList();
+      expect(images, hasLength(1));
+      expect(images.first.mimeType, 'image/png');
+      final decoded = decodeImage(base64Decode(images.first.data))!;
+      expect(decoded.width, 30);
+      expect(decoded.height, 20);
+    });
+
+    test('throws a clean error for undecodable image bytes', () async {
+      // Valid PNG signature but a garbage payload: detected as PNG by the
+      // magic bytes, yet undecodable.
+      final bogus = Uint8List.fromList([
+        0x89,
+        0x50,
+        0x4E,
+        0x47,
+        0x0D,
+        0x0A,
+        0x1A,
+        0x0A,
+        ...List.filled(64, 0x41),
+      ]);
+      await env.writeBinaryFile('/work/bogus.png', bogus);
+      final tool = registry.lookup('read')!;
+      expect(
+        tool.execute({'path': '/work/bogus.png'}, null, null),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('Could not decode image'),
+          ),
+        ),
+      );
+    });
+
+    test('passes a small WebP original through untouched', () async {
+      final webp = Uint8List.fromList(encodeWebP(Image(width: 50, height: 40)));
+      await env.writeBinaryFile('/work/small.webp', webp);
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute(
+        {'path': '/work/small.webp'},
+        null,
+        null,
+      );
+      final note = _text(result);
+      expect(note, contains('50x40'));
+      expect(note, isNot(contains('resized')));
+      final image = result.content.whereType<ImageContent>().single;
+      expect(image.mimeType, 'image/webp');
+      // Pass-through: the original bytes are sent untouched.
+      expect(image.data, base64Encode(webp));
+    });
+
+    test('resizes a tall portrait image by its height', () async {
+      await env.writeBinaryFile('/work/tall.png', makePng(1500, 3000));
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute({'path': '/work/tall.png'}, null, null);
+      final note = _text(result);
+      expect(note, contains('1500x3000'));
+      expect(note, contains('resized to 1000x2000'));
+      final images = result.content.whereType<ImageContent>().toList();
+      expect(images, hasLength(1));
+      expect(images.first.mimeType, 'image/png');
+    });
+
+    test(
+      'degrades an over-budget image within the dimension limit to JPEG',
+      () async {
+        // 1125x1125 fits the dimension clamp, but incompressible noise blows
+        // past the base64 byte budget: PNG is retried as JPEG at the SAME
+        // dimensions.
+        final noisy = makeNoisyPng(1125, 1125);
+        expect(base64Encode(noisy).length, greaterThan(4718592));
+        await env.writeBinaryFile('/work/noisy.png', noisy);
+        final tool = registry.lookup('read')!;
+        final result = await tool.execute(
+          {'path': '/work/noisy.png'},
+          null,
+          null,
+        );
+        final note = _text(result);
+        expect(note, contains('resized to 1125x1125'));
+        final images = result.content.whereType<ImageContent>().toList();
+        expect(images, hasLength(1));
+        expect(images.first.mimeType, 'image/jpeg');
+        expect(images.first.data.length, lessThan(4718592));
+        final decoded = decodeImage(base64Decode(images.first.data))!;
+        expect(decoded.width, 1125);
+        expect(decoded.height, 1125);
+      },
+    );
+
+    test('adds a non-vision note when the model cannot take images', () async {
+      await env.writeBinaryFile('/work/small.png', makePng(10, 10));
+      final textOnly = Model(
+        id: 'text-only',
+        api: 'openai-completions',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        contextWindow: 128000,
+        maxTokens: 4096,
+      );
+      final tool = readFileTool(env, model: () => textOnly);
+      final result = await tool.execute(
+        {'path': '/work/small.png'},
+        null,
+        null,
+      );
+      expect(
+        _text(result),
+        contains(
+          '[Current model does not support images. The image will be '
+          'omitted from this request.]',
+        ),
+      );
+      // The image itself stays in the result; providers substitute an
+      // explicit placeholder at request time.
+      expect(result.content.whereType<ImageContent>(), hasLength(1));
+    });
+
+    test('omits the non-vision note for vision-capable models', () async {
+      await env.writeBinaryFile('/work/small.png', makePng(10, 10));
+      final vision = Model(
+        id: 'gpt-4o',
+        api: 'openai-completions',
+        provider: 'openai',
+        baseUrl: 'https://api.openai.com/v1',
+        input: const ['text', 'image'],
+        contextWindow: 128000,
+        maxTokens: 4096,
+      );
+      final tool = readFileTool(env, model: () => vision);
+      final result = await tool.execute(
+        {'path': '/work/small.png'},
+        null,
+        null,
+      );
+      expect(_text(result), isNot(contains('does not support images')));
+    });
+
+    test('empty files are treated as text, not images', () async {
+      await env.writeFile('/work/empty.txt', '');
+      final tool = registry.lookup('read')!;
+      final result = await tool.execute(
+        {'path': '/work/empty.txt'},
+        null,
+        null,
+      );
+      expect(result.content.whereType<ImageContent>(), isEmpty);
+      expect(_text(result), isEmpty);
+    });
+  });
+
+  group('read image auto-route (gh-1984)', () {
+    late MemoryExecutionEnv env;
+
+    setUp(() {
+      env = MemoryExecutionEnv(cwd: '/work');
+    });
+
+    Uint8List makePng() {
+      final img = Image(width: 2, height: 2)..getPixel(0, 0).r = 255;
+      return Uint8List.fromList(encodePng(img));
+    }
+
+    /// An SSE vision endpoint returning [content]; records its call count.
+    /// [afterRequest] runs when the request arrives (cancel seams).
+    (http.Client, int Function()) fakeVision(
+      String content, {
+      Object? Function()? afterRequest,
+    }) {
+      var calls = 0;
+      final client = http_testing.MockClient.streaming((
+        request,
+        bodyStream,
+      ) async {
+        calls++;
+        afterRequest?.call();
+        final payload = jsonEncode({
+          'id': 'chatcmpl-test',
+          'object': 'chat.completion.chunk',
+          'created': 1234567890,
+          'model': 'glm-5.3-flash',
+          'choices': [
+            {
+              'index': 0,
+              'delta': {'role': 'assistant', 'content': content},
+              'finish_reason': null,
+            },
+          ],
+        });
+        final done = jsonEncode({
+          'id': 'chatcmpl-test',
+          'object': 'chat.completion.chunk',
+          'created': 1234567890,
+          'model': 'glm-5.3-flash',
+          'choices': [
+            {'index': 0, 'delta': {}, 'finish_reason': 'stop'},
+          ],
+          'usage': {
+            'prompt_tokens': 1200,
+            'completion_tokens': 42,
+            'total_tokens': 1242,
+          },
+        });
+        final sse = Stream.fromIterable([
+          'data: $payload\n\n',
+          'data: $done\n\n',
+        ]);
+        return http.StreamedResponse(
+          sse.transform(utf8.encoder),
+          200,
+          headers: {'content-type': 'text/event-stream'},
+        );
+      });
+      return (client, () => calls);
+    }
+
+    Model textOnlyModel([List<String> input = const ['text']]) => Model(
+      id: 'glm-5.3',
+      api: 'openai-completions',
+      provider: 'openai-completions',
+      baseUrl: 'https://api.example.com/v1',
+      input: input,
+      contextWindow: 128000,
+      maxTokens: 4096,
+    );
+
+    InspectImageConfig visionConfig(http.Client client) => InspectImageConfig(
+      modelId: 'glm-5.3-flash',
+      apiKey: 'vision-key',
+      baseUrl: 'https://api.example.com/v1',
+      httpClient: client,
+    );
+
+    Future<ToolExecutionResult> readImage(
+      AgentTool tool, {
+      CancelToken? token,
+    }) => tool.execute({'path': '/work/shot.png'}, token, null);
+
+    test('AC2: non-vision model + configured vision → inline description with '
+        'attribution, no ImageContent', () async {
+      await env.writeBinaryFile('/work/shot.png', makePng());
+      final (client, calls) = fakeVision('A tiny red pixel.');
+      final usages = <Usage>[];
+      final tool = readFileTool(
+        env,
+        model: () => textOnlyModel(),
+        vision: () async => visionConfig(client),
+        onImageUsage: usages.add,
+      );
+      final result = await readImage(tool);
+      final note = _text(result);
+      expect(note, contains('A tiny red pixel.'));
+      // The attribution marker names the vision model (AC2).
+      expect(note, contains('[via vision model glm-5.3-flash]'));
+      // NOT the bare omission note (AC2).
+      expect(note, isNot(contains('does not support images')));
+      // The payload leaves with the description: the chat model cannot
+      // use the bytes anyway (providers placeholder them at request time).
+      expect(result.content.whereType<ImageContent>(), isEmpty);
+      // One vision-model call per read, no loops (AC2).
+      expect(calls(), 1);
+      // The side-call's spend is reported (AC2: cost visible in /cost).
+      expect(usages, hasLength(1));
+      expect(usages.first.totalTokens, greaterThan(0));
+    });
+
+    test('AC3: images.autoInspect: false → the note names inspect_image + '
+        'the vision model, image stays', () async {
+      await env.writeBinaryFile('/work/shot.png', makePng());
+      final (client, calls) = fakeVision('A tiny red pixel.');
+      final tool = readFileTool(
+        env,
+        model: () => textOnlyModel(),
+        vision: () async => visionConfig(client),
+        autoInspect: () => false,
+      );
+      final result = await readImage(tool);
+      final note = _text(result);
+      expect(note, contains('does not support images'));
+      expect(note, contains('inspect_image'));
+      expect(note, contains('glm-5.3-flash'));
+      expect(result.content.whereType<ImageContent>(), hasLength(1));
+      expect(calls(), 0, reason: 'no auto-route call happens');
+    });
+
+    test(
+      'AC4: no vision configured → the note instructs how to configure',
+      () async {
+        await env.writeBinaryFile('/work/shot.png', makePng());
+        final tool = readFileTool(env, model: () => textOnlyModel());
+        final result = await readImage(tool);
+        final note = _text(result);
+        expect(note, contains('does not support images'));
+        expect(note, contains('No vision model is configured'));
+        expect(note, contains('models.slots.vision'));
+        expect(result.content.whereType<ImageContent>(), hasLength(1));
+      },
+    );
+
+    test(
+      'AC4 REG: vision chat model rides in place — no note, no call',
+      () async {
+        await env.writeBinaryFile('/work/shot.png', makePng());
+        final (client, calls) = fakeVision('A tiny red pixel.');
+        final visionModel = textOnlyModel(const ['text', 'image']);
+        final tool = readFileTool(
+          env,
+          model: () => visionModel,
+          vision: () async => visionConfig(client),
+        );
+        final result = await readImage(tool);
+        expect(_text(result), isNot(contains('does not support images')));
+        expect(result.content.whereType<ImageContent>(), hasLength(1));
+        expect(calls(), 0);
+      },
+    );
+
+    test('AC6: vision provider failure degrades to the omission note + '
+        'reason; the read still succeeds', () async {
+      await env.writeBinaryFile('/work/shot.png', makePng());
+      final client = http_testing.MockClient.streaming((request, body) async {
+        throw http.ClientException('quota exceeded', request.url);
+      });
+      final tool = readFileTool(
+        env,
+        model: () => textOnlyModel(),
+        vision: () async => visionConfig(client),
+      );
+      final result = await readImage(tool);
+      final note = _text(result);
+      expect(note, contains('does not support images'));
+      expect(note, contains('quota exceeded'));
+      // The read did not fail; the image stays for when the vision path
+      // recovers (provider placeholder rules are unchanged).
+      expect(result.content.whereType<ImageContent>(), hasLength(1));
+    });
+
+    test('AC6: cancellation mid-call aborts the auto-route', () async {
+      await env.writeBinaryFile('/work/shot.png', makePng());
+      final source = CancelTokenSource();
+      final client = http_testing.MockClient.streaming((request, body) async {
+        // Block until the test cancels, then surface the cancel.
+        await source.token.onCancel;
+        throw CancelledException('cancelled mid-call');
+      });
+      final tool = readFileTool(
+        env,
+        model: () => textOnlyModel(),
+        vision: () async => visionConfig(client),
+      );
+      final future = tool.execute(
+        {'path': '/work/shot.png'},
+        source.token,
+        null,
+      );
+      await Future<void>.delayed(Duration.zero);
+      source.cancel();
+      Object outcome;
+      try {
+        outcome = _text(await future);
+      } on Object catch (error) {
+        outcome = error;
+      }
+      expect(outcome, isA<CancelledException>());
+    });
+
+    test(
+      'live re-read: the resolver runs per read (slot edits apply live)',
+      () async {
+        await env.writeBinaryFile('/work/shot.png', makePng());
+        final (client, calls) = fakeVision('A tiny red pixel.');
+        var slotConfigured = true;
+        final tool = readFileTool(
+          env,
+          model: () => textOnlyModel(),
+          vision: () async => slotConfigured ? visionConfig(client) : null,
+        );
+        final first = await readImage(tool);
+        expect(_text(first), contains('[via vision model glm-5.3-flash]'));
+        // The slot is withdrawn mid-session (e.g. /models remove vision) —
+        // the NEXT read degrades honestly instead of keeping a stale config.
+        slotConfigured = false;
+        final second = await readImage(tool);
+        final note = _text(second);
+        expect(note, contains('No vision model is configured'));
+        expect(second.content.whereType<ImageContent>(), hasLength(1));
+        expect(calls(), 1, reason: 'only the first read inspects');
+      },
+    );
+
+    test(
+      'images.maxBytesPerRequest budget applies to the auto-route',
+      () async {
+        await env.writeBinaryFile('/work/shot.png', makePng());
+        final (client, calls) = fakeVision('A tiny red pixel.');
+        final saved = imageRegistryConfig;
+        imageRegistryConfig = ImageRegistryConfig(
+          enabled: saved.enabled,
+          maxPerRequest: saved.maxPerRequest,
+          maxBytesPerRequest: 1,
+          perModel: saved.perModel,
+          autoInspect: saved.autoInspect,
+        );
+        try {
+          final tool = readFileTool(
+            env,
+            model: () => textOnlyModel(),
+            vision: () async => visionConfig(client),
+          );
+          final result = await readImage(tool);
+          final note = _text(result);
+          expect(note, contains('does not support images'));
+          expect(note, contains('maxBytesPerRequest'));
+          expect(result.content.whereType<ImageContent>(), hasLength(1));
+          expect(calls(), 0);
+        } finally {
+          imageRegistryConfig = saved;
+        }
+      },
+    );
+
+    test('the auto-route uploads the PROCESSED payload — gate, mime, and '
+        'bytes agree (review: resized/converted images)', () async {
+      // A BMP: the inline pipeline converts it to PNG before the budget
+      // gate (providers refuse inline BMP) — the vision request must
+      // carry the converted PNG, not the raw BMP bytes labeled image/png.
+      final bmp = Uint8List.fromList(encodeBmp(Image(width: 64, height: 64)));
+      await env.writeBinaryFile('/work/shot.bmp', bmp);
+      final bodies = <String>[];
+      final client = http_testing.MockClient.streaming((
+        request,
+        bodyStream,
+      ) async {
+        bodies.add(await utf8.decoder.bind(bodyStream).join());
+        return http.StreamedResponse(
+          Stream.fromIterable([
+            'data: ${jsonEncode({
+              'id': 'c',
+              'object': 'chat.completion.chunk',
+              'created': 1,
+              'model': 'glm-5.3-flash',
+              'choices': [
+                {
+                  'index': 0,
+                  'delta': {'role': 'assistant', 'content': 'A solid gray square.'},
+                  'finish_reason': null,
+                },
+              ],
+            })}\n\n',
+            'data: ${jsonEncode({
+              'id': 'c',
+              'object': 'chat.completion.chunk',
+              'created': 1,
+              'model': 'glm-5.3-flash',
+              'choices': [
+                {'index': 0, 'delta': {}, 'finish_reason': 'stop'},
+              ],
+            })}\n\n',
+          ]).transform(utf8.encoder),
+          200,
+          headers: {'content-type': 'text/event-stream'},
+        );
+      });
+      final tool = readFileTool(
+        env,
+        model: () => textOnlyModel(),
+        vision: () async => visionConfig(client),
+      );
+      final result = await tool.execute({'path': '/work/shot.bmp'}, null, null);
+      expect(_text(result), contains('[via vision model glm-5.3-flash]'));
+      expect(bodies, hasLength(1));
+      final params = jsonDecode(bodies.first) as Map<String, dynamic>;
+      final content = (params['messages'] as List).last['content'] as List;
+      final imagePart =
+          content.firstWhere(
+                (part) => part is Map && part['type'] == 'image_url',
+              )
+              as Map<String, dynamic>;
+      final dataUrl = (imagePart['image_url'] as Map)['url'] as String;
+      final match = RegExp(r'^data:([^;]+);base64,(.*)$').firstMatch(dataUrl)!;
+      // The mime names the CONVERTED payload…
+      expect(match.group(1), 'image/png');
+      final uploaded = base64Decode(match.group(2)!);
+      // …and the bytes ARE that payload: the converted PNG, not the raw
+      // BMP mislabeled as PNG. The gate that measured the processed
+      // base64 must bound the same bytes the request carries.
+      expect(uploaded, isNot(equals(bmp)));
+      const pngMagic = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+      expect(uploaded.sublist(0, 8), pngMagic);
+      final resized = decodeImage(uploaded)!;
+      expect(resized.width, 64, reason: 'the converted PNG keeps its size');
+    });
+
+    test(
+      'the budget gate bounds the bytes the auto-route uploads (a large '
+      'original whose processed payload fits still uploads ≤ budget)',
+      () async {
+        // A big-enough original that the shrink ladder re-encodes it: the
+        // buggy path uploaded the ORIGINAL bytes while gating the
+        // processed ones, so the request payload blew past
+        // images.maxBytesPerRequest. The processed path must ride.
+        final big = Uint8List.fromList(
+          encodePng(Image(width: 2200, height: 40)),
+        );
+        await env.writeBinaryFile('/work/wide.png', big);
+        final bodies = <String>[];
+        final client = http_testing.MockClient.streaming((
+          request,
+          bodyStream,
+        ) async {
+          bodies.add(await utf8.decoder.bind(bodyStream).join());
+          return http.StreamedResponse(
+            Stream.fromIterable([
+              'data: ${jsonEncode({
+                'id': 'c',
+                'object': 'chat.completion.chunk',
+                'created': 1,
+                'model': 'glm-5.3-flash',
+                'choices': [
+                  {
+                    'index': 0,
+                    'delta': {'role': 'assistant', 'content': 'A very wide thin image.'},
+                    'finish_reason': null,
+                  },
+                ],
+              })}\n\n',
+              'data: ${jsonEncode({
+                'id': 'c',
+                'object': 'chat.completion.chunk',
+                'created': 1,
+                'model': 'glm-5.3-flash',
+                'choices': [
+                  {'index': 0, 'delta': {}, 'finish_reason': 'stop'},
+                ],
+              })}\n\n',
+            ]).transform(utf8.encoder),
+            200,
+            headers: {'content-type': 'text/event-stream'},
+          );
+        });
+        final saved = imageRegistryConfig;
+        // Budget between the processed and the original payload sizes.
+        imageRegistryConfig = ImageRegistryConfig(
+          enabled: saved.enabled,
+          maxPerRequest: saved.maxPerRequest,
+          maxBytesPerRequest: 40000,
+          perModel: saved.perModel,
+          autoInspect: saved.autoInspect,
+        );
+        try {
+          final tool = readFileTool(
+            env,
+            model: () => textOnlyModel(),
+            vision: () async => visionConfig(client),
+          );
+          final result = await tool.execute(
+            {'path': '/work/wide.png'},
+            null,
+            null,
+          );
+          expect(_text(result), contains('[via vision model glm-5.3-flash]'));
+          expect(bodies, hasLength(1));
+          final params = jsonDecode(bodies.first) as Map<String, dynamic>;
+          final content = (params['messages'] as List).last['content'] as List;
+          final imagePart =
+              content.firstWhere(
+                    (part) => part is Map && part['type'] == 'image_url',
+                  )
+                  as Map<String, dynamic>;
+          final dataUrl = (imagePart['image_url'] as Map)['url'] as String;
+          final uploadedBase64 = dataUrl.split('base64,').last;
+          expect(
+            uploadedBase64.length,
+            lessThanOrEqualTo(40000),
+            reason:
+                'the upload must be the gated processed payload — the '
+                'original bytes would exceed images.maxBytesPerRequest',
+          );
+          expect(base64Decode(uploadedBase64).length, lessThan(big.length));
+          final resized = decodeImage(base64Decode(uploadedBase64))!;
+          expect(
+            resized.width,
+            2000,
+            reason: 'the shrink ladder clamped the 2200px original',
+          );
+        } finally {
+          imageRegistryConfig = saved;
+        }
+      },
+    );
+  });
+
+  group('read audio/video notes (gh-1984 AC10)', () {
+    late MemoryExecutionEnv env;
+
+    setUp(() {
+      env = MemoryExecutionEnv(cwd: '/work');
+    });
+
+    test(
+      'audio with a transcription slot → the note names transcribe_audio',
+      () async {
+        await env.writeBinaryFile('/work/note.mp3', Uint8List.fromList([1, 2]));
+        final tool = readFileTool(
+          env,
+          mediaFileReadNotes: true,
+          transcribeAvailable: () => true,
+        );
+        final result = await tool.execute(
+          {'path': '/work/note.mp3'},
+          null,
+          null,
+        );
+        final note = _text(result);
+        expect(note, contains('[Audio file: /work/note.mp3'));
+        expect(note, contains('transcribe_audio'));
+      },
+    );
+
+    test('audio without a slot → the note names what to configure', () async {
+      await env.writeBinaryFile('/work/note.mp3', Uint8List.fromList([1, 2]));
+      final tool = readFileTool(
+        env,
+        mediaFileReadNotes: true,
+        transcribeAvailable: () => false,
+      );
+      final result = await tool.execute({'path': '/work/note.mp3'}, null, null);
+      final note = _text(result);
+      expect(note, contains('models.slots.transcription'));
+      expect(note, contains('--transcribe-model'));
+    });
+
+    test('video in the CLI → the note names the video-model configuration '
+        '(gh-1985 C1 replaced the app-host-only hint)', () async {
+      await env.writeBinaryFile('/work/clip.mp4', Uint8List.fromList([1, 2]));
+      final tool = readFileTool(env, mediaFileReadNotes: true);
+      final result = await tool.execute({'path': '/work/clip.mp4'}, null, null);
+      final note = _text(result);
+      expect(note, contains('[Video file: /work/clip.mp4'));
+      expect(note, contains('models.slots.vision'));
+      expect(note, contains('--vision-model'));
+    });
+
+    test('gate off (app host) → audio falls through unchanged (REG)', () async {
+      await env.writeBinaryFile('/work/note.mp3', Uint8List.fromList([1, 2]));
+      final tool = readFileTool(env);
+      final result = await tool.execute({'path': '/work/note.mp3'}, null, null);
+      expect(_text(result), isNot(contains('[Audio file:')));
+    });
+  });
+
+  group('inline image shrink helpers', () {
+    test('nextShrinkStep shrinks by 0.75 with a floor of 1', () {
+      expect(bt.nextShrinkStep(100, 80), (75, 60));
+      expect(bt.nextShrinkStep(1, 80), (1, 60));
+      expect(bt.nextShrinkStep(2, 2), (1, 1));
+    });
+
+    test('shrinkStepStalls at 1x1 or when the step stops making progress', () {
+      expect(bt.shrinkStepStalls(1, 1, 1, 1), isTrue);
+      expect(bt.shrinkStepStalls(2, 2, 1, 1), isFalse);
+      expect(bt.shrinkStepStalls(1, 5, 1, 3), isFalse);
+      expect(bt.shrinkStepStalls(100, 100, 75, 75), isFalse);
+    });
+  });
+}

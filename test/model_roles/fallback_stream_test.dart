@@ -1,0 +1,1663 @@
+import 'dart:async';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+Model _model(String provider, String id) => Model(
+  id: id,
+  api: 'test-api',
+  provider: provider,
+  baseUrl: 'https://example.test',
+  contextWindow: 100000,
+  maxTokens: 4096,
+);
+
+AssistantMessage _msg(
+  Model model, {
+  String text = '',
+  StopReason stop = StopReason.stop,
+  String? error,
+  String? raw,
+}) {
+  return AssistantMessage(
+    content: text.isEmpty ? const [] : [TextContent(text: text)],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: Usage.zero,
+    stopReason: stop,
+    errorMessage: error,
+    rawStopReason: raw,
+    timestamp: DateTime.utc(2026),
+  );
+}
+
+List<AssistantMessageEvent> _okTurn(Model model, String text) {
+  final empty = _msg(model);
+  final full = _msg(model, text: text);
+  return [
+    StartEvent(partial: empty),
+    TextStartEvent(contentIndex: 0, partial: empty),
+    TextDeltaEvent(contentIndex: 0, delta: text, partial: full),
+    DoneEvent(reason: StopReason.stop, message: full),
+  ];
+}
+
+List<AssistantMessageEvent> _rateLimitTurn(
+  Model model, {
+  Duration? retryAfter,
+  String error = '429: rate limit exceeded',
+}) {
+  final partial = _msg(model);
+  return [
+    StartEvent(partial: partial),
+    ErrorEvent(
+      reason: StopReason.error,
+      error: _msg(model, stop: StopReason.error, error: error),
+      retryAfter: retryAfter,
+    ),
+  ];
+}
+
+/// A scripted stream factory: serves pre-recorded turns per API-key value.
+class _Probe {
+  final Map<String, List<List<AssistantMessageEvent>>> scriptsByKey;
+  final calls = <String>[];
+
+  _Probe(this.scriptsByKey);
+
+  StreamFunction streamForKey(String apiKey) {
+    return (model, context, {cancelToken}) {
+      calls.add(apiKey);
+      final queue = scriptsByKey[apiKey];
+      if (queue == null || queue.isEmpty) {
+        throw StateError('no scripted turn left for key $apiKey');
+      }
+      final stream = AssistantMessageEventStream();
+      for (final event in queue.removeAt(0)) {
+        stream.push(event);
+      }
+      stream.end();
+      return stream;
+    };
+  }
+}
+
+String _signature(AssistantMessageEvent event) => switch (event) {
+  StartEvent(:final partial) => 'start:${partial.model}',
+  TextStartEvent() => 'textStart',
+  TextDeltaEvent(:final delta) => 'delta:$delta',
+  DoneEvent(:final message) => 'done:${message.model}',
+  ErrorEvent(:final reason, :final error) =>
+    'error(${reason.name}):${error.model}:${error.errorMessage}',
+  _ => event.runtimeType.toString(),
+};
+
+void main() {
+  group('FallbackStreamFunction', () {
+    late DateTime now;
+    late List<Duration> sleeps;
+    late List<FallbackNotice> notices;
+
+    setUp(() {
+      now = DateTime.utc(2026);
+      sleeps = [];
+      notices = [];
+    });
+
+    ChainEntry entry(
+      _Probe probe,
+      Model model,
+      List<String> keyValues, {
+      Duration? keyBackoff,
+    }) {
+      return ChainEntry(
+        model: model,
+        keyRing: ApiKeyRing(
+          baseName: 'K_${model.provider}_${model.id}',
+          credentials: [
+            for (var i = 0; i < keyValues.length; i++)
+              ApiKeyCredential(
+                i == 0 ? 'K_${model.id}' : 'K_${model.id}_${i + 1}',
+                keyValues[i],
+              ),
+          ],
+          startIndex: 0,
+          now: () => now,
+        ),
+        streamForKey: probe.streamForKey,
+      );
+    }
+
+    FallbackStreamFunction wrapper(
+      List<ChainEntry> entries, {
+      ModelRolesRetryPolicy policy = const ModelRolesRetryPolicy(),
+      Future<bool> Function(Duration, CancelToken?)? sleeper,
+      double jitter = 1.0,
+    }) {
+      return FallbackStreamFunction(
+        entries: entries,
+        policy: policy,
+        onNotice: notices.add,
+        now: () => now,
+        jitterFraction: () => jitter,
+        sleeper:
+            sleeper ??
+            (delay, token) async {
+              sleeps.add(delay);
+              now = now.add(delay);
+              return true;
+            },
+      );
+    }
+
+    Future<List<String>> run(
+      FallbackStreamFunction w, {
+      CancelToken? cancelToken,
+    }) async {
+      final stream = w.call(
+        _model('ignored', 'ignored'),
+        const Context(messages: []),
+        cancelToken: cancelToken,
+      );
+      return [for (final event in await stream.toList()) _signature(event)];
+    }
+
+    test('falls back to the next chain entry on 429, note surfaced', () async {
+      final a = _model('openai', 'gpt-a');
+      final b = _model('anthropic', 'claude-b');
+      final probe = _Probe({
+        'v-a': [_rateLimitTurn(a)],
+        'v-b': [_okTurn(b, 'hello from b')],
+      });
+      final w = wrapper(
+        [
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ],
+        // No same-entry retries: the run takes over with the next entry
+        // right after the first rate-limit failure.
+        policy: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+      );
+
+      final events = await run(w);
+
+      // Only B's events were forwarded — the rate-limited attempt left no
+      // trace (not even its StartEvent).
+      expect(events, [
+        'start:${b.id}',
+        'textStart',
+        'delta:hello from b',
+        'done:${b.id}',
+      ]);
+      expect(probe.calls, ['v-a', 'v-b']);
+      expect(sleeps, isEmpty); // model switches are delay-0 (omp rule)
+      expect(notices, hasLength(1));
+      final notice = notices.single;
+      expect(notice.kind, FallbackNoticeKind.modelFallback);
+      expect(notice.fromModel, 'openai/gpt-a');
+      expect(notice.toModel, 'anthropic/claude-b');
+      expect(notice.describe(), contains('falling back to anthropic/claude-b'));
+      expect(w.activeIndex, 1);
+      expect(w.currentModel.id, 'claude-b');
+    });
+
+    test(
+      'budget exhaustion advances to the fallback at once (issue #926)',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final b = _model('anthropic', 'claude-b');
+        final probe = _Probe({
+          'v-a': [
+            _rateLimitTurn(
+              a,
+              error:
+                  '403: CodeMie monthly budget limit reached '
+                  '(\$150.08 / \$150.00). Next budget reset: 01/10/2026',
+            ),
+          ],
+          'v-b': [_okTurn(b, 'hello from b')],
+        });
+        // DEFAULT policy (paid retries per entry) — the budget death must
+        // skip the whole ladder.
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ]);
+
+        final events = await run(w);
+
+        expect(events, [
+          'start:${b.id}',
+          'textStart',
+          'delta:hello from b',
+          'done:${b.id}',
+        ]);
+        expect(probe.calls, [
+          'v-a',
+          'v-b',
+        ], reason: 'no paid retries against the dead budget');
+        expect(sleeps, isEmpty);
+        // The clear user notice: the modelFallback reason carries the
+        // provider's budget wording verbatim.
+        expect(notices, hasLength(1));
+        expect(notices.single.kind, FallbackNoticeKind.modelFallback);
+        expect(notices.single.fromModel, 'openai/gpt-a');
+        expect(notices.single.toModel, 'anthropic/claude-b');
+        expect(notices.single.reason, contains('budget limit reached'));
+        expect(notices.single.reason, contains('\$150.08'));
+        expect(w.activeIndex, 1);
+      },
+    );
+
+    test(
+      'retries the same entry with capped backoff before succeeding',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v-a': [_rateLimitTurn(a), _okTurn(a, 'second try')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+        ]);
+
+        final events = await run(w);
+
+        expect(events.last, 'done:${a.id}');
+        expect(probe.calls, ['v-a', 'v-a']);
+        // jitter 1.0 → nominal 500ms first backoff (omp baseDelayMs).
+        expect(sleeps, [const Duration(milliseconds: 500)]);
+        expect(notices.single.kind, FallbackNoticeKind.retry);
+        expect(notices.single.describe(), contains('retrying in 0.5s'));
+      },
+    );
+
+    test('honors the provider Retry-After hint over local backoff', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [
+          _rateLimitTurn(a, retryAfter: const Duration(seconds: 3)),
+          _okTurn(a, 'after wait'),
+        ],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ]);
+
+      await run(w);
+
+      expect(sleeps, [const Duration(seconds: 3)]);
+    });
+
+    test(
+      'rotates API keys immediately (delay 0) before spending retries',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v1': [_rateLimitTurn(a)],
+          'v2': [_okTurn(a, 'second key works')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v1', 'v2']),
+        ]);
+
+        final events = await run(w);
+
+        expect(events.last, 'done:${a.id}');
+        expect(probe.calls, ['v1', 'v2']);
+        expect(sleeps, isEmpty);
+        expect(notices.single.kind, FallbackNoticeKind.keyRotation);
+        expect(notices.single.apiKeyName, 'K_gpt-a_2');
+        expect(
+          notices.single.describe(),
+          contains('rotating API key to K_gpt-a_2'),
+        );
+      },
+    );
+
+    test(
+      'never retries after observable output (mid-stream failure stands)',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final partial = _msg(a);
+        final withText = _msg(a, text: 'partial');
+        final probe = _Probe({
+          'v-a': [
+            [
+              StartEvent(partial: partial),
+              TextStartEvent(contentIndex: 0, partial: partial),
+              TextDeltaEvent(
+                contentIndex: 0,
+                delta: 'partial',
+                partial: withText,
+              ),
+              ErrorEvent(
+                reason: StopReason.error,
+                error: _msg(
+                  a,
+                  stop: StopReason.error,
+                  error: '429: rate limit exceeded',
+                ),
+              ),
+            ],
+            _okTurn(a, 'must not be served'),
+          ],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+        ]);
+
+        final events = await run(w);
+
+        expect(probe.calls, ['v-a']); // no second attempt
+        expect(events, contains('delta:partial'));
+        expect(
+          events.last,
+          startsWith('error(error):${a.id}:Provider failed mid-answer'),
+        );
+        expect(
+          events.last,
+          contains('Provider error: 429: rate limit exceeded'),
+        );
+        expect(notices, isEmpty);
+      },
+    );
+
+    test('context overflow is not retried (compaction owns it)', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [
+          _rateLimitTurn(
+            a,
+            error: 'prompt is too long: 213462 tokens > 200000 maximum',
+          ),
+        ],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ]);
+
+      final events = await run(w);
+
+      expect(probe.calls, ['v-a']);
+      expect(events.last, contains('prompt is too long'));
+      expect(notices, isEmpty);
+    });
+
+    test('non-rate-limit errors are not retried', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [_rateLimitTurn(a, error: '400: invalid request')],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ]);
+
+      final events = await run(w);
+
+      expect(probe.calls, ['v-a']);
+      expect(events.last, contains('400: invalid request'));
+      expect(notices, isEmpty);
+    });
+
+    test('aborted streams are forwarded without retry', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [
+          [
+            ErrorEvent(
+              reason: StopReason.aborted,
+              error: _msg(
+                a,
+                stop: StopReason.aborted,
+                error: 'Request was aborted',
+              ),
+            ),
+          ],
+        ],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ]);
+
+      final events = await run(w);
+
+      expect(probe.calls, ['v-a']);
+      expect(events.single, 'error(aborted):${a.id}:Request was aborted');
+      expect(notices, isEmpty);
+    });
+
+    test('exhausted chain forwards the last error', () async {
+      final a = _model('openai', 'gpt-a');
+      final b = _model('anthropic', 'claude-b');
+      final probe = _Probe({
+        'v-a': [_rateLimitTurn(a), _rateLimitTurn(a, error: '429: still down')],
+        'v-b': [_rateLimitTurn(b), _rateLimitTurn(b, error: '429: b down too')],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+        entry(probe, b, ['v-b']),
+      ], policy: const ModelRolesRetryPolicy(retriesPerEntry: 1));
+
+      final events = await run(w);
+
+      expect(probe.calls, ['v-a', 'v-a', 'v-b', 'v-b']);
+      expect(
+        events.single,
+        startsWith('error(error):${b.id}:Provider chain exhausted'),
+      );
+      expect(events.single, contains('2 of 2 chain model(s) failed'));
+      expect(events.single, contains('anthropic/claude-b: 429: b down too'));
+      expect(notices.map((n) => n.kind), [
+        FallbackNoticeKind.retry,
+        FallbackNoticeKind.modelFallback,
+        FallbackNoticeKind.retry,
+      ]);
+    });
+
+    test(
+      'cooldown skips a failed entry on the next call and reverts later',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final b = _model('anthropic', 'claude-b');
+        final probe = _Probe({
+          'v-a': [_rateLimitTurn(a), _okTurn(a, 'a is back')],
+          'v-b': [_okTurn(b, 'b takes over'), _okTurn(b, 'b again')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ], policy: const ModelRolesRetryPolicy(retriesPerEntry: 0));
+
+        await run(w); // A 429s, B takes over; A cools down (keyBackoff 60s)
+        expect(w.isInCooldown(0), isTrue);
+
+        final second = await run(w); // starts at B: A is benched
+        expect(second, [
+          'start:${b.id}',
+          'textStart',
+          'delta:b again',
+          'done:${b.id}',
+        ]);
+
+        now = now.add(const Duration(minutes: 2)); // cooldown expires
+        final third = await run(w); // reverts to the primary entry
+        expect(third.last, 'done:${a.id}');
+        expect(w.isInCooldown(0), isFalse);
+      },
+    );
+
+    test('abort during the backoff sleep ends the call as aborted', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [_rateLimitTurn(a)],
+      });
+      final source = CancelTokenSource();
+      final w = wrapper(
+        [
+          entry(probe, a, ['v-a']),
+        ],
+        sleeper: (delay, token) async {
+          source.cancel();
+          return false; // sleeper contract: false means cancelled
+        },
+      );
+
+      final events = await run(w, cancelToken: source.token);
+
+      expect(probe.calls, ['v-a']); // no second attempt
+      expect(events.single, 'error(aborted):${a.id}:Request was aborted');
+    });
+
+    test('an empty Done (no content) is forwarded, not retried', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [
+          [
+            StartEvent(partial: _msg(a)),
+            DoneEvent(reason: StopReason.stop, message: _msg(a)),
+          ],
+        ],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ]);
+
+      final events = await run(w);
+
+      expect(events, ['start:${a.id}', 'done:${a.id}']);
+      expect(notices, isEmpty);
+    });
+
+    test(
+      'waits for a benched sibling key when the whole stack is down',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v1': [_rateLimitTurn(a)],
+          'v2': [_rateLimitTurn(a), _okTurn(a, 'stack recovered')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v1', 'v2']),
+        ]);
+
+        final events = await run(w);
+
+        // k1 429 → rotate k2 → k2 429 → both benched 60s: backoff sleep 500ms,
+        // then sibling wait until the earliest key frees (60s + 1s buffer).
+        // The retry after the wait keeps round-robin order (k2 was current).
+        expect(probe.calls, ['v1', 'v2', 'v2']);
+        expect(events.last, 'done:${a.id}');
+        expect(sleeps.first, const Duration(milliseconds: 500));
+        expect(sleeps.length, 2);
+        expect(sleeps[1] > const Duration(seconds: 55), isTrue);
+        expect(
+          sleeps[1] <= const Duration(seconds: 61),
+          isTrue,
+          reason: 'sibling wait ends 1s after the earliest bench',
+        );
+      },
+    );
+
+    test(
+      'a Retry-After beyond maxWait fails over instead of sleeping',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final b = _model('anthropic', 'claude-b');
+        final probe = _Probe({
+          'v-a': [_rateLimitTurn(a, retryAfter: const Duration(minutes: 10))],
+          'v-b': [_okTurn(b, 'b instead of waiting')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ]);
+
+        final events = await run(w);
+
+        expect(sleeps, isEmpty); // 10min > 5min maxWait: no sleep, failover
+        expect(events.last, 'done:${b.id}');
+        expect(notices.single.kind, FallbackNoticeKind.modelFallback);
+      },
+    );
+
+    test(
+      'sole entry waits out a Retry-After beyond maxWait (issue #1066)',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v-a': [
+            _rateLimitTurn(a, retryAfter: const Duration(seconds: 60)),
+            _okTurn(a, 'recovered after the wait'),
+          ],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+        ], policy: const ModelRolesRetryPolicy(maxWait: Duration(seconds: 30)));
+
+        final events = await run(w);
+
+        // No fallback exists, so 60s > 30s maxWait no longer kills the
+        // chain: the engine waits out the full minute (under the 5m
+        // sole-entry ceiling) and the retry succeeds.
+        expect(sleeps, [const Duration(seconds: 60)]);
+        expect(probe.calls, ['v-a', 'v-a']);
+        expect(events.last, 'done:${a.id}');
+        expect(notices.single.kind, FallbackNoticeKind.retry);
+      },
+    );
+
+    test('a pathological Retry-After waits out the ceiling, then exhausts '
+        '(issue #1066)', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [
+          _rateLimitTurn(a, retryAfter: const Duration(hours: 2)),
+          _rateLimitTurn(a, retryAfter: const Duration(hours: 2)),
+          _rateLimitTurn(a, retryAfter: const Duration(hours: 2)),
+        ],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ], policy: const ModelRolesRetryPolicy(maxWait: Duration(seconds: 30)));
+
+      final events = await run(w);
+
+      // Each wait-out is bounded to the 5m sole-entry ceiling; the
+      // retries keep consuming the per-entry budget, so the chain still
+      // exhausts — with the waited total in the story.
+      expect(sleeps, [const Duration(minutes: 5), const Duration(minutes: 5)]);
+      expect(probe.calls, hasLength(3)); // 1 + retriesPerEntry(2)
+      expect(
+        events.single,
+        startsWith('error(error):${a.id}:Provider chain exhausted'),
+      );
+      expect(events.single, contains('waited 10m on rate limits'));
+    });
+
+    test(
+      'the waited-total label counts rate-limit waits only (issue #1066)',
+      () async {
+        final a = _model('openai', 'gpt-a');
+        final partial = _msg(a);
+        List<AssistantMessageEvent> transportTurn() => [
+          StartEvent(partial: partial),
+          ErrorEvent(
+            reason: StopReason.error,
+            error: _msg(
+              a,
+              stop: StopReason.error,
+              error: 'ClientException: Connection closed while receiving data',
+            ),
+            retryAfter: const Duration(seconds: 90),
+          ),
+        ];
+        final probe = _Probe({
+          'v-a': [transportTurn(), transportTurn(), transportTurn()],
+        });
+        final w = wrapper(
+          [
+            entry(probe, a, ['v-a']),
+          ],
+          policy: const ModelRolesRetryPolicy(
+            retriesPerEntry: 2,
+            maxWait: Duration(seconds: 30),
+          ),
+        );
+
+        final events = await run(w);
+
+        // Two bounded 90s wait-outs, both transport-class: the chain
+        // exhausted after real waiting, but an outage must not be
+        // misdiagnosed as rate limiting in the story.
+        expect(sleeps, [
+          const Duration(seconds: 90),
+          const Duration(seconds: 90),
+        ]);
+        expect(
+          events.single,
+          startsWith('error(error):${a.id}:Provider chain exhausted'),
+        );
+        expect(events.single, isNot(contains('waited')));
+      },
+    );
+
+    test('the last eligible entry waits out even after an instant failover '
+        '(issue #1066)', () async {
+      final a = _model('openai', 'gpt-a');
+      final b = _model('anthropic', 'claude-b');
+      final probe = _Probe({
+        'v-a': [_rateLimitTurn(a, retryAfter: const Duration(minutes: 10))],
+        'v-b': [
+          _rateLimitTurn(b, retryAfter: const Duration(seconds: 60)),
+          _okTurn(b, 'b waited it out'),
+        ],
+      });
+      final w = wrapper(
+        [
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ],
+        policy: const ModelRolesRetryPolicy(
+          retriesPerEntry: 1,
+          maxWait: Duration(seconds: 30),
+        ),
+      );
+
+      final events = await run(w);
+
+      // A's 10m wall instant-fails over to B (a fallback exists — the
+      // old policy); B is the last eligible entry, so its 60s wall is
+      // waited out instead of exhausting the chain.
+      expect(sleeps, [const Duration(seconds: 60)]);
+      expect(probe.calls, ['v-a', 'v-b', 'v-b']);
+      expect(events.last, 'done:${b.id}');
+      expect(notices.map((n) => n.kind), [
+        FallbackNoticeKind.modelFallback,
+        FallbackNoticeKind.retry,
+      ]);
+    });
+
+    test('single-key exhaustion ends with the all-rate-limited path', () async {
+      final a = _model('openai', 'gpt-a');
+      final probe = _Probe({
+        'v-a': [_rateLimitTurn(a), _rateLimitTurn(a), _rateLimitTurn(a)],
+      });
+      final w = wrapper([
+        entry(probe, a, ['v-a']),
+      ]);
+
+      final events = await run(w);
+
+      expect(probe.calls, hasLength(3)); // 1 + retriesPerEntry(2)
+      expect(
+        events.single,
+        startsWith('error(error):${a.id}:Provider chain exhausted'),
+      );
+      expect(events.single, contains('1 of 1 chain model(s) failed'));
+      expect(events.single, contains('after 3 attempt(s)'));
+      expect(events.single, contains('openai/gpt-a: 429: rate limit exceeded'));
+      expect(notices.map((n) => n.kind), [
+        FallbackNoticeKind.retry,
+        FallbackNoticeKind.retry,
+      ]);
+    });
+
+    group('transport errors', () {
+      List<AssistantMessageEvent> transportTurn(
+        Model model, {
+        String error =
+            'ClientException: Connection closed while receiving data',
+      }) {
+        final partial = _msg(model);
+        return [
+          StartEvent(partial: partial),
+          ErrorEvent(
+            reason: StopReason.error,
+            error: _msg(model, stop: StopReason.error, error: error),
+          ),
+        ];
+      }
+
+      /// The terminal the transient ladder emits after its zero-byte
+      /// replay budget is spent (gh-1308): the endpoint accepted every
+      /// request and produced nothing — the run-idle watchdog killed the
+      /// silent attempts.
+      List<AssistantMessageEvent> zeroByteStallTurn(Model model) {
+        return transportTurn(
+          model,
+          error:
+              'Provider zero-byte stall after 2 attempt(s) over 962s — the '
+              'endpoint accepted the request but streamed nothing; the '
+              'run-idle watchdog killed every silent attempt (zero-byte '
+              'stall). Attempts: run-idle watchdog replay of zero-byte '
+              'request: Request was aborted; run-idle watchdog replay of '
+              'zero-byte request: Request was aborted. The failure is '
+              'retryable: a fallback model may take over, or check the '
+              'provider status / try again later.',
+        );
+      }
+
+      test('retries the same entry on a dropped connection', () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v-a': [transportTurn(a), _okTurn(a, 'second try')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+        ]);
+
+        final events = await run(w);
+
+        // The failed pre-content attempt left no trace; the retry streamed.
+        expect(events, [
+          'start:${a.id}',
+          'textStart',
+          'delta:second try',
+          'done:${a.id}',
+        ]);
+        expect(probe.calls, ['v-a', 'v-a']);
+        expect(sleeps, [const Duration(milliseconds: 500)]);
+        expect(notices.single.kind, FallbackNoticeKind.transportRetry);
+        expect(
+          notices.single.describe(),
+          contains('connection lost on openai/gpt-a'),
+        );
+      });
+
+      test('never rotates API keys for a transport failure', () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v-a': [transportTurn(a), _okTurn(a, 'recovered')],
+          'v-a-2': [_okTurn(a, 'wrong key')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a', 'v-a-2']),
+        ]);
+
+        await run(w);
+
+        // Same credential retried: the sibling key is never touched.
+        expect(probe.calls, ['v-a', 'v-a']);
+        expect(
+          notices.map((n) => n.kind),
+          everyElement(FallbackNoticeKind.transportRetry),
+        );
+      });
+
+      test('issue #1168: a resumed-exhaustion terminal passes the '
+          'mid-answer guard unwrapped', () async {
+        // The production wiring composes the transient wrapper INSIDE the
+        // ladder (providerStreamFunction per chain entry): the wrapper
+        // resumes a mid-answer transport cut until its own budget dies,
+        // and the ladder must NOT re-narrate the consumed verdict as
+        // "not retried".
+        final a = _model('openai', 'gpt-a');
+        var innerCalls = 0;
+        AssistantMessageEventStream dying(Model model) {
+          final stream = AssistantMessageEventStream();
+          scheduleMicrotask(() {
+            ++innerCalls;
+            final part = _msg(model, text: 'part');
+            stream
+              ..push(StartEvent(partial: _msg(model)))
+              ..push(TextStartEvent(contentIndex: 0, partial: _msg(model)))
+              ..push(
+                TextDeltaEvent(contentIndex: 0, delta: 'part', partial: part),
+              )
+              ..push(
+                TextEndEvent(contentIndex: 0, content: 'part', partial: part),
+              )
+              ..push(
+                ErrorEvent(
+                  reason: StopReason.error,
+                  error: _msg(
+                    model,
+                    stop: StopReason.error,
+                    text: 'part',
+                    error:
+                        'SocketException: Connection failed (OS Error: '
+                        'Operation timed out, errno = 60)',
+                  ),
+                ),
+              )
+              ..end();
+          });
+          return stream;
+        }
+
+        final w = wrapper([
+          ChainEntry(
+            model: a,
+            keyRing: ApiKeyRing(
+              baseName: 'K_gpt-a',
+              credentials: [ApiKeyCredential('K_gpt-a', 'v-a')],
+              startIndex: 0,
+              now: () => now,
+            ),
+            streamForKey: (apiKey) => (model, context, {cancelToken}) {
+              return transientRetryStreamFunction(
+                (innerModel, innerContext, {cancelToken}) => dying(innerModel),
+                maxAttempts: 2,
+              )(model, context, cancelToken: cancelToken);
+            },
+          ),
+        ]);
+
+        final stream = w.call(
+          _model('ignored', 'ignored'),
+          const Context(messages: []),
+        );
+        final events = await stream.toList();
+        final terminal = events.whereType<ErrorEvent>().single;
+
+        // The wrapper spent its own budget (2 attempts, resumed between
+        // them); the ladder adds no false narration and no extra retry.
+        expect(innerCalls, 2);
+        expect(
+          terminal.error.errorMessage,
+          startsWith('Provider retry chain exhausted after 2 attempt(s)'),
+        );
+        expect(terminal.error.errorMessage, isNot(contains('not retried')));
+        // The preserved prefix rides (nothing the host streamed is lost).
+        expect(
+          terminal.error.content.whereType<TextContent>().map((b) => b.text),
+          containsAllInOrder(['part', 'part']),
+        );
+      });
+
+      test('fails over to the next entry when retries are spent', () async {
+        final a = _model('openai', 'gpt-a');
+        final b = _model('anthropic', 'claude-b');
+        final probe = _Probe({
+          'v-a': [transportTurn(a)],
+          'v-b': [_okTurn(b, 'hello from b')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ], policy: const ModelRolesRetryPolicy(retriesPerEntry: 0));
+
+        final events = await run(w);
+
+        expect(events.last, 'done:${b.id}');
+        expect(probe.calls, ['v-a', 'v-b']);
+        expect(notices.single.kind, FallbackNoticeKind.modelFallback);
+      });
+
+      test(
+        'gh-1308 AC2: a zero-byte stall on the primary hands off to the '
+        'next chain entry — the fallback answers, its model recorded',
+        () async {
+          final a = _model('openai', 'gpt-a');
+          final b = _model('anthropic', 'claude-b');
+          final probe = _Probe({
+            'v-a': [zeroByteStallTurn(a)],
+            'v-b': [_okTurn(b, 'hello from the fallback')],
+          });
+          // DEFAULT policy: the wedged primary gets NO same-entry paid
+          // retries — its verdict already consumed the whole silent-replay
+          // budget, and each in-place retry would cost another watchdog
+          // interval. The chain advances at once (auth precedent).
+          final w = wrapper([
+            entry(probe, a, ['v-a']),
+            entry(probe, b, ['v-b']),
+          ]);
+
+          final events = await run(w);
+
+          // The turn completes on the SECONDARY — the hung primary did
+          // not dead-end the run, and it was not replayed in place.
+          expect(events.last, 'done:${b.id}');
+          expect(probe.calls, ['v-a', 'v-b']);
+          final fallback = notices.single;
+          expect(fallback.kind, FallbackNoticeKind.modelFallback);
+          expect(fallback.toModel, 'anthropic/claude-b');
+          // The take-over reason names the zero-byte classification.
+          expect(fallback.reason, contains('zero-byte stall'));
+        },
+      );
+
+      test(
+        'forwards the last transport error when the chain exhausts',
+        () async {
+          final a = _model('openai', 'gpt-a');
+          final probe = _Probe({
+            'v-a': [
+              transportTurn(a),
+              transportTurn(a, error: 'SocketException: Connection refused'),
+              transportTurn(a, error: 'Failed host lookup: api.example.test'),
+            ],
+          });
+          final w = wrapper([
+            entry(probe, a, ['v-a']),
+          ]);
+
+          final events = await run(w);
+
+          expect(probe.calls, hasLength(3)); // 1 + retriesPerEntry(2)
+          expect(
+            events.single,
+            startsWith('error(error):${a.id}:Provider chain exhausted'),
+          );
+        },
+      );
+
+      test(
+        'a mid-stream transport drop is forwarded, never replayed',
+        () async {
+          final a = _model('openai', 'gpt-a');
+          final partial = _msg(a);
+          final probe = _Probe({
+            'v-a': [
+              [
+                StartEvent(partial: partial),
+                TextStartEvent(contentIndex: 0, partial: partial),
+                TextDeltaEvent(
+                  contentIndex: 0,
+                  delta: 'half',
+                  partial: _msg(a, text: 'half'),
+                ),
+                ErrorEvent(
+                  reason: StopReason.error,
+                  error: _msg(
+                    a,
+                    stop: StopReason.error,
+                    error: 'Connection closed while receiving data',
+                  ),
+                ),
+              ],
+              _okTurn(a, 'must not be used'),
+            ],
+          });
+          final w = wrapper([
+            entry(probe, a, ['v-a']),
+          ]);
+
+          final events = await run(w);
+
+          // Observable output already left: the failure stands (the CLI
+          // appends deltas — a silent replay would duplicate the transcript).
+          expect(events, [
+            'start:${a.id}',
+            'textStart',
+            'delta:half',
+            'error(error):${a.id}:Provider failed mid-answer: the stream '
+                'died after output was already delivered (not retried — a '
+                'replay would duplicate the transcript). Provider error: '
+                'Connection closed while receiving data',
+          ]);
+          expect(probe.calls, ['v-a']);
+          expect(notices, isEmpty);
+        },
+      );
+    });
+    group('issue #290 — verbatim 500 coverage + exhaustion story', () {
+      List<AssistantMessageEvent> gateway500Turn(
+        Model model, {
+        String error =
+            '500: Internal network failure, error id: '
+            '20260913154946260720382f38417e, please try again later.',
+      }) {
+        final partial = _msg(model);
+        return [
+          StartEvent(partial: partial),
+          ErrorEvent(
+            reason: StopReason.error,
+            error: _msg(model, stop: StopReason.error, error: error),
+          ),
+        ];
+      }
+
+      test(
+        'verbatim gateway 500 is retried in place (main-loop stream, AC1)',
+        () async {
+          final a = _model('kimi', 'kimi-k2');
+          final probe = _Probe({
+            'v-a': [gateway500Turn(a), _okTurn(a, 'recovered')],
+          });
+          final w = wrapper([
+            entry(probe, a, ['v-a']),
+          ]);
+
+          final events = await run(w);
+
+          expect(events, [
+            'start:${a.id}',
+            'textStart',
+            'delta:recovered',
+            'done:${a.id}',
+          ]);
+          expect(probe.calls, ['v-a', 'v-a']);
+          expect(sleeps, [const Duration(milliseconds: 500)]);
+          expect(notices.single.kind, FallbackNoticeKind.transportRetry);
+        },
+      );
+
+      test(
+        'exhausted chain tells the retry story, not a raw dump (AC2/E1)',
+        () async {
+          final a = _model('kimi', 'kimi-k2');
+          final b = _model('openai', 'gpt-b');
+          const incident =
+              '500: Internal network failure, error id: X, please try again later.';
+          final probe = _Probe({
+            'v-a': [
+              gateway500Turn(a, error: incident),
+              gateway500Turn(a, error: incident),
+            ],
+            'v-b': [
+              gateway500Turn(b, error: incident),
+              gateway500Turn(b, error: incident),
+            ],
+          });
+          final w = wrapper(
+            [
+              entry(probe, a, ['v-a']),
+              entry(probe, b, ['v-b']),
+            ],
+            policy: const ModelRolesRetryPolicy(
+              retriesPerEntry: 1,
+              baseDelay: Duration(milliseconds: 10),
+            ),
+          );
+
+          final events = await run(w);
+
+          final terminal = events.single;
+          expect(
+            terminal,
+            startsWith('error(error):${b.id}:Provider chain exhausted'),
+          );
+          // E1: the story says the WHOLE chain failed (an outage), never
+          // "key rotated, try again".
+          expect(terminal, contains('2 of 2 chain model(s) failed'));
+          expect(terminal, contains('after 4 attempt(s)'));
+          expect(terminal, contains('over <1s'));
+          expect(
+            terminal,
+            contains('kimi/kimi-k2: 500: Internal network failure'),
+          );
+          expect(
+            terminal,
+            contains('openai/gpt-b: 500: Internal network failure'),
+          );
+          expect(terminal, contains('not a key problem'));
+        },
+      );
+
+      test('cooldown-wall exhaustion (no attempts this call) still tells a '
+          'story', () async {
+        final a = _model('kimi', 'kimi-k2');
+        final b = _model('openai', 'gpt-b');
+        const backoff = Duration(minutes: 10);
+        final probe = _Probe({
+          'v-a': [_rateLimitTurn(a, retryAfter: backoff)],
+          'v-a2': [_rateLimitTurn(a, retryAfter: backoff)],
+          'v-b': [_rateLimitTurn(b, retryAfter: backoff)],
+          'v-b2': [_rateLimitTurn(b, retryAfter: backoff)],
+        });
+        final w = wrapper(
+          [
+            entry(probe, a, ['v-a', 'v-a2']),
+            entry(probe, b, ['v-b', 'v-b2']),
+          ],
+          policy: const ModelRolesRetryPolicy(
+            retriesPerEntry: 1,
+            // Issue #1066: the 30s sole-entry ceiling keeps the wait-outs
+            // short so the 10m wall outlasts them and the budget burns out.
+            maxWaitForLastEntry: Duration(seconds: 30),
+          ),
+        );
+
+        // Call 1 benches every key (10m retryAfter): A instant-fails over
+        // to B, B (last eligible) waits out 30s, and the spent budget
+        // exhausts the run. Call 2 starts with the whole chain still
+        // benched — no attempt lands, and the run tells the cooldown-wall
+        // story.
+        await run(w);
+        final events = await run(w);
+
+        expect(events.single, startsWith('error(error):${a.id}:Provider'));
+        expect(
+          events.single,
+          contains('every chain model is rate limited and cooling down'),
+        );
+        expect(
+          events.single,
+          contains('retried automatically once its cooldown lapses'),
+        );
+      });
+
+      test(
+        'post-commit gateway 500 stands as a mid-answer error (AC4)',
+        () async {
+          final a = _model('kimi', 'kimi-k2');
+          final partial = _msg(a);
+          const incident =
+              '500: Internal network failure, error id: X, please try again later.';
+          final probe = _Probe({
+            'v-a': [
+              [
+                StartEvent(partial: partial),
+                TextStartEvent(contentIndex: 0, partial: partial),
+                TextDeltaEvent(
+                  contentIndex: 0,
+                  delta: 'half',
+                  partial: _msg(a, text: 'half'),
+                ),
+                ErrorEvent(
+                  reason: StopReason.error,
+                  error: _msg(a, stop: StopReason.error, error: incident),
+                ),
+              ],
+              _okTurn(a, 'must not be used'),
+            ],
+          });
+          final w = wrapper([
+            entry(probe, a, ['v-a']),
+          ]);
+
+          final events = await run(w);
+
+          expect(events, [
+            'start:${a.id}',
+            'textStart',
+            'delta:half',
+            'error(error):${a.id}:Provider failed mid-answer: the stream died '
+                'after output was already delivered (not retried — a replay '
+                'would duplicate the transcript). Provider error: $incident',
+          ]);
+          expect(probe.calls, [
+            'v-a',
+          ], reason: 'no retry after observable output');
+        },
+      );
+
+      test(
+        'transport backoff follows the retry: knobs, jitter pins (AC5/E3)',
+        () async {
+          final a = _model('openai', 'gpt-a');
+          final probe = _Probe({
+            'v-a': [
+              gateway500Turn(a),
+              gateway500Turn(a),
+              gateway500Turn(a),
+              _okTurn(a, 'fourth try'),
+            ],
+          });
+          final w = wrapper(
+            [
+              entry(probe, a, ['v-a']),
+            ],
+            policy: const ModelRolesRetryPolicy(
+              retriesPerEntry: 3,
+              baseDelay: Duration(milliseconds: 100),
+              maxBackoff: Duration(milliseconds: 250),
+            ),
+          );
+
+          final events = await run(w);
+
+          expect(events.last, 'done:${a.id}');
+          // Knob-driven ladder: 100→200→capped at maxBackoff 250.
+          expect(sleeps, [
+            const Duration(milliseconds: 100),
+            const Duration(milliseconds: 200),
+            const Duration(milliseconds: 250),
+          ]);
+
+          // E3: jitter (fraction 0.5 → ×0.875) de-phases retries — no herd.
+          final probe2 = _Probe({
+            'v-a': [gateway500Turn(a), _okTurn(a, 'second try')],
+          });
+          final w2 = wrapper(
+            [
+              entry(probe2, a, ['v-a']),
+            ],
+            policy: const ModelRolesRetryPolicy(
+              baseDelay: Duration(milliseconds: 100),
+            ),
+            jitter: 0.5,
+          );
+
+          final events2 = await run(w2);
+
+          expect(events2.last, 'done:${a.id}');
+          expect(sleeps.last, const Duration(milliseconds: 88));
+        },
+      );
+    });
+
+    group('finish_reason classification (issue #312)', () {
+      List<AssistantMessageEvent> finishTurn(
+        Model model, {
+        required String raw,
+      }) {
+        final partial = _msg(model);
+        return [
+          StartEvent(partial: partial),
+          ErrorEvent(
+            reason: StopReason.error,
+            error: _msg(
+              model,
+              stop: StopReason.error,
+              error: 'Provider finish_reason: $raw',
+              raw: raw,
+            ),
+          ),
+        ];
+      }
+
+      test(
+        'an unknown vendor finish_reason retries the entry in place',
+        () async {
+          final a = _model('openai', 'gpt-a');
+          final probe = _Probe({
+            'v-a': [
+              finishTurn(a, raw: 'unexpected_state'),
+              _okTurn(a, 'second try'),
+            ],
+          });
+          final w = wrapper([
+            entry(probe, a, ['v-a']),
+          ]);
+
+          final events = await run(w);
+
+          expect(events, [
+            'start:${a.id}',
+            'textStart',
+            'delta:second try',
+            'done:${a.id}',
+          ]);
+          expect(probe.calls, ['v-a', 'v-a']);
+          expect(notices.single.kind, FallbackNoticeKind.transportRetry);
+        },
+      );
+
+      test('a TERMINAL finish_reason is forwarded without any retry', () async {
+        final a = _model('openai', 'gpt-a');
+        final probe = _Probe({
+          'v-a': [finishTurn(a, raw: 'content_filter')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+        ]);
+
+        final events = await run(w);
+
+        expect(probe.calls, ['v-a'], reason: 'retrying a filter is unsafe');
+        expect(events, [
+          'start:${a.id}',
+          'error(error):${a.id}:Provider finish_reason: content_filter',
+        ]);
+        expect(notices, isEmpty);
+      });
+      test('a post-commit classified failure wraps into the mid-answer '
+          'story (no replay)', () async {
+        final a = _model('openai', 'gpt-a');
+        final partial = _msg(a);
+        final probe = _Probe({
+          'v-a': [
+            [
+              StartEvent(partial: partial),
+              TextStartEvent(contentIndex: 0, partial: partial),
+              TextDeltaEvent(contentIndex: 0, delta: 'half', partial: partial),
+              ErrorEvent(
+                reason: StopReason.error,
+                error: _msg(
+                  a,
+                  stop: StopReason.error,
+                  error: 'Provider finish_reason: unexpected_state',
+                  raw: 'unexpected_state',
+                ),
+              ),
+            ],
+          ],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+        ]);
+
+        final events = await run(w);
+
+        // The deltas are already committed: a replay would duplicate the
+        // transcript, so the failure lands as the mid-answer terminal.
+        expect(probe.calls, ['v-a']);
+        expect(events, [
+          'start:${a.id}',
+          'textStart',
+          'delta:half',
+          'error(error):${a.id}:Provider failed mid-answer: the stream died '
+              'after output was already delivered (not retried — a replay '
+              'would duplicate the transcript). Provider error: Provider '
+              'finish_reason: unexpected_state',
+        ]);
+      });
+
+      test('a provider failing every call fails over to the next entry '
+          '(E2)', () async {
+        final a = _model('openai', 'gpt-a');
+        final b = _model('anthropic', 'claude-b');
+        final probe = _Probe({
+          'v-a': [finishTurn(a, raw: 'unexpected_state')],
+          'v-b': [_okTurn(b, 'hello from b')],
+        });
+        final w = wrapper([
+          entry(probe, a, ['v-a']),
+          entry(probe, b, ['v-b']),
+        ], policy: const ModelRolesRetryPolicy(retriesPerEntry: 0));
+
+        final events = await run(w);
+
+        expect(events.last, 'done:${b.id}');
+        expect(probe.calls, ['v-a', 'v-b']);
+        expect(notices.single.kind, FallbackNoticeKind.modelFallback);
+      });
+    });
+  });
+
+  group('isTransientTransportError', () {
+    AssistantMessage errorMessage(String text) => AssistantMessage(
+      content: const [],
+      api: 'test-api',
+      provider: 'test-provider',
+      model: 'test-model',
+      usage: Usage.zero,
+      stopReason: StopReason.error,
+      errorMessage: text,
+      timestamp: DateTime.utc(2026),
+    );
+
+    test('classifies dropped connections, DNS, TLS, and 5xx gateways', () {
+      for (final text in [
+        'ClientException: Connection closed while receiving data',
+        'Connection reset by peer',
+        'SocketException: Connection refused',
+        'Connection aborted',
+        'Connection terminated during handshake',
+        'Connection timed out',
+        'Failed host lookup: api.openai.com',
+        'Network is unreachable',
+        'No route to host',
+        'Broken pipe',
+        '502 Bad Gateway',
+        '503 Service Unavailable',
+        '504 Gateway Timeout',
+        '500: Internal network failure, error id: 2026090604313429886c81faba4889, please try again later.',
+        '500: internal server error',
+        'TimeoutException after 0:03:00.000000: Future not completed',
+        'Request timed out',
+      ]) {
+        expect(
+          isTransientTransportError(errorMessage(text)),
+          isTrue,
+          reason: text,
+        );
+      }
+    });
+
+    test('formatProviderError keeps every watchdog timeout retryable '
+        '(issue #1036)', () {
+      // The five TimeoutException shapes the provider watchdogs produce —
+      // message texts are the asserted contracts in
+      // provider_common_test/chatgpt_codex_test. Each is classified through
+      // the REAL transcript path: formatProviderError renders the
+      // assistant error, the failover chain reads it.
+      final m = _model('openai', 'gpt-a');
+      for (final exception in [
+        // sendProviderFetch connect leg.
+        TimeoutException(
+          'provider fetch (models list): no response headers within '
+          '30s (connect watchdog)',
+        ),
+        // sendProviderFetch read leg.
+        TimeoutException(
+          'provider fetch (models list): response did not complete within '
+          '120s (read watchdog; FA_PROVIDER_TIMEOUT_SECONDS overrides this)',
+        ),
+        // _sendWatched connect leg.
+        TimeoutException(
+          'provider stream request to https://example.test/v1/responses '
+          'timed out: no response headers within 180s (connect watchdog)',
+        ),
+        // createSseIterator idle leg.
+        TimeoutException(
+          'no events from the endpoint for 300s (stream idle timeout)',
+        ),
+        // codex bypass idle leg.
+        TimeoutException(
+          'chatgpt-codex https://example.test/v1/responses stalled: no SSE '
+          'bytes for 300s (stream idle timeout)',
+        ),
+      ]) {
+        final message = _msg(
+          m,
+          stop: StopReason.error,
+          error: formatProviderError(exception),
+        );
+        expect(
+          message.errorMessage,
+          contains('TimeoutException'),
+          reason: 'rendered watchdog error must keep the keyword',
+        );
+        expect(
+          isTransientTransportError(message),
+          isTrue,
+          reason: message.errorMessage,
+        );
+      }
+    });
+
+    test('rejects rate limits, overflow, non-errors, and clean failures', () {
+      for (final text in [
+        '429: rate limit exceeded',
+        'insufficient_quota: You exceeded your current quota',
+        'prompt is too long: 5 > 3 maximum',
+        '400: invalid request',
+        '400: bad request',
+      ]) {
+        expect(
+          isTransientTransportError(errorMessage(text)),
+          isFalse,
+          reason: text,
+        );
+      }
+      final ok = AssistantMessage(
+        content: const [],
+        api: 'a',
+        provider: 'p',
+        model: 'm',
+        usage: Usage.zero,
+        stopReason: StopReason.stop,
+        timestamp: DateTime.utc(2026),
+      );
+      expect(isTransientTransportError(ok), isFalse);
+    });
+  });
+
+  group('isRateLimitOrQuota', () {
+    AssistantMessage errorMessage(String text) => AssistantMessage(
+      content: const [],
+      api: 'test-api',
+      provider: 'test-provider',
+      model: 'test-model',
+      usage: Usage.zero,
+      stopReason: StopReason.error,
+      errorMessage: text,
+      timestamp: DateTime.utc(2026),
+    );
+
+    test('classifies 429, rate-limit, quota, throttling wordings', () {
+      for (final text in [
+        '429: rate limit exceeded',
+        'Rate limit reached for requests',
+        'too many requests, slow down',
+        'insufficient_quota: You exceeded your current quota',
+        'Resource has been exhausted (e.g. check quota)',
+        'usage limit reached for this hour',
+        'Throttling error: Too many tokens, please wait',
+        '429 Too Many Requests',
+      ]) {
+        expect(isRateLimitOrQuota(errorMessage(text)), isTrue, reason: text);
+      }
+    });
+
+    test('rejects overflow, non-errors, and unrelated failures', () {
+      expect(
+        isRateLimitOrQuota(errorMessage('prompt is too long: 5 > 3 maximum')),
+        isFalse,
+      );
+      expect(isRateLimitOrQuota(errorMessage('400: invalid request')), isFalse);
+      expect(isRateLimitOrQuota(errorMessage('502 bad gateway')), isFalse);
+      final ok = AssistantMessage(
+        content: const [],
+        api: 'a',
+        provider: 'p',
+        model: 'm',
+        usage: Usage.zero,
+        stopReason: StopReason.stop,
+        timestamp: DateTime.utc(2026),
+      );
+      expect(isRateLimitOrQuota(ok), isFalse);
+    });
+
+    test('a Retry-After hint alone does not classify', () {
+      expect(
+        isRateLimitOrQuota(
+          errorMessage('500: internal error'),
+          retryAfter: const Duration(seconds: 5),
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('caller-model window honor (gh-1742 review round 1, comment 6)', () {
+    test('a same-identity caller model dials with the caller window', () async {
+      // The catalog entry carries the stale window; the caller (the
+      // compaction adapters, the registry-patched agent model) hands the
+      // chain the SAME identity with the registered window — the dial
+      // must ride the caller's window, not the stale catalog 400.
+      final catalog = _model('anthropic', 'kimi').copyWith(contextWindow: 400);
+      final registered = catalog.copyWith(contextWindow: 478000);
+      final dialed = <Model>[];
+      final probe = FallbackStreamFunction(
+        entries: [
+          ChainEntry(
+            model: catalog,
+            keyRing: ApiKeyRing(
+              baseName: 'K_kimi',
+              credentials: [ApiKeyCredential('K_kimi', 'v-a')],
+              startIndex: 0,
+              now: () => DateTime.utc(2026),
+            ),
+            streamForKey: (apiKey) => (model, context, {cancelToken}) {
+              dialed.add(model);
+              final out = AssistantMessageEventStream();
+              for (final event in _okTurn(model, 'ok')) {
+                out.push(event);
+              }
+              out.end();
+              return out;
+            },
+          ),
+        ],
+        policy: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        now: () => DateTime.utc(2026),
+        jitterFraction: () => 1.0,
+        sleeper: (delay, token) async => true,
+      );
+      final out = probe.call(registered, const Context(messages: []));
+      await out.toList();
+      expect(dialed, hasLength(1));
+      expect(
+        dialed.single.contextWindow,
+        478000,
+        reason:
+            'the chain must dial the caller-supplied window for a '
+            'same-identity entry — the registry truth over the stale '
+            'catalog value (invariant 2: the window rides the Model '
+            'instance itself)',
+      );
+    });
+
+    test('a different-identity caller model keeps the entry model', () async {
+      final catalog = _model('anthropic', 'kimi');
+      final stranger = _model('ignored', 'ignored');
+      final dialed = <Model>[];
+      final probe = FallbackStreamFunction(
+        entries: [
+          ChainEntry(
+            model: catalog,
+            keyRing: ApiKeyRing(
+              baseName: 'K_kimi',
+              credentials: [ApiKeyCredential('K_kimi', 'v-a')],
+              startIndex: 0,
+              now: () => DateTime.utc(2026),
+            ),
+            streamForKey: (apiKey) => (model, context, {cancelToken}) {
+              dialed.add(model);
+              final out = AssistantMessageEventStream();
+              for (final event in _okTurn(model, 'ok')) {
+                out.push(event);
+              }
+              out.end();
+              return out;
+            },
+          ),
+        ],
+        policy: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        now: () => DateTime.utc(2026),
+        jitterFraction: () => 1.0,
+        sleeper: (delay, token) async => true,
+      );
+      final out = probe.call(stranger, const Context(messages: []));
+      await out.toList();
+      expect(dialed, hasLength(1));
+      expect(dialed.single.contextWindow, catalog.contextWindow);
+      expect(dialed.single.id, catalog.id);
+    });
+  });
+}

@@ -1,0 +1,4862 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:intl/intl.dart' as intl;
+
+import 'app_localizations_en.dart';
+import 'app_localizations_ru.dart';
+
+// ignore_for_file: type=lint
+
+/// Callers can lookup localized strings with an instance of AppLocalizations
+/// returned by `AppLocalizations.of(context)`.
+///
+/// Applications need to include `AppLocalizations.delegate()` in their app's
+/// `localizationDelegates` list, and the locales they support in the app's
+/// `supportedLocales` list. For example:
+///
+/// ```dart
+/// import 'l10n/app_localizations.dart';
+///
+/// return MaterialApp(
+///   localizationsDelegates: AppLocalizations.localizationsDelegates,
+///   supportedLocales: AppLocalizations.supportedLocales,
+///   home: MyApplicationHome(),
+/// );
+/// ```
+///
+/// ## Update pubspec.yaml
+///
+/// Please make sure to update your pubspec.yaml to include the following
+/// packages:
+///
+/// ```yaml
+/// dependencies:
+///   # Internationalization support.
+///   flutter_localizations:
+///     sdk: flutter
+///   intl: any # Use the pinned version from flutter_localizations
+///
+///   # Rest of dependencies
+/// ```
+///
+/// ## iOS Applications
+///
+/// iOS applications define key application metadata, including supported
+/// locales, in an Info.plist file that is built into the application bundle.
+/// To configure the locales supported by your app, you’ll need to edit this
+/// file.
+///
+/// First, open your project’s ios/Runner.xcworkspace Xcode workspace file.
+/// Then, in the Project Navigator, open the Info.plist file under the Runner
+/// project’s Runner folder.
+///
+/// Next, select the Information Property List item, select Add Item from the
+/// Editor menu, then select Localizations from the pop-up menu.
+///
+/// Select and expand the newly-created Localizations item then, for each
+/// locale your application supports, add a new item and select the locale
+/// you wish to add from the pop-up menu in the Value field. This list should
+/// be consistent with the languages listed in the AppLocalizations.supportedLocales
+/// property.
+abstract class AppLocalizations {
+  AppLocalizations(String locale)
+    : localeName = intl.Intl.canonicalizedLocale(locale.toString());
+
+  final String localeName;
+
+  static AppLocalizations of(BuildContext context) {
+    return Localizations.of<AppLocalizations>(context, AppLocalizations)!;
+  }
+
+  static const LocalizationsDelegate<AppLocalizations> delegate =
+      _AppLocalizationsDelegate();
+
+  /// A list of this localizations delegate along with the default localizations
+  /// delegates.
+  ///
+  /// Returns a list of localizations delegates containing this delegate along with
+  /// GlobalMaterialLocalizations.delegate, GlobalCupertinoLocalizations.delegate,
+  /// and GlobalWidgetsLocalizations.delegate.
+  ///
+  /// Additional delegates can be added by appending to this list in
+  /// MaterialApp. This list does not have to be used at all if a custom list
+  /// of delegates is preferred or required.
+  static const List<LocalizationsDelegate<dynamic>> localizationsDelegates =
+      <LocalizationsDelegate<dynamic>>[
+        delegate,
+        GlobalMaterialLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+      ];
+
+  /// A list of this localizations delegate's supported locales.
+  static const List<Locale> supportedLocales = <Locale>[
+    Locale('en'),
+    Locale('ru'),
+  ];
+
+  /// Application title shown in the window title bar.
+  ///
+  /// In en, this message translates to:
+  /// **'Fa'**
+  String get appTitle;
+
+  /// No description provided for @approvalAllowOnce.
+  ///
+  /// In en, this message translates to:
+  /// **'Allow once'**
+  String get approvalAllowOnce;
+
+  /// No description provided for @approvalAllowToolTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Allow {tool}?'**
+  String approvalAllowToolTitle(Object tool);
+
+  /// No description provided for @approvalAlwaysAllow.
+  ///
+  /// In en, this message translates to:
+  /// **'Always allow'**
+  String get approvalAlwaysAllow;
+
+  /// No description provided for @approvalDeny.
+  ///
+  /// In en, this message translates to:
+  /// **'Deny'**
+  String get approvalDeny;
+
+  /// No description provided for @attachedEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No messages yet — say something below'**
+  String get attachedEmpty;
+
+  /// No description provided for @attachedToCli.
+  ///
+  /// In en, this message translates to:
+  /// **'attached to fa cli'**
+  String get attachedToCli;
+
+  /// No description provided for @sendToCli.
+  ///
+  /// In en, this message translates to:
+  /// **'Message the fa cli session…'**
+  String get sendToCli;
+
+  /// No description provided for @sessionFolderPersonal.
+  ///
+  /// In en, this message translates to:
+  /// **'Personal'**
+  String get sessionFolderPersonal;
+
+  /// No description provided for @sessionInfoNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Session name'**
+  String get sessionInfoNameLabel;
+
+  /// No description provided for @newSessionFolderTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'New session — folder'**
+  String get newSessionFolderTitle;
+
+  /// No description provided for @newSessionCurrentFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Current folder ({folder})'**
+  String newSessionCurrentFolder(Object folder);
+
+  /// No description provided for @approvalModeAlwaysAsk.
+  ///
+  /// In en, this message translates to:
+  /// **'Always ask'**
+  String get approvalModeAlwaysAsk;
+
+  /// No description provided for @approvalModeAlwaysAskHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Every tool call asks for approval.'**
+  String get approvalModeAlwaysAskHint;
+
+  /// No description provided for @approvalModeTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Tool approvals'**
+  String get approvalModeTitle;
+
+  /// No description provided for @approvalModeWrite.
+  ///
+  /// In en, this message translates to:
+  /// **'Write'**
+  String get approvalModeWrite;
+
+  /// No description provided for @approvalModeWriteHint.
+  ///
+  /// In en, this message translates to:
+  /// **'File reads run freely; writes, edits and shell commands ask for approval.'**
+  String get approvalModeWriteHint;
+
+  /// No description provided for @approvalModeYolo.
+  ///
+  /// In en, this message translates to:
+  /// **'YOLO'**
+  String get approvalModeYolo;
+
+  /// No description provided for @approvalModeYoloHint.
+  ///
+  /// In en, this message translates to:
+  /// **'All tools run without asking (destructive shell commands still ask).'**
+  String get approvalModeYoloHint;
+
+  /// No description provided for @approvalTierLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Tier: {tier}'**
+  String approvalTierLabel(Object tier);
+
+  /// No description provided for @appsAskFaAbout.
+  ///
+  /// In en, this message translates to:
+  /// **'Ask Fa about {name}'**
+  String appsAskFaAbout(Object name);
+
+  /// No description provided for @appsAskFaHint.
+  ///
+  /// In en, this message translates to:
+  /// **'e.g. make the buttons bigger and purple'**
+  String get appsAskFaHint;
+
+  /// No description provided for @appsAskFaSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Fa gets your message, the app state and a screenshot.'**
+  String get appsAskFaSubtitle;
+
+  /// No description provided for @appsAskFaTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Ask Fa about this app'**
+  String get appsAskFaTooltip;
+
+  /// No description provided for @appsChatEmptyHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Nothing here yet — ask Fa about this app.'**
+  String get appsChatEmptyHint;
+
+  /// No description provided for @appsCollapseChatTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Collapse chat'**
+  String get appsCollapseChatTooltip;
+
+  /// No description provided for @appsDismissReplyTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Dismiss'**
+  String get appsDismissReplyTooltip;
+
+  /// No description provided for @appsEmptyState.
+  ///
+  /// In en, this message translates to:
+  /// **'No apps yet. Ask Fa to build one —\nit will land in the apps/ folder.'**
+  String get appsEmptyState;
+
+  /// No description provided for @appsFaStatusThinking.
+  ///
+  /// In en, this message translates to:
+  /// **'thinking…'**
+  String get appsFaStatusThinking;
+
+  /// No description provided for @appsFaStatusWorking.
+  ///
+  /// In en, this message translates to:
+  /// **'Fa is working…'**
+  String get appsFaStatusWorking;
+
+  /// No description provided for @appsFaStatusWriting.
+  ///
+  /// In en, this message translates to:
+  /// **'writing…'**
+  String get appsFaStatusWriting;
+
+  /// No description provided for @appsFollowUpHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Follow up…'**
+  String get appsFollowUpHint;
+
+  /// No description provided for @appsGridTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Apps'**
+  String get appsGridTitle;
+
+  /// No description provided for @appsHideAppsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Hide apps'**
+  String get appsHideAppsTooltip;
+
+  /// No description provided for @appsLoadError.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to load apps: {error}'**
+  String appsLoadError(Object error);
+
+  /// No description provided for @widgetsCatalogInstallFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Install failed: {error}'**
+  String widgetsCatalogInstallFailed(Object error);
+
+  /// No description provided for @widgetsCatalogNotInstalled.
+  ///
+  /// In en, this message translates to:
+  /// **'Widget is not installed yet.'**
+  String get widgetsCatalogNotInstalled;
+
+  /// No description provided for @widgetsCatalogOffline.
+  ///
+  /// In en, this message translates to:
+  /// **'Offline — showing the last known catalog.'**
+  String get widgetsCatalogOffline;
+
+  /// No description provided for @widgetsCatalogLoadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not load the widgets catalog.\n{error}'**
+  String widgetsCatalogLoadFailed(Object error);
+
+  /// No description provided for @widgetsCatalogFilterAll.
+  ///
+  /// In en, this message translates to:
+  /// **'All'**
+  String get widgetsCatalogFilterAll;
+
+  /// No description provided for @widgetsCatalogRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get widgetsCatalogRetry;
+
+  /// No description provided for @appsOpenChatTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Open chat'**
+  String get appsOpenChatTooltip;
+
+  /// No description provided for @appsOpenFullChatTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Open full chat'**
+  String get appsOpenFullChatTooltip;
+
+  /// No description provided for @appsOpenTrajectoryTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Open trajectory'**
+  String get appsOpenTrajectoryTooltip;
+
+  /// No description provided for @appsPermissionCalendar.
+  ///
+  /// In en, this message translates to:
+  /// **'Calendar'**
+  String get appsPermissionCalendar;
+
+  /// No description provided for @appsPermissionCalendarDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.calendar — read your system calendar events'**
+  String get appsPermissionCalendarDesc;
+
+  /// No description provided for @appsPermissionContacts.
+  ///
+  /// In en, this message translates to:
+  /// **'Contacts'**
+  String get appsPermissionContacts;
+
+  /// No description provided for @appsPermissionContactsDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.contacts — address book (coming soon)'**
+  String get appsPermissionContactsDesc;
+
+  /// No description provided for @appsPermissionHealth.
+  ///
+  /// In en, this message translates to:
+  /// **'Health'**
+  String get appsPermissionHealth;
+
+  /// No description provided for @appsPermissionHealthDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.health — health data (coming soon)'**
+  String get appsPermissionHealthDesc;
+
+  /// No description provided for @appsPermissionHomekit.
+  ///
+  /// In en, this message translates to:
+  /// **'HomeKit'**
+  String get appsPermissionHomekit;
+
+  /// No description provided for @appsPermissionHomekitDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.homekit — smart home devices (coming soon)'**
+  String get appsPermissionHomekitDesc;
+
+  /// No description provided for @appsPermissionKeys.
+  ///
+  /// In en, this message translates to:
+  /// **'Host keys'**
+  String get appsPermissionKeys;
+
+  /// No description provided for @appsPermissionKeysDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.keys — read the API keys saved in Fa and request new ones'**
+  String get appsPermissionKeysDesc;
+
+  /// No description provided for @appsPermissionTheme.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme packs'**
+  String get appsPermissionTheme;
+
+  /// No description provided for @appsPermissionThemeDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.theme — list theme packs and apply one (the user confirms every apply)'**
+  String get appsPermissionThemeDesc;
+
+  /// No description provided for @appsPermissionLlm.
+  ///
+  /// In en, this message translates to:
+  /// **'LLM'**
+  String get appsPermissionLlm;
+
+  /// No description provided for @appsPermissionLlmDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.llm — let the app ask the connected model'**
+  String get appsPermissionLlmDesc;
+
+  /// No description provided for @appsPermissionMedia.
+  ///
+  /// In en, this message translates to:
+  /// **'Media'**
+  String get appsPermissionMedia;
+
+  /// No description provided for @appsPermissionMediaDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.media — generate images, speech, and music'**
+  String get appsPermissionMediaDesc;
+
+  /// No description provided for @appsPermissionMicrophone.
+  ///
+  /// In en, this message translates to:
+  /// **'Microphone'**
+  String get appsPermissionMicrophone;
+
+  /// No description provided for @appsPermissionMicrophoneDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.asr — record audio and transcribe speech'**
+  String get appsPermissionMicrophoneDesc;
+
+  /// No description provided for @appsPermissionNetwork.
+  ///
+  /// In en, this message translates to:
+  /// **'Network'**
+  String get appsPermissionNetwork;
+
+  /// No description provided for @appsPermissionNetworkDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fetchJson — let the app call HTTP APIs'**
+  String get appsPermissionNetworkDesc;
+
+  /// No description provided for @appsPermissionNotifications.
+  ///
+  /// In en, this message translates to:
+  /// **'Notifications'**
+  String get appsPermissionNotifications;
+
+  /// No description provided for @appsPermissionNotificationsDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'jsr.fa.notify — schedule local notifications'**
+  String get appsPermissionNotificationsDesc;
+
+  /// No description provided for @appsPermissionsDone.
+  ///
+  /// In en, this message translates to:
+  /// **'Done'**
+  String get appsPermissionsDone;
+
+  /// No description provided for @appsPermissionsTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'{name} permissions'**
+  String appsPermissionsTitle(Object name);
+
+  /// No description provided for @appsPermissionsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'App permissions'**
+  String get appsPermissionsTooltip;
+
+  /// No description provided for @appsCloseTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Close app'**
+  String get appsCloseTooltip;
+
+  /// No description provided for @appsRefreshTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Refresh'**
+  String get appsRefreshTooltip;
+
+  /// No description provided for @appsReloadTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Reload app'**
+  String get appsReloadTooltip;
+
+  /// No description provided for @appsSendToFa.
+  ///
+  /// In en, this message translates to:
+  /// **'Send to Fa'**
+  String get appsSendToFa;
+
+  /// No description provided for @appsSendTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Send'**
+  String get appsSendTooltip;
+
+  /// No description provided for @appsShowAppsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Show apps'**
+  String get appsShowAppsTooltip;
+
+  /// No description provided for @appsStartError.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to start {name}:\n{error}'**
+  String appsStartError(Object error, Object name);
+
+  /// No description provided for @appsStopTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Stop'**
+  String get appsStopTooltip;
+
+  /// No description provided for @askAnswerAction.
+  ///
+  /// In en, this message translates to:
+  /// **'Answer'**
+  String get askAnswerAction;
+
+  /// No description provided for @askBack.
+  ///
+  /// In en, this message translates to:
+  /// **'Back'**
+  String get askBack;
+
+  /// No description provided for @askCancel.
+  ///
+  /// In en, this message translates to:
+  /// **'Cancel'**
+  String get askCancel;
+
+  /// No description provided for @askNext.
+  ///
+  /// In en, this message translates to:
+  /// **'Next'**
+  String get askNext;
+
+  /// No description provided for @askOtherLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Other (type your own)'**
+  String get askOtherLabel;
+
+  /// No description provided for @askQuestionProgress.
+  ///
+  /// In en, this message translates to:
+  /// **'Question {index} of {total}'**
+  String askQuestionProgress(Object index, Object total);
+
+  /// No description provided for @askQuestionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Question'**
+  String get askQuestionTitle;
+
+  /// No description provided for @askRecommended.
+  ///
+  /// In en, this message translates to:
+  /// **'Recommended'**
+  String get askRecommended;
+
+  /// No description provided for @askYourAnswerLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Your answer'**
+  String get askYourAnswerLabel;
+
+  /// No description provided for @cacheBrowserSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device model weights cached in your browser. Deleting frees space; a model re-downloads on next use.'**
+  String get cacheBrowserSubtitle;
+
+  /// No description provided for @cacheDeleteTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete {name}?'**
+  String cacheDeleteTitle(Object name);
+
+  /// No description provided for @cacheDeleteTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete {name}'**
+  String cacheDeleteTooltip(Object name);
+
+  /// No description provided for @cacheDeleteWeightsBrowser.
+  ///
+  /// In en, this message translates to:
+  /// **'Removes the downloaded weights ({size}) from the browser cache. The model downloads again the next time you use it.'**
+  String cacheDeleteWeightsBrowser(Object size);
+
+  /// No description provided for @cacheEntryCached.
+  ///
+  /// In en, this message translates to:
+  /// **'{size} · {bytes} cached'**
+  String cacheEntryCached(Object bytes, Object size);
+
+  /// No description provided for @cacheNoModels.
+  ///
+  /// In en, this message translates to:
+  /// **'No models downloaded yet.'**
+  String get cacheNoModels;
+
+  /// No description provided for @cacheNoticeDeleteFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Failed to delete {name}: {error}'**
+  String cacheNoticeDeleteFailed(Object error, Object name);
+
+  /// No description provided for @cacheNoticeDeleted.
+  ///
+  /// In en, this message translates to:
+  /// **'Deleted {name}.'**
+  String cacheNoticeDeleted(Object name);
+
+  /// No description provided for @cacheNoticeLoadedModel.
+  ///
+  /// In en, this message translates to:
+  /// **'{name} was the loaded model — it downloads again on next use.'**
+  String cacheNoticeLoadedModel(Object name);
+
+  /// No description provided for @chatAbortTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Abort'**
+  String get chatAbortTooltip;
+
+  /// No description provided for @chatAttachError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not attach {name}: {error}'**
+  String chatAttachError(Object error, Object name);
+
+  /// No description provided for @chatAttachFile.
+  ///
+  /// In en, this message translates to:
+  /// **'Attach file'**
+  String get chatAttachFile;
+
+  /// No description provided for @chatAttachNoName.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not attach \"{name}\": no usable file name.'**
+  String chatAttachNoName(Object name);
+
+  /// No description provided for @chatAttachTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Attach'**
+  String get chatAttachTooltip;
+
+  /// No description provided for @chatCamera.
+  ///
+  /// In en, this message translates to:
+  /// **'Camera'**
+  String get chatCamera;
+
+  /// No description provided for @chatCollapse.
+  ///
+  /// In en, this message translates to:
+  /// **'Collapse'**
+  String get chatCollapse;
+
+  /// No description provided for @chatCopiedToClipboard.
+  ///
+  /// In en, this message translates to:
+  /// **'Session copied to clipboard'**
+  String get chatCopiedToClipboard;
+
+  /// No description provided for @chatCopySessionTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy session'**
+  String get chatCopySessionTooltip;
+
+  /// No description provided for @chatFilesTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Files'**
+  String get chatFilesTooltip;
+
+  /// No description provided for @chatGallery.
+  ///
+  /// In en, this message translates to:
+  /// **'Gallery'**
+  String get chatGallery;
+
+  /// No description provided for @chatInputHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Type a message'**
+  String get chatInputHint;
+
+  /// No description provided for @chatMicDenied.
+  ///
+  /// In en, this message translates to:
+  /// **'Microphone access was denied. Enable it in the system privacy settings (Privacy & Security → Microphone), then try again.'**
+  String get chatMicDenied;
+
+  /// No description provided for @chatMicError.
+  ///
+  /// In en, this message translates to:
+  /// **'Voice input failed: {error}'**
+  String chatMicError(Object error);
+
+  /// No description provided for @chatMicStopTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Stop recording'**
+  String get chatMicStopTooltip;
+
+  /// No description provided for @chatMicTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Voice input'**
+  String get chatMicTooltip;
+
+  /// No description provided for @chatModelSwitchTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Switch model'**
+  String get chatModelSwitchTooltip;
+
+  /// No description provided for @chatRemoveAttachment.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove attachment'**
+  String get chatRemoveAttachment;
+
+  /// No description provided for @chatSendError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not send: {error}'**
+  String chatSendError(Object error);
+
+  /// No description provided for @chatSendTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Send'**
+  String get chatSendTooltip;
+
+  /// No description provided for @chatSessionsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Sessions & model'**
+  String get chatSessionsTooltip;
+
+  /// No description provided for @chatSettingsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Connection settings'**
+  String get chatSettingsTooltip;
+
+  /// No description provided for @chatShowAll.
+  ///
+  /// In en, this message translates to:
+  /// **'Show all ({count})'**
+  String chatShowAll(Object count);
+
+  /// No description provided for @chatUploadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Upload failed: {error}'**
+  String chatUploadFailed(Object error);
+
+  /// No description provided for @commonCancel.
+  ///
+  /// In en, this message translates to:
+  /// **'Cancel'**
+  String get commonCancel;
+
+  /// No description provided for @commonDelete.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete'**
+  String get commonDelete;
+
+  /// No description provided for @filePreviewCannotRead.
+  ///
+  /// In en, this message translates to:
+  /// **'Cannot read file'**
+  String get filePreviewCannotRead;
+
+  /// No description provided for @filePreviewCannotStat.
+  ///
+  /// In en, this message translates to:
+  /// **'Cannot stat file'**
+  String get filePreviewCannotStat;
+
+  /// No description provided for @filePreviewDecodeError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not decode image'**
+  String get filePreviewDecodeError;
+
+  /// No description provided for @filePreviewLoadError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not load file'**
+  String get filePreviewLoadError;
+
+  /// No description provided for @filePreviewNoPreview.
+  ///
+  /// In en, this message translates to:
+  /// **'No preview available'**
+  String get filePreviewNoPreview;
+
+  /// No description provided for @filePreviewEdit.
+  ///
+  /// In en, this message translates to:
+  /// **'Edit'**
+  String get filePreviewEdit;
+
+  /// No description provided for @filePreviewSave.
+  ///
+  /// In en, this message translates to:
+  /// **'Save'**
+  String get filePreviewSave;
+
+  /// No description provided for @filePreviewSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Saved'**
+  String get filePreviewSaved;
+
+  /// No description provided for @filePreviewSaveError.
+  ///
+  /// In en, this message translates to:
+  /// **'Save failed'**
+  String get filePreviewSaveError;
+
+  /// No description provided for @filePreviewTabPreview.
+  ///
+  /// In en, this message translates to:
+  /// **'Preview'**
+  String get filePreviewTabPreview;
+
+  /// No description provided for @filePreviewTabSource.
+  ///
+  /// In en, this message translates to:
+  /// **'Source'**
+  String get filePreviewTabSource;
+
+  /// No description provided for @filePreviewTooLarge.
+  ///
+  /// In en, this message translates to:
+  /// **'File too large to preview'**
+  String get filePreviewTooLarge;
+
+  /// No description provided for @filePreviewTruncated.
+  ///
+  /// In en, this message translates to:
+  /// **'Showing the first {size} — truncated'**
+  String filePreviewTruncated(Object size);
+
+  /// No description provided for @filesBackTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Back to files'**
+  String get filesBackTooltip;
+
+  /// No description provided for @filesEmptyFileName.
+  ///
+  /// In en, this message translates to:
+  /// **'(empty file name)'**
+  String get filesEmptyFileName;
+
+  /// No description provided for @filesEmptyFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Empty folder'**
+  String get filesEmptyFolder;
+
+  /// No description provided for @filesFolderAccessDenied.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not get access to that folder.'**
+  String get filesFolderAccessDenied;
+
+  /// No description provided for @filesFolderPickerError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not open folder picker: {error}'**
+  String filesFolderPickerError(Object error);
+
+  /// No description provided for @filesICloudSyncDone.
+  ///
+  /// In en, this message translates to:
+  /// **'Synced {files} files ({size}) — last sync {when}'**
+  String filesICloudSyncDone(Object files, Object size, Object when);
+
+  /// No description provided for @filesICloudSyncFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'iCloud sync failed: {error}'**
+  String filesICloudSyncFailed(Object error);
+
+  /// No description provided for @filesICloudSyncTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Sync sessions and apps with iCloud'**
+  String get filesICloudSyncTooltip;
+
+  /// No description provided for @filesICloudSyncUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'iCloud sync is unavailable — enable iCloud Drive for Fa in Settings → Apple ID → iCloud'**
+  String get filesICloudSyncUnavailable;
+
+  /// No description provided for @filesListFolderError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not list folder'**
+  String get filesListFolderError;
+
+  /// No description provided for @filesMountUnavailableTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Previously used folder is unavailable: {path} — tap to pick again'**
+  String filesMountUnavailableTooltip(Object path);
+
+  /// No description provided for @filesOpenFolderError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not open folder'**
+  String get filesOpenFolderError;
+
+  /// No description provided for @filesOpenProjectFolderTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Open project folder…'**
+  String get filesOpenProjectFolderTooltip;
+
+  /// No description provided for @filesPanelTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Files'**
+  String get filesPanelTitle;
+
+  /// No description provided for @filesRefreshTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Refresh'**
+  String get filesRefreshTooltip;
+
+  /// No description provided for @filesRetryButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get filesRetryButton;
+
+  /// No description provided for @filesUnmountTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Unmount {path}'**
+  String filesUnmountTooltip(Object path);
+
+  /// No description provided for @filesUpTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Up'**
+  String get filesUpTooltip;
+
+  /// No description provided for @filesUploadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Upload failed: {error}'**
+  String filesUploadFailed(Object error);
+
+  /// No description provided for @filesUploadFailures.
+  ///
+  /// In en, this message translates to:
+  /// **', {count} failed: {names}'**
+  String filesUploadFailures(Object count, Object names);
+
+  /// No description provided for @filesUploadSummary.
+  ///
+  /// In en, this message translates to:
+  /// **'{uploaded, plural, =1{Uploaded 1 file} other{Uploaded {uploaded} files}}{failures}'**
+  String filesUploadSummary(Object failures, num uploaded);
+
+  /// No description provided for @filesUploadTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Upload files here'**
+  String get filesUploadTooltip;
+
+  /// No description provided for @keysAddButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Add key'**
+  String get keysAddButton;
+
+  /// No description provided for @keysAddDialogTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Add key'**
+  String get keysAddDialogTitle;
+
+  /// No description provided for @keysAddNameDuplicate.
+  ///
+  /// In en, this message translates to:
+  /// **'A key with this name already exists.'**
+  String get keysAddNameDuplicate;
+
+  /// No description provided for @keysAddNameHint.
+  ///
+  /// In en, this message translates to:
+  /// **'GITHUB_TOKEN'**
+  String get keysAddNameHint;
+
+  /// No description provided for @keysAddNameInvalid.
+  ///
+  /// In en, this message translates to:
+  /// **'Use A–Z, 0–9 and underscores, starting with a letter.'**
+  String get keysAddNameInvalid;
+
+  /// No description provided for @keysAddNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Name'**
+  String get keysAddNameLabel;
+
+  /// No description provided for @keysDeleteBody.
+  ///
+  /// In en, this message translates to:
+  /// **'The saved value is removed from this device. A value from the .env file, if any, applies again.'**
+  String get keysDeleteBody;
+
+  /// No description provided for @keysDeleteTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete {name}?'**
+  String keysDeleteTitle(Object name);
+
+  /// No description provided for @keysSectionNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Values are never displayed. Saved keys persist on this device; session keys are gone on reload.'**
+  String get keysSectionNote;
+
+  /// No description provided for @keysSectionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Keys'**
+  String get keysSectionTitle;
+
+  /// No description provided for @keysSetButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Set'**
+  String get keysSetButton;
+
+  /// No description provided for @keysSetDialogTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Set {name}'**
+  String keysSetDialogTitle(Object name);
+
+  /// No description provided for @keysSourceEnv.
+  ///
+  /// In en, this message translates to:
+  /// **'env file'**
+  String get keysSourceEnv;
+
+  /// No description provided for @keysSourceNone.
+  ///
+  /// In en, this message translates to:
+  /// **'not set'**
+  String get keysSourceNone;
+
+  /// No description provided for @keysSourceProviderSession.
+  ///
+  /// In en, this message translates to:
+  /// **'provider key · this session'**
+  String get keysSourceProviderSession;
+
+  /// No description provided for @keysSourceSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'saved'**
+  String get keysSourceSaved;
+
+  /// No description provided for @keysValueHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Paste the key value'**
+  String get keysValueHint;
+
+  /// No description provided for @keysValueLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Value'**
+  String get keysValueLabel;
+
+  /// No description provided for @launcherChatActionsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Chat actions'**
+  String get launcherChatActionsTooltip;
+
+  /// No description provided for @faEntryHintTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Tap: continue the active chat · Hold: new chat'**
+  String get faEntryHintTooltip;
+
+  /// No description provided for @launcherChatEmptyHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Nothing here yet — ask Fa anything.'**
+  String get launcherChatEmptyHint;
+
+  /// No description provided for @launcherDissolveFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove folder'**
+  String get launcherDissolveFolder;
+
+  /// No description provided for @launcherFolderDefaultName.
+  ///
+  /// In en, this message translates to:
+  /// **'Folder'**
+  String get launcherFolderDefaultName;
+
+  /// No description provided for @launcherFolderNameHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Folder name'**
+  String get launcherFolderNameHint;
+
+  /// No description provided for @launcherOpenApp.
+  ///
+  /// In en, this message translates to:
+  /// **'Open'**
+  String get launcherOpenApp;
+
+  /// No description provided for @launcherOpenAppError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not open the app: {error}'**
+  String launcherOpenAppError(Object error);
+
+  /// No description provided for @launcherRenameFolderTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Rename folder'**
+  String get launcherRenameFolderTooltip;
+
+  /// No description provided for @launcherRestoreDemoApp.
+  ///
+  /// In en, this message translates to:
+  /// **'Restore reference version'**
+  String get launcherRestoreDemoApp;
+
+  /// No description provided for @launcherRestoreDemoAppDone.
+  ///
+  /// In en, this message translates to:
+  /// **'App code restored (your data was kept)'**
+  String get launcherRestoreDemoAppDone;
+
+  /// No description provided for @launcherRemoveWidget.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove widget'**
+  String get launcherRemoveWidget;
+
+  /// No description provided for @launcherRemoveWidgetTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove {name}?'**
+  String launcherRemoveWidgetTitle(String name);
+
+  /// No description provided for @launcherRemoveWidgetBody.
+  ///
+  /// In en, this message translates to:
+  /// **'The widget files are deleted; its saved data (storage.json) is kept, so reinstalling restores its state.'**
+  String get launcherRemoveWidgetBody;
+
+  /// No description provided for @launcherSearchHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Search widgets…'**
+  String get launcherSearchHint;
+
+  /// No description provided for @launcherTabWidgets.
+  ///
+  /// In en, this message translates to:
+  /// **'Widgets'**
+  String get launcherTabWidgets;
+
+  /// No description provided for @launcherLoadUnpacked.
+  ///
+  /// In en, this message translates to:
+  /// **'Load unpacked'**
+  String get launcherLoadUnpacked;
+
+  /// No description provided for @unpackedLoadTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Load unpacked widget'**
+  String get unpackedLoadTitle;
+
+  /// No description provided for @unpackedLoadIdLine.
+  ///
+  /// In en, this message translates to:
+  /// **'id: {id}'**
+  String unpackedLoadIdLine(Object id);
+
+  /// No description provided for @unpackedLoadNetworkNote.
+  ///
+  /// In en, this message translates to:
+  /// **'This widget declares network access — it can fetch from the network (jsr.fetchJson).'**
+  String get unpackedLoadNetworkNote;
+
+  /// No description provided for @unpackedLoadCommandsNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Shell commands it may run (jsr.exec): {commands}'**
+  String unpackedLoadCommandsNote(Object commands);
+
+  /// No description provided for @unpackedLoadReplaceNote.
+  ///
+  /// In en, this message translates to:
+  /// **'A widget with this id already exists ({source}, v{version}). Replacing overwrites its code; the saved data (storage.json) is kept.'**
+  String unpackedLoadReplaceNote(Object source, Object version);
+
+  /// No description provided for @unpackedLoadConfirm.
+  ///
+  /// In en, this message translates to:
+  /// **'Load'**
+  String get unpackedLoadConfirm;
+
+  /// No description provided for @unpackedLoadReplaceConfirm.
+  ///
+  /// In en, this message translates to:
+  /// **'Replace'**
+  String get unpackedLoadReplaceConfirm;
+
+  /// No description provided for @unpackedLoadErrorTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Widget was not loaded'**
+  String get unpackedLoadErrorTitle;
+
+  /// No description provided for @unpackedLoadDone.
+  ///
+  /// In en, this message translates to:
+  /// **'{name} loaded from the folder'**
+  String unpackedLoadDone(Object name);
+
+  /// No description provided for @unpackedLoadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Load failed: {error}'**
+  String unpackedLoadFailed(Object error);
+
+  /// No description provided for @unpackedSourceChip.
+  ///
+  /// In en, this message translates to:
+  /// **'unpacked'**
+  String get unpackedSourceChip;
+
+  /// No description provided for @unpackedSourceBadgeTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Loaded from a local folder (unpacked)'**
+  String get unpackedSourceBadgeTooltip;
+
+  /// No description provided for @unpackedSourceCatalog.
+  ///
+  /// In en, this message translates to:
+  /// **'installed from the catalog'**
+  String get unpackedSourceCatalog;
+
+  /// No description provided for @unpackedSourceUnpacked.
+  ///
+  /// In en, this message translates to:
+  /// **'loaded from a local folder'**
+  String get unpackedSourceUnpacked;
+
+  /// No description provided for @unpackedSourceAgent.
+  ///
+  /// In en, this message translates to:
+  /// **'created by the agent'**
+  String get unpackedSourceAgent;
+
+  /// No description provided for @unpackedSourceUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'installed from an unknown source ({source})'**
+  String unpackedSourceUnknown(Object source);
+
+  /// No description provided for @settingsResetApps.
+  ///
+  /// In en, this message translates to:
+  /// **'Reset apps'**
+  String get settingsResetApps;
+
+  /// No description provided for @settingsResetAppsHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Restore the widget apps to their initial state'**
+  String get settingsResetAppsHint;
+
+  /// No description provided for @settingsResetAppsConfirmTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Reset all apps?'**
+  String get settingsResetAppsConfirmTitle;
+
+  /// No description provided for @settingsResetAppsConfirmBody.
+  ///
+  /// In en, this message translates to:
+  /// **'This deletes EVERY widget you downloaded from the catalog or created here, together with ALL its data (saved state, settings, storage). The apps grid returns to a clean slate — re-download anything from Get widgets. This cannot be undone.'**
+  String get settingsResetAppsConfirmBody;
+
+  /// No description provided for @settingsResetAppsDone.
+  ///
+  /// In en, this message translates to:
+  /// **'Apps reset — {count} widget(s) removed'**
+  String settingsResetAppsDone(int count);
+
+  /// No description provided for @appsCatalogCreatedByMe.
+  ///
+  /// In en, this message translates to:
+  /// **'Created by me'**
+  String get appsCatalogCreatedByMe;
+
+  /// No description provided for @commonError.
+  ///
+  /// In en, this message translates to:
+  /// **'Something went wrong'**
+  String get commonError;
+
+  /// No description provided for @launcherTabGetWidgets.
+  ///
+  /// In en, this message translates to:
+  /// **'Get widgets'**
+  String get launcherTabGetWidgets;
+
+  /// No description provided for @launcherRestoreDemoAppFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not restore the app'**
+  String get launcherRestoreDemoAppFailed;
+
+  /// No description provided for @launcherSeedErrorCopy.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy error'**
+  String get launcherSeedErrorCopy;
+
+  /// No description provided for @launcherSeedErrorHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Send this error to Fa — it can fix the app.'**
+  String get launcherSeedErrorHint;
+
+  /// No description provided for @launcherSeedErrorTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'App failed to install'**
+  String get launcherSeedErrorTitle;
+
+  /// No description provided for @launcherManifestErrorTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'App failed to load'**
+  String get launcherManifestErrorTitle;
+
+  /// No description provided for @appsManifestErrorLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Manifest error'**
+  String get appsManifestErrorLabel;
+
+  /// No description provided for @launcherTileSizeIcon.
+  ///
+  /// In en, this message translates to:
+  /// **'Icon (1×1)'**
+  String get launcherTileSizeIcon;
+
+  /// No description provided for @launcherTileSizeLarge.
+  ///
+  /// In en, this message translates to:
+  /// **'Large (4×4)'**
+  String get launcherTileSizeLarge;
+
+  /// No description provided for @launcherTileSizeMedium.
+  ///
+  /// In en, this message translates to:
+  /// **'Medium (4×2)'**
+  String get launcherTileSizeMedium;
+
+  /// No description provided for @launcherTileSizeReset.
+  ///
+  /// In en, this message translates to:
+  /// **'Reset to default'**
+  String get launcherTileSizeReset;
+
+  /// No description provided for @launcherTileSizeSmall.
+  ///
+  /// In en, this message translates to:
+  /// **'Small (2×2)'**
+  String get launcherTileSizeSmall;
+
+  /// No description provided for @launcherTileSizeTall.
+  ///
+  /// In en, this message translates to:
+  /// **'Tall (1×2)'**
+  String get launcherTileSizeTall;
+
+  /// No description provided for @launcherTileSizeWide.
+  ///
+  /// In en, this message translates to:
+  /// **'Wide (2×1)'**
+  String get launcherTileSizeWide;
+
+  /// No description provided for @launcherTileSizeColumn.
+  ///
+  /// In en, this message translates to:
+  /// **'Column (1×3)'**
+  String get launcherTileSizeColumn;
+
+  /// No description provided for @launcherTileSizeRow.
+  ///
+  /// In en, this message translates to:
+  /// **'Row (3×1)'**
+  String get launcherTileSizeRow;
+
+  /// No description provided for @mediaFileMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'Media file not found'**
+  String get mediaFileMissing;
+
+  /// No description provided for @mediaModelsApiKeyNameHelper.
+  ///
+  /// In en, this message translates to:
+  /// **'Name of a saved key (see Keys) — never the key itself. Empty reuses the main connection\'s key.'**
+  String get mediaModelsApiKeyNameHelper;
+
+  /// No description provided for @mediaModelsApiKeyNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'API key name (optional)'**
+  String get mediaModelsApiKeyNameLabel;
+
+  /// No description provided for @mediaModelsCapabilitiesNote.
+  ///
+  /// In en, this message translates to:
+  /// **'This endpoint\'s models suggest support for:'**
+  String get mediaModelsCapabilitiesNote;
+
+  /// No description provided for @mediaModelsClearButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Clear'**
+  String get mediaModelsClearButton;
+
+  /// No description provided for @mediaModelsEditTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Edit {slot}'**
+  String mediaModelsEditTitle(Object slot);
+
+  /// No description provided for @mediaModelsFallbackSummary.
+  ///
+  /// In en, this message translates to:
+  /// **'Same as main connection'**
+  String get mediaModelsFallbackSummary;
+
+  /// No description provided for @mediaModelsMainConnection.
+  ///
+  /// In en, this message translates to:
+  /// **'Main connection'**
+  String get mediaModelsMainConnection;
+
+  /// No description provided for @mediaModelsOverrideSummary.
+  ///
+  /// In en, this message translates to:
+  /// **'{modelId} · {host}'**
+  String mediaModelsOverrideSummary(Object host, Object modelId);
+
+  /// No description provided for @mediaModelsSectionNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Image, audio, video and transcription calls use the main connection unless a slot overrides it.'**
+  String get mediaModelsSectionNote;
+
+  /// No description provided for @mediaModelsSectionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Media models'**
+  String get mediaModelsSectionTitle;
+
+  /// No description provided for @mediaModelsSlotAudioTts.
+  ///
+  /// In en, this message translates to:
+  /// **'Text-to-speech'**
+  String get mediaModelsSlotAudioTts;
+
+  /// No description provided for @mediaModelsSlotImageGeneration.
+  ///
+  /// In en, this message translates to:
+  /// **'Image generation'**
+  String get mediaModelsSlotImageGeneration;
+
+  /// No description provided for @mediaModelsSlotMusicGeneration.
+  ///
+  /// In en, this message translates to:
+  /// **'Music generation'**
+  String get mediaModelsSlotMusicGeneration;
+
+  /// No description provided for @mediaModelsSlotTranscription.
+  ///
+  /// In en, this message translates to:
+  /// **'Transcription'**
+  String get mediaModelsSlotTranscription;
+
+  /// No description provided for @mediaModelsSlotVideoGeneration.
+  ///
+  /// In en, this message translates to:
+  /// **'Video generation'**
+  String get mediaModelsSlotVideoGeneration;
+
+  /// No description provided for @mediaModelsSlotVision.
+  ///
+  /// In en, this message translates to:
+  /// **'Vision (image reading)'**
+  String get mediaModelsSlotVision;
+
+  /// No description provided for @mediaMuteTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Mute'**
+  String get mediaMuteTooltip;
+
+  /// No description provided for @mediaPauseTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Pause'**
+  String get mediaPauseTooltip;
+
+  /// No description provided for @mediaPlayTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Play'**
+  String get mediaPlayTooltip;
+
+  /// No description provided for @mediaUnmuteTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Unmute'**
+  String get mediaUnmuteTooltip;
+
+  /// No description provided for @mediaVideoUnsupportedWeb.
+  ///
+  /// In en, this message translates to:
+  /// **'Video playback is not supported in the web build'**
+  String get mediaVideoUnsupportedWeb;
+
+  /// No description provided for @modelPresetBudgetDescription.
+  ///
+  /// In en, this message translates to:
+  /// **'Cheapest solid combo for every day — fast chat plus all media on OpenRouter'**
+  String get modelPresetBudgetDescription;
+
+  /// No description provided for @modelPresetBudgetName.
+  ///
+  /// In en, this message translates to:
+  /// **'Budget optimal'**
+  String get modelPresetBudgetName;
+
+  /// No description provided for @modelPresetQualityDescription.
+  ///
+  /// In en, this message translates to:
+  /// **'Top-tier chat plus flagship image generation — the strongest combo on OpenRouter'**
+  String get modelPresetQualityDescription;
+
+  /// No description provided for @modelPresetQualityName.
+  ///
+  /// In en, this message translates to:
+  /// **'Quality'**
+  String get modelPresetQualityName;
+
+  /// No description provided for @modelPresetsApplied.
+  ///
+  /// In en, this message translates to:
+  /// **'Applied'**
+  String get modelPresetsApplied;
+
+  /// No description provided for @modelPresetsChatLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Chat'**
+  String get modelPresetsChatLabel;
+
+  /// No description provided for @modelPresetsKeyMissing.
+  ///
+  /// In en, this message translates to:
+  /// **'This preset needs an API key for {provider}.'**
+  String modelPresetsKeyMissing(Object provider);
+
+  /// No description provided for @modelPresetsSectionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Model presets'**
+  String get modelPresetsSectionTitle;
+
+  /// No description provided for @modelPresetsSetKey.
+  ///
+  /// In en, this message translates to:
+  /// **'Set key'**
+  String get modelPresetsSetKey;
+
+  /// No description provided for @onboardingAiDisclaimer.
+  ///
+  /// In en, this message translates to:
+  /// **'Answers come from third-party AI providers you connect. AI can be wrong or incomplete — always verify important information.'**
+  String get onboardingAiDisclaimer;
+
+  /// No description provided for @onboardingAiDisclaimerTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'AI can make mistakes'**
+  String get onboardingAiDisclaimerTitle;
+
+  /// No description provided for @onboardingFeatureApps.
+  ///
+  /// In en, this message translates to:
+  /// **'Builds real mini-apps with live widgets right on your home grid'**
+  String get onboardingFeatureApps;
+
+  /// No description provided for @onboardingFeatureAutomation.
+  ///
+  /// In en, this message translates to:
+  /// **'Automates your calendar, reminders and smart home'**
+  String get onboardingFeatureAutomation;
+
+  /// No description provided for @onboardingFeatureMedia.
+  ///
+  /// In en, this message translates to:
+  /// **'Generates images, music and video on demand'**
+  String get onboardingFeatureMedia;
+
+  /// No description provided for @onboardingGetStarted.
+  ///
+  /// In en, this message translates to:
+  /// **'Get started'**
+  String get onboardingGetStarted;
+
+  /// No description provided for @onboardingModelsBody.
+  ///
+  /// In en, this message translates to:
+  /// **'One tap applies a full combo — chat plus image, music and video models. You can change everything later in Settings.'**
+  String get onboardingModelsBody;
+
+  /// No description provided for @onboardingModelsSetUpLater.
+  ///
+  /// In en, this message translates to:
+  /// **'Set up later'**
+  String get onboardingModelsSetUpLater;
+
+  /// No description provided for @onboardingModelsTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Pick your models'**
+  String get onboardingModelsTitle;
+
+  /// No description provided for @onboardingNext.
+  ///
+  /// In en, this message translates to:
+  /// **'Continue'**
+  String get onboardingNext;
+
+  /// No description provided for @onboardingPermissionCalendar.
+  ///
+  /// In en, this message translates to:
+  /// **'Calendar'**
+  String get onboardingPermissionCalendar;
+
+  /// No description provided for @onboardingPermissionCalendarDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Event planning'**
+  String get onboardingPermissionCalendarDesc;
+
+  /// No description provided for @onboardingPermissionContacts.
+  ///
+  /// In en, this message translates to:
+  /// **'Contacts'**
+  String get onboardingPermissionContacts;
+
+  /// No description provided for @onboardingPermissionContactsDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Call and message actions'**
+  String get onboardingPermissionContactsDesc;
+
+  /// No description provided for @onboardingPermissionHealth.
+  ///
+  /// In en, this message translates to:
+  /// **'Health'**
+  String get onboardingPermissionHealth;
+
+  /// No description provided for @onboardingPermissionHealthDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Activity summaries'**
+  String get onboardingPermissionHealthDesc;
+
+  /// No description provided for @onboardingPermissionHome.
+  ///
+  /// In en, this message translates to:
+  /// **'Home'**
+  String get onboardingPermissionHome;
+
+  /// No description provided for @onboardingPermissionHomeDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Smart home control'**
+  String get onboardingPermissionHomeDesc;
+
+  /// No description provided for @onboardingPermissionMicrophone.
+  ///
+  /// In en, this message translates to:
+  /// **'Microphone'**
+  String get onboardingPermissionMicrophone;
+
+  /// No description provided for @onboardingPermissionMicrophoneDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Voice input'**
+  String get onboardingPermissionMicrophoneDesc;
+
+  /// No description provided for @onboardingPermissionNotifications.
+  ///
+  /// In en, this message translates to:
+  /// **'Notifications'**
+  String get onboardingPermissionNotifications;
+
+  /// No description provided for @onboardingPermissionNotificationsDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Reminders and alerts'**
+  String get onboardingPermissionNotificationsDesc;
+
+  /// No description provided for @onboardingPermissionsBody.
+  ///
+  /// In en, this message translates to:
+  /// **'All of these are optional — core chat works without any of them. Fa asks only in context, when a feature actually needs it, and you can change your mind anytime in the system Settings.'**
+  String get onboardingPermissionsBody;
+
+  /// No description provided for @onboardingPermissionsTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Permissions, on your terms'**
+  String get onboardingPermissionsTitle;
+
+  /// No description provided for @onboardingPrivacyKeysDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'API keys live in the platform Keychain (iOS/macOS) or the local secure store — never in chat logs.'**
+  String get onboardingPrivacyKeysDesc;
+
+  /// No description provided for @onboardingPrivacyKeysTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Keys stay locked away'**
+  String get onboardingPrivacyKeysTitle;
+
+  /// No description provided for @onboardingPrivacyOnDeviceDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Your conversations and files stay on this device.'**
+  String get onboardingPrivacyOnDeviceDesc;
+
+  /// No description provided for @onboardingPrivacyOnDeviceTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Chats and files stay on device'**
+  String get onboardingPrivacyOnDeviceTitle;
+
+  /// No description provided for @onboardingPrivacyPolicyLink.
+  ///
+  /// In en, this message translates to:
+  /// **'Privacy policy'**
+  String get onboardingPrivacyPolicyLink;
+
+  /// No description provided for @onboardingPrivacyProvidersDesc.
+  ///
+  /// In en, this message translates to:
+  /// **'Content is sent only to the AI providers you explicitly connect.'**
+  String get onboardingPrivacyProvidersDesc;
+
+  /// No description provided for @onboardingPrivacyProvidersTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'You choose the providers'**
+  String get onboardingPrivacyProvidersTitle;
+
+  /// No description provided for @onboardingPrivacyTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Your data stays yours'**
+  String get onboardingPrivacyTitle;
+
+  /// No description provided for @onboardingSkip.
+  ///
+  /// In en, this message translates to:
+  /// **'Skip'**
+  String get onboardingSkip;
+
+  /// No description provided for @onboardingWelcomeBody.
+  ///
+  /// In en, this message translates to:
+  /// **'Chat with an AI agent that does real work, not just talk.'**
+  String get onboardingWelcomeBody;
+
+  /// No description provided for @onboardingWelcomeTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Meet Fa'**
+  String get onboardingWelcomeTitle;
+
+  /// No description provided for @quickStartCachedLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'{size} · {bytes} cached'**
+  String quickStartCachedLabel(Object bytes, Object size);
+
+  /// No description provided for @quickStartLoading.
+  ///
+  /// In en, this message translates to:
+  /// **'Loading model…'**
+  String get quickStartLoading;
+
+  /// No description provided for @quickStartSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Already on this device — one tap, no API key needed.'**
+  String get quickStartSubtitle;
+
+  /// No description provided for @quickStartTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Downloaded models'**
+  String get quickStartTitle;
+
+  /// No description provided for @quickStartUse.
+  ///
+  /// In en, this message translates to:
+  /// **'Use'**
+  String get quickStartUse;
+
+  /// No description provided for @secretRequestInvalidName.
+  ///
+  /// In en, this message translates to:
+  /// **'Use UPPER_SNAKE: A–Z, 0–9, _, starting with a letter'**
+  String get secretRequestInvalidName;
+
+  /// No description provided for @secretRequestNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Key name'**
+  String get secretRequestNameLabel;
+
+  /// No description provided for @secretRequestNotNow.
+  ///
+  /// In en, this message translates to:
+  /// **'Not now'**
+  String get secretRequestNotNow;
+
+  /// No description provided for @secretRequestSave.
+  ///
+  /// In en, this message translates to:
+  /// **'Save'**
+  String get secretRequestSave;
+
+  /// No description provided for @secretRequestTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Fa needs a key'**
+  String get secretRequestTitle;
+
+  /// No description provided for @secretRequestValueLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Key value'**
+  String get secretRequestValueLabel;
+
+  /// No description provided for @settingsAddProvider.
+  ///
+  /// In en, this message translates to:
+  /// **'Add provider'**
+  String get settingsAddProvider;
+
+  /// No description provided for @settingsApiKeyHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Paste your provider key'**
+  String get settingsApiKeyHint;
+
+  /// No description provided for @settingsApiKeyLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'API key'**
+  String get settingsApiKeyLabel;
+
+  /// No description provided for @settingsApiKeyLocalHelper.
+  ///
+  /// In en, this message translates to:
+  /// **'Leave empty for local servers (llama.cpp, Ollama, LM Studio)'**
+  String get settingsApiKeyLocalHelper;
+
+  /// No description provided for @settingsApiKeyOptionalLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'API key (optional)'**
+  String get settingsApiKeyOptionalLabel;
+
+  /// No description provided for @settingsApiKeyRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'API key is required'**
+  String get settingsApiKeyRequired;
+
+  /// No description provided for @settingsApplyButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Apply'**
+  String get settingsApplyButton;
+
+  /// No description provided for @settingsBaseUrlHelper.
+  ///
+  /// In en, this message translates to:
+  /// **'OpenAI-compatible endpoint'**
+  String get settingsBaseUrlHelper;
+
+  /// No description provided for @settingsBaseUrlLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Base URL'**
+  String get settingsBaseUrlLabel;
+
+  /// No description provided for @settingsBaseUrlRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Base URL is required'**
+  String get settingsBaseUrlRequired;
+
+  /// No description provided for @settingsCliOnlyTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'CLI-only settings'**
+  String get settingsCliOnlyTitle;
+
+  /// No description provided for @settingsCliOnlyLead.
+  ///
+  /// In en, this message translates to:
+  /// **'These settings live in the CLI and its config file — this app cannot host them:'**
+  String get settingsCliOnlyLead;
+
+  /// No description provided for @settingsCliOnlyMcpServers.
+  ///
+  /// In en, this message translates to:
+  /// **'MCP servers'**
+  String get settingsCliOnlyMcpServers;
+
+  /// No description provided for @settingsCliOnlyTtsrRules.
+  ///
+  /// In en, this message translates to:
+  /// **'Stream rules (TTSR)'**
+  String get settingsCliOnlyTtsrRules;
+
+  /// No description provided for @settingsCliOnlyCubeSandbox.
+  ///
+  /// In en, this message translates to:
+  /// **'Cube sandbox'**
+  String get settingsCliOnlyCubeSandbox;
+
+  /// No description provided for @settingsCliOnlyPromptOverrides.
+  ///
+  /// In en, this message translates to:
+  /// **'Prompt overrides'**
+  String get settingsCliOnlyPromptOverrides;
+
+  /// No description provided for @settingsCliOnlyAgentMode.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent mode'**
+  String get settingsCliOnlyAgentMode;
+
+  /// No description provided for @settingsCliOnlyMemoryStores.
+  ///
+  /// In en, this message translates to:
+  /// **'Memory stores'**
+  String get settingsCliOnlyMemoryStores;
+
+  /// No description provided for @settingsCancelButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Cancel'**
+  String get settingsCancelButton;
+
+  /// No description provided for @settingsCoderBadge.
+  ///
+  /// In en, this message translates to:
+  /// **'coder'**
+  String get settingsCoderBadge;
+
+  /// No description provided for @settingsCorsNoteCustom.
+  ///
+  /// In en, this message translates to:
+  /// **'Any OpenAI-compatible endpoint. The provider must allow browser (CORS) requests — api.anthropic.com does not, so reach Anthropic models via OpenRouter instead.'**
+  String get settingsCorsNoteCustom;
+
+  /// No description provided for @settingsCopyDebugLogs.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy debug logs'**
+  String get settingsCopyDebugLogs;
+
+  /// No description provided for @settingsSendTestCrashReport.
+  ///
+  /// In en, this message translates to:
+  /// **'Send test crash report'**
+  String get settingsSendTestCrashReport;
+
+  /// No description provided for @settingsTestCrashReportNoFirebase.
+  ///
+  /// In en, this message translates to:
+  /// **'Crashlytics not initialized on this device'**
+  String get settingsTestCrashReportNoFirebase;
+
+  /// No description provided for @settingsTestCrashReportSent.
+  ///
+  /// In en, this message translates to:
+  /// **'Test report sent — check the Firebase console in a few minutes'**
+  String get settingsTestCrashReportSent;
+
+  /// No description provided for @settingsDebugLogsCopied.
+  ///
+  /// In en, this message translates to:
+  /// **'Debug logs copied to clipboard'**
+  String get settingsDebugLogsCopied;
+
+  /// No description provided for @settingsCorsNoteOllama.
+  ///
+  /// In en, this message translates to:
+  /// **'Calls go straight from your browser to ollama.com, which currently does not send CORS headers — browser calls fail. Use OpenRouter here, or pick Ollama from the mobile/desktop app instead.'**
+  String get settingsCorsNoteOllama;
+
+  /// No description provided for @settingsDefaultChatModelTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Default chat model'**
+  String get settingsDefaultChatModelTitle;
+
+  /// No description provided for @settingsDapAddConnection.
+  ///
+  /// In en, this message translates to:
+  /// **'Add connection'**
+  String get settingsDapAddConnection;
+
+  /// No description provided for @settingsDapAgentIdLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent id'**
+  String get settingsDapAgentIdLabel;
+
+  /// No description provided for @settingsDapAgentNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent name'**
+  String get settingsDapAgentNameLabel;
+
+  /// The hub password field on the connection editor
+  ///
+  /// In en, this message translates to:
+  /// **'Hub password'**
+  String get settingsDapPasswordLabel;
+
+  /// No description provided for @settingsDapChannelsEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'No channels yet — channels appear here once the agent joins one (dap_invite / dap_connect).'**
+  String get settingsDapChannelsEmpty;
+
+  /// No description provided for @settingsDapChannelsTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Channels'**
+  String get settingsDapChannelsTitle;
+
+  /// No description provided for @settingsDapEditConnection.
+  ///
+  /// In en, this message translates to:
+  /// **'Edit connection'**
+  String get settingsDapEditConnection;
+
+  /// No description provided for @settingsDapMakeActive.
+  ///
+  /// In en, this message translates to:
+  /// **'Make active'**
+  String get settingsDapMakeActive;
+
+  /// No description provided for @settingsDapActiveChip.
+  ///
+  /// In en, this message translates to:
+  /// **'Active'**
+  String get settingsDapActiveChip;
+
+  /// No description provided for @settingsDapSavedTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Saved connections'**
+  String get settingsDapSavedTitle;
+
+  /// No description provided for @settingsDapSavedHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Bookmarked hubs. Tap one to make it the hub this agent is online on — the switch is live.'**
+  String get settingsDapSavedHint;
+
+  /// No description provided for @settingsDapRemoveSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove'**
+  String get settingsDapRemoveSaved;
+
+  /// No description provided for @settingsDapEnvNote.
+  ///
+  /// In en, this message translates to:
+  /// **'DAP_HUB_URL or DAP_AGENT_NAME is set in the environment — env overrides the saved connection.'**
+  String get settingsDapEnvNote;
+
+  /// No description provided for @settingsDapHubHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Let Fa agents find and message each other'**
+  String get settingsDapHubHint;
+
+  /// No description provided for @settingsDapHubIntro.
+  ///
+  /// In en, this message translates to:
+  /// **'A hub is where your Fa agents meet — the CLI, this app, and the browser extension. Connect once and this agent becomes reachable by name: others can find it and send it messages.'**
+  String get settingsDapHubIntro;
+
+  /// No description provided for @settingsAgentNetworkJoin.
+  ///
+  /// In en, this message translates to:
+  /// **'Join as agent'**
+  String get settingsAgentNetworkJoin;
+
+  /// No description provided for @settingsAgentNetworkJoinHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Your agent joins the hub as a live, addressable member — CLI peers and other apps reach it by DM.'**
+  String get settingsAgentNetworkJoinHint;
+
+  /// No description provided for @settingsAgentNetworkUrl.
+  ///
+  /// In en, this message translates to:
+  /// **'Hub URL'**
+  String get settingsAgentNetworkUrl;
+
+  /// No description provided for @settingsAgentNetworkToken.
+  ///
+  /// In en, this message translates to:
+  /// **'Pairing token'**
+  String get settingsAgentNetworkToken;
+
+  /// No description provided for @settingsAgentNetworkName.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent name'**
+  String get settingsAgentNetworkName;
+
+  /// No description provided for @settingsAgentNetworkSave.
+  ///
+  /// In en, this message translates to:
+  /// **'Save'**
+  String get settingsAgentNetworkSave;
+
+  /// No description provided for @settingsAgentNetworkConnected.
+  ///
+  /// In en, this message translates to:
+  /// **'Connected'**
+  String get settingsAgentNetworkConnected;
+
+  /// No description provided for @settingsAgentNetworkConnecting.
+  ///
+  /// In en, this message translates to:
+  /// **'Connecting…'**
+  String get settingsAgentNetworkConnecting;
+
+  /// No description provided for @settingsAgentNetworkOffline.
+  ///
+  /// In en, this message translates to:
+  /// **'Offline'**
+  String get settingsAgentNetworkOffline;
+
+  /// No description provided for @settingsAgentNetworkPeers.
+  ///
+  /// In en, this message translates to:
+  /// **'Peers'**
+  String get settingsAgentNetworkPeers;
+
+  /// No description provided for @settingsAgentNetworkNoPeers.
+  ///
+  /// In en, this message translates to:
+  /// **'No peers visible yet'**
+  String get settingsAgentNetworkNoPeers;
+
+  /// No description provided for @settingsAgentNetworkDmHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Message a peer…'**
+  String get settingsAgentNetworkDmHint;
+
+  /// No description provided for @settingsAgentNetworkSend.
+  ///
+  /// In en, this message translates to:
+  /// **'Send DM'**
+  String get settingsAgentNetworkSend;
+
+  /// No description provided for @settingsAgentNetworkUnsupported.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent network membership is not available on this platform.'**
+  String get settingsAgentNetworkUnsupported;
+
+  /// No description provided for @settingsAgentNetworkSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent network settings saved'**
+  String get settingsAgentNetworkSaved;
+
+  /// No description provided for @settingsDapIdentityTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'How other agents see you'**
+  String get settingsDapIdentityTitle;
+
+  /// No description provided for @settingsDapIdentityHint.
+  ///
+  /// In en, this message translates to:
+  /// **'The name is how other agents address you. The id is derived from this device’s key.'**
+  String get settingsDapIdentityHint;
+
+  /// No description provided for @settingsDapInboundTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Incoming messages'**
+  String get settingsDapInboundTitle;
+
+  /// No description provided for @settingsDapInboundHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Where messages from other agents land'**
+  String get settingsDapInboundHint;
+
+  /// No description provided for @settingsDapInboundDedicated.
+  ///
+  /// In en, this message translates to:
+  /// **'A dedicated agent session (recommended)'**
+  String get settingsDapInboundDedicated;
+
+  /// No description provided for @settingsDapInboundCurrent.
+  ///
+  /// In en, this message translates to:
+  /// **'Whichever session is open'**
+  String get settingsDapInboundCurrent;
+
+  /// No description provided for @settingsDapInboundNamed.
+  ///
+  /// In en, this message translates to:
+  /// **'A session you pick'**
+  String get settingsDapInboundNamed;
+
+  /// No description provided for @settingsDapInboundBadgeTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'This session receives messages from other agents'**
+  String get settingsDapInboundBadgeTooltip;
+
+  /// No description provided for @settingsDapHubTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Agent network'**
+  String get settingsDapHubTitle;
+
+  /// No description provided for @settingsDapNameHint.
+  ///
+  /// In en, this message translates to:
+  /// **'alice'**
+  String get settingsDapNameHint;
+
+  /// Helper text: an empty password field keeps the stored one
+  ///
+  /// In en, this message translates to:
+  /// **'Leave empty to keep the current one'**
+  String get settingsDapPasswordHint;
+
+  /// No description provided for @settingsDapProbeButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Check connection'**
+  String get settingsDapProbeButton;
+
+  /// No description provided for @settingsDapStatusConnected.
+  ///
+  /// In en, this message translates to:
+  /// **'Connected'**
+  String get settingsDapStatusConnected;
+
+  /// No description provided for @settingsDapStatusOffline.
+  ///
+  /// In en, this message translates to:
+  /// **'Unreachable'**
+  String get settingsDapStatusOffline;
+
+  /// No description provided for @settingsDapStatusUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'Not checked'**
+  String get settingsDapStatusUnknown;
+
+  /// No description provided for @settingsDapUnsupported.
+  ///
+  /// In en, this message translates to:
+  /// **'DAP hub is not supported on this platform.'**
+  String get settingsDapUnsupported;
+
+  /// No description provided for @settingsDapUrlHint.
+  ///
+  /// In en, this message translates to:
+  /// **'hub.example.com or ws://hub.example.com/ws'**
+  String get settingsDapUrlHint;
+
+  /// No description provided for @settingsDapUrlLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Hub URL'**
+  String get settingsDapUrlLabel;
+
+  /// No description provided for @settingsDapUrlRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Hub URL is required'**
+  String get settingsDapUrlRequired;
+
+  /// No description provided for @settingsDapLoadFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not read the DAP config on this machine.'**
+  String get settingsDapLoadFailed;
+
+  /// No description provided for @settingsDapSaveFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not save the DAP connection — check the hub URL.'**
+  String get settingsDapSaveFailed;
+
+  /// No description provided for @settingsDeleteButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete'**
+  String get settingsDeleteButton;
+
+  /// No description provided for @settingsDeleteProviderBody.
+  ///
+  /// In en, this message translates to:
+  /// **'The provider is removed from the picker. The current connection is not affected.'**
+  String get settingsDeleteProviderBody;
+
+  /// No description provided for @settingsDeleteProviderTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete {name}?'**
+  String settingsDeleteProviderTitle(Object name);
+
+  /// No description provided for @settingsDownloadingWeights.
+  ///
+  /// In en, this message translates to:
+  /// **'Downloading model weights…'**
+  String get settingsDownloadingWeights;
+
+  /// No description provided for @settingsEditButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Edit'**
+  String get settingsEditButton;
+
+  /// No description provided for @settingsEditProviderTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Edit provider'**
+  String get settingsEditProviderTitle;
+
+  /// No description provided for @settingsEditorKeyNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Name, URL and model are saved; the key is kept in memory for this session only — never persisted.'**
+  String get settingsEditorKeyNote;
+
+  /// No description provided for @settingsEditorKeyNoteSecure.
+  ///
+  /// In en, this message translates to:
+  /// **'Name, URL and model are saved; the key is stored in the device\'s secure key store (Keychain/Keystore) while it\'s available.'**
+  String get settingsEditorKeyNoteSecure;
+
+  /// No description provided for @settingsEditorKeepKeyNote.
+  ///
+  /// In en, this message translates to:
+  /// **'A key is saved for this provider — leave the field empty to keep it.'**
+  String get settingsEditorKeepKeyNote;
+
+  /// No description provided for @settingsKeyNoteCustom.
+  ///
+  /// In en, this message translates to:
+  /// **'The provider definition (name, URL, model) is saved — no secrets. The API key stays in memory for this session only and is gone on reload.'**
+  String get settingsKeyNoteCustom;
+
+  /// No description provided for @settingsKeyNoteCustomSecure.
+  ///
+  /// In en, this message translates to:
+  /// **'The provider definition (name, URL, model) is saved — no secrets. Saved keys are stored in the device\'s secure key store (Keychain/Keystore) while it\'s available; an unsaved key stays in memory for this session only.'**
+  String get settingsKeyNoteCustomSecure;
+
+  /// No description provided for @settingsKeyNoteHosted.
+  ///
+  /// In en, this message translates to:
+  /// **'In-memory only: your key is never persisted and is gone on reload. Calls go straight from your browser to the provider — nothing is proxied or stored.'**
+  String get settingsKeyNoteHosted;
+
+  /// No description provided for @settingsKeyNoteHostedSecure.
+  ///
+  /// In en, this message translates to:
+  /// **'Saved keys are stored in the device\'s secure key store (Keychain/Keystore) while it\'s available; a key only typed into the form stays in memory for this session. Calls go straight from the app to the provider — nothing is proxied.'**
+  String get settingsKeyNoteHostedSecure;
+
+  /// No description provided for @settingsLoadingModel.
+  ///
+  /// In en, this message translates to:
+  /// **'Loading model…'**
+  String get settingsLoadingModel;
+
+  /// No description provided for @settingsModelIdLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Model id'**
+  String get settingsModelIdLabel;
+
+  /// No description provided for @settingsModelIdOptionalLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Model id (optional)'**
+  String get settingsModelIdOptionalLabel;
+
+  /// No description provided for @settingsModelIdRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Model id is required'**
+  String get settingsModelIdRequired;
+
+  /// No description provided for @settingsModelsFetching.
+  ///
+  /// In en, this message translates to:
+  /// **'Fetching models from the endpoint…'**
+  String get settingsModelsFetching;
+
+  /// No description provided for @settingsModelsGroupTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Models'**
+  String get settingsModelsGroupTitle;
+
+  /// No description provided for @settingsNameRequired.
+  ///
+  /// In en, this message translates to:
+  /// **'Name is required'**
+  String get settingsNameRequired;
+
+  /// No description provided for @settingsOnDeviceModelLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device model'**
+  String get settingsOnDeviceModelLabel;
+
+  /// No description provided for @settingsPickModelTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Choose model'**
+  String get settingsPickModelTitle;
+
+  /// No description provided for @settingsPickProviderTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Choose provider'**
+  String get settingsPickProviderTitle;
+
+  /// No description provided for @settingsPresetCustom.
+  ///
+  /// In en, this message translates to:
+  /// **'Custom'**
+  String get settingsPresetCustom;
+
+  /// No description provided for @settingsPresetOllama.
+  ///
+  /// In en, this message translates to:
+  /// **'Ollama'**
+  String get settingsPresetOllama;
+
+  /// No description provided for @settingsPresetOpenrouter.
+  ///
+  /// In en, this message translates to:
+  /// **'OpenRouter'**
+  String get settingsPresetOpenrouter;
+
+  /// No description provided for @settingsPresetTransformersJs.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device (transformers.js)'**
+  String get settingsPresetTransformersJs;
+
+  /// No description provided for @settingsPresetWebllm.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device (WebLLM)'**
+  String get settingsPresetWebllm;
+
+  /// No description provided for @settingsProviderLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Provider'**
+  String get settingsProviderLabel;
+
+  /// No description provided for @settingsProviderModelSummary.
+  ///
+  /// In en, this message translates to:
+  /// **'{model} · {provider}'**
+  String settingsProviderModelSummary(Object model, Object provider);
+
+  /// No description provided for @settingsProviderNameHint.
+  ///
+  /// In en, this message translates to:
+  /// **'My provider'**
+  String get settingsProviderNameHint;
+
+  /// No description provided for @settingsProviderNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Name'**
+  String get settingsProviderNameLabel;
+
+  /// No description provided for @settingsProvidersSectionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Providers'**
+  String get settingsProvidersSectionTitle;
+
+  /// No description provided for @settingsSaveButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Save'**
+  String get settingsSaveButton;
+
+  /// No description provided for @settingsStaleModelCache.
+  ///
+  /// In en, this message translates to:
+  /// **'The previously used model ({model}) was removed from the cache — pick a model to download it again.'**
+  String settingsStaleModelCache(Object model);
+
+  /// No description provided for @settingsSkillsAccess.
+  ///
+  /// In en, this message translates to:
+  /// **'Skills access'**
+  String get settingsSkillsAccess;
+
+  /// No description provided for @settingsSkillsAccessHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Reuse skills Claude, Copilot or Codex left in the project folder (.claude, .github, .codex)'**
+  String get settingsSkillsAccessHint;
+
+  /// No description provided for @settingsSkillsToggles.
+  ///
+  /// In en, this message translates to:
+  /// **'Built-in skills'**
+  String get settingsSkillsToggles;
+
+  /// No description provided for @settingsSkillsTogglesHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Enable or disable the skills that ship with Fa'**
+  String get settingsSkillsTogglesHint;
+
+  /// No description provided for @skillsAccessAsk.
+  ///
+  /// In en, this message translates to:
+  /// **'Ask'**
+  String get skillsAccessAsk;
+
+  /// No description provided for @skillsAccessAllowed.
+  ///
+  /// In en, this message translates to:
+  /// **'Allowed'**
+  String get skillsAccessAllowed;
+
+  /// No description provided for @skillsAccessDenied.
+  ///
+  /// In en, this message translates to:
+  /// **'Denied'**
+  String get skillsAccessDenied;
+
+  /// No description provided for @skillsAccessDialogTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Reuse existing agent skills?'**
+  String get skillsAccessDialogTitle;
+
+  /// No description provided for @skillsAccessDialogBody.
+  ///
+  /// In en, this message translates to:
+  /// **'This project may contain skills from Claude, Copilot or Codex (.claude, .github, .codex folders) — instructions other tools placed on this machine. Fa can reuse them for your tasks.'**
+  String get skillsAccessDialogBody;
+
+  /// No description provided for @skillsAccessAllow.
+  ///
+  /// In en, this message translates to:
+  /// **'Allow'**
+  String get skillsAccessAllow;
+
+  /// No description provided for @skillsAccessNotNow.
+  ///
+  /// In en, this message translates to:
+  /// **'Not now'**
+  String get skillsAccessNotNow;
+
+  /// No description provided for @settingsThemeDark.
+  ///
+  /// In en, this message translates to:
+  /// **'Dark'**
+  String get settingsThemeDark;
+
+  /// No description provided for @settingsThemeLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme'**
+  String get settingsThemeLabel;
+
+  /// No description provided for @settingsChatTextLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Chat text size'**
+  String get settingsChatTextLabel;
+
+  /// No description provided for @settingsImagePreviewsLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'High-quality image previews'**
+  String get settingsImagePreviewsLabel;
+
+  /// No description provided for @settingsImagePreviewsHelper.
+  ///
+  /// In en, this message translates to:
+  /// **'Decode chat image previews at full resolution. Off keeps the faster 600px downscale.'**
+  String get settingsImagePreviewsHelper;
+
+  /// No description provided for @settingsThemeLight.
+  ///
+  /// In en, this message translates to:
+  /// **'Light'**
+  String get settingsThemeLight;
+
+  /// No description provided for @settingsThemeSystem.
+  ///
+  /// In en, this message translates to:
+  /// **'System'**
+  String get settingsThemeSystem;
+
+  /// No description provided for @settingsStartChat.
+  ///
+  /// In en, this message translates to:
+  /// **'Start chat'**
+  String get settingsStartChat;
+
+  /// No description provided for @settingsTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Settings'**
+  String get settingsTitle;
+
+  /// No description provided for @settingsToolsBadge.
+  ///
+  /// In en, this message translates to:
+  /// **'tools via prompt'**
+  String get settingsToolsBadge;
+
+  /// No description provided for @settingsTransformersJsNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Runs fully offline after download · needs WebGPU (Chrome/Edge/newer Safari) · weights download once from HuggingFace (public repo, no token) and are cached in your browser'**
+  String get settingsTransformersJsNote;
+
+  /// No description provided for @settingsVisionBadge.
+  ///
+  /// In en, this message translates to:
+  /// **'vision'**
+  String get settingsVisionBadge;
+
+  /// No description provided for @settingsWebllmNote.
+  ///
+  /// In en, this message translates to:
+  /// **'Runs fully offline after download · needs WebGPU (Chrome/Edge/newer Safari) · weights ~0.5-4 GB cached in your browser'**
+  String get settingsWebllmNote;
+
+  /// No description provided for @taskModelSameAsMain.
+  ///
+  /// In en, this message translates to:
+  /// **'Same as main'**
+  String get taskModelSameAsMain;
+
+  /// No description provided for @taskModelSave.
+  ///
+  /// In en, this message translates to:
+  /// **'Save'**
+  String get taskModelSave;
+
+  /// No description provided for @taskModelSectionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Task models'**
+  String get taskModelSectionTitle;
+
+  /// No description provided for @taskModelSmolDescription.
+  ///
+  /// In en, this message translates to:
+  /// **'For summaries and subagents'**
+  String get taskModelSmolDescription;
+
+  /// No description provided for @taskModelSmolTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Quick model'**
+  String get taskModelSmolTitle;
+
+  /// No description provided for @taskModelUseMain.
+  ///
+  /// In en, this message translates to:
+  /// **'Use main model'**
+  String get taskModelUseMain;
+
+  /// No description provided for @setupAppBarTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Connect to Fa'**
+  String get setupAppBarTitle;
+
+  /// No description provided for @sidebarAllApps.
+  ///
+  /// In en, this message translates to:
+  /// **'All apps ({count})'**
+  String sidebarAllApps(Object count);
+
+  /// No description provided for @sidebarAppsHeader.
+  ///
+  /// In en, this message translates to:
+  /// **'Apps'**
+  String get sidebarAppsHeader;
+
+  /// No description provided for @sidebarCancel.
+  ///
+  /// In en, this message translates to:
+  /// **'Cancel'**
+  String get sidebarCancel;
+
+  /// No description provided for @sidebarDelete.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete'**
+  String get sidebarDelete;
+
+  /// No description provided for @sidebarDeleteUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete unavailable — session lives in the host app'**
+  String get sidebarDeleteUnavailable;
+
+  /// No description provided for @sidebarDeletePersistedContent.
+  ///
+  /// In en, this message translates to:
+  /// **'Session {id}'**
+  String sidebarDeletePersistedContent(Object id);
+
+  /// No description provided for @sidebarDeleteSessionContent.
+  ///
+  /// In en, this message translates to:
+  /// **'This removes the saved session permanently.'**
+  String get sidebarDeleteSessionContent;
+
+  /// No description provided for @sidebarDeleteSessionFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not delete session: {error}'**
+  String sidebarDeleteSessionFailed(Object error);
+
+  /// No description provided for @sidebarDeleteSessionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete session?'**
+  String get sidebarDeleteSessionTitle;
+
+  /// No description provided for @sidebarDeleteSessionTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Delete session'**
+  String get sidebarDeleteSessionTooltip;
+
+  /// No description provided for @sidebarLoadSessionsError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not load sessions'**
+  String get sidebarLoadSessionsError;
+
+  /// No description provided for @sidebarModelHeader.
+  ///
+  /// In en, this message translates to:
+  /// **'Model'**
+  String get sidebarModelHeader;
+
+  /// No description provided for @sidebarNewSessionTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'New session'**
+  String get sidebarNewSessionTooltip;
+
+  /// No description provided for @sidebarNoActiveSession.
+  ///
+  /// In en, this message translates to:
+  /// **'No active session'**
+  String get sidebarNoActiveSession;
+
+  /// No description provided for @sidebarNoModel.
+  ///
+  /// In en, this message translates to:
+  /// **'no model'**
+  String get sidebarNoModel;
+
+  /// No description provided for @sidebarNoSessions.
+  ///
+  /// In en, this message translates to:
+  /// **'No sessions yet'**
+  String get sidebarNoSessions;
+
+  /// No description provided for @sidebarOnThisDevice.
+  ///
+  /// In en, this message translates to:
+  /// **'On this device'**
+  String get sidebarOnThisDevice;
+
+  /// No description provided for @sidebarOpenAppsGridTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Open apps grid'**
+  String get sidebarOpenAppsGridTooltip;
+
+  /// No description provided for @sidebarProviderAnthropic.
+  ///
+  /// In en, this message translates to:
+  /// **'Anthropic'**
+  String get sidebarProviderAnthropic;
+
+  /// No description provided for @sidebarProviderGoogle.
+  ///
+  /// In en, this message translates to:
+  /// **'Google'**
+  String get sidebarProviderGoogle;
+
+  /// No description provided for @sidebarProviderOnDeviceWebllm.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device (WebLLM)'**
+  String get sidebarProviderOnDeviceWebllm;
+
+  /// No description provided for @sidebarProviderOpenaiCompatible.
+  ///
+  /// In en, this message translates to:
+  /// **'OpenAI-compatible API'**
+  String get sidebarProviderOpenaiCompatible;
+
+  /// No description provided for @sidebarRefreshAppsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Refresh apps'**
+  String get sidebarRefreshAppsTooltip;
+
+  /// No description provided for @sidebarRefreshSessionsTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Refresh sessions'**
+  String get sidebarRefreshSessionsTooltip;
+
+  /// No description provided for @sidebarRenameClear.
+  ///
+  /// In en, this message translates to:
+  /// **'Clear'**
+  String get sidebarRenameClear;
+
+  /// No description provided for @sidebarRenameDialogTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Rename session'**
+  String get sidebarRenameDialogTitle;
+
+  /// No description provided for @sidebarRenameHint.
+  ///
+  /// In en, this message translates to:
+  /// **'An empty name restores the default one.'**
+  String get sidebarRenameHint;
+
+  /// No description provided for @sidebarRenameNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Name'**
+  String get sidebarRenameNameLabel;
+
+  /// No description provided for @sidebarRenameSessionTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Rename session'**
+  String get sidebarRenameSessionTooltip;
+
+  /// No description provided for @sidebarRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get sidebarRetry;
+
+  /// No description provided for @sidebarSessionTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'session {id}'**
+  String sidebarSessionTitle(Object id);
+
+  /// No description provided for @sidebarSearchHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Search sessions'**
+  String get sidebarSearchHint;
+
+  /// No description provided for @sidebarSearchClearTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Clear search'**
+  String get sidebarSearchClearTooltip;
+
+  /// No description provided for @sidebarSearchNoMatches.
+  ///
+  /// In en, this message translates to:
+  /// **'No sessions match \"{query}\"'**
+  String sidebarSearchNoMatches(Object query);
+
+  /// No description provided for @sidebarSessionsHeader.
+  ///
+  /// In en, this message translates to:
+  /// **'Sessions'**
+  String get sidebarSessionsHeader;
+
+  /// No description provided for @sidebarSubagentSessionCount.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, =1{1 agent} other{{count} agents}}'**
+  String sidebarSubagentSessionCount(int count);
+
+  /// No description provided for @sidebarSubagentTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'subagent {id}'**
+  String sidebarSubagentTitle(String id);
+
+  /// No description provided for @tjsCacheTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Downloaded models (transformers.js)'**
+  String get tjsCacheTitle;
+
+  /// No description provided for @tjsCacheWebOnly.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device (transformers.js) models are available in the web build only.'**
+  String get tjsCacheWebOnly;
+
+  /// No description provided for @uploadTooLarge.
+  ///
+  /// In en, this message translates to:
+  /// **'Upload is too large: {total} exceeds the {max} per-batch limit.'**
+  String uploadTooLarge(Object max, Object total);
+
+  /// No description provided for @webllmCacheManagedByOs.
+  ///
+  /// In en, this message translates to:
+  /// **'On-device models are managed by the OS/app storage on this platform.'**
+  String get webllmCacheManagedByOs;
+
+  /// No description provided for @webllmCacheTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Downloaded models'**
+  String get webllmCacheTitle;
+
+  /// No description provided for @settingsVisionLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Supports images (vision)'**
+  String get settingsVisionLabel;
+
+  /// No description provided for @settingsIconsPerRow.
+  ///
+  /// In en, this message translates to:
+  /// **'Icons per row'**
+  String get settingsIconsPerRow;
+
+  /// No description provided for @settingsIconsPerRowHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Home grid columns; Auto is 4 on phone, 6 on wide screens'**
+  String get settingsIconsPerRowHint;
+
+  /// No description provided for @settingsIconsPerRowAuto.
+  ///
+  /// In en, this message translates to:
+  /// **'Auto'**
+  String get settingsIconsPerRowAuto;
+
+  /// No description provided for @settingsShowOnboarding.
+  ///
+  /// In en, this message translates to:
+  /// **'Show welcome tour'**
+  String get settingsShowOnboarding;
+
+  /// No description provided for @chatSteerTooltip.
+  ///
+  /// In en, this message translates to:
+  /// **'Send now (interrupt)'**
+  String get chatSteerTooltip;
+
+  /// No description provided for @bootstrapSessionStartError.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not start a session: {error}'**
+  String bootstrapSessionStartError(Object error);
+
+  /// No description provided for @bootstrapRetry.
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get bootstrapRetry;
+
+  /// No description provided for @workspaceDialogTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Session'**
+  String get workspaceDialogTitle;
+
+  /// No description provided for @workspaceDialogChangeFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Change folder…'**
+  String get workspaceDialogChangeFolder;
+
+  /// No description provided for @workspaceDialogClearFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Use Personal folder'**
+  String get workspaceDialogClearFolder;
+
+  /// No description provided for @workspaceDialogClose.
+  ///
+  /// In en, this message translates to:
+  /// **'Close'**
+  String get workspaceDialogClose;
+
+  /// No description provided for @workspaceDialogCurrentFolder.
+  ///
+  /// In en, this message translates to:
+  /// **'Session folder'**
+  String get workspaceDialogCurrentFolder;
+
+  /// No description provided for @workspaceDialogHostPath.
+  ///
+  /// In en, this message translates to:
+  /// **'Host path'**
+  String get workspaceDialogHostPath;
+
+  /// No description provided for @workspaceDialogMountHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Files at /project/... in the agent map to this folder on your Mac.'**
+  String get workspaceDialogMountHint;
+
+  /// No description provided for @workspaceDialogUnsupported.
+  ///
+  /// In en, this message translates to:
+  /// **'Project folders are only available on macOS right now.'**
+  String get workspaceDialogUnsupported;
+
+  /// No description provided for @workspaceDialogPersonal.
+  ///
+  /// In en, this message translates to:
+  /// **'Personal (no folder mounted)'**
+  String get workspaceDialogPersonal;
+
+  /// No description provided for @workspaceDialogMailbox.
+  ///
+  /// In en, this message translates to:
+  /// **'Your mailbox'**
+  String get workspaceDialogMailbox;
+
+  /// No description provided for @workspaceDialogMailboxHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Other Fa agents can message this session at this address.'**
+  String get workspaceDialogMailboxHint;
+
+  /// No description provided for @workspaceDialogMailboxCopy.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy'**
+  String get workspaceDialogMailboxCopy;
+
+  /// No description provided for @workspaceDialogMailboxCopied.
+  ///
+  /// In en, this message translates to:
+  /// **'Mailbox address copied'**
+  String get workspaceDialogMailboxCopied;
+
+  /// No description provided for @workspaceDialogRestrictTools.
+  ///
+  /// In en, this message translates to:
+  /// **'Restrict tools to this folder'**
+  String get workspaceDialogRestrictTools;
+
+  /// No description provided for @workspaceDialogRestrictToolsHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Disable anything that would read or write outside the mounted folder. Off-project attempts will be blocked (and a dialog will ask you to approve them once that flow is wired up).'**
+  String get workspaceDialogRestrictToolsHint;
+
+  /// No description provided for @toolsAvailabilityTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Tools'**
+  String get toolsAvailabilityTitle;
+
+  /// No description provided for @toolsAvailabilityHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Turn tools off or on for Fa — applies immediately, no restart.'**
+  String get toolsAvailabilityHint;
+
+  /// No description provided for @settingsRedaction.
+  ///
+  /// In en, this message translates to:
+  /// **'Secret redaction'**
+  String get settingsRedaction;
+
+  /// No description provided for @settingsRedactionHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Mask API keys and secrets in everything Fa sends or stores. Applies immediately, no restart.'**
+  String get settingsRedactionHint;
+
+  /// No description provided for @toolsAvailabilityUnavailable.
+  ///
+  /// In en, this message translates to:
+  /// **'Unavailable: {reason}'**
+  String toolsAvailabilityUnavailable(Object reason);
+
+  /// No description provided for @githubAccountSection.
+  ///
+  /// In en, this message translates to:
+  /// **'GitHub account'**
+  String get githubAccountSection;
+
+  /// No description provided for @githubAccountHint.
+  ///
+  /// In en, this message translates to:
+  /// **'Connect GitHub to publish your widgets to the fa_widgets catalog.'**
+  String get githubAccountHint;
+
+  /// No description provided for @githubConnect.
+  ///
+  /// In en, this message translates to:
+  /// **'Connect GitHub'**
+  String get githubConnect;
+
+  /// No description provided for @githubDisconnect.
+  ///
+  /// In en, this message translates to:
+  /// **'Disconnect'**
+  String get githubDisconnect;
+
+  /// No description provided for @githubDisconnectConfirm.
+  ///
+  /// In en, this message translates to:
+  /// **'PRs already opened stay on GitHub — only status polling stops.'**
+  String get githubDisconnectConfirm;
+
+  /// No description provided for @githubTokenHint.
+  ///
+  /// In en, this message translates to:
+  /// **'GitHub token with public_repo scope'**
+  String get githubTokenHint;
+
+  /// No description provided for @githubConnectTokenTab.
+  ///
+  /// In en, this message translates to:
+  /// **'Token'**
+  String get githubConnectTokenTab;
+
+  /// No description provided for @githubConnectDeviceTab.
+  ///
+  /// In en, this message translates to:
+  /// **'Device code'**
+  String get githubConnectDeviceTab;
+
+  /// No description provided for @githubConnectDeviceInstructions.
+  ///
+  /// In en, this message translates to:
+  /// **'Enter this code at github.com/login/device — it lets Fa create public widget repos under your account.'**
+  String get githubConnectDeviceInstructions;
+
+  /// No description provided for @githubCopyCode.
+  ///
+  /// In en, this message translates to:
+  /// **'Copy code'**
+  String get githubCopyCode;
+
+  /// No description provided for @githubOpenDevicePage.
+  ///
+  /// In en, this message translates to:
+  /// **'Open github.com/login/device'**
+  String get githubOpenDevicePage;
+
+  /// No description provided for @githubConnectValidating.
+  ///
+  /// In en, this message translates to:
+  /// **'Validating…'**
+  String get githubConnectValidating;
+
+  /// No description provided for @myPublications.
+  ///
+  /// In en, this message translates to:
+  /// **'My publications'**
+  String get myPublications;
+
+  /// No description provided for @publicationsEmpty.
+  ///
+  /// In en, this message translates to:
+  /// **'Nothing published yet.'**
+  String get publicationsEmpty;
+
+  /// No description provided for @publicationsRefresh.
+  ///
+  /// In en, this message translates to:
+  /// **'Refresh'**
+  String get publicationsRefresh;
+
+  /// No description provided for @publicationsOffline.
+  ///
+  /// In en, this message translates to:
+  /// **'Offline — showing last known states.'**
+  String get publicationsOffline;
+
+  /// No description provided for @publicationStateOpen.
+  ///
+  /// In en, this message translates to:
+  /// **'Open'**
+  String get publicationStateOpen;
+
+  /// No description provided for @publicationStatePublished.
+  ///
+  /// In en, this message translates to:
+  /// **'Published'**
+  String get publicationStatePublished;
+
+  /// No description provided for @publicationStateRejected.
+  ///
+  /// In en, this message translates to:
+  /// **'Rejected'**
+  String get publicationStateRejected;
+
+  /// No description provided for @publicationStateUnknown.
+  ///
+  /// In en, this message translates to:
+  /// **'Unknown'**
+  String get publicationStateUnknown;
+
+  /// No description provided for @widgetStatusNotPublished.
+  ///
+  /// In en, this message translates to:
+  /// **'Not published'**
+  String get widgetStatusNotPublished;
+
+  /// No description provided for @widgetStatusValidating.
+  ///
+  /// In en, this message translates to:
+  /// **'Validating…'**
+  String get widgetStatusValidating;
+
+  /// No description provided for @widgetStatusInvalid.
+  ///
+  /// In en, this message translates to:
+  /// **'Invalid'**
+  String get widgetStatusInvalid;
+
+  /// No description provided for @widgetStatusFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Publish failed'**
+  String get widgetStatusFailed;
+
+  /// No description provided for @widgetStatusErrors.
+  ///
+  /// In en, this message translates to:
+  /// **'Validator errors:'**
+  String get widgetStatusErrors;
+
+  /// No description provided for @widgetStatusOpenRun.
+  ///
+  /// In en, this message translates to:
+  /// **'Open CI run'**
+  String get widgetStatusOpenRun;
+
+  /// No description provided for @widgetDetailVersion.
+  ///
+  /// In en, this message translates to:
+  /// **'Version'**
+  String get widgetDetailVersion;
+
+  /// No description provided for @widgetDetailAuthor.
+  ///
+  /// In en, this message translates to:
+  /// **'Author'**
+  String get widgetDetailAuthor;
+
+  /// No description provided for @publicationSubmittedAt.
+  ///
+  /// In en, this message translates to:
+  /// **'Submitted {date}'**
+  String publicationSubmittedAt(Object date);
+
+  /// No description provided for @publicationComments.
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, =1{1 comment}other{{count} comments}}'**
+  String publicationComments(num count);
+
+  /// No description provided for @publishWidgetTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Publish “{name}”'**
+  String publishWidgetTitle(Object name);
+
+  /// No description provided for @publishPreflightFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Fix these issues before publishing:'**
+  String get publishPreflightFailed;
+
+  /// No description provided for @publishRepoNameLabel.
+  ///
+  /// In en, this message translates to:
+  /// **'Repository name'**
+  String get publishRepoNameLabel;
+
+  /// No description provided for @publishButton.
+  ///
+  /// In en, this message translates to:
+  /// **'Publish'**
+  String get publishButton;
+
+  /// No description provided for @publishInProgress.
+  ///
+  /// In en, this message translates to:
+  /// **'Publishing…'**
+  String get publishInProgress;
+
+  /// No description provided for @publishSuccess.
+  ///
+  /// In en, this message translates to:
+  /// **'Pull request opened:'**
+  String get publishSuccess;
+
+  /// No description provided for @publishDone.
+  ///
+  /// In en, this message translates to:
+  /// **'Done'**
+  String get publishDone;
+
+  /// Tile-menu action that opens the widget publish sheet (issue #35)
+  ///
+  /// In en, this message translates to:
+  /// **'Publish…'**
+  String get launcherPublishWidget;
+
+  /// Shown when a connected GitHub token lacks repository rights
+  ///
+  /// In en, this message translates to:
+  /// **'This token cannot create repositories — publishing needs repo rights. Use a classic PAT with the public_repo scope (or a fine-grained PAT with All repositories + Administration + Contents read/write). The Device code login often yields a token without repo rights.'**
+  String get githubTokenNoRepoScope;
+
+  /// Warning shown on the device-flow tab when only the fallback Copilot plugin client id is available
+  ///
+  /// In en, this message translates to:
+  /// **'Heads-up: this device login uses the public Copilot Plugin app, whose tokens GitHub limits to identity-only — they cannot publish. To publish via device code, register your own GitHub OAuth App (Settings → Developer settings → OAuth Apps, set the Authorization callback URL to https://fa1.dev/oauth/callback) and save its client id in Settings → Keys as github_oauth_client_id, or rebuild the app with --dart-define=FA_GITHUB_CLIENT_ID=<id>. Until then, connect with a classic PAT (public_repo) on the Token tab.'**
+  String get githubDeviceFallbackWarn;
+
+  /// Connect-sheet tab running the GitHub OAuth web flow through the fa1.dev callback page
+  ///
+  /// In en, this message translates to:
+  /// **'Browser'**
+  String get githubConnectWebTab;
+
+  /// Instructions shown on the Browser (OAuth web flow) tab
+  ///
+  /// In en, this message translates to:
+  /// **'Opens github.com in your browser. After \"Authorize\" the fa1.dev callback page shows a one-time code — paste it below. Needs your own OAuth App: its client id in Keys as github_oauth_client_id and its secret as github_oauth_client_secret.'**
+  String get githubBrowserHint;
+
+  /// Re-opens the github.com authorize page on the Browser tab
+  ///
+  /// In en, this message translates to:
+  /// **'Open GitHub again'**
+  String get githubBrowserOpen;
+
+  /// Hint of the one-time-code field on the Browser tab
+  ///
+  /// In en, this message translates to:
+  /// **'One-time code from fa1.dev'**
+  String get githubBrowserCodeHint;
+
+  /// Viewer notice when a live ownership lease blocks opening a session for drive (#428)
+  ///
+  /// In en, this message translates to:
+  /// **'Driven by {host} (pid {pid}) — you are viewing. Your messages are delivered to the live agent.'**
+  String sessionDrivenElsewhere(String host, int pid);
+
+  /// Fallback when an over-budget session cannot open windowed — the full open is refused (issue #381)
+  ///
+  /// In en, this message translates to:
+  /// **'Session ({size} MB) is over the instant-open budget and couldn\'t be opened safely.'**
+  String sessionTooLargeTitle(String size);
+
+  /// Fa-entry long-press mint failure: the new session could not be created — logged and surfaced as a snack, the active session is kept (issue #864, review #1144 follow-up)
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t create a new session.'**
+  String get sessionMintFailed;
+
+  /// Boot notice when the last-active session is over the instant-open budget and was not resumed (issue #381); the action opens it windowed
+  ///
+  /// In en, this message translates to:
+  /// **'Resumed a fresh session — “{name}” ({size} MB) is over the instant-open budget.'**
+  String sessionBootSkippedOversize(String name, String size);
+
+  /// Action on the boot oversize notice: opens the skipped session through the windowed loader
+  ///
+  /// In en, this message translates to:
+  /// **'Open windowed'**
+  String get sessionBootSkippedOpen;
+
+  /// Top-bar button listing the session's dynamic messages (issue #102)
+  ///
+  /// In en, this message translates to:
+  /// **'Dynamic messages'**
+  String get dynamicMessagesButtonTooltip;
+
+  /// Title of the dynamic-messages list sheet (issue #102 AC5)
+  ///
+  /// In en, this message translates to:
+  /// **'Dynamic messages'**
+  String get dynamicMessagesSheetTitle;
+
+  /// Badge marking a dynamic message with a running engine (issue #102)
+  ///
+  /// In en, this message translates to:
+  /// **'live'**
+  String get dynamicMessagesLive;
+
+  /// Event back-channel count in the dynamic-messages list (issue #102 AC5)
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, =1{1 event} other{{count} events}}'**
+  String dynamicMessagesEventCount(int count);
+
+  /// Snack bar after a dynamic message is graduated into an installed app (issue #102 AC7)
+  ///
+  /// In en, this message translates to:
+  /// **'Saved to your apps as “{appId}”'**
+  String dynamicMessagesSaved(String appId);
+
+  /// Snack bar when graduating a dynamic message fails (issue #102 AC7)
+  ///
+  /// In en, this message translates to:
+  /// **'Could not save this dynamic message as an app.'**
+  String get dynamicMessagesSaveFailed;
+
+  /// Tile affordance graduating a dynamic message into an installed app (issue #102 AC7)
+  ///
+  /// In en, this message translates to:
+  /// **'Save as app'**
+  String get dynamicTileSaveAsApp;
+
+  /// Tile affordance opening the app permission dialog for a dynamic message (issue #102)
+  ///
+  /// In en, this message translates to:
+  /// **'Permissions'**
+  String get dynamicTilePermissions;
+
+  /// Title of the expandable error tile for a failed dynamic message (issue #102 AC9)
+  ///
+  /// In en, this message translates to:
+  /// **'Widget error'**
+  String get dynamicTileError;
+
+  /// Overflow strip (error colors) on the dynamic-message tile once the canvas detected a viewport overflow (issue #692 C)
+  ///
+  /// In en, this message translates to:
+  /// **'This widget is wider than the chat viewport — content on the right is clipped. The agent has been asked to rebuild it to fit.'**
+  String get dynamicTileOverflow;
+
+  /// Retry button on the dynamic-message error tile (issue #102 AC9)
+  ///
+  /// In en, this message translates to:
+  /// **'Retry'**
+  String get dynamicTileRetry;
+
+  /// Overflow (⋮) menu on the dynamic-message tile title bar (issue #378)
+  ///
+  /// In en, this message translates to:
+  /// **'More actions'**
+  String get dynamicTileMenu;
+
+  /// Ephemeral full-screen launch of a dynamic message; nothing is installed (issue #378)
+  ///
+  /// In en, this message translates to:
+  /// **'Open as app (without saving)'**
+  String get dynamicTileOpenAsApp;
+
+  /// Reason shown when the ephemeral open action is disabled for a failed widget (issue #378 E1)
+  ///
+  /// In en, this message translates to:
+  /// **'Widget can\'t start — boot failed. Retry it in the chat first.'**
+  String get dynamicTileOpenUnavailable;
+
+  /// No description provided for @themeConsentTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Apply theme pack?'**
+  String get themeConsentTitle;
+
+  /// No description provided for @themeConsentBody.
+  ///
+  /// In en, this message translates to:
+  /// **'{app} wants to apply the theme pack \"{pack}\".'**
+  String themeConsentBody(String app, String pack);
+
+  /// No description provided for @themeConsentContrast.
+  ///
+  /// In en, this message translates to:
+  /// **'Warning: some color pairs in this pack are below WCAG AA contrast (4.5:1).'**
+  String get themeConsentContrast;
+
+  /// No description provided for @themeConsentApply.
+  ///
+  /// In en, this message translates to:
+  /// **'Apply'**
+  String get themeConsentApply;
+
+  /// No description provided for @themeConsentDeny.
+  ///
+  /// In en, this message translates to:
+  /// **'Keep current'**
+  String get themeConsentDeny;
+
+  /// No description provided for @themePacksTitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme packs'**
+  String get themePacksTitle;
+
+  /// No description provided for @themePacksSubtitle.
+  ///
+  /// In en, this message translates to:
+  /// **'Install a .zip with theme.json, switch the active pack, or remove one'**
+  String get themePacksSubtitle;
+
+  /// No description provided for @themePackDefault.
+  ///
+  /// In en, this message translates to:
+  /// **'Default Fa look'**
+  String get themePackDefault;
+
+  /// No description provided for @themePackImport.
+  ///
+  /// In en, this message translates to:
+  /// **'Import theme pack'**
+  String get themePackImport;
+
+  /// No description provided for @themePackDelete.
+  ///
+  /// In en, this message translates to:
+  /// **'Remove'**
+  String get themePackDelete;
+
+  /// No description provided for @themePackActiveChip.
+  ///
+  /// In en, this message translates to:
+  /// **'active'**
+  String get themePackActiveChip;
+
+  /// No description provided for @themePackWallpaperChip.
+  ///
+  /// In en, this message translates to:
+  /// **'wallpaper'**
+  String get themePackWallpaperChip;
+
+  /// No description provided for @themePackImported.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme pack \"{name}\" installed'**
+  String themePackImported(String name);
+
+  /// Title of the Settings compaction-engine section (issue #287)
+  ///
+  /// In en, this message translates to:
+  /// **'Compaction'**
+  String get settingsCompactionLabel;
+
+  /// One-line explainer under the compaction section title (issue #287)
+  ///
+  /// In en, this message translates to:
+  /// **'How the context is compacted when it nears the model\'s window. Applies at the next compaction.'**
+  String get settingsCompactionHelper;
+
+  /// Picker item: the structured 2.0 engine (issue #287)
+  ///
+  /// In en, this message translates to:
+  /// **'Structured (recommended)'**
+  String get settingsCompactionStructured;
+
+  /// Tradeoff copy for the structured engine (issue #287, E1: no health-check claim)
+  ///
+  /// In en, this message translates to:
+  /// **'Hides consumed records in place, expandable on demand — requires a configured model for the judge pass.'**
+  String get settingsCompactionStructuredHint;
+
+  /// Picker item: the classic 1.0 engine, the supported rollback (issue #287)
+  ///
+  /// In en, this message translates to:
+  /// **'Classic (legacy 1.0)'**
+  String get settingsCompactionClassic;
+
+  /// Tradeoff copy for the classic engine (issue #287)
+  ///
+  /// In en, this message translates to:
+  /// **'Lossy prefix summary — zero extra model calls.'**
+  String get settingsCompactionClassicHint;
+
+  /// Source-layer caption when the project config wins (issue #287 AC2)
+  ///
+  /// In en, this message translates to:
+  /// **'effective from the project .fah/config.yaml'**
+  String get settingsCompactionSourceProject;
+
+  /// Source-layer caption when the user config wins (issue #287 AC2)
+  ///
+  /// In en, this message translates to:
+  /// **'effective from the user ~/.fah/config.yaml'**
+  String get settingsCompactionSourceUser;
+
+  /// Source-layer caption when no config states a choice (issue #287 AC2)
+  ///
+  /// In en, this message translates to:
+  /// **'structured default — no compaction setting in any config'**
+  String get settingsCompactionSourceFallback;
+
+  /// Note shown instead of the picker on the web stub (issue #287 AC5)
+  ///
+  /// In en, this message translates to:
+  /// **'Not configurable on the web — there is no config file here, so the structured engine applies.'**
+  String get settingsCompactionWebNote;
+
+  /// No description provided for @settingsCompactionSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Saved to {file} — applies at the next compaction.'**
+  String settingsCompactionSaved(String file);
+
+  /// No description provided for @settingsCompactionSaveFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not save the compaction engine: {error}'**
+  String settingsCompactionSaveFailed(String error);
+
+  /// Link to the compaction documentation from the settings section (issue #287)
+  ///
+  /// In en, this message translates to:
+  /// **'Compaction docs'**
+  String get settingsCompactionDocs;
+
+  /// Title of the Settings provider-queue section (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'Provider queue'**
+  String get settingsQueueTitle;
+
+  /// Explainer under the queue section title (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'An ordered chain of providers: when the current provider dies (quota, auth, network, timeout, malformed stream, 5xx, bad finish), the next takes over and the winner sticks for the session. Applies from the next run.'**
+  String get settingsQueueHelper;
+
+  /// Empty-state caption (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'No provider queue — the single provider/model boot applies. Add an entry to build the chain.'**
+  String get settingsQueueEmpty;
+
+  /// Env-wins caption; the env scope is read-only (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'effective from the FA_PROVIDERS_QUEUE environment variable — edit the env to change it (read-only here)'**
+  String get settingsQueueScopeEnv;
+
+  /// Web stub note (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'Not configurable on the web — there is no config file or environment here.'**
+  String get settingsQueueUnsupported;
+
+  /// Button adding a queue entry (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'Add entry'**
+  String get settingsQueueAdd;
+
+  /// Title of the queue provider/model picker (issue #418, two-step flow #693)
+  ///
+  /// In en, this message translates to:
+  /// **'Add queue entry'**
+  String get settingsQueueAddTitle;
+
+  /// Reorder tooltip (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'Move up'**
+  String get settingsQueueMoveUp;
+
+  /// Reorder tooltip (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'Move down'**
+  String get settingsQueueMoveDown;
+
+  /// Remove tooltip (issue #418)
+  ///
+  /// In en, this message translates to:
+  /// **'Remove'**
+  String get settingsQueueRemove;
+
+  /// No description provided for @settingsQueueSaved.
+  ///
+  /// In en, this message translates to:
+  /// **'Queue saved to {file} — applies from the next run.'**
+  String settingsQueueSaved(String file);
+
+  /// No description provided for @settingsQueueSaveFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Could not save the queue: {error}'**
+  String settingsQueueSaveFailed(String error);
+
+  /// No description provided for @themePackImportFailed.
+  ///
+  /// In en, this message translates to:
+  /// **'Theme pack rejected'**
+  String get themePackImportFailed;
+
+  /// Settings tile opening the device-automation consent screen
+  ///
+  /// In en, this message translates to:
+  /// **'Device automation'**
+  String get settingsMobileAutomation;
+
+  /// Title of the device-automation consent screen
+  ///
+  /// In en, this message translates to:
+  /// **'Device automation'**
+  String get mobileConsentTitle;
+
+  /// Consent body: what the accessibility service enables
+  ///
+  /// In en, this message translates to:
+  /// **'Enabling this lets the Fa accessibility service read the screen content and perform taps and typing on your behalf, so Fa can drive apps and settings for you.'**
+  String get mobileConsentWhat;
+
+  /// Consent body: default state
+  ///
+  /// In en, this message translates to:
+  /// **'The service is off by default — nothing runs until you turn it on here.'**
+  String get mobileConsentOffByDefault;
+
+  /// Consent body: one-tap disable promise
+  ///
+  /// In en, this message translates to:
+  /// **'You can disable it any time with one tap in Fa settings.'**
+  String get mobileConsentDisableHint;
+
+  /// Consent body: data-leave-device scope
+  ///
+  /// In en, this message translates to:
+  /// **'Your data stays on the device: only the messages you exchange are sent inline to the model you configured.'**
+  String get mobileConsentPrivacy;
+
+  /// Button sending the user to system accessibility settings
+  ///
+  /// In en, this message translates to:
+  /// **'Enable — open system settings'**
+  String get mobileConsentEnable;
+
+  /// One-tap disable button
+  ///
+  /// In en, this message translates to:
+  /// **'Disable'**
+  String get mobileConsentDisable;
+
+  /// Status row when the service is enabled
+  ///
+  /// In en, this message translates to:
+  /// **'Accessibility service: on'**
+  String get mobileConsentStatusOn;
+
+  /// Status row when the service is disabled
+  ///
+  /// In en, this message translates to:
+  /// **'Accessibility service: off'**
+  String get mobileConsentStatusOff;
+
+  /// Defensive message on store builds, where the consent surface never appears
+  ///
+  /// In en, this message translates to:
+  /// **'Device automation is not available in this build of Fa.'**
+  String get mobileConsentStoreUnavailable;
+
+  /// In-app Get banner: title
+  ///
+  /// In en, this message translates to:
+  /// **'Get Fa on the App Store'**
+  String get storeBannerTitle;
+
+  /// In-app Get banner: paid vs free-forever-beta messaging
+  ///
+  /// In en, this message translates to:
+  /// **'The App Store release is paid — it funds development. The TestFlight beta is free forever.'**
+  String get storeBannerBody;
+
+  /// In-app Get banner: the Android slot while links.play is unset
+  ///
+  /// In en, this message translates to:
+  /// **'Android: coming soon'**
+  String get storeBannerAndroidSoon;
+
+  /// In-app Get banner: the primary CTA button
+  ///
+  /// In en, this message translates to:
+  /// **'Open the App Store'**
+  String get storeBannerCta;
+
+  /// In-app Get banner: the secondary beta link
+  ///
+  /// In en, this message translates to:
+  /// **'or join the free TestFlight beta'**
+  String get storeBannerBeta;
+
+  /// In-app Get banner: dismiss tooltip/label
+  ///
+  /// In en, this message translates to:
+  /// **'Hide banner'**
+  String get storeBannerDismiss;
+
+  /// Network-mode chip: the local (classic) mode segment
+  ///
+  /// In en, this message translates to:
+  /// **'Local'**
+  String get networkModeLocal;
+
+  /// Network-mode chip: the network mode segment
+  ///
+  /// In en, this message translates to:
+  /// **'Network'**
+  String get networkModeNetwork;
+
+  /// Network mode welcome title (wide empty state)
+  ///
+  /// In en, this message translates to:
+  /// **'Welcome to Fa networks'**
+  String get networkWelcomeTitle;
+
+  /// Network mode welcome body (wide empty state)
+  ///
+  /// In en, this message translates to:
+  /// **'Join an existing network or create your own — channels and showcases open here.'**
+  String get networkWelcomeBody;
+
+  /// Selected membership synced from the account without a stored password
+  ///
+  /// In en, this message translates to:
+  /// **'This network needs your password'**
+  String get networkNeedsPasswordTitle;
+
+  /// Body under networkNeedsPasswordTitle; the join button follows
+  ///
+  /// In en, this message translates to:
+  /// **'Account sync listed this network, but its password is stored only after you join once. Enter it to open the network.'**
+  String get networkNeedsPasswordBody;
+
+  /// Network picker header / sidebar title
+  ///
+  /// In en, this message translates to:
+  /// **'Networks'**
+  String get networkNetworksTitle;
+
+  /// Network home back button tooltip
+  ///
+  /// In en, this message translates to:
+  /// **'Back'**
+  String get networkBackTooltip;
+
+  /// Network search field hint
+  ///
+  /// In en, this message translates to:
+  /// **'Search networks'**
+  String get networkSearchHint;
+
+  /// Sign-in dialog title, button and sidebar row
+  ///
+  /// In en, this message translates to:
+  /// **'Sign in'**
+  String get networkSignInTitle;
+
+  /// Sign-in dialog helper note
+  ///
+  /// In en, this message translates to:
+  /// **'Sign in with your ai-native.cloud account to create and manage networks.'**
+  String get networkSignInHelper;
+
+  /// Sign-in dialog OAuth provider button
+  ///
+  /// In en, this message translates to:
+  /// **'Continue with {provider}'**
+  String networkSignInWithProvider(Object provider);
+
+  /// Sign-in dialog note while the browser OAuth flow is open
+  ///
+  /// In en, this message translates to:
+  /// **'Complete the sign-in in your browser…'**
+  String get networkSignInWaiting;
+
+  /// Sign-in dialog collapsed section with the dev-login form
+  ///
+  /// In en, this message translates to:
+  /// **'Developer (local only)'**
+  String get networkSignInDeveloperSection;
+
+  /// Sign-in dialog note on iOS/Android replacing the provider buttons
+  ///
+  /// In en, this message translates to:
+  /// **'Provider sign-in is unavailable here until the fa:// redirect is allowlisted on the server — only the developer login below works for now.'**
+  String get networkSignInMobileNote;
+
+  /// Sidebar account row note when the stored tokens can no longer be refreshed
+  ///
+  /// In en, this message translates to:
+  /// **'Session expired — sign in again.'**
+  String get networkSessionExpired;
+
+  /// Sign-in dialog login field label
+  ///
+  /// In en, this message translates to:
+  /// **'Login'**
+  String get networkLoginLabel;
+
+  /// Sidebar account row: sign-out action
+  ///
+  /// In en, this message translates to:
+  /// **'Sign out'**
+  String get networkSignOut;
+
+  /// Sidebar account row label when the login is unknown
+  ///
+  /// In en, this message translates to:
+  /// **'Account'**
+  String get networkAccountFallback;
+
+  /// Sidebar section label for the public-networks directory
+  ///
+  /// In en, this message translates to:
+  /// **'Public networks'**
+  String get networkPublicSection;
+
+  /// Public directory row: member count
+  ///
+  /// In en, this message translates to:
+  /// **'{count} members'**
+  String networkPublicMembers(Object count);
+
+  /// Empty state when the wallet has no memberships
+  ///
+  /// In en, this message translates to:
+  /// **'No networks yet'**
+  String get networkEmptyTitle;
+
+  /// Empty state CTA
+  ///
+  /// In en, this message translates to:
+  /// **'Join your first network'**
+  String get networkJoinFirst;
+
+  /// Search with no matching memberships
+  ///
+  /// In en, this message translates to:
+  /// **'No matches'**
+  String get networkNoMatches;
+
+  /// Create-network button and dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'Create a network'**
+  String get networkCreateNetwork;
+
+  /// Name field label (create network/channel dialogs)
+  ///
+  /// In en, this message translates to:
+  /// **'Name'**
+  String get networkNameLabel;
+
+  /// Password field label
+  ///
+  /// In en, this message translates to:
+  /// **'Password'**
+  String get networkPasswordLabel;
+
+  /// Create dialog confirm button
+  ///
+  /// In en, this message translates to:
+  /// **'Create'**
+  String get networkCreate;
+
+  /// Join sheet title and join-button tooltip
+  ///
+  /// In en, this message translates to:
+  /// **'Join a network'**
+  String get networkJoinTitle;
+
+  /// ⌘K quick-switcher dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'Quick switch'**
+  String get networkQuickSwitcherTitle;
+
+  /// Join sheet: join link field label
+  ///
+  /// In en, this message translates to:
+  /// **'Join link'**
+  String get networkJoinLinkLabel;
+
+  /// Join sheet: fill form from pasted link
+  ///
+  /// In en, this message translates to:
+  /// **'Fill'**
+  String get networkJoinFill;
+
+  /// Join sheet: network id-or-name field label
+  ///
+  /// In en, this message translates to:
+  /// **'Network id or name'**
+  String get networkIdLabel;
+
+  /// Display name field label
+  ///
+  /// In en, this message translates to:
+  /// **'Display name'**
+  String get networkDisplayNameLabel;
+
+  /// Join sheet note when a JWT pins the display name
+  ///
+  /// In en, this message translates to:
+  /// **'Display name locked to your account.'**
+  String get networkDisplayNameLocked;
+
+  /// Join sheet validation error
+  ///
+  /// In en, this message translates to:
+  /// **'Network id or name and password are required.'**
+  String get networkJoinRequired;
+
+  /// Join sheet error when the server rejects the credentials
+  ///
+  /// In en, this message translates to:
+  /// **'Invalid credentials — {message}'**
+  String networkJoinInvalidCredentials(Object message);
+
+  /// Rate-limit suffix appended to the join error
+  ///
+  /// In en, this message translates to:
+  /// **' Try again in {seconds}s.'**
+  String networkJoinRetryAfter(Object seconds);
+
+  /// Join sheet confirm button
+  ///
+  /// In en, this message translates to:
+  /// **'Join'**
+  String get networkJoin;
+
+  /// Empty chat pane placeholder
+  ///
+  /// In en, this message translates to:
+  /// **'Select a channel'**
+  String get networkSelectChannel;
+
+  /// Offline banner above the channel chat
+  ///
+  /// In en, this message translates to:
+  /// **'Reconnecting — messages will send when back.'**
+  String get networkReconnecting;
+
+  /// Tooltip for the manual reconnect button in the offline banner
+  ///
+  /// In en, this message translates to:
+  /// **'Reconnect now'**
+  String get networkReconnectNow;
+
+  /// Channel composer input hint
+  ///
+  /// In en, this message translates to:
+  /// **'Message {channel}'**
+  String networkMessageHint(Object channel);
+
+  /// Create-channel button tooltip and dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'New channel'**
+  String get networkNewChannel;
+
+  /// Live member count under the network name
+  ///
+  /// In en, this message translates to:
+  /// **'{count} online'**
+  String networkOnlineCount(Object count);
+
+  /// Roster bottom-sheet title and online-counter tooltip
+  ///
+  /// In en, this message translates to:
+  /// **'Members'**
+  String get networkRosterTitle;
+
+  /// Roster sheet state before the network session is ready
+  ///
+  /// In en, this message translates to:
+  /// **'Loading members…'**
+  String get networkRosterLoading;
+
+  /// Roster sheet empty state
+  ///
+  /// In en, this message translates to:
+  /// **'No members yet.'**
+  String get networkRosterEmpty;
+
+  /// Roster presence label for a live member
+  ///
+  /// In en, this message translates to:
+  /// **'Online'**
+  String get networkPresenceOnline;
+
+  /// Roster presence label for an offline member
+  ///
+  /// In en, this message translates to:
+  /// **'Offline'**
+  String get networkPresenceOffline;
+
+  /// Roster presence label for a busy member
+  ///
+  /// In en, this message translates to:
+  /// **'Busy'**
+  String get networkPresenceBusy;
+
+  /// Roster member class: owner
+  ///
+  /// In en, this message translates to:
+  /// **'Owner'**
+  String get networkMemberOwner;
+
+  /// Roster member class: admin
+  ///
+  /// In en, this message translates to:
+  /// **'Admin'**
+  String get networkMemberAdmin;
+
+  /// Roster member class: regular member
+  ///
+  /// In en, this message translates to:
+  /// **'Member'**
+  String get networkMemberMember;
+
+  /// Roster member class: guest
+  ///
+  /// In en, this message translates to:
+  /// **'Guest'**
+  String get networkMemberGuest;
+
+  /// Roster member class: agent
+  ///
+  /// In en, this message translates to:
+  /// **'Agent'**
+  String get networkMemberAgent;
+
+  /// Roster fallback for an unrecognized member class
+  ///
+  /// In en, this message translates to:
+  /// **'Unknown'**
+  String get networkMemberUnknown;
+
+  /// Roster access badge for network-wide access
+  ///
+  /// In en, this message translates to:
+  /// **'Whole network'**
+  String get networkAccessWholeNetwork;
+
+  /// Roster access badge for a channel-scoped member outside channel context
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, =1{1 channel} other{{count} channels}}'**
+  String networkAccessChannels(int count);
+
+  /// Roster access badge when only the currently open channel is accessible
+  ///
+  /// In en, this message translates to:
+  /// **'This channel only'**
+  String get networkAccessThisChannelOnly;
+
+  /// Roster access badge when the open channel and other channels are accessible
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, =1{This channel + 1 other channel} other{This channel + {count} other channels}}'**
+  String networkAccessThisChannelAndOthers(int count);
+
+  /// Roster access badge when accessible channels exclude the open channel
+  ///
+  /// In en, this message translates to:
+  /// **'{count, plural, =1{1 other channel} other{{count} other channels}}'**
+  String networkAccessOtherChannels(int count);
+
+  /// Roster action that removes an agent from the network
+  ///
+  /// In en, this message translates to:
+  /// **'Drop agent…'**
+  String get networkDropAgent;
+
+  /// Drop-agent confirmation title
+  ///
+  /// In en, this message translates to:
+  /// **'Drop this agent?'**
+  String get networkDropAgentTitle;
+
+  /// Drop-agent confirmation body naming the selected agent
+  ///
+  /// In en, this message translates to:
+  /// **'\"{displayName}\" will be removed from this network and lose access. This cannot be undone.'**
+  String networkDropAgentBody(String displayName);
+
+  /// Destructive drop-agent confirmation button
+  ///
+  /// In en, this message translates to:
+  /// **'Drop agent'**
+  String get networkDropAgentConfirm;
+
+  /// Channel rail section header: regular (private) channels
+  ///
+  /// In en, this message translates to:
+  /// **'Channels'**
+  String get networkChannelsSection;
+
+  /// Channel rail section header: public showcases
+  ///
+  /// In en, this message translates to:
+  /// **'Showcases'**
+  String get networkShowcasesSection;
+
+  /// Composer replacement in the anonymous showcase
+  ///
+  /// In en, this message translates to:
+  /// **'Read-only preview — tap to join the network and write.'**
+  String get networkShowcaseReadOnly;
+
+  /// Composer replacement for a joined guest or member viewing a public showcase
+  ///
+  /// In en, this message translates to:
+  /// **'Only the owner and admins can post in this showcase.'**
+  String get networkShowcaseMemberReadOnly;
+
+  /// Channel rail placeholder while the session connects
+  ///
+  /// In en, this message translates to:
+  /// **'Connecting…'**
+  String get networkConnecting;
+
+  /// Channel rail empty state
+  ///
+  /// In en, this message translates to:
+  /// **'No channels'**
+  String get networkNoChannels;
+
+  /// Channel overflow menu tooltip
+  ///
+  /// In en, this message translates to:
+  /// **'Channel options'**
+  String get networkChannelOptions;
+
+  /// Channel overflow menu item for renaming
+  ///
+  /// In en, this message translates to:
+  /// **'Rename channel…'**
+  String get networkRenameChannel;
+
+  /// Rename-channel dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'Rename channel'**
+  String get networkRenameChannelTitle;
+
+  /// Rename-channel dialog confirm button
+  ///
+  /// In en, this message translates to:
+  /// **'Rename'**
+  String get networkRename;
+
+  /// Rename-channel validation error
+  ///
+  /// In en, this message translates to:
+  /// **'Channel name cannot be empty.'**
+  String get networkChannelNameRequired;
+
+  /// Channel overflow menu item for deleting
+  ///
+  /// In en, this message translates to:
+  /// **'Delete channel…'**
+  String get networkDeleteChannel;
+
+  /// Delete-channel confirmation title
+  ///
+  /// In en, this message translates to:
+  /// **'Delete this channel?'**
+  String get networkDeleteChannelTitle;
+
+  /// Delete-channel confirmation body
+  ///
+  /// In en, this message translates to:
+  /// **'The channel and all its messages are deleted for everyone. This cannot be undone.'**
+  String get networkDeleteChannelBody;
+
+  /// Snackbar after a channel was deleted
+  ///
+  /// In en, this message translates to:
+  /// **'Channel deleted'**
+  String get networkChannelDeleted;
+
+  /// Channel overflow menu item opening the agent invite
+  ///
+  /// In en, this message translates to:
+  /// **'Add agent…'**
+  String get networkAddAgent;
+
+  /// Create-channel dialog: public toggle
+  ///
+  /// In en, this message translates to:
+  /// **'Showcase (public)'**
+  String get networkShowcasePublic;
+
+  /// Agent invite dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'Add an agent'**
+  String get networkAddAgentTitle;
+
+  /// Agent invite dialog security warning
+  ///
+  /// In en, this message translates to:
+  /// **'Share out-of-band — anyone with this string can read the channel.'**
+  String get networkAddAgentWarning;
+
+  /// Agent invite placeholder when the wallet holds no channel keys
+  ///
+  /// In en, this message translates to:
+  /// **'No keys for this channel on this device.'**
+  String get networkAddAgentNoKeys;
+
+  /// Network-scope agent invite note when the wallet can produce no channel invites to bundle
+  ///
+  /// In en, this message translates to:
+  /// **'No channel keys in this wallet — the agent will see channels only after a key invite'**
+  String get networkAddAgentNoChannelKeys;
+
+  /// Composer replacement when a joined private channel has no key in this device's wallet
+  ///
+  /// In en, this message translates to:
+  /// **'This device needs the private channel key to read and write.'**
+  String get networkChannelKeyMissing;
+
+  /// Button and dialog title for importing a private channel key invite
+  ///
+  /// In en, this message translates to:
+  /// **'Import channel key'**
+  String get networkChannelKeyImport;
+
+  /// Input label for the private channel invite carrying its keypair
+  ///
+  /// In en, this message translates to:
+  /// **'Channel key invite'**
+  String get networkChannelKeyInviteLabel;
+
+  /// Helper text explaining where to obtain a channel key invite
+  ///
+  /// In en, this message translates to:
+  /// **'Paste the private-channel invite from a device that already has the key.'**
+  String get networkChannelKeyImportHint;
+
+  /// Validation error when the invite channel id differs from the open channel
+  ///
+  /// In en, this message translates to:
+  /// **'This invite is for a different channel.'**
+  String get networkChannelKeyWrongChannel;
+
+  /// Validation error when the invite targets another hub deployment than the connected session
+  ///
+  /// In en, this message translates to:
+  /// **'This invite is for a different hub.'**
+  String get networkChannelKeyWrongHub;
+
+  /// Validation error for an inconsistent X25519 channel keypair
+  ///
+  /// In en, this message translates to:
+  /// **'The invite public and private keys do not match.'**
+  String get networkChannelKeyMismatch;
+
+  /// Generic safe channel-key import failure
+  ///
+  /// In en, this message translates to:
+  /// **'The channel key could not be imported. Try again.'**
+  String get networkChannelKeyImportFailed;
+
+  /// Agent invite scope segment: channel-only access
+  ///
+  /// In en, this message translates to:
+  /// **'This channel'**
+  String get networkAddAgentScopeChannel;
+
+  /// Agent invite scope segment: full network membership
+  ///
+  /// In en, this message translates to:
+  /// **'Whole network'**
+  String get networkAddAgentScopeNetwork;
+
+  /// Agent invite format segment: bare link for apps
+  ///
+  /// In en, this message translates to:
+  /// **'Link (app)'**
+  String get networkAddAgentFormatLink;
+
+  /// Agent invite format segment: ready fa CLI one-liner
+  ///
+  /// In en, this message translates to:
+  /// **'CLI command'**
+  String get networkAddAgentFormatCli;
+
+  /// Agent invite format segment: env-var launch line for CI runners
+  ///
+  /// In en, this message translates to:
+  /// **'Env (CI)'**
+  String get networkAddAgentFormatEnv;
+
+  /// Agent invite format segment: pure-DAP client env (self-hosted DAP hub)
+  ///
+  /// In en, this message translates to:
+  /// **'DAP'**
+  String get networkAddAgentFormatDap;
+
+  /// Agent invite helper under the DAP format explaining how to paste the enrollment block into fa chat
+  ///
+  /// In en, this message translates to:
+  /// **'Copy this block and paste it into the fa chat (CLI, macOS, iOS or web) — the agent joins the channel automatically.'**
+  String get networkAddAgentDapHint;
+
+  /// Snack bar after a pasted DAP enrollment joined successfully
+  ///
+  /// In en, this message translates to:
+  /// **'Joined DAP channel #{channel}. Channel mail now reaches this agent.'**
+  String dapEnrollmentJoined(String channel);
+
+  /// Snack bar after a pasted DAP enrollment joined on a platform without Keychain/Keystore; discloses the unencrypted fallback
+  ///
+  /// In en, this message translates to:
+  /// **'Joined DAP channel #{channel}. Channel mail now reaches this agent. Storage warning: the invite private key and hub credential are stored UNENCRYPTED (plaintext) in this app\'s sandbox (IndexedDB on web).'**
+  String dapEnrollmentJoinedPlaintext(String channel);
+
+  /// Snack bar after a pasted DAP enrollment failed; never includes credential or raw transport error
+  ///
+  /// In en, this message translates to:
+  /// **'Couldn\'t join DAP channel #{channel}. Check the invite and hub connection, then try again.'**
+  String dapEnrollmentFailed(String channel);
+
+  /// Snack bar for a recognized DAP enrollment paste on an unsupported platform
+  ///
+  /// In en, this message translates to:
+  /// **'DAP join is not supported on this platform — use a native app or the fa CLI.'**
+  String get dapEnrollmentUnsupported;
+
+  /// Agent invite: button that enrolls the typed agent name against the fa_network backend (DAP format)
+  ///
+  /// In en, this message translates to:
+  /// **'Enroll agent'**
+  String get networkAddAgentEnroll;
+
+  /// Agent invite note under the pure-DAP format explaining the one-time secret and independent same-name enrollment
+  ///
+  /// In en, this message translates to:
+  /// **'Enrollment creates an independent, revocable credential, so agents with the same name can connect simultaneously. The secret is shown ONCE: copy it now.'**
+  String get networkAddAgentEnrollHint;
+
+  /// Agent invite note shown on the DAP format when there is no signed-in network account
+  ///
+  /// In en, this message translates to:
+  /// **'Sign in to the network to enroll agents'**
+  String get networkAddAgentEnrollNeedSignIn;
+
+  /// Agent invite inline error for an invalid agent name on the DAP format
+  ///
+  /// In en, this message translates to:
+  /// **'3–64 chars: a-z, 0-9, hyphens'**
+  String get networkAddAgentNameInvalid;
+
+  /// Agent invite note under the env format
+  ///
+  /// In en, this message translates to:
+  /// **'Env vars for a CI runner (GitHub Actions) — the link already carries the network id + password (or the channel keys); nothing else to fill in. Reserved for the upcoming CLI network mode — desktop and mobile agents use the link.'**
+  String get networkAddAgentEnvHint;
+
+  /// Agent invite hint for the network scope
+  ///
+  /// In en, this message translates to:
+  /// **'The agent joins as a full member and sees every channel in the network.'**
+  String get networkAddAgentNetworkHint;
+
+  /// Agent invite note when the join link carries no password
+  ///
+  /// In en, this message translates to:
+  /// **'The network password is not on this device — the link will ask for it.'**
+  String get networkAddAgentNetworkNoPassword;
+
+  /// Agent invite note under the CLI format (channel scope)
+  ///
+  /// In en, this message translates to:
+  /// **'The command works against hubs with direct DAP access (e.g. the local stand); CLI join for production fa_network is coming.'**
+  String get networkAddAgentCliHint;
+
+  /// Agent invite note under the CLI format (network scope)
+  ///
+  /// In en, this message translates to:
+  /// **'CLI network join is not shipped yet — share the link for now.'**
+  String get networkAddAgentNetworkCliHint;
+
+  /// Snack after copying the agent invite
+  ///
+  /// In en, this message translates to:
+  /// **'Invite copied to clipboard.'**
+  String get networkInviteCopied;
+
+  /// Copy invite button
+  ///
+  /// In en, this message translates to:
+  /// **'Copy'**
+  String get networkCopy;
+
+  /// Close dialog button
+  ///
+  /// In en, this message translates to:
+  /// **'Close'**
+  String get networkClose;
+
+  /// Wallet overflow menu tooltip
+  ///
+  /// In en, this message translates to:
+  /// **'Wallet'**
+  String get networkWalletTooltip;
+
+  /// Wallet menu item and export dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'Export wallet'**
+  String get networkWalletExport;
+
+  /// Wallet menu item and import dialog title
+  ///
+  /// In en, this message translates to:
+  /// **'Import wallet'**
+  String get networkWalletImport;
+
+  /// Snack after a successful wallet export
+  ///
+  /// In en, this message translates to:
+  /// **'Wallet exported — JSON copied to clipboard.'**
+  String get networkWalletExported;
+
+  /// Error snack after a failed wallet export
+  ///
+  /// In en, this message translates to:
+  /// **'Export failed: {error}'**
+  String networkWalletExportFailed(Object error);
+
+  /// Snack after a successful wallet import
+  ///
+  /// In en, this message translates to:
+  /// **'Wallet imported.'**
+  String get networkWalletImported;
+
+  /// Passphrase field label
+  ///
+  /// In en, this message translates to:
+  /// **'Passphrase'**
+  String get networkPassphraseLabel;
+
+  /// Second passphrase field label
+  ///
+  /// In en, this message translates to:
+  /// **'Repeat passphrase'**
+  String get networkPassphraseRepeatLabel;
+
+  /// Export dialog validation error
+  ///
+  /// In en, this message translates to:
+  /// **'Passphrase must not be empty.'**
+  String get networkPassphraseEmpty;
+
+  /// Export dialog validation error
+  ///
+  /// In en, this message translates to:
+  /// **'Passphrases do not match.'**
+  String get networkPassphraseMismatch;
+
+  /// Export dialog confirm button
+  ///
+  /// In en, this message translates to:
+  /// **'Export'**
+  String get networkExport;
+
+  /// Import dialog confirm button
+  ///
+  /// In en, this message translates to:
+  /// **'Import'**
+  String get networkImport;
+
+  /// Import dialog: JSON paste field label
+  ///
+  /// In en, this message translates to:
+  /// **'Exported wallet JSON'**
+  String get networkWalletJsonLabel;
+
+  /// Import dialog warning note
+  ///
+  /// In en, this message translates to:
+  /// **'Importing replaces the wallet on this device.'**
+  String get networkWalletImportWarning;
+
+  /// Network name helper text (server rule)
+  ///
+  /// In en, this message translates to:
+  /// **'A display name — becomes a lowercase slug'**
+  String get networkNameHint;
+
+  /// Network password helper text (server rule)
+  ///
+  /// In en, this message translates to:
+  /// **'8–128 characters'**
+  String get networkPasswordHint;
+
+  /// Network name validation error
+  ///
+  /// In en, this message translates to:
+  /// **'Needs 3–64 chars after slugifying (letters, digits, hyphens)'**
+  String get networkNameInvalid;
+
+  /// Network password validation error
+  ///
+  /// In en, this message translates to:
+  /// **'Password must be 8–128 characters'**
+  String get networkPasswordInvalid;
+
+  /// Create-network dialog checkbox — publish the network in the public catalog
+  ///
+  /// In en, this message translates to:
+  /// **'List in the public directory'**
+  String get networkListPublic;
+
+  /// Network row menu item (owner only)
+  ///
+  /// In en, this message translates to:
+  /// **'Delete network…'**
+  String get networkDelete;
+
+  /// Delete-network confirmation title
+  ///
+  /// In en, this message translates to:
+  /// **'Delete this network?'**
+  String get networkDeleteTitle;
+
+  /// Delete-network confirmation body
+  ///
+  /// In en, this message translates to:
+  /// **'The network, its channels and all messages are deleted for everyone. This cannot be undone.'**
+  String get networkDeleteBody;
+
+  /// Snackbar after a network was deleted
+  ///
+  /// In en, this message translates to:
+  /// **'Network deleted'**
+  String get networkDeleted;
+
+  /// Live slug preview under the network name field
+  ///
+  /// In en, this message translates to:
+  /// **'Will be created as: {slug}'**
+  String networkSlugPreview(Object slug);
+
+  /// Snackbar when create is attempted without a JWT
+  ///
+  /// In en, this message translates to:
+  /// **'Sign in to create a network'**
+  String get networkSignInToCreate;
+
+  /// Anonymous showcase: generic 404 (non-public or unknown network)
+  ///
+  /// In en, this message translates to:
+  /// **'This network is not publicly available'**
+  String get networkShowcaseUnavailable;
+
+  /// Badge in the showcase header
+  ///
+  /// In en, this message translates to:
+  /// **'read-only'**
+  String get networkShowcaseReadOnlyBadge;
+
+  /// Showcase back-button tooltip
+  ///
+  /// In en, this message translates to:
+  /// **'Back to networks'**
+  String get networkBackToNetworks;
+
+  /// Agent invite dialog hint for public (keyless) channels
+  ///
+  /// In en, this message translates to:
+  /// **'Anyone with this link can read the channel — it is public. Agents join keyless.'**
+  String get networkAddAgentPublicHint;
+}
+
+class _AppLocalizationsDelegate
+    extends LocalizationsDelegate<AppLocalizations> {
+  const _AppLocalizationsDelegate();
+
+  @override
+  Future<AppLocalizations> load(Locale locale) {
+    return SynchronousFuture<AppLocalizations>(lookupAppLocalizations(locale));
+  }
+
+  @override
+  bool isSupported(Locale locale) =>
+      <String>['en', 'ru'].contains(locale.languageCode);
+
+  @override
+  bool shouldReload(_AppLocalizationsDelegate old) => false;
+}
+
+AppLocalizations lookupAppLocalizations(Locale locale) {
+  // Lookup logic when only language code is specified.
+  switch (locale.languageCode) {
+    case 'en':
+      return AppLocalizationsEn();
+    case 'ru':
+      return AppLocalizationsRu();
+  }
+
+  throw FlutterError(
+    'AppLocalizations.delegate failed to load unsupported locale "$locale". This is likely '
+    'an issue with the localizations generation tool. Please file an issue '
+    'on GitHub with a reproducible sample app and the gen-l10n configuration '
+    'that was used.',
+  );
+}

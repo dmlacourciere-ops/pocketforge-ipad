@@ -1,0 +1,1595 @@
+import 'dart:typed_data';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+/// A [FileSystem] that tallies how many bytes each read strategy touched —
+/// the O(window)-not-O(file) proof for issue #135.
+final class CountingFileSystem implements FileSystem, RangedReadFileSystem {
+  CountingFileSystem(this.delegate);
+
+  final FileSystem delegate;
+
+  /// Bytes moved by ranged (seek) reads — the windowed path.
+  int rangedBytes = 0;
+
+  /// Bytes moved by whole-file reads — must stay 0 while windowed.
+  int bulkBytes = 0;
+
+  @override
+  String get cwd => delegate.cwd;
+
+  @override
+  Future<Result<String, FileError>> absolutePath(String path) =>
+      delegate.absolutePath(path);
+
+  @override
+  Future<Result<String, FileError>> joinPath(List<String> parts) =>
+      delegate.joinPath(parts);
+
+  @override
+  Future<Result<String, FileError>> readTextFile(String path) async {
+    final result = await delegate.readTextFile(path);
+    if (result.isOk) bulkBytes += result.valueOrNull!.length;
+    return result;
+  }
+
+  @override
+  Future<Result<Uint8List, FileError>> readBinaryFile(String path) async {
+    final result = await delegate.readBinaryFile(path);
+    if (result.isOk) bulkBytes += result.valueOrNull!.length;
+    return result;
+  }
+
+  @override
+  Future<Result<List<String>, FileError>> readTextLines(
+    String path, {
+    int? maxLines,
+  }) => delegate.readTextLines(path, maxLines: maxLines);
+
+  @override
+  Future<Result<void, FileError>> writeBinaryFile(
+    String path,
+    Uint8List content,
+  ) => delegate.writeBinaryFile(path, content);
+
+  @override
+  Future<Result<void, FileError>> writeFile(String path, String content) =>
+      delegate.writeFile(path, content);
+
+  @override
+  Future<Result<void, FileError>> appendFile(String path, String content) =>
+      delegate.appendFile(path, content);
+
+  @override
+  Future<Result<FileInfo, FileError>> fileInfo(String path) =>
+      delegate.fileInfo(path);
+
+  @override
+  Future<Result<List<FileInfo>, FileError>> listDir(String path) =>
+      delegate.listDir(path);
+
+  @override
+  Future<Result<bool, FileError>> exists(String path) => delegate.exists(path);
+
+  @override
+  Future<Result<void, FileError>> createDir(
+    String path, {
+    bool recursive = true,
+  }) => delegate.createDir(path, recursive: recursive);
+
+  @override
+  Future<Result<void, FileError>> remove(
+    String path, {
+    bool recursive = false,
+    bool force = false,
+  }) => delegate.remove(path, recursive: recursive, force: force);
+
+  @override
+  Future<Result<Uint8List, FileError>> readRange(
+    String path,
+    int start,
+    int end,
+  ) async {
+    final Result<Uint8List, FileError> result;
+    if (delegate case final RangedReadFileSystem ranged) {
+      result = await ranged.readRange(path, start, end);
+    } else {
+      result = Err(
+        FileError(FileErrorCode.notSupported, 'no ranged reads', path: path),
+      );
+    }
+    if (result.isOk) rangedBytes += result.valueOrNull!.length;
+    return result;
+  }
+}
+
+void main() {
+  late MemoryFileSystem fs;
+  const path = '/sessions/big.jsonl';
+
+  setUp(() {
+    fs = MemoryFileSystem();
+  });
+
+  /// Builds a big session file in one write (raw JSONL lines) — thousands
+  /// of awaited storage appends would dominate the test runtime.
+  /// [compactionAt] inserts a compaction record with that chain index.
+  Future<int> seedRaw(int count, {int? compactionAt}) async {
+    const iso = '2026-01-01T00:00:00.000Z';
+    final buffer = StringBuffer(
+      '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+      '"cwd":"/work"}\n',
+    );
+    for (var i = 0; i < count; i++) {
+      if (compactionAt == i) {
+        buffer.write(
+          '{"type":"compaction","id":"c$i","parentId":'
+          '${i == 0 ? 'null' : '"e${i - 1}"'},"timestamp":"$iso",'
+          '"summary":"compacted prefix","firstKeptEntryId":"e$i",'
+          '"tokensBefore":12345}\n',
+        );
+      }
+      buffer.write(
+        '{"type":"message","id":"e$i","parentId":'
+        '${i == 0 && compactionAt != 0 ? 'null' : (compactionAt == i ? '"c$i"' : '"e${i - 1}"')},'
+        '"timestamp":"$iso",'
+        '"message":{"role":"user","content":[{"type":"text","text":'
+        '"message $i with a bit of body to be realistic"}]}}\n',
+      );
+    }
+    await fs.writeFile(path, buffer.toString());
+    return count;
+  }
+
+  /// [seedRaw] with deterministic per-record sizes: 400-char texts price
+  /// 100 tokens each (chars/4), with an optional giant record and an
+  /// optional compaction boundary — the fixtures for the gh-968 budget
+  /// trim tests.
+  Future<void> seedSized(
+    int count, {
+    int? compactionAt,
+    int? giantAt,
+    int giantChars = 20000,
+    int textChars = 400,
+  }) async {
+    const iso = '2026-01-01T00:00:00.000Z';
+    final buffer = StringBuffer(
+      '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+      '"cwd":"/work"}\n',
+    );
+    String body(int i) => i == giantAt ? 'g' * giantChars : 'a' * textChars;
+    for (var i = 0; i < count; i++) {
+      if (compactionAt == i) {
+        buffer.write(
+          '{"type":"compaction","id":"c$i","parentId":'
+          '${i == 0 ? 'null' : '"e${i - 1}"'},"timestamp":"$iso",'
+          '"summary":"compacted prefix","firstKeptEntryId":"e$i",'
+          '"tokensBefore":12345}\n',
+        );
+      }
+      buffer.write(
+        '{"type":"message","id":"e$i","parentId":'
+        '${i == 0 && compactionAt != 0 ? 'null' : (compactionAt == i ? '"c$i"' : '"e${i - 1}"')},'
+        '"timestamp":"$iso",'
+        '"message":{"role":"user","content":[{"type":"text","text":'
+        '"${body(i)}"}]}}\n',
+      );
+    }
+    await fs.writeFile(path, buffer.toString());
+  }
+
+  Future<JsonlSessionStorage> seed(int count) async {
+    final storage = await JsonlSessionStorage.create(
+      fs,
+      path,
+      cwd: '/work',
+      sessionId: 'big',
+    );
+    for (var i = 0; i < count; i++) {
+      await storage.appendEntry(
+        MessageRecord(
+          id: 'e$i',
+          parentId: i == 0 ? null : 'e${i - 1}',
+          timestamp: DateTime.utc(2026, 1, 1).add(Duration(minutes: i)),
+          message: UserMessage.text('message $i'),
+        ),
+      );
+    }
+    return storage;
+  }
+
+  List<String> idsOf(List<SessionRecord> records) => [
+    for (final record in records) record.id,
+  ];
+
+  group('WindowedSessionStorage.open', () {
+    test('reads only the tail window, not the whole file', () async {
+      const count = 20000; // ~4 MB file
+      await seedRaw(count);
+      final raw = (await fs.readBinaryFile(path)).getOrThrow();
+      final counting = CountingFileSystem(fs);
+
+      final windowed = await WindowedSessionStorage.open(
+        counting,
+        path,
+        chunkRecords: 200,
+      );
+
+      // Functional: the newest 200 records are resident, oldest-first.
+      final entries = await windowed.getEntries();
+      expect(entries, hasLength(200));
+      expect(idsOf(entries).first, 'e${count - 200}');
+      expect(idsOf(entries).last, 'e${count - 1}');
+      expect(windowed.hasOlder, isTrue);
+      expect(windowed.cachedMetadata.id, 'big');
+
+      // The bound: opening a ~4 MB session must move on the order of the
+      // initial window (128 KiB) plus a small header prefix — a small
+      // constant, never a fraction of the file, and never via a whole-file
+      // read.
+      expect(
+        counting.bulkBytes,
+        0,
+        reason:
+            'windowed open must not materialize the file via '
+            'readTextFile/readBinaryFile',
+      );
+      expect(
+        counting.rangedBytes,
+        lessThan(256 << 10),
+        reason: 'open touched ${counting.rangedBytes} of ${raw.length} bytes',
+      );
+    });
+
+    test('header parse fails loudly on a corrupt first line', () async {
+      await fs.writeFile(path, 'not json at all\n');
+      await expectLater(
+        WindowedSessionStorage.open(fs, path),
+        throwsA(isA<SessionException>()),
+      );
+    });
+
+    test('missing file surfaces notFound', () async {
+      await expectLater(
+        WindowedSessionStorage.open(fs, '/sessions/nope.jsonl'),
+        throwsA(
+          isA<SessionException>().having(
+            (error) => error.code,
+            'code',
+            SessionErrorCode.notFound,
+          ),
+        ),
+      );
+    });
+  });
+
+  group('WindowedSessionStorage.loadOlder', () {
+    test('pages older records in order until the file top', () async {
+      const count = 120;
+      final full = await seed(count);
+      final expected = idsOf(await full.getEntries());
+
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 30,
+      );
+      final loaded = idsOf(await windowed.getEntries());
+      expect(loaded, expected.sublist(count - 30));
+
+      var batches = 0;
+      while (windowed.hasOlder) {
+        final older = await windowed.loadOlder(maxRecords: 30);
+        batches++;
+        expect(older, isNotEmpty);
+        // Root-first: each batch continues upward without gaps or overlaps.
+        final previous = 'e${int.parse(loaded.first.substring(1)) - 1}';
+        expect(idsOf(older).last, previous);
+        loaded.insertAll(0, idsOf(older));
+      }
+      expect(batches, 3, reason: '120 records in 30-record pages');
+      expect(windowed.hasOlder, isFalse);
+      expect(await windowed.loadOlder(), isEmpty);
+      expect(idsOf(await windowed.getEntries()), expected);
+      // The exact count agrees with a whole-file newline scan.
+      expect(await windowed.countRecords(), count);
+    });
+
+    test('small sessions load whole: window == file', () async {
+      await seed(5);
+      final windowed = await WindowedSessionStorage.open(fs, path);
+      expect(await windowed.getEntries(), hasLength(5));
+      expect(windowed.hasOlder, isFalse);
+      expect(await windowed.loadOlder(), isEmpty);
+    });
+
+    test('a chunk of foreign-branch records does not strand paging', () async {
+      // File shape (root-first): e0 - e1 - [e2 (branch A) | f2 (branch B)]
+      // - e3, with the active leaf on branch A. The newest window (records
+      // e3, f2) contains NO active-branch record above e3 — paging must
+      // keep going and land e2, then e1/e0.
+      const iso = '2026-01-01T00:00:00.000Z';
+      final header =
+          '{"type":"session","version":3,"id":"fork","timestamp":"$iso",'
+          '"cwd":"/work"}';
+      String entry(String id, String? parent) =>
+          '{"type":"message","id":"$id","parentId":${parent == null ? 'null' : '"$parent"'},'
+          '"timestamp":"$iso","message":{"role":"user","content":[{"type":"text","text":"$id"}]}}';
+      final lines = [
+        header,
+        entry('e0', null),
+        entry('e1', 'e0'),
+        entry('e2', 'e1'), // branch A
+        entry('f2', 'e1'), // branch B (foreign)
+        entry('e3', 'e2'), // newest write: active leaf chain e3-e2-e1-e0
+      ];
+      await fs.writeFile(path, '${lines.join('\n')}\n');
+
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 2,
+      );
+      expect(idsOf(await windowed.getEntries()), ['f2', 'e3']);
+      expect(await windowed.getLeafId(), 'e3');
+
+      final older = await windowed.loadOlder(maxRecords: 2);
+      // The 2-record chunk above f2 is [e1, e2]; both join the branch in
+      // one batch (f2 itself is skipped — foreign). Root-first.
+      expect(idsOf(older), ['e1', 'e2']);
+      expect(idsOf(await windowed.getEntries()), ['e1', 'e2', 'f2', 'e3']);
+
+      final older2 = await windowed.loadOlder(maxRecords: 2);
+      expect(idsOf(older2), ['e0']);
+      expect(windowed.hasOlder, isFalse);
+      // The branch walk renders the active branch only, root-first.
+      expect(idsOf(await windowed.getPathToRoot('e3')), [
+        'e0',
+        'e1',
+        'e2',
+        'e3',
+      ]);
+    });
+  });
+
+  group('WindowedSessionStorage.loadAllOlder', () {
+    test('pages the whole file head in when under the size bound', () async {
+      final full = await seed(120);
+      final expected = idsOf(await full.getEntries());
+
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 30,
+      );
+      expect((await windowed.getEntries()).length, lessThan(120));
+
+      await windowed.loadAllOlder();
+      expect(windowed.hasOlder, isFalse);
+      expect(idsOf(await windowed.getEntries()), expected);
+    });
+
+    test(
+      'refuses past the whole-ledger size bound with the gh-1073 tooLarge '
+      'SessionException (repair hint) BEFORE the scan starts — the '
+      'honest-degradation contract for truly-giant ledgers',
+      () async {
+        await seed(120);
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 30,
+        );
+        expect(windowed.hasOlder, isTrue);
+
+        // A bound below the file size: the pre-check must fire before
+        // any strip scan, with the same code and remediation hint the
+        // full-open backstop throws.
+        expect(
+          () => windowed.loadAllOlder(maxWholeLedgerBytes: 1),
+          throwsA(
+            isA<SessionException>()
+                .having(
+                  (e) => e.code,
+                  'code',
+                  SessionErrorCode.tooLarge,
+                )
+                .having(
+                  (e) => e.message,
+                  'message',
+                  allOf(contains('fa session repair'), contains('gh-1073')),
+                ),
+          ),
+        );
+        // Nothing was paged in: the window still reports more above.
+        expect(windowed.hasOlder, isTrue);
+      },
+    );
+  });
+
+  group('WindowedSessionStorage byte cap', () {
+    test(
+      'keeps at least one record even when it alone exceeds the cap',
+      () async {
+        await seed(3); // e0, e1, e2 — e2 is the newest
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 10,
+          chunkBytes: 1, // nothing should fit; the newest record still must
+        );
+        final entries = await windowed.getEntries();
+        expect(idsOf(entries), ['e2']);
+        expect(windowed.hasOlder, isTrue);
+      },
+    );
+  });
+
+  group('WindowedSessionStorage.mutations', () {
+    test('appends persist and a full reopen sees them', () async {
+      await seed(4);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 2,
+      );
+      await windowed.appendEntry(
+        MessageRecord(
+          id: 'e4',
+          parentId: 'e3',
+          timestamp: DateTime.utc(2026, 1, 2),
+          message: UserMessage.text('appended'),
+        ),
+      );
+      expect(await windowed.getLeafId(), 'e4');
+
+      final reopened = await JsonlSessionStorage.open(fs, path);
+      final all = await reopened.getEntries();
+      expect(idsOf(all).last, 'e4');
+      expect(await reopened.getLeafId(), 'e4');
+    });
+
+    test(
+      'setLeafId writes a leaf record chaining from the current leaf',
+      () async {
+        await seed(4);
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 2,
+        );
+        await windowed.setLeafId('e2'); // fork up to e2 — an in-window record
+        final reopened = await JsonlSessionStorage.open(fs, path);
+        expect(await reopened.getLeafId(), 'e2');
+      },
+    );
+
+    test('createEntryId avoids collisions with loaded records', () async {
+      await seed(2);
+      final windowed = await WindowedSessionStorage.open(fs, path);
+      final id = await windowed.createEntryId();
+      final entries = await windowed.getEntries();
+      expect(idsOf(entries), isNot(contains(id)));
+    });
+  });
+
+  group('WindowedSessionStorage.live tail', () {
+    test('ingestAppended picks up externally-appended records', () async {
+      await seed(10);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 5,
+      );
+
+      // An external writer (running CLI) appends below the app's nose.
+      final external = await JsonlSessionStorage.open(fs, path);
+      await external.appendEntry(
+        MessageRecord(
+          id: 'e10',
+          parentId: 'e9',
+          timestamp: DateTime.utc(2026, 1, 2),
+          message: UserMessage.text('from cli'),
+        ),
+      );
+
+      expect(idsOf((await windowed.ingestAppended()).delta), ['e10']);
+      final entries = await windowed.getEntries();
+      expect(idsOf(entries).last, 'e10');
+      expect(await windowed.getLeafId(), 'e10');
+      // Idempotent when nothing new landed.
+      expect((await windowed.ingestAppended()).delta, isEmpty);
+    });
+
+    test('a shrunken file re-anchors to the new tail (E5)', () async {
+      await seed(10);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 5,
+      );
+      final raw = (await fs.readTextFile(path)).getOrThrow();
+      final truncated = '${raw.split('\n').take(4).join('\n')}\n';
+      await fs.writeFile(path, truncated);
+
+      expect((await windowed.ingestAppended()).reanchored, isTrue);
+      final entries = await windowed.getEntries();
+      expect(entries, hasLength(3)); // e0..e2 survive truncation
+      expect(idsOf(entries), ['e0', 'e1', 'e2']);
+      expect(await windowed.getLeafId(), 'e2');
+    });
+
+    test(
+      'deep-paged (jumped) ingest counts appends below the window without re-anchoring',
+      () async {
+        await seed(10);
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 5,
+        );
+        // Jump mid-file: the tail (e5..e9) now sits BELOW the window and
+        // the below-count is unknown until an edge is walked. The jump
+        // chunk is bounded (defaultChunkRecords=200 would readAround the
+        // whole 10-record file, swallow the tail into the window, and the
+        // ingest would rightly take the tail path instead).
+        await windowed.jumpToRecord('e2', maxRecords: 5);
+        expect(windowed.countBelow, isNull);
+
+        // An external writer appends BELOW the window.
+        final external = await JsonlSessionStorage.open(fs, path);
+        await external.appendEntry(
+          MessageRecord(
+            id: 'e10',
+            parentId: 'e9',
+            timestamp: DateTime.utc(2026, 1, 2),
+            message: UserMessage.text('from cli'),
+          ),
+        );
+
+        // Deep-paged ingest: the appended range is counted and its
+        // offsets remembered for jumps, but the window is untouched —
+        // no delta, no re-anchor.
+        final ingest = await windowed.ingestAppended();
+        expect(ingest.reanchored, isFalse);
+        expect(ingest.delta, isEmpty);
+
+        // The remembered offset makes the appended record jumpable.
+        final branch = await windowed.jumpToRecord('e10', maxRecords: 5);
+        expect(idsOf(branch), contains('e10'));
+      },
+    );
+  });
+
+  group('SessionChunkReader', () {
+    test('countRecords counts records, not lines', () async {
+      await seed(7);
+      final reader = SessionChunkReader(fs: fs, path: path);
+      expect(await reader.countRecords(), 7);
+    });
+
+    test('readAround centers on the target record', () async {
+      await seed(20);
+      final reader = SessionChunkReader(fs: fs, path: path);
+      final tail = await reader.readTail(maxRecords: 20);
+      final target = tail.entries
+          .firstWhere((entry) => entry.record.id == 'e10')
+          .offset;
+      final around = await reader.readAround(target, maxRecords: 9);
+      final ids = [for (final entry in around.entries) entry.record.id];
+      // Records below AND above the target are present, in order.
+      expect(ids.indexOf('e10'), lessThan(ids.length - 1));
+      expect(ids.indexOf('e10'), greaterThan(0));
+    });
+
+    test('readForward parses only bytes from the offset', () async {
+      await seed(6);
+      final reader = SessionChunkReader(fs: fs, path: path);
+      final tail = await reader.readTail(maxRecords: 6);
+      final e3 = tail.entries
+          .firstWhere((entry) => entry.record.id == 'e3')
+          .offset;
+      final forward = await reader.readForward(e3);
+      expect(
+        [for (final entry in forward.entries) entry.record.id],
+        ['e3', 'e4', 'e5'],
+      );
+      expect(forward.limitOffset, (await fs.fileInfo(path)).getOrThrow().size);
+    });
+  });
+
+  group('residency bound', () {
+    test('resident window stays capped while paging far past it', () async {
+      await seedRaw(3000);
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 200,
+        residentRecords: 600,
+        residentBytes: 24 * 1024 * 1024,
+      );
+      expect(storage.residentCount, 200); // open: tail chunk only
+      // The app's load-end refresh primes the above-count memo.
+      expect(await storage.countAbove(), 2800);
+      for (var i = 0; i < 10; i++) {
+        await storage.loadOlder();
+      }
+      // Ten pages loaded 2200 records, yet the index never outgrew the
+      // cache bound - the invariant retires the full-materialization
+      // blowup (issue #135 AC1, instrumented).
+      expect(storage.residentCount, 600);
+      expect(storage.residentWindowBytes, lessThanOrEqualTo(24 * 1024 * 1024));
+      // Paging up keeps the OLDEST resident slice (the just-loaded
+      // history); the newest side slides out (re-readable by paging
+      // back down) and the anchor keeps moving toward the file top.
+      final ids = [for (final entry in await storage.getEntries()) entry.id];
+      expect(ids, [for (var i = 800; i < 1400; i++) 'e$i']);
+      // 800 records remain above; the exact total survives eviction.
+      expect(await storage.countAbove(), 800);
+      // The evicted newest side is COUNTED below (the page-down
+      // banner), not silently gone: 10 pages x 200 slid out.
+      expect(storage.countBelow, 1600);
+      expect(await storage.countRecords(), 3000);
+    });
+
+    test(
+      'eviction prunes every side structure - nothing outlives residency',
+      () async {
+        await seedRaw(3000);
+        final storage = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 200,
+          residentRecords: 600,
+          residentBytes: 24 * 1024 * 1024,
+        );
+        for (var i = 0; i < 10; i++) {
+          await storage.loadOlder();
+        }
+        // The id index and the branch walk stop at the window edge: the
+        // evicted newest records hold no strong reference (round-2
+        // review: monotonic map growth). getEntry may still READ an
+        // evicted record straight from the file (AC10 branch-switch
+        // locate) — the residency itself must not keep it.
+        expect(idsOf(await storage.getEntries()), isNot(contains('e2999')));
+        expect(await storage.getLabel('e2999'), isNull);
+        expect(
+          idsOf(await storage.getPathToRoot('e1399')),
+          isNot(contains('e2999')),
+        );
+        expect(idsOf(await storage.getPathToRoot('e1399')), [
+          for (var i = 800; i <= 1399; i++) 'e$i',
+        ]);
+        // The sparse offset map keeps everything explored (AC6 jumps).
+        expect(storage.offsetOf('e2999'), isNotNull);
+        expect(storage.offsetOf('e2998'), isNotNull);
+      },
+    );
+
+    test(
+      'appends never evict the live tail; the oldest side gives way',
+      () async {
+        await seedRaw(100);
+        final storage = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 50,
+          residentRecords: 60,
+          residentBytes: 1 << 30,
+        );
+        for (var i = 100; i < 400; i++) {
+          await storage.appendEntry(
+            MessageRecord(
+              id: 'e$i',
+              parentId: 'e${i - 1}',
+              timestamp: DateTime.utc(2026, 1, 2),
+              message: UserMessage.text('appended $i'),
+            ),
+          );
+        }
+        expect(storage.residentCount, 60);
+        // The live tail is resident, the leaf is the TRUE file leaf, and
+        // eviction only ever took the oldest side (round-2 review: the
+        // tail can never silently vanish).
+        final ids = idsOf(await storage.getEntries());
+        expect(ids.last, 'e399');
+        expect(ids, isNot(contains('e50')));
+        expect(await storage.getEntry('e399'), isNotNull);
+        expect(await storage.getLeafId(), 'e399');
+        expect(await storage.countAbove(), 340);
+        expect(storage.countBelow, 0);
+      },
+    );
+
+    test('external ingest never evicts the live tail either', () async {
+      await seedRaw(1000);
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 200,
+        residentRecords: 220,
+        residentBytes: 1 << 30,
+      );
+      const iso = '2026-01-01T00:00:00.000Z';
+      final extra = StringBuffer();
+      for (var i = 1000; i < 1050; i++) {
+        extra.write(
+          '{"type":"message","id":"e$i","parentId":"e${i - 1}",'
+          '"timestamp":"$iso","message":{"role":"user","content":'
+          '[{"type":"text","text":"cli $i"}]}}\n',
+        );
+      }
+      await fs.appendFile(path, extra.toString());
+      expect(idsOf((await storage.ingestAppended()).delta).last, 'e1049');
+      expect(idsOf(await storage.getEntries()).last, 'e1049');
+      // 200 + 50 ingested over the 220 cap: the OLDEST side gives way,
+      // the tail stays.
+      expect(storage.residentCount, 220);
+      expect(await storage.countAbove(), 830);
+    });
+    test(
+      'deep paging slides the newest side out; loadNewer pages it back',
+      () async {
+        await seedRaw(3000);
+        final storage = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 200,
+          residentRecords: 600,
+          residentBytes: 24 * 1024 * 1024,
+        );
+        final view = idsOf(await storage.getEntries());
+        while (storage.hasOlder) {
+          final joined = await storage.loadOlder();
+          if (joined.isEmpty) fail('loadOlder stalled with history above');
+          view.insertAll(0, idsOf(joined));
+        }
+        // The paged deltas rebuild the whole branch above the open tail:
+        // no gaps, no duplicates, no reordering (AC3).
+        expect(view, [for (var i = 0; i < 3000; i++) 'e$i']);
+        expect(await storage.countAbove(), 0);
+        // Everything that slid out the newest side is COUNTED below.
+        expect(storage.countBelow, 2400);
+
+        // The page-down path (round-2 review): the evicted newest side
+        // comes back chunk by chunk, oldest-first, until the live tail.
+        final paged = <String>[];
+        while (storage.hasNewer) {
+          final joined = await storage.loadNewer();
+          if (joined.isEmpty) fail('loadNewer stalled with records below');
+          paged.addAll(idsOf(joined));
+        }
+        expect(paged, [for (var i = 600; i < 3000; i++) 'e$i']);
+        expect(storage.countBelow, 0);
+        expect(idsOf(await storage.getEntries()).last, 'e2999');
+      },
+    );
+
+    test(
+      'jumpToTail pins the tail: fill overshoot trims the OLD side',
+      () async {
+        await seedRaw(20);
+        final storage = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 2,
+          residentRecords: 6,
+          residentBytes: 24 * 1024 * 1024,
+        );
+        // Deep-page to the very top: 2-record chunks against a 6-record
+        // residency overshoot, and the deep-paging eviction drops the
+        // NEWEST side - countBelow lights up.
+        while (storage.hasOlder) {
+          final joined = await storage.loadOlder();
+          if (joined.isEmpty) fail('loadOlder stalled with history above');
+        }
+        expect(storage.countBelow, greaterThan(0));
+        expect(storage.hasNewer, isTrue);
+
+        // The jump re-anchors the tail, then fills upward: the fill's
+        // overshoot must trim the OLD side only - a newest-side eviction
+        // here would un-anchor the tail and re-light hasNewer into an
+        // auto-follow loop (issue #1159 review).
+        final branch = await storage.jumpToTail();
+        expect(storage.hasNewer, isFalse);
+        expect(storage.countBelow, 0);
+        expect(idsOf(branch), ['e14', 'e15', 'e16', 'e17', 'e18', 'e19']);
+      },
+    );
+
+    test(
+      'jumpToOffset recenters the window; leaf and counts behave (AC6)',
+      () async {
+        await seedRaw(3000);
+        final storage = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 200,
+        );
+        await storage.loadOlder(); // explore one chunk up: e2600..e2799
+        final target = storage.offsetOf('e2700');
+        expect(target, isNotNull);
+
+        final branch = await storage.jumpToOffset(target!);
+        expect(idsOf(branch), contains('e2700'));
+        final ids = idsOf(await storage.getEntries());
+        expect(ids, contains('e2700'));
+        expect(ids.length, lessThanOrEqualTo(200));
+        // The leaf is the TRUE file leaf regardless of the window position.
+        expect(await storage.getLeafId(), 'e2999');
+        // Edges are unknown right after a jump (null, not a guess).
+        expect(await storage.countAbove(), isNull);
+        // And the jump window pages back down to the tail cleanly.
+        while (storage.hasNewer) {
+          await storage.loadNewer();
+        }
+        expect(idsOf(await storage.getEntries()).last, 'e2999');
+        expect(storage.countBelow, 0);
+      },
+    );
+
+    test('byte cap bounds residency with pathological records', () async {
+      // Five ~1.2 MiB records: the record cap alone would admit them all.
+      const iso = '2026-01-01T00:00:00.000Z';
+      final buffer = StringBuffer(
+        '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+        '"cwd":"/work"}\n',
+      );
+      for (var i = 0; i < 5; i++) {
+        buffer.write(
+          '{"type":"message","id":"e$i","parentId":'
+          '${i == 0 ? 'null' : '"e${i - 1}"'},"timestamp":"$iso",'
+          '"message":{"role":"user","content":[{"type":"text","text":'
+          '"${'x' * (1200 * 1024)}"}]}}\n',
+        );
+      }
+      await fs.writeFile(path, buffer.toString());
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 4,
+        chunkBytes: 8 * 1024 * 1024,
+        residentRecords: 6,
+        residentBytes: 3 * 1024 * 1024,
+      );
+      await storage.loadOlder();
+      // The byte cap holds even though the record cap (6) would allow
+      // every one of the 5 MiB-scale records resident.
+      expect(storage.residentWindowBytes, lessThanOrEqualTo(3 * 1024 * 1024));
+      expect(storage.residentCount, lessThan(5));
+    });
+
+    test('external appends keep the cached total fresh (no drift)', () async {
+      await seedRaw(1000);
+      final storage = await WindowedSessionStorage.open(fs, path);
+      expect(await storage.countRecords(), 1000);
+      // A CLI appends 5 records straight to the file.
+      const iso = '2026-01-01T00:00:00.000Z';
+      final extra = StringBuffer();
+      for (var i = 0; i < 5; i++) {
+        extra.write(
+          '{"type":"message","id":"e${1000 + i}","parentId":"e${999 + i}",'
+          '"timestamp":"$iso","message":{"role":"user","content":'
+          '[{"type":"text","text":"appended $i"}]}}\n',
+        );
+      }
+      final appended = await fs.appendFile(path, extra.toString());
+      if (appended.isErr) fail('append failed: ${appended.errorOrNull}');
+      expect(idsOf((await storage.ingestAppended()).delta), hasLength(5));
+      // A stale memo would report 1000 and drift the banner count
+      // downward (negative) after every external append.
+      expect(await storage.countRecords(), 1005);
+    });
+
+    test('seeded tap-walk concatenates the full branch with no gaps', () async {
+      await seedRaw(777);
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 5000,
+        residentBytes: 1 << 30,
+      );
+      final walked = <String>[];
+      while (storage.hasOlder) {
+        final joined = await storage.loadOlder();
+        if (joined.isEmpty) fail('loadOlder stalled with history above');
+        walked.insertAll(0, [for (final record in joined) record.id]);
+      }
+      // The deltas (tap-joined records, root-first each tap) rebuild
+      // everything above the open tail exactly: e0..e726, no gaps, no
+      // duplicates, no reordering (issue #135 AC3).
+      expect(walked, [for (var i = 0; i < 727; i++) 'e$i']);
+      // And the resident window now spans the whole branch in file
+      // order, open tail included.
+      final ids = [for (final record in await storage.getEntries()) record.id];
+      expect(ids, [for (var i = 0; i < 777; i++) 'e$i']);
+    });
+  });
+
+  group('round 4', () {
+    test('AC6: jumpToRecord through the offset map scans nothing', () async {
+      await seedRaw(3000);
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 200,
+        residentRecords: 600,
+        residentBytes: 1 << 30,
+      );
+      // Explore upward far enough that the open-tail records were
+      // evicted from residency (they stay in the sparse offset map).
+      for (var i = 0; i < 8; i++) {
+        await storage.loadOlder();
+      }
+      expect(idsOf(await storage.getEntries()), isNot(contains('e2999')));
+      expect(storage.offsetOf('e2999'), isNotNull);
+      final passesBefore = storage.reader.locatePassCount;
+      final branch = await storage.jumpToRecord('e2999');
+      // Instant: the offset map served the jump — the locate scanner
+      // read nothing (issue #135 AC6, instrumented).
+      expect(storage.reader.locatePassCount, passesBefore);
+      expect(idsOf(branch), contains('e2999'));
+      expect(idsOf(await storage.getEntries()), contains('e2999'));
+      // An UNEXPLORED record pays exactly one seek pass.
+      final unexplored = await storage.jumpToRecord('e5');
+      expect(idsOf(unexplored), contains('e5'));
+      expect(storage.reader.locatePassCount, greaterThan(passesBefore));
+    });
+
+    test('AC10: branch switch re-centers on the new branch tail', () async {
+      // One trunk e0..e99, then two forks: B (e100b..e199b) first in
+      // file order, A (e100a..e299a) after — the open tail lands on A.
+      const iso = '2026-01-01T00:00:00.000Z';
+      String line(String id, String? parent, [String tag = 'a']) =>
+          '{"type":"message","id":"$id","parentId":'
+          '${parent == null ? 'null' : '"$parent"'},"timestamp":"$iso",'
+          '"message":{"role":"user","content":[{"type":"text","text":'
+          '"message $id $tag"}]}}\n';
+      final buffer = StringBuffer(
+        '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+        '"cwd":"/work"}\n',
+      );
+      for (var i = 0; i < 100; i++) {
+        buffer.write(line('e$i', i == 0 ? null : 'e${i - 1}'));
+      }
+      for (var i = 0; i < 100; i++) {
+        buffer.write(line('e${100 + i}b', i == 0 ? 'e99' : 'e${99 + i}b', 'b'));
+      }
+      for (var i = 0; i < 200; i++) {
+        buffer.write(line('e${100 + i}a', i == 0 ? 'e99' : 'e${99 + i}a'));
+      }
+      await fs.writeFile(path, buffer.toString());
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 150,
+        residentBytes: 1 << 30,
+      );
+      expect(await storage.getLeafId(), 'e299a');
+      // The foreign-branch target resolves even though it never was
+      // resident (the moveTo existence check).
+      expect((await storage.getEntry('e150b'))?.id, 'e150b');
+      await storage.setLeafId('e150b');
+      // The window re-centered on B's tail: the leaf is the target, no
+      // A-branch record renders (issue #135 AC10).
+      expect(await storage.getLeafId(), 'e150b');
+      final resident = idsOf(await storage.getEntries());
+      expect(resident, contains('e150b'));
+      expect(resident, isNot(contains('e299a')));
+      // The branch walk climbs B's chain to the trunk — never through A.
+      final branch = idsOf(await storage.currentBranch());
+      expect(branch.last, 'e150b');
+      expect(branch, isNot(contains('e100a')));
+      // Paging up continues B's own chain.
+      final older = await storage.loadOlder();
+      expect(idsOf(older), isNot(contains('e299a')));
+      expect(idsOf(older).first, isNot('e100a'));
+    });
+    test('branch re-center keeps the load-newer banner off (#197)', () async {
+      // One trunk e0..e99, then two forks: B (e100b..e199b) first in
+      // file order, A (e100a..e299a) after — the open tail lands on A.
+      const iso = '2026-01-01T00:00:00.000Z';
+      String line(String id, String? parent, [String tag = 'a']) =>
+          '{"type":"message","id":"$id","parentId":'
+          '${parent == null ? 'null' : '"$parent"'},"timestamp":"$iso",'
+          '"message":{"role":"user","content":[{"type":"text","text":'
+          '"message $id $tag"}]}}\n';
+      final buffer = StringBuffer(
+        '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+        '"cwd":"/work"}\n',
+      );
+      for (var i = 0; i < 100; i++) {
+        buffer.write(line('e$i', i == 0 ? null : 'e${i - 1}'));
+      }
+      for (var i = 0; i < 100; i++) {
+        buffer.write(line('e${100 + i}b', i == 0 ? 'e99' : 'e${99 + i}b', 'b'));
+      }
+      for (var i = 0; i < 200; i++) {
+        buffer.write(line('e${100 + i}a', i == 0 ? 'e99' : 'e${99 + i}a'));
+      }
+      await fs.writeFile(path, buffer.toString());
+      final storage = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 150,
+        residentBytes: 1 << 30,
+      );
+      await storage.setLeafId('e150b');
+      // The re-centered window sits at B's head: branch A's records
+      // continue BELOW in file order, but they are not B's newer
+      // history — the banner must not claim them (issue #197 defect 3).
+      expect(storage.hasNewer, isFalse);
+      expect(storage.countBelow, 0);
+      // With the below-count known, the above-count resolves too.
+      expect(await storage.countAbove(), isNotNull);
+      // A page-down tap stays a no-op instead of paging foreign records.
+      expect(await storage.loadNewer(), isEmpty);
+      expect(storage.hasNewer, isFalse);
+    });
+
+    test(
+      'locateRecord skips a torn line that carries the needle (#197)',
+      () async {
+        await seedRaw(10);
+        // The torn tail: a partially-written record embedding an id (the
+        // ASCII gate passes) whose JSON never completes.
+        final raw = (await fs.readTextFile(path)).valueOrNull!;
+        await fs.writeFile(
+          path,
+          '$raw{"type":"message","id":"eZ","parentId":"e9"',
+        );
+        final reader = SessionChunkReader(fs: fs, path: path);
+        // A torn hit degrades to a clean miss, never a throw (defect 1).
+        expect(await reader.locateRecord('eZ'), isNull);
+        // Whole records still resolve.
+        expect(await reader.locateRecord('e5'), isNotNull);
+      },
+    );
+
+    test('AC7: a same-size rewrite (mtime) re-anchors to tail', () async {
+      await seedRaw(100);
+      fs.setMtime(path, 1_000);
+      final storage = await WindowedSessionStorage.open(fs, path);
+      expect((await storage.ingestAppended()).reanchored, isFalse);
+      // External rewrite: same size, different bytes, newer mtime.
+      fs.setMtime(path, 2_000);
+      final ingest = await storage.ingestAppended();
+      expect(ingest.reanchored, isTrue);
+      // The window re-anchored on the (rewritten) tail.
+      expect(idsOf(await storage.getEntries()).last, 'e99');
+    });
+  });
+
+  group('growOlderUntil (resume boundary walk)', () {
+    // The CLI resume pages a windowed open back to the newest compaction
+    // boundary (issue #503). The page loop MUST keep the tail anchored:
+    // the old ensure path slid the newest side out of the residency cache
+    // on the first chunk and the branch read EMPTY — every resume with a
+    // boundary deeper than one chunk fell back to a full open (10s+ on a
+    // marathon session, observed on a 1.4 GB live file).
+    test(
+      'pages several chunks to the boundary WITHOUT sliding the tail out',
+      () async {
+        const count = 1200;
+        const boundary = 300; // chunks above the tail window
+        await seedRaw(count, compactionAt: boundary);
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 50,
+          residentRecords: 100,
+        );
+        final leafBefore = await windowed.getLeafId();
+        expect(leafBefore, 'e${count - 1}');
+
+        final ok = await windowed.growOlderUntil((r) => r is CompactionRecord);
+
+        expect(ok, isTrue);
+        expect(await windowed.getLeafId(), leafBefore);
+        final branch = await windowed.getPathToRoot(leafBefore!);
+        expect(branch, isNotEmpty);
+        expect(branch.last.id, leafBefore);
+        expect(branch.any((r) => r is CompactionRecord), isTrue);
+        // The boundary itself is resident: the resume context starts here.
+        final boundaryRecord = branch.firstWhere((r) => r is CompactionRecord);
+        expect(boundaryRecord.id, 'c$boundary');
+      },
+    );
+
+    test('session without compaction pages to the file head and keeps the '
+        'whole chain (no full-open fallback needed)', () async {
+      const count = 700;
+      await seedRaw(count);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+      final leafBefore = await windowed.getLeafId();
+
+      final ok = await windowed.growOlderUntil((r) => r is CompactionRecord);
+
+      expect(ok, isTrue);
+      expect(windowed.hasOlder, isFalse);
+      final branch = await windowed.getPathToRoot(leafBefore!);
+      expect(branch.first.id, 'e0');
+      expect(branch.last.id, leafBefore);
+      expect(branch, hasLength(count));
+    });
+
+    test('maxPages exhaustion reports false (fallback preserved)', () async {
+      const count = 1200;
+      await seedRaw(count, compactionAt: 100);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+
+      final ok = await windowed.growOlderUntil(
+        (r) => r is CompactionRecord,
+        maxPages: 1,
+      );
+
+      expect(ok, isFalse);
+    });
+
+    test('token budget stops the walk before the boundary once the resident '
+        'tail already fills the context window (issue #503: resume reads '
+        'only what fits the model window, never the whole file)', () async {
+      const count = 700;
+      const boundary = 100; // deep in the file — must NOT be reached
+      await seedRaw(count, compactionAt: boundary);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+      final leafBefore = await windowed.getLeafId();
+
+      // Seeded messages are ~45 chars ≈ 12 tokens each; the 100-record
+      // tail window alone already covers a 1000-token budget, so the
+      // walk must stop without paging at all.
+      final ok = await windowed.growOlderUntil(
+        (r) => r is CompactionRecord,
+        tokenBudget: 1000,
+      );
+
+      expect(ok, isTrue);
+      expect(await windowed.getLeafId(), leafBefore);
+      final branch = await windowed.getPathToRoot(leafBefore!);
+      // Budget stop: the boundary is NOT resident and the file head
+      // was NOT reached (unlike the no-compaction degenerate walk).
+      expect(branch.any((r) => r is CompactionRecord), isFalse);
+      expect(windowed.hasOlder, isTrue);
+      expect(branch.length, lessThan(count));
+      // ...and the resident tail genuinely covers the budget — within
+      // one record's tokens (gh-968 AC-R4: the stop is record-granular
+      // now, so the kept tail sits at/below the budget, never a block
+      // past it; a ~45-char record prices ~12 tokens).
+      expect(estimateSessionBranchTokens(branch), lessThanOrEqualTo(1000));
+      expect(
+        estimateSessionBranchTokens(branch),
+        greaterThanOrEqualTo(1000 - 12),
+      );
+    });
+
+    test(
+      'walk pages giant model_request_summary records header-only: chain '
+      'stays intact, walked customs lose data, tail window keeps it '
+      '(issue #503 round 3b — 467 × 0.75MB monsters were the 9.3s walk)',
+      () async {
+        const iso = '2026-01-01T00:00:00.000Z';
+        const monster = 200 * 1024;
+        final buffer = StringBuffer(
+          '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+          '"cwd":"/work"}\n',
+        );
+        // 200 messages, a giant custom after every 10th — all chained.
+        var prev = 'null';
+        for (var i = 0; i < 200; i++) {
+          buffer.write(
+            '{"type":"message","id":"e$i","parentId":$prev,'
+            '"timestamp":"$iso","message":{"role":"user","content":'
+            '[{"type":"text","text":"message $i body"}]}}\n',
+          );
+          prev = '"e$i"';
+          if (i % 10 == 9) {
+            buffer.write(
+              '{"type":"custom","id":"m$i","parentId":$prev,'
+              '"timestamp":"$iso","customType":"model_request_summary",'
+              '"data":{"blob":"${'x' * monster}"}}\n',
+            );
+            prev = '"m$i"';
+          }
+        }
+        await fs.writeFile(path, buffer.toString());
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 50,
+          residentRecords: 400,
+        );
+        final leaf = (await windowed.getLeafId())!;
+
+        // Walk to the file top (predicate that never fires, no budget).
+        final ok = await windowed.growOlderUntil((r) => false);
+        expect(ok, isTrue);
+        expect(windowed.hasOlder, isFalse);
+
+        final branch = await windowed.getPathToRoot(leaf);
+        // Chain intact: every message AND monster present, in order.
+        expect(branch.whereType<MessageRecord>(), hasLength(200));
+        expect(branch.whereType<CustomRecord>(), hasLength(20));
+        // The initial tail window (opened via the full-fidelity path)
+        // keeps data; records paged by the walk are header-only.
+        final customs = branch.whereType<CustomRecord>().toList();
+        final walked = customs.take(customs.length - 5);
+        final tailWindow = customs.skip(customs.length - 5);
+        for (final c in walked) {
+          expect(c.data, isNull, reason: 'walked ${c.id} must be shallow');
+        }
+        for (final c in tailWindow) {
+          expect(
+            c.data,
+            isNotNull,
+            reason: 'tail-window ${c.id} keeps full fidelity',
+          );
+        }
+      },
+    );
+
+    test(
+      'budget walk with a hidden_range hiding most messages does NOT trip '
+      'early: the projected estimate sees markers, so the walk reaches '
+      'the deep compaction boundary (issue #503 round 3b — raw estimate '
+      'overshot the projection ~8x and under-filled the resume window)',
+      () async {
+        const iso = '2026-01-01T00:00:00.000Z';
+        final body = 'y' * 400; // ≈100 tokens per message
+        final buffer = StringBuffer(
+          '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+          '"cwd":"/work"}\n',
+        );
+        // Compaction boundary deep at index 100.
+        buffer.write(
+          '{"type":"message","id":"e0","parentId":null,'
+          '"timestamp":"$iso","message":{"role":"user","content":'
+          '[{"type":"text","text":"$body"}]}}\n',
+        );
+        for (var i = 1; i < 700; i++) {
+          if (i == 100) {
+            buffer.write(
+              '{"type":"compaction","id":"c100","parentId":"e99",'
+              '"timestamp":"$iso","summary":"compacted prefix",'
+              '"firstKeptEntryId":"e100","tokensBefore":12345}\n',
+            );
+          }
+          buffer.write(
+            '{"type":"message","id":"e$i","parentId":'
+            '"${i == 100 ? 'c100' : 'e${i - 1}'}",'
+            '"timestamp":"$iso","message":{"role":"user","content":'
+            '[{"type":"text","text":"$body"}]}}\n',
+          );
+        }
+        // Hidden range at the tail covers e100..e600 — the structured
+        // compaction marker sits NEWER than the records it hides.
+        final hiddenIds = [for (var i = 100; i <= 600; i++) '"e$i"'].join(',');
+        buffer.write(
+          '{"type":"hidden_range","id":"h0","parentId":"e699",'
+          '"timestamp":"$iso","recordIds":[$hiddenIds]}\n',
+        );
+        await fs.writeFile(path, buffer.toString());
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 50,
+          residentRecords: 800,
+        );
+        final leaf = (await windowed.getLeafId())!;
+
+        // Raw tally of the tail alone: 100 records × ~100 tokens ≈ 10k —
+        // a 30k budget would trip ~300 records short of the boundary
+        // under the raw estimator. Projected: 501 hidden × 10 (markers)
+        // + 199 visible × 100 ≈ 25k — under budget, walk continues.
+        final ok = await windowed.growOlderUntil(
+          (r) => r is CompactionRecord,
+          tokenBudget: 30000,
+        );
+
+        expect(ok, isTrue);
+        final branch = await windowed.getPathToRoot(leaf);
+        expect(
+          branch.any((r) => r is CompactionRecord),
+          isTrue,
+          reason: 'the walk must reach the deep boundary, not trip early',
+        );
+      },
+    );
+
+    test('budget stop trims to the parity bound (gh-968 AC-R4): the kept '
+        'tail never prices past the budget, and dropped history pages back '
+        'lazily', () async {
+      // 700 records × 100 tokens, a 5000-token giant at index 300: the
+      // block that crosses a 19750 budget prices ~44.9k (300 records +
+      // the giant) — the old stop returned it whole.
+      await seedSized(700, giantAt: 300);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+      final leafBefore = await windowed.getLeafId();
+
+      const budget = 19750;
+      final ok = await windowed.growOlderUntil(
+        (r) => r is CompactionRecord,
+        tokenBudget: budget,
+      );
+
+      expect(ok, isTrue);
+      // The walk stays tail-anchored (no full-open fallback on the
+      // caller's side).
+      expect(await windowed.getLeafId(), leafBefore);
+      final branch = await windowed.getPathToRoot(leafBefore!);
+      final estimate = estimateProjectedBranchTokens(branch);
+      // The kept tail is within the budget — overshoot bounded by the
+      // crossing record, never one doubling block.
+      expect(estimate, lessThanOrEqualTo(budget));
+      expect(estimate, greaterThan(budget - 200));
+      // Records below the cut are gone from the branch — the giant too —
+      // while the live tail stays.
+      expect(branch.any((r) => r.id == 'giant'), isFalse);
+      expect(branch.last.id, leafBefore);
+      // Dropped history stays lazy-scrollable (issue #503 preserved):
+      // loadOlder pages it back.
+      expect(windowed.hasOlder, isTrue);
+      final older = await windowed.loadOlder();
+      expect(older, isNotEmpty);
+      // The record just below the cut pages back first among the joined
+      // tail (loadOlder returns root-first) — the trim dropped everything
+      // older than the kept boundary.
+      expect(older.last.id, branch.first.parentId);
+    });
+
+    test('boundary-first preserved: a reachable compaction boundary stops '
+        'the walk before the budget and is NEVER trimmed (the parity budget '
+        'is the safety net, not the target)', () async {
+      await seedSized(700, compactionAt: 100);
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+      final leafBefore = await windowed.getLeafId();
+
+      // Budget 45000 < the 700-record projection: the walk crosses it —
+      // but only AFTER the boundary is resident, and the boundary stop
+      // wins, so nothing is trimmed.
+      const budget = 45000;
+      final ok = await windowed.growOlderUntil(
+        (r) => r is CompactionRecord,
+        tokenBudget: budget,
+      );
+
+      expect(ok, isTrue);
+      expect(await windowed.getLeafId(), leafBefore);
+      final branch = await windowed.getPathToRoot(leafBefore!);
+      expect(branch.any((r) => r is CompactionRecord), isTrue);
+      // Whole chain resident: the boundary path reconstructs the real
+      // pre-close projection, budget notwithstanding.
+      expect(branch, hasLength(701));
+      expect(
+        estimateProjectedBranchTokens(branch),
+        greaterThan(budget),
+        reason: 'the boundary stop tolerates a budget-crossing projection',
+      );
+    });
+
+    test('a budget under the newest record alone floors at the tail record '
+        '(E3: giant in the tail — never an empty window)', () async {
+      await seedSized(10, textChars: 2000); // 10 records × 500 tokens
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+      final leafBefore = await windowed.getLeafId();
+
+      final ok = await windowed.growOlderUntil(
+        (r) => r is CompactionRecord,
+        tokenBudget: 100,
+      );
+
+      expect(ok, isTrue);
+      expect(await windowed.getLeafId(), leafBefore);
+      final branch = await windowed.getPathToRoot(leafBefore!);
+      expect(branch, hasLength(1));
+      expect(branch.single.id, leafBefore);
+      expect(windowed.hasOlder, isTrue);
+    });
+
+    test('walk + trim keep the tail byte-exact: Cyrillic payloads and '
+        'image blocks survive the JSONL round-trip (mojibake-family '
+        'regression, E2E tail shape)', () async {
+      final storage = await JsonlSessionStorage.create(
+        fs,
+        path,
+        cwd: '/work',
+        sessionId: 'cyr',
+      );
+      // 60 records × 101 tokens (403-char texts — 400 Cyrillic ж + a
+      // №-marker), an image every 10th record.
+      final texts = <String>[];
+      for (var i = 0; i < 60; i++) {
+        final text = 'ж' * 400 + '№$i';
+        texts.add(text);
+        final content = <ContentBlock>[
+          TextContent(text: text),
+          if (i % 10 == 0)
+            const ImageContent(data: 'AAAA', mimeType: 'image/png'),
+        ];
+        await storage.appendEntry(
+          MessageRecord(
+            id: 'e$i',
+            parentId: i == 0 ? null : 'e${i - 1}',
+            timestamp: DateTime.utc(2026, 1, 1).add(Duration(minutes: i)),
+            message: UserMessage(
+              content: content,
+              timestamp: DateTime.utc(2026, 1, 1).add(Duration(minutes: i)),
+            ),
+          ),
+        );
+      }
+      final windowed = await WindowedSessionStorage.open(
+        fs,
+        path,
+        chunkRecords: 50,
+        residentRecords: 100,
+      );
+      final leafBefore = await windowed.getLeafId();
+
+      // 50 × 101 = 5050 < 5800: the walk pages one block (records e0..e9
+      // re-parse from multibyte JSONL), then trims to the budget.
+      final ok = await windowed.growOlderUntil(
+        (r) => r is CompactionRecord,
+        tokenBudget: 5800,
+      );
+
+      expect(ok, isTrue);
+      expect(await windowed.getLeafId(), leafBefore);
+      final branch = await windowed.getPathToRoot(leafBefore!);
+      expect(estimateProjectedBranchTokens(branch), lessThanOrEqualTo(5800));
+      // The walked-then-kept records keep their exact content — no
+      // mojibake, no split codepoints.
+      final byId = {for (final r in branch) r.id: r};
+      // e40/e50 carry images and are checked below.
+      for (final i in [31, 35, 39, 41, 45, 59]) {
+        final record = byId['e$i']! as MessageRecord;
+        final message = record.message as UserMessage;
+        expect(
+          (message.content as List).single as TextContent,
+          isA<TextContent>().having((t) => t.text, 'text', texts[i]),
+          reason: 'e$i must survive the walk byte-exact',
+        );
+      }
+      for (final i in [40, 50]) {
+        final carrier = (byId['e$i']! as MessageRecord).message as UserMessage;
+        expect(carrier.content as List, hasLength(2), reason: 'e$i');
+        final image = (carrier.content as List).last as ImageContent;
+        expect(image.data, 'AAAA', reason: 'e$i');
+        expect(image.mimeType, 'image/png', reason: 'e$i');
+      }
+    });
+
+    test(
+      'gh-1425 AC1: the boundary stop waits for the kept path — a block '
+      'bottom between firstKeptEntryId and the compaction record keeps '
+      'paging (the kept region must never silently drop at resume)',
+      () async {
+        // 1200 records, boundary at e450/c450, firstKeptEntryId = e380 (the
+        // compaction keeps its last 70 records — the classic post-compaction
+        // shape). The doubling blocks land the branch bottom at
+        // 1150/1101/1001/801/401 — 401 sits INSIDE the kept region
+        // (380 < 401 ≤ 450), exactly the geometry where the old found-stop
+        // fired with firstKeptEntryId non-resident and classicTransform
+        // dropped the whole kept region.
+        const iso = '2026-01-01T00:00:00.000Z';
+        const count = 1200;
+        const boundary = 450;
+        const firstKept = 380;
+        final buffer = StringBuffer(
+          '{"type":"session","version":3,"id":"big","timestamp":"$iso",'
+          '"cwd":"/work"}\n',
+        );
+        for (var i = 0; i < count; i++) {
+          if (i == boundary) {
+            buffer.write(
+              '{"type":"compaction","id":"c$i","parentId":"e${i - 1}",'
+              '"timestamp":"$iso","summary":"compacted prefix",'
+              '"firstKeptEntryId":"e$firstKept","tokensBefore":12345}\n',
+            );
+          }
+          buffer.write(
+            '{"type":"message","id":"e$i","parentId":'
+            '${i == 0 ? 'null' : (i == boundary ? '"c$i"' : '"e${i - 1}"')},'
+            '"timestamp":"$iso",'
+            '"message":{"role":"user","content":[{"type":"text","text":'
+            '"body $i ${'a' * 40}"}]}}\n',
+          );
+        }
+        await fs.writeFile(path, buffer.toString());
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 50,
+          residentRecords: 100,
+        );
+        final leafBefore = await windowed.getLeafId();
+
+        final ok = await windowed.growOlderUntil((r) => r is CompactionRecord);
+
+        expect(ok, isTrue);
+        expect(await windowed.getLeafId(), leafBefore);
+        final branch = await windowed.getPathToRoot(leafBefore!);
+        expect(branch.any((r) => r is CompactionRecord), isTrue);
+        // THE FIX: the kept path is resident — firstKeptEntryId itself, and
+        // with it the whole kept region the live session rendered.
+        expect(
+          branch.any((r) => r.id == 'e$firstKept'),
+          isTrue,
+          reason:
+              'firstKeptEntryId must be resident when the walk stops at '
+              'the boundary, or the kept region silently drops',
+        );
+        // The boundary block bottom (e401) sits above firstKept — the walk
+        // had to page PAST it for this test to exercise the fix at all.
+        expect(
+          branch.any((r) => r.id == 'e401'),
+          isTrue,
+          reason: 'fixture geometry: the stop must land inside the kept region',
+        );
+      },
+    );
+
+    test(
+      'gh-1425 AC1: budget stop wins over kept-path completeness when '
+      'the boundary is unreachable (issue #503 bounded boot preserved)',
+      () async {
+        // The tail alone prices past the budget: the walk must stop on the
+        // budget (trim) even though no compaction is resident — the boot
+        // cap (AC3) owns the over-window residue, the walk stays bounded.
+        await seedSized(700, textChars: 2000); // ~500 tokens per record
+        final windowed = await WindowedSessionStorage.open(
+          fs,
+          path,
+          chunkRecords: 50,
+          residentRecords: 100,
+        );
+        final leafBefore = await windowed.getLeafId();
+
+        final ok = await windowed.growOlderUntil(
+          (r) => r is CompactionRecord,
+          tokenBudget: 5000,
+        );
+
+        expect(ok, isTrue);
+        expect(await windowed.getLeafId(), leafBefore);
+        final branch = await windowed.getPathToRoot(leafBefore!);
+        expect(branch.any((r) => r is CompactionRecord), isFalse);
+        expect(estimateProjectedBranchTokens(branch), lessThanOrEqualTo(5000));
+        expect(windowed.hasOlder, isTrue);
+      },
+    );
+  });
+}

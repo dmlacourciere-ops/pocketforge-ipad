@@ -1,0 +1,983 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+/// Wraps a [FileSystem] and tracks how many session-header reads are
+/// in flight at once. The gate completes as soon as two overlap, so a
+/// sequential implementation stalls on its own first read until the
+/// timeout and fails the max-in-flight assertion below.
+class ProbeFs implements FileSystem {
+  ProbeFs(this._delegate);
+
+  final FileSystem _delegate;
+  int inFlight = 0;
+  int maxInFlight = 0;
+  final Completer<void> _twoInFlight = Completer<void>();
+
+  @override
+  Future<Result<List<String>, FileError>> readTextLines(
+    String path, {
+    int? maxLines,
+  }) async {
+    final isHeaderRead = maxLines == 1;
+    if (isHeaderRead) {
+      inFlight++;
+      if (maxInFlight < inFlight) maxInFlight = inFlight;
+      if (inFlight >= 2 && !_twoInFlight.isCompleted) {
+        _twoInFlight.complete();
+      }
+      try {
+        await _twoInFlight.future.timeout(const Duration(seconds: 5));
+      } on TimeoutException {
+        // Sequential caller: the gate never opened.
+      } finally {
+        inFlight--;
+      }
+    }
+    return _delegate.readTextLines(path, maxLines: maxLines);
+  }
+
+  @override
+  String get cwd => _delegate.cwd;
+  @override
+  Future<Result<String, FileError>> absolutePath(String path) =>
+      _delegate.absolutePath(path);
+  @override
+  Future<Result<String, FileError>> joinPath(List<String> parts) =>
+      _delegate.joinPath(parts);
+  @override
+  Future<Result<String, FileError>> readTextFile(String path) =>
+      _delegate.readTextFile(path);
+  @override
+  Future<Result<Uint8List, FileError>> readBinaryFile(String path) =>
+      _delegate.readBinaryFile(path);
+  @override
+  Future<Result<void, FileError>> writeBinaryFile(
+    String path,
+    Uint8List content,
+  ) => _delegate.writeBinaryFile(path, content);
+  @override
+  Future<Result<void, FileError>> writeFile(String path, String content) =>
+      _delegate.writeFile(path, content);
+  @override
+  Future<Result<void, FileError>> appendFile(String path, String content) =>
+      _delegate.appendFile(path, content);
+  @override
+  Future<Result<FileInfo, FileError>> fileInfo(String path) =>
+      _delegate.fileInfo(path);
+  @override
+  Future<Result<List<FileInfo>, FileError>> listDir(String path) =>
+      _delegate.listDir(path);
+  @override
+  Future<Result<bool, FileError>> exists(String path) => _delegate.exists(path);
+  @override
+  Future<Result<void, FileError>> createDir(
+    String path, {
+    bool recursive = true,
+  }) => _delegate.createDir(path, recursive: recursive);
+  @override
+  Future<Result<void, FileError>> remove(
+    String path, {
+    bool recursive = false,
+    bool force = false,
+  }) => _delegate.remove(path, recursive: recursive, force: force);
+}
+
+/// Counts parse batches crossing the executor boundary. The raw
+/// needle scan (issue #369) must never send the session body through
+/// it — zero batches is the "no full parse" proof on a big fixture.
+class CountingParseExecutor implements SessionParseExecutor {
+  int batchCount = 0;
+
+  @override
+  Future<SessionParseResult> parse(SessionParseBatch batch) async {
+    batchCount++;
+    return parseSessionEntryLinesSync(batch);
+  }
+}
+
+/// Counts every ranged byte reads touch. Issue #369 AC1: resolving a
+/// name - present OR absent - must cost bytes far below the file size;
+/// the body between the probe windows is never read.
+class CountingRangedFs implements FileSystem, RangedReadFileSystem {
+  CountingRangedFs(FileSystem delegate)
+    : _delegate = delegate,
+      _ranged = delegate as RangedReadFileSystem;
+
+  final FileSystem _delegate;
+  final RangedReadFileSystem _ranged;
+  int rangedBytes = 0;
+
+  @override
+  Future<Result<Uint8List, FileError>> readRange(
+    String path,
+    int start,
+    int end,
+  ) async {
+    rangedBytes += end - start;
+    return _ranged.readRange(path, start, end);
+  }
+
+  @override
+  Future<Result<List<String>, FileError>> readTextLines(
+    String path, {
+    int? maxLines,
+  }) => _delegate.readTextLines(path, maxLines: maxLines);
+
+  @override
+  String get cwd => _delegate.cwd;
+  @override
+  Future<Result<String, FileError>> absolutePath(String path) =>
+      _delegate.absolutePath(path);
+  @override
+  Future<Result<String, FileError>> joinPath(List<String> parts) =>
+      _delegate.joinPath(parts);
+  @override
+  Future<Result<String, FileError>> readTextFile(String path) =>
+      _delegate.readTextFile(path);
+  @override
+  Future<Result<Uint8List, FileError>> readBinaryFile(String path) =>
+      _delegate.readBinaryFile(path);
+  @override
+  Future<Result<void, FileError>> writeBinaryFile(
+    String path,
+    Uint8List content,
+  ) => _delegate.writeBinaryFile(path, content);
+  @override
+  Future<Result<void, FileError>> writeFile(String path, String content) =>
+      _delegate.writeFile(path, content);
+  @override
+  Future<Result<void, FileError>> appendFile(String path, String content) =>
+      _delegate.appendFile(path, content);
+  @override
+  Future<Result<FileInfo, FileError>> fileInfo(String path) =>
+      _delegate.fileInfo(path);
+  @override
+  Future<Result<List<FileInfo>, FileError>> listDir(String path) =>
+      _delegate.listDir(path);
+  @override
+  Future<Result<bool, FileError>> exists(String path) => _delegate.exists(path);
+  @override
+  Future<Result<void, FileError>> createDir(
+    String path, {
+    bool recursive = true,
+  }) => _delegate.createDir(path, recursive: recursive);
+  @override
+  Future<Result<void, FileError>> remove(
+    String path, {
+    bool recursive = false,
+    bool force = false,
+  }) => _delegate.remove(path, recursive: recursive, force: force);
+}
+
+void main() {
+  late MemoryFileSystem fs;
+  late JsonlSessionRepo repo;
+
+  setUp(() {
+    fs = MemoryFileSystem();
+    repo = JsonlSessionRepo(fs: fs, sessionsRoot: '/sessions');
+  });
+
+  group('encodeSessionCwd / decodeSessionCwd', () {
+    test('decodes a slug back to its absolute path', () {
+      expect(
+        decodeSessionCwd('--Users-Uladzimir_Klyshevich-git-dm.ai--'),
+        '/Users/Uladzimir_Klyshevich/git/dm.ai',
+      );
+    });
+
+    test('round-trips typical absolute paths', () {
+      expect(decodeSessionCwd(encodeSessionCwd('/foo/bar')), '/foo/bar');
+      expect(
+        decodeSessionCwd(
+          encodeSessionCwd('/Users/Uladzimir_Klyshevich/git/dm.ai'),
+        ),
+        '/Users/Uladzimir_Klyshevich/git/dm.ai',
+      );
+      expect(decodeSessionCwd(encodeSessionCwd('/single')), '/single');
+    });
+
+    test('round-trips paths containing hyphens (gh-1744)', () {
+      // The ticket's failing workspace: every hyphen below used to decode
+      // as a path separator, naming a directory that does not exist.
+      const cwd = '/Users/Yury_Bakhmutski/_w/postal-nl';
+      expect(decodeSessionCwd(encodeSessionCwd(cwd)), cwd);
+      expect(decodeSessionCwd(encodeSessionCwd('/a/b-c/d')), '/a/b-c/d');
+      expect(decodeSessionCwd(encodeSessionCwd('/w/-weird-')), '/w/-weird-');
+    });
+
+    test('escapes literal hyphens reversibly, separators stay hyphens', () {
+      // Separators keep the legacy shape, literal hyphens are escaped, so
+      // hyphen-free paths produce byte-identical slugs (on-disk folders
+      // and pi-mono layout stay stable).
+      expect(encodeSessionCwd('/foo/bar'), '--foo-bar--');
+      expect(encodeSessionCwd('/w/postal-nl'), '--w-postal%2Dnl--');
+      expect(encodeSessionCwd('/tmp/a-b_c/d.e'), '--tmp-a%2Db_c-d.e--');
+    });
+
+    test('round-trips percent and colon characters (gh-1744)', () {
+      const cwd = '/tmp/a%2Db:c';
+      expect(decodeSessionCwd(encodeSessionCwd(cwd)), cwd);
+    });
+
+    test('legacy escape-free slugs decode as before (compat)', () {
+      // Existing on-disk folders keep decoding through the legacy split.
+      expect(
+        decodeSessionCwd('--Users-Uladzimir_Klyshevich-git-dm.ai--'),
+        '/Users/Uladzimir_Klyshevich/git/dm.ai',
+      );
+      expect(decodeSessionCwd('--tmp-a-b--'), '/tmp/a/b');
+    });
+
+    test('ignores trailing slashes when encoding', () {
+      expect(encodeSessionCwd('/foo/bar/'), encodeSessionCwd('/foo/bar'));
+      expect(encodeSessionCwd('/foo/bar//'), encodeSessionCwd('/foo/bar'));
+    });
+
+    test('returns null for bad or empty slugs', () {
+      expect(decodeSessionCwd('Users-Uladzimir_Klyshevich-git-dm.ai'), isNull);
+      expect(decodeSessionCwd('--Users'), isNull);
+      expect(decodeSessionCwd('Users--'), isNull);
+      expect(decodeSessionCwd('--'), isNull);
+      expect(decodeSessionCwd(''), isNull);
+      expect(decodeSessionCwd('---foo---'), isNull);
+    });
+  });
+
+  group('JsonlSessionRepo', () {
+    test('create lays out files under an encoded cwd directory', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work/dir', id: 'sess-1'),
+      );
+      final metadata = await session.getMetadata();
+      expect(metadata.id, 'sess-1');
+      expect(metadata.cwd, '/work/dir');
+      expect(
+        metadata.path,
+        matches(r'^/sessions/--work-dir--/.+_sess-1\.jsonl$'),
+      );
+      expect((await fs.exists(metadata.path)).valueOrNull, isTrue);
+    });
+
+    test(
+      'create lays hyphenated cwds under a reversible slug dir (gh-1744)',
+      () async {
+        final session = await repo.create(
+          JsonlSessionCreateOptions(cwd: '/w/postal-nl', id: 'sess-h'),
+        );
+        final metadata = await session.getMetadata();
+        expect(
+          metadata.path,
+          matches(r'^/sessions/--w-postal%2Dnl--/.+_sess-h\.jsonl$'),
+        );
+      },
+    );
+
+    test(
+      'create rejects nothing; ids default to unique generated values',
+      () async {
+        final a = await repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+        final b = await repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+        expect((await a.getMetadata()).id, isNot((await b.getMetadata()).id));
+      },
+    );
+
+    test('open re-loads an existing session with its entries', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      await session.appendMessage(UserMessage.text('persisted'));
+      final metadata = await session.getMetadata();
+
+      final reopened = await repo.open(metadata);
+      final messages = await reopened.buildContextMessages();
+      expect((messages.single as UserMessage).content, 'persisted');
+    });
+
+    test('open of a missing session throws not_found', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      final metadata = await session.getMetadata();
+      await fs.remove(metadata.path);
+      expect(
+        () => repo.open(metadata),
+        throwsA(
+          isA<SessionException>().having(
+            (e) => e.code,
+            'code',
+            SessionErrorCode.notFound,
+          ),
+        ),
+      );
+    });
+
+    test(
+      'list returns sessions most recently updated first, filtered by cwd',
+      () async {
+        final a = await repo.create(
+          JsonlSessionCreateOptions(cwd: '/work', id: 'a'),
+        );
+        final b = await repo.create(
+          JsonlSessionCreateOptions(cwd: '/other', id: 'b'),
+        );
+        final c = await repo.create(
+          JsonlSessionCreateOptions(cwd: '/work', id: 'c'),
+        );
+
+        final all = await repo.list();
+        expect(
+          all.map((m) => m.id),
+          containsAll([
+            (await a.getMetadata()).id,
+            (await b.getMetadata()).id,
+            (await c.getMetadata()).id,
+          ]),
+        );
+        final activityTimes = all
+            .map((m) => m.lastUpdatedAt ?? m.createdAt)
+            .toList();
+        final sorted = [...activityTimes]..sort((x, y) => y.compareTo(x));
+        expect(activityTimes, sorted);
+
+        final workOnly = await repo.list(cwd: '/work');
+        expect(workOnly.map((m) => m.cwd).toSet(), {'/work'});
+        expect(workOnly, hasLength(2));
+      },
+    );
+
+    test('list populates sizeBytes from the filesystem entry', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      await session.appendMessage(UserMessage.text('hello'));
+      final all = await repo.list();
+      expect(all, hasLength(1));
+      final size = all.single.sizeBytes;
+      expect(size, isNotNull);
+      expect(size!, greaterThan(0));
+    });
+
+    test('list skips corrupt session files', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      final metadata = await session.getMetadata();
+      await fs.writeFile(metadata.path, 'garbage\n');
+      expect(await repo.list(), isEmpty);
+    });
+
+    test('delete removes the session file', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      final metadata = await session.getMetadata();
+      await repo.delete(metadata);
+      expect((await fs.exists(metadata.path)).valueOrNull, isFalse);
+    });
+
+    test(
+      'fork copies the full tree by default and records parent session',
+      () async {
+        final source = await repo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        await source.appendMessage(UserMessage.text('one'));
+        await source.appendMessage(UserMessage.text('two'));
+        final sourceMeta = await source.getMetadata();
+
+        final fork = await repo.fork(sourceMeta, cwd: '/work');
+        final forkMeta = await fork.getMetadata();
+        expect(forkMeta.parentSessionPath, sourceMeta.path);
+        expect(forkMeta.id, isNot(sourceMeta.id));
+        final messages = await fork.buildContextMessages();
+        expect(messages.map((m) => (m as UserMessage).content), ['one', 'two']);
+
+        // Fork is independent: appending to it does not touch the source.
+        await fork.appendMessage(UserMessage.text('fork only'));
+        expect(await source.buildContextMessages(), hasLength(2));
+      },
+    );
+
+    test('fork at an entry truncates to that prefix', () async {
+      final source = await repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+      final one = await source.appendMessage(UserMessage.text('one'));
+      await source.appendMessage(UserMessage.text('two'));
+
+      final fork = await repo.fork(
+        await source.getMetadata(),
+        cwd: '/work',
+        entryId: one,
+        position: ForkPosition.at,
+      );
+      final messages = await fork.buildContextMessages();
+      expect(messages.map((m) => (m as UserMessage).content), ['one']);
+    });
+
+    test('fork before a user message drops that message', () async {
+      final source = await repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+      final one = await source.appendMessage(UserMessage.text('one'));
+      final two = await source.appendMessage(UserMessage.text('two'));
+
+      final fork = await repo.fork(
+        await source.getMetadata(),
+        cwd: '/work',
+        entryId: two,
+      );
+      final messages = await fork.buildContextMessages();
+      expect(messages.map((m) => (m as UserMessage).content), ['one']);
+      expect(one, isNotNull);
+    });
+
+    test('fork before a non-user message is rejected', () async {
+      final source = await repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+      await source.appendMessage(UserMessage.text('one'));
+      final assistant = await source.appendMessage(
+        AssistantMessage(
+          content: const [TextContent(text: 'hi')],
+          api: 'openai-completions',
+          provider: 'p',
+          model: 'm',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+      final meta = await source.getMetadata();
+      expect(
+        () => repo.fork(meta, cwd: '/work', entryId: assistant),
+        throwsA(
+          isA<SessionException>().having(
+            (e) => e.code,
+            'code',
+            SessionErrorCode.invalidForkTarget,
+          ),
+        ),
+      );
+    });
+
+    test('fork of an unknown entry is rejected', () async {
+      final source = await repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+      final meta = await source.getMetadata();
+      expect(
+        () => repo.fork(meta, cwd: '/work', entryId: 'ghost'),
+        throwsA(
+          isA<SessionException>().having(
+            (e) => e.code,
+            'code',
+            SessionErrorCode.invalidForkTarget,
+          ),
+        ),
+      );
+    });
+
+    test(
+      'cleanupEmptySessions removes header-only .jsonl files and keeps the rest',
+      () async {
+        final envFs = MemoryFileSystem();
+        final cleanRepo = JsonlSessionRepo(
+          fs: envFs,
+          sessionsRoot: '/sessions',
+        );
+        // Empty session: header record only.
+        final empty = await cleanRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        final emptyPath = (await empty.getMetadata()).path;
+        // Real session: header + at least one entry.
+        final real = await cleanRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        final realPath = (await real.getMetadata()).path;
+        await real.appendMessage(UserMessage.text('hello'));
+
+        final removed = await cleanRepo.cleanupEmptySessions();
+        expect(removed, 1);
+        expect((await envFs.exists(emptyPath)).valueOrNull, isFalse);
+        expect((await envFs.exists(realPath)).valueOrNull, isTrue);
+      },
+    );
+
+    test(
+      'cleanupEmptySessions returns 0 and removes nothing when everything has '
+      'transcript',
+      () async {
+        final envFs = MemoryFileSystem();
+        final cleanRepo = JsonlSessionRepo(
+          fs: envFs,
+          sessionsRoot: '/sessions',
+        );
+        final s = await cleanRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        await s.appendMessage(UserMessage.text('one'));
+        await s.appendMessage(UserMessage.text('two'));
+        final removed = await cleanRepo.cleanupEmptySessions();
+        expect(removed, 0);
+        expect(
+          (await envFs.exists((await s.getMetadata()).path)).valueOrNull,
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'cleanupEmptySessions olderThan spares fresh header-only files',
+      () async {
+        final envFs = MemoryFileSystem();
+        final cleanRepo = JsonlSessionRepo(
+          fs: envFs,
+          sessionsRoot: '/sessions',
+        );
+        // Fresh header-only file: exactly what a concurrently booting
+        // process owns between repo.create and its first append — never
+        // sweep food, whatever its live-row state.
+        final fresh = await cleanRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        final freshPath = (await fresh.getMetadata()).path;
+        // Old header-only file: garbage a crashed run left behind.
+        final old = await cleanRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        final oldPath = (await old.getMetadata()).path;
+        // Old but with transcript: never empty-cleanup food.
+        final real = await cleanRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        final realPath = (await real.getMetadata()).path;
+        await real.appendMessage(UserMessage.text('hello'));
+        final past = DateTime.now().subtract(const Duration(minutes: 30));
+        envFs.setMtime(oldPath, past.millisecondsSinceEpoch);
+        envFs.setMtime(realPath, past.millisecondsSinceEpoch);
+
+        final removed = await cleanRepo.cleanupEmptySessions(
+          olderThan: const Duration(minutes: 10),
+        );
+        expect(removed, 1);
+        expect((await envFs.exists(oldPath)).valueOrNull, isFalse);
+        expect((await envFs.exists(freshPath)).valueOrNull, isTrue);
+        expect((await envFs.exists(realPath)).valueOrNull, isTrue);
+      },
+    );
+  });
+
+  group('issue #199 — parallel listing', () {
+    test('list fans header reads out concurrently, bounded pool', () async {
+      for (var i = 0; i < 40; i++) {
+        await repo.create(JsonlSessionCreateOptions(cwd: '/work', id: 's$i'));
+      }
+      final probe = ProbeFs(fs);
+      final probeRepo = JsonlSessionRepo(fs: probe, sessionsRoot: '/sessions');
+      final sessions = await probeRepo.list();
+      expect(sessions, hasLength(40));
+      expect(
+        probe.maxInFlight,
+        greaterThanOrEqualTo(2),
+        reason:
+            'sequential listing never overlaps header reads '
+            '(issue #199: latency adds up linearly)',
+      );
+      expect(
+        probe.maxInFlight,
+        lessThanOrEqualTo(16),
+        reason: 'concurrency pool must stay bounded (no fd exhaustion)',
+      );
+    });
+  });
+
+  group('sortSessionsCurrentFolderFirst', () {
+    // Base instant + n minutes, for readable timestamps.
+    SessionMetadata meta(String id, String cwd, int createdMin, int activeMin) {
+      final base = DateTime.utc(2026, 1, 1);
+      return SessionMetadata(
+        id: id,
+        createdAt: base.add(Duration(minutes: createdMin)),
+        cwd: cwd,
+        path: '/sessions/$id.jsonl',
+        lastUpdatedAt: base.add(Duration(minutes: activeMin)),
+      );
+    }
+
+    test(
+      'current folder first, then other folders, each group newest first',
+      () {
+        final sessions = [
+          meta('here-old', '/work', 1, 10),
+          meta('there-new', '/other', 2, 60),
+          meta('there-old', '/other', 3, 20),
+          meta('here-new', '/work', 4, 30),
+        ];
+        expect(
+          sortSessionsCurrentFolderFirst(sessions, '/work').map((m) => m.id),
+          ['here-new', 'here-old', 'there-new', 'there-old'],
+        );
+      },
+    );
+
+    test('falls back to createdAt when a session has no activity stamp', () {
+      final base = DateTime.utc(2026, 1, 1);
+      final sessions = [
+        SessionMetadata(
+          id: 'a',
+          createdAt: base,
+          cwd: '/work',
+          path: '/sessions/a.jsonl',
+        ),
+        SessionMetadata(
+          id: 'b',
+          createdAt: base.add(const Duration(minutes: 1)),
+          cwd: '/other',
+          path: '/sessions/b.jsonl',
+        ),
+      ];
+      expect(
+        sortSessionsCurrentFolderFirst(sessions, '/work').map((m) => m.id),
+        ['a', 'b'],
+      );
+    });
+
+    test('no current cwd keeps the plain activity order', () {
+      final sessions = [
+        meta('here-old', '/work', 1, 10),
+        meta('there-new', '/other', 2, 60),
+      ];
+      expect(sortSessionsCurrentFolderFirst(sessions, null).map((m) => m.id), [
+        'there-new',
+        'here-old',
+      ]);
+      expect(sortSessionsCurrentFolderFirst(sessions, '').map((m) => m.id), [
+        'there-new',
+        'here-old',
+      ]);
+    });
+  });
+  group('issue #369 — session-name resolution without full parse', () {
+    const mb = 1 << 20;
+
+    /// Header + one session_info record naming the session.
+    Future<SessionMetadata> namedSession(String name) async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      await session.appendSessionName(name);
+      return session.getMetadata();
+    }
+
+    /// One valid filler message record; [textChars] x's wide.
+    String fillerLine(int textChars) =>
+        '{"type":"message","id":"pad","parentId":null,'
+        '"timestamp":"2026-01-01T00:00:00.000","message":{"role":"user",'
+        '"content":[{"type":"text","text":"${'x' * textChars}"}]}}';
+
+    test(
+      'big named-at-creation file resolves with zero parse batches',
+      () async {
+        final executor = CountingParseExecutor();
+        final bigRepo = JsonlSessionRepo(
+          fs: fs,
+          sessionsRoot: '/sessions',
+          parseExecutor: executor,
+        );
+        final session = await bigRepo.create(
+          JsonlSessionCreateOptions(cwd: '/work'),
+        );
+        // Named at creation: the only session_info sits at the file
+        // START, so resolution resolves from the HEAD probe window —
+        // via raw bytes, never the per-record executor parse the
+        // chunk-paged scan paid (hundreds of batches on this size).
+        await session.appendSessionName('giant');
+        final metadata = await session.getMetadata();
+        await fs.appendFile(
+          metadata.path,
+          '${fillerLine(4096)}\n' * 640, // ~2.7 MiB across 3 blocks
+        );
+        expect(await bigRepo.sessionNameQuick(metadata), 'giant');
+        expect(executor.batchCount, 0);
+      },
+    );
+
+    test('rename at the tail wins over the creation name', () async {
+      final metadata = await namedSession('early');
+      final session = await repo.open(metadata);
+      await session.appendSessionName('tail');
+      expect(await repo.sessionNameQuick(metadata), 'tail');
+    });
+
+    test('a name archived by segment rotation still resolves', () async {
+      // gh-1077 review: sessionNameQuick probed the primary file only,
+      // so a name set before a rotation (its record archived to a
+      // `.part-NN` segment) silently resolved to null.
+      final metadata = await namedSession('early');
+      final session = await repo.open(metadata);
+      await session.appendMessage(UserMessage.text('later'));
+      // Simulate a rotation: header + session_info archived, header +
+      // message stays primary.
+      final content = (await fs.readTextFile(metadata.path)).getOrThrow();
+      final lines = content.trim().split('\n');
+      await fs.writeFile(
+        '${metadata.path}.part-0001',
+        '${lines[0]}\n${lines[1]}\n',
+      );
+      await fs.writeFile(
+        metadata.path,
+        '${lines[0]}\n${lines.sublist(2).join('\n')}\n',
+      );
+      expect(await repo.sessionNameQuick(metadata), 'early');
+    });
+
+    test(
+      'an empty rename in the active segment clears an archived name',
+      () async {
+        final metadata = await namedSession('early');
+        final session = await repo.open(metadata);
+        await session.appendSessionName('');
+        final content = (await fs.readTextFile(metadata.path)).getOrThrow();
+        final lines = content.trim().split('\n');
+        await fs.writeFile(
+          '${metadata.path}.part-0001',
+          '${lines[0]}\n${lines[1]}\n',
+        );
+        await fs.writeFile(
+          metadata.path,
+          '${lines[0]}\n${lines.sublist(2).join('\n')}\n',
+        );
+        expect(await repo.sessionNameQuick(metadata), isNull);
+      },
+    );
+
+    test('newest empty name clears an older name', () async {
+      final metadata = await namedSession('early');
+      final session = await repo.open(metadata);
+      await session.appendSessionName('');
+      expect(await repo.sessionNameQuick(metadata), isNull);
+    });
+
+    test('file without session_info resolves to null', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      await session.appendMessage(UserMessage.text('hi'));
+      expect(await repo.sessionNameQuick(await session.getMetadata()), isNull);
+    });
+
+    test('a foreign torn line carrying the needle is skipped', () async {
+      final metadata = await namedSession('early');
+      await fs.appendFile(
+        metadata.path,
+        'garbage "type":"session_info" garbage\n${fillerLine(64)}\n',
+      );
+      expect(await repo.sessionNameQuick(metadata), 'early');
+    });
+
+    test('needle straddling a 1 MiB block boundary is found', () async {
+      final metadata = await namedSession('early');
+      final path = metadata.path;
+      final prefixBytes = (await fs.fileInfo(path)).valueOrNull!.size;
+      // Blocks are anchored at EOF, so place the crafted record by
+      // byte arithmetic: the padding line length is solved so the
+      // boundary at finalSize - 1 MiB lands 10 bytes into the needle.
+      const crafted =
+          '{"type":"session_info","id":"si2","parentId":null,'
+          '"timestamp":"2026-01-01T00:00:00.000","name":"straddle"}\n';
+      final needleAt = crafted.indexOf('"type":"session_info"');
+      final finalLine = '${fillerLine(100)}\n';
+      final fillerOverhead = fillerLine(0).length + 1;
+      final padChars =
+          mb -
+          crafted.length -
+          finalLine.length +
+          needleAt +
+          10 -
+          fillerOverhead;
+      await fs.appendFile(path, '$crafted${fillerLine(padChars)}\n$finalLine');
+      final total = (await fs.fileInfo(path)).valueOrNull!.size;
+      expect(total - mb - (prefixBytes + needleAt), 10);
+      expect(await repo.sessionNameQuick(metadata), 'straddle');
+    });
+
+    test('missing file throws like open', () async {
+      final metadata = SessionMetadata(
+        id: 'gone',
+        createdAt: DateTime.utc(2026, 1, 1),
+        cwd: '/work',
+        path: '/sessions/gone.jsonl',
+      );
+      await expectLater(
+        repo.sessionNameQuick(metadata),
+        throwsA(isA<SessionException>()),
+      );
+    });
+
+    test('non-ranged store keeps the ranged-read error contract', () async {
+      final metadata = await namedSession('early');
+      final probeRepo = JsonlSessionRepo(
+        fs: ProbeFs(fs),
+        sessionsRoot: '/sessions',
+      );
+      await expectLater(
+        probeRepo.sessionNameQuick(metadata),
+        throwsA(isA<SessionException>()),
+      );
+    });
+
+    test('AC1: a 50 MB name-miss proves absence with bounded bytes', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      await session.appendMessage(UserMessage.text('hi'));
+      final metadata = await session.getMetadata();
+      await fs.appendFile(
+        metadata.path,
+        '${fillerLine(50 * mb)}\n', // one huge record, no session_info
+      );
+      final size = (await fs.fileInfo(metadata.path)).valueOrNull!.size;
+      final counting = CountingRangedFs(fs);
+      final probeRepo = JsonlSessionRepo(
+        fs: counting,
+        sessionsRoot: '/sessions',
+      );
+      expect(await probeRepo.sessionNameQuick(metadata), isNull);
+      // Two 1 MiB probe windows and nothing else - the 50 MB body
+      // between them is never read to prove the name is absent.
+      expect(counting.rangedBytes, lessThanOrEqualTo(2 * mb + 64));
+      expect(counting.rangedBytes * 20, lessThan(size));
+    });
+
+    test(
+      'AC2: header name resolves with bounded bytes on a 9 MB file',
+      () async {
+        final metadata = await namedSession('header');
+        await fs.appendFile(metadata.path, '${fillerLine(9 * mb)}\n');
+        final counting = CountingRangedFs(fs);
+        final probeRepo = JsonlSessionRepo(
+          fs: counting,
+          sessionsRoot: '/sessions',
+        );
+        expect(await probeRepo.sessionNameQuick(metadata), 'header');
+        // Head window + tail window + the short line's own parse.
+        expect(counting.rangedBytes, lessThanOrEqualTo(2 * mb + (1 << 17)));
+      },
+    );
+
+    test('AC5: tail rename beats the header name, bounded bytes', () async {
+      final metadata = await namedSession('early');
+      final session = await repo.open(metadata);
+      await fs.appendFile(metadata.path, '${fillerLine(2 * mb)}\n');
+      await session.appendSessionName('renamed');
+      // The rename must sit inside the tail window: trailing filler
+      // stays well under 1 MiB.
+      await fs.appendFile(metadata.path, '${fillerLine(mb ~/ 2)}\n');
+      final counting = CountingRangedFs(fs);
+      final probeRepo = JsonlSessionRepo(
+        fs: counting,
+        sessionsRoot: '/sessions',
+      );
+      expect(await probeRepo.sessionNameQuick(metadata), 'renamed');
+      expect(counting.rangedBytes, lessThanOrEqualTo(4 * mb + (1 << 17)));
+    });
+
+    test('a rename pushed beyond both probe windows is outside the '
+        'bounded contract', () async {
+      // Issue #369 makes full-file scans unacceptable, so a rename
+      // buried deeper than a probe window from each edge is not seen;
+      // the creation-time header name stays authoritative. Pinning the
+      // trade: the probe never escalates to the unbounded middle.
+      final metadata = await namedSession('early');
+      final session = await repo.open(metadata);
+      await fs.appendFile(metadata.path, '${fillerLine(2 * mb)}\n');
+      await session.appendSessionName('midlife');
+      await fs.appendFile(metadata.path, '${fillerLine(mb)}\n');
+      expect(await repo.sessionNameQuick(metadata), 'early');
+    });
+
+    test('needle crossing the head window edge is found via overlap', () async {
+      final metadata = await namedSession('early');
+      final path = metadata.path;
+      final prefixBytes = (await fs.fileInfo(path)).valueOrNull!.size;
+      // Place the crafted record so its needle straddles the head
+      // probe's upper edge at 1 MiB: the line STARTS inside the window,
+      // the needle ends past it - only the overlap read sees it whole.
+      const crafted =
+          '{"type":"session_info","id":"si3","parentId":null,'
+          '"timestamp":"2026-01-01T00:00:00.000","name":"headedge"}\n';
+      final needleAt = crafted.indexOf('"type":"session_info"');
+      const needleMiss = 5; // needle starts 5 bytes below the edge
+      final fillerOverhead = fillerLine(0).length + 1;
+      final padChars =
+          mb - needleMiss - needleAt - prefixBytes - fillerOverhead;
+      await fs.appendFile(
+        path,
+        '${fillerLine(padChars)}\n$crafted${fillerLine(2 * mb)}\n',
+      );
+      expect(await repo.sessionNameQuick(metadata), 'headedge');
+    });
+  });
+
+  group('persistTransform — record-write mask (gh-1952 review)', () {
+    const secret = 'opensesame-registered-secret-value';
+
+    AssistantMessage assistantWithCall(Map<String, dynamic> arguments) =>
+        AssistantMessage(
+          content: [ToolCall(id: 'c1', name: 'bash', arguments: arguments)],
+          api: 'test-api',
+          provider: 'test-provider',
+          model: 'test-model',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        );
+
+    test('appended records carry masked tool-call arguments', () async {
+      final pipeline = RedactionPipeline(registeredSecrets: [secret]);
+      final maskingRepo = JsonlSessionRepo(
+        fs: fs,
+        sessionsRoot: '/sessions',
+        persistTransform: (message) => persistRedactMessage(pipeline, message),
+      );
+      final session = await maskingRepo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      final message = assistantWithCall({'command': 'echo $secret'});
+      await session.appendMessage(message);
+
+      final record = (await session.getEntries())
+          .whereType<MessageRecord>()
+          .single;
+      final persisted = record.message as AssistantMessage;
+      final call = persisted.content.single as ToolCall;
+      expect(
+        call.arguments['command'],
+        contains('[REDACTED:Registered-Secret]'),
+      );
+      expect(
+        call.arguments['command'],
+        isNot(contains(secret)),
+        reason: 'the session JSONL must not carry the raw secret',
+      );
+      // The CALLER's message object stays untouched — the mask runs on
+      // the record copy only (execution/provider context keep raw bytes).
+      expect(
+        (message.content.single as ToolCall).arguments['command'],
+        contains(secret),
+      );
+    });
+
+    test('a repo without a transform persists byte-identically', () async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(cwd: '/work'),
+      );
+      final message = assistantWithCall({'command': 'echo $secret'});
+      await session.appendMessage(message);
+      final record = (await session.getEntries())
+          .whereType<MessageRecord>()
+          .single;
+      final call =
+          (record.message as AssistantMessage).content.single as ToolCall;
+      expect(call.arguments['command'], 'echo $secret');
+    });
+  });
+}

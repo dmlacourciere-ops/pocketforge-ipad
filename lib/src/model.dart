@@ -1,0 +1,291 @@
+/// Model descriptors and pricing.
+///
+/// Ported from pi-mono `packages/ai/src/types.ts` (`Model`, `ModelCost`,
+/// `OpenAICompletionsCompat`) and `packages/ai/src/models.ts`
+/// (`calculateCost`). Only the subset needed for the Phase 0
+/// openai-completions adapter is ported; pricing tiers and the full compat
+/// matrix arrive with later providers.
+library;
+
+import 'types.dart';
+
+/// Per-million-token pricing for a model, in USD.
+///
+/// Ported from pi's `ModelCostRates`. Request-wide pricing tiers from pi's
+/// `ModelCost` are not ported yet.
+final class ModelCost {
+  const ModelCost({
+    this.input = 0,
+    this.output = 0,
+    this.cacheRead = 0,
+    this.cacheWrite = 0,
+  });
+
+  /// Cost per million input tokens.
+  final double input;
+
+  /// Cost per million output tokens.
+  final double output;
+
+  /// Cost per million tokens read from the prompt cache.
+  final double cacheRead;
+
+  /// Cost per million tokens written to the prompt cache.
+  final double cacheWrite;
+}
+
+/// How a provider expects the reasoning/thinking parameter to be shaped.
+///
+/// Ported from the `openai` and `openrouter` cases of pi's
+/// `OpenAICompletionsCompat.thinkingFormat`; the remaining provider-specific
+/// formats arrive with their adapters.
+enum ThinkingFormat {
+  /// OpenAI-style top-level `reasoning_effort`.
+  openai,
+
+  /// OpenRouter-style nested `reasoning: { effort: ... }`.
+  openrouter,
+}
+
+/// Compatibility flags for OpenAI-compatible chat-completions endpoints.
+///
+/// Ported subset of pi's `OpenAICompletionsCompat`. When a flag is `null`
+/// the adapter auto-detects it from the model's provider/baseUrl.
+final class OpenAICompletionsCompat {
+  const OpenAICompletionsCompat({
+    this.maxTokensField,
+    this.supportsUsageInStreaming,
+    this.thinkingFormat,
+    this.requiresToolResultName,
+    this.sendsToolStrict = true,
+    this.omitMaxOutputTokens,
+  });
+
+  /// Which field carries the output-token cap: `max_tokens` or
+  /// `max_completion_tokens`. Default: `max_completion_tokens`.
+  final String? maxTokensField;
+
+  /// Whether the provider supports `stream_options: { include_usage: true }`.
+  /// Default: true.
+  final bool? supportsUsageInStreaming;
+
+  /// How to send reasoning effort. Default: auto-detected
+  /// ([ThinkingFormat.openrouter] for OpenRouter, [ThinkingFormat.openai]
+  /// otherwise).
+  final ThinkingFormat? thinkingFormat;
+
+  /// Whether tool results must carry the tool `name` field. Default: false.
+  final bool? requiresToolResultName;
+
+  /// Whether the top-level tool entry carries a `strict` field. Strict
+  /// schemas (DIAL Core's pydantic validation) reject unknown fields with
+  /// `400 Extra inputs are not permitted`. Default: true (OpenAI accepts
+  /// `strict`).
+  final bool sendsToolStrict;
+
+  /// The endpoint rejects the max-output field outright (400 on
+  /// `max_tokens`/`max_completion_tokens`): the adapter omits the field
+  /// entirely (gh-1426 AC7 — the omp/codex compat lesson). Default: null
+  /// (false — the field rides as today).
+  final bool? omitMaxOutputTokens;
+}
+
+/// A model the harness can call.
+///
+/// Ported subset of pi's `Model`: pricing tiers, thinking-level maps, and
+/// per-provider compat beyond [OpenAICompletionsCompat] are deferred to the
+/// phases that need them.
+final class Model {
+  const Model({
+    required this.id,
+    this.name = '',
+    required this.api,
+    required this.provider,
+    required this.baseUrl,
+    this.reasoning = false,
+    this.input = const ['text'],
+    this.thinkingLevel,
+    this.cost = const ModelCost(),
+    required this.contextWindow,
+    required this.maxTokens,
+    this.headers,
+    this.compat,
+    this.authHeader,
+    this.capabilityNotes = const [],
+    this.connectTimeout,
+    this.streamIdleTimeout,
+    this.timeoutScopeLabel,
+    this.maxImages,
+  });
+
+  /// The model id sent to the provider (e.g. `gpt-4o-mini`,
+  /// `anthropic/claude-sonnet-4` on OpenRouter).
+  final String id;
+
+  /// Human-readable display name.
+  final String name;
+
+  /// The API dialect used to talk to this model (e.g. `openai-completions`).
+  final String api;
+
+  /// The provider id (e.g. `openai`, `openrouter`).
+  final String provider;
+
+  /// Base URL of the API. Swapping this is how OpenRouter and other
+  /// OpenAI-compatible endpoints are reached (e.g.
+  /// `https://openrouter.ai/api/v1`).
+  final String baseUrl;
+
+  /// Whether the model produces reasoning/thinking output.
+  final bool reasoning;
+
+  /// Input modalities the model accepts: `text` and/or `image`.
+  final List<String> input;
+
+  /// The config-declared thinking level (`minimal…max`, issue #734) riding
+  /// this model from a roles chain entry or the env preconfig; null when
+  /// undeclared — the adapter options' own level (e.g.
+  /// `AnthropicOptions.thinkingLevel`) stays the explicit override.
+  final String? thinkingLevel;
+
+  /// Pricing used for inline cost accounting.
+  final ModelCost cost;
+
+  /// Total context window in tokens.
+  final int contextWindow;
+
+  /// Maximum output tokens the model can produce.
+  final int maxTokens;
+
+  /// Default headers sent with every request to this model.
+  final Map<String, String>? headers;
+
+  /// Compatibility overrides for OpenAI-compatible APIs. When `null`, the
+  /// adapter auto-detects from [provider]/[baseUrl].
+  final OpenAICompletionsCompat? compat;
+
+  /// Config-declared auth header NAME (`authHeader:` on a `models.custom`
+  /// or `customProviders` entry, issue #964): when set, the OpenAI-
+  /// completions adapter sends `<authHeader>: <apiKey>` INSTEAD of the
+  /// default `Authorization: Bearer <apiKey>` — an AWS API Gateway fronting
+  /// Bedrock rejects Bearer and requires `x-api-key`. Null keeps the Bearer
+  /// default; a keyless request sends neither (see
+  /// OpenAICompletionsOptions.apiKey).
+  final String? authHeader;
+
+  /// The capability resolver's loud notes riding this model (gh-1426):
+  /// gate drops (E3 — a pinned rung on a non-reasoning model), endpoint
+  /// divergences (E1 — an override wins over the endpoint report), and
+  /// catalog-miss warnings (E4). Empty for the silent default build
+  /// (REG-1); the status surfaces render them (`/model-edit`, the boot
+  /// notice) — the wire never reads them.
+  final List<String> capabilityNotes;
+
+  /// Request-scoped connect/first-headers watchdog override
+  /// (`connectTimeoutMs` on a roles chain entry, issue #1554). The top
+  /// layer of the per-field precedence — role chain entry >
+  /// custom-provider entry > `models:` entry > global `providerTimeouts:`
+  /// > built-in default. Null keeps the endpoint/global layers.
+  final Duration? connectTimeout;
+
+  /// Request-scoped stream-idle watchdog override (`streamIdleTimeoutMs`
+  /// on a roles chain entry, issue #1554). Same precedence as
+  /// [connectTimeout], per field.
+  final Duration? streamIdleTimeout;
+
+  /// Where [connectTimeout]/[streamIdleTimeout] came from, rendered into
+  /// the stall lines when a scoped override is in effect
+  /// (`idle window 1800s (role smol override)`) so a wide window never
+  /// looks like a hang. Null when the model carries no scoped windows.
+  final String? timeoutScopeLabel;
+
+  /// The per-model unique-image cap (`images.perModel` config beats it;
+  /// issue #1750). Null = no catalog knowledge, the global
+  /// `images.maxPerRequest` default applies. A ceiling-setter only —
+  /// nothing raises a cap above provider reality.
+  final int? maxImages;
+
+  /// A copy of this model with the given fields replaced (null = keep).
+  /// The ONE hand-rolled field list for limit/window swaps — the registry
+  /// (`withRegisteredContextWindow`) and the CLI's limit editors build
+  /// through this, so a new [Model] field is remembered next to the class
+  /// it mirrors instead of in every swap site (gh-1742 review round 1,
+  /// comment 5).
+  // crap:ignore: hand-rolled copyWith boilerplate (the idiomatic Dart shape every immutable type here shares); codegen is the real fix — gh-1106.
+  Model copyWith({
+    String? id,
+    String? name,
+    String? api,
+    String? provider,
+    String? baseUrl,
+    bool? reasoning,
+    List<String>? input,
+    String? thinkingLevel,
+    ModelCost? cost,
+    int? contextWindow,
+    int? maxTokens,
+    Map<String, String>? headers,
+    OpenAICompletionsCompat? compat,
+    String? authHeader,
+    List<String>? capabilityNotes,
+    Duration? connectTimeout,
+    Duration? streamIdleTimeout,
+    String? timeoutScopeLabel,
+    int? maxImages,
+  }) {
+    return Model(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      api: api ?? this.api,
+      provider: provider ?? this.provider,
+      baseUrl: baseUrl ?? this.baseUrl,
+      reasoning: reasoning ?? this.reasoning,
+      input: input ?? this.input,
+      thinkingLevel: thinkingLevel ?? this.thinkingLevel,
+      cost: cost ?? this.cost,
+      contextWindow: contextWindow ?? this.contextWindow,
+      maxTokens: maxTokens ?? this.maxTokens,
+      headers: headers ?? this.headers,
+      compat: compat ?? this.compat,
+      authHeader: authHeader ?? this.authHeader,
+      capabilityNotes: capabilityNotes ?? this.capabilityNotes,
+      connectTimeout: connectTimeout ?? this.connectTimeout,
+      streamIdleTimeout: streamIdleTimeout ?? this.streamIdleTimeout,
+      timeoutScopeLabel: timeoutScopeLabel ?? this.timeoutScopeLabel,
+      maxImages: maxImages ?? this.maxImages,
+    );
+  }
+}
+
+/// The effective context window: the owner override ([cap],
+/// `agent.contextWindowCap`, issues #273/#729) when configured and
+/// positive; a `null`/non-positive cap leaves the raw window, so uncapped
+/// runs behave byte-identically to before. A cap below the catalog window
+/// clamps down (owner budget guard); a cap above it RAISES the effective
+/// window to the served truth — a resumed branch can legitimately outgrow
+/// the catalog entry (cross-model resume, failed end-of-session compaction)
+/// when the endpoint actually serves more than the catalog reports. Every
+/// consumer of the EFFECTIVE window — the compaction thresholds, the ctx
+/// meter/footer, the loop's over-window guard — computes through this (one
+/// override point, not one per consumer).
+int effectiveContextWindow(int contextWindow, int? cap) =>
+    cap == null || cap <= 0 ? contextWindow : cap;
+
+/// Fills in [Usage.cost] from the model's [ModelCost] rates.
+///
+/// Ported from pi's `calculateCost` (flat-rate case; tiered pricing is not
+/// ported yet). Returns [usage] unchanged apart from the cost breakdown.
+Usage calculateCost(Usage usage, Model model) {
+  const perMillion = 1000000.0;
+  final cost = UsageCost(
+    input: usage.input * model.cost.input / perMillion,
+    output: usage.output * model.cost.output / perMillion,
+    cacheRead: usage.cacheRead * model.cost.cacheRead / perMillion,
+    cacheWrite: usage.cacheWrite * model.cost.cacheWrite / perMillion,
+  );
+  return usage.copyWith(
+    cost: cost.copyWith(
+      total: cost.input + cost.output + cost.cacheRead + cost.cacheWrite,
+    ),
+  );
+}

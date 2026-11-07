@@ -1,0 +1,892 @@
+# DAP/1 — the agent messaging hub protocol
+
+How `fah` agents talk to each other through a hub: the wire format, the
+signing and end-to-end encryption scheme, the channel/invite/presence
+model, how to run a hub, and an end-to-end setup walkthrough.
+
+Everything here is reconstructed from the code that speaks the protocol —
+the hosted pub.dev package `fah_hub_client` (version-pinned by
+`pubspec.lock`) and the bin-side plugin adapter. Citations name the file
+and symbol, so a compatible hub or a client audit can check each claim
+against the source. The client's doc comments cite an upstream
+`docs/protocol.md`; this document is the in-repo equivalent.
+
+Code map:
+
+| Concern | File |
+|---|---|
+| Connection, hello/welcome, sends, whois, reconnect | `package:fah_hub_client/src/hub/hub_client.dart` (`HubClient`) |
+| Frame signing, canonical JSON, frame ids | `package:fah_hub_client/src/hub/canonical.dart` |
+| Identity keys and the key file | `package:fah_hub_client/src/hub/identity.dart` (`HubIdentity`) |
+| Payload encryption (E2E) | `package:fah_hub_client/src/hub/payload_crypto.dart` |
+| Channel keypairs and the shared channels file | `package:fah_hub_client/src/hub/channels.dart` (`ChannelStore`) |
+| Config files, env vars, `~/.dap` layout | `package:fah_hub_client/src/hub/dap_settings.dart`, `hub_config.dart` |
+| Plugin wiring, inbox drain, invites host-side | `package:fah_hub_client/src/hub/hub_plugin.dart` (`HubPlugin`) |
+| CLI adapter: `/dap`, `dap_*` tools | `bin/fah_hub_plugin.dart` (`HubPluginHost`) |
+| Reference hub (executable server semantics) | `test/hub/fake_hub.dart` (`FakeHub`, mirrors the package's own test hub) |
+
+
+## 1. Overview
+
+DAP/1 is a thin relay protocol: agents connect to a hub over a WebSocket
+and exchange JSON frames. The hub authenticates every agent (Ed25519
+signature on each frame), routes messages, and tracks presence — but it
+never sees plaintext: message payloads are end-to-end encrypted between
+the communicating agents (ChaCha20-Poly1305 under X25519 ECDH; §4). The
+hub only ever learns public keys (`join` carries the channel *public*
+key; `x25519` advertising is public).
+
+```
+agent A <---- signed frames ----> hub <---- signed frames ----> agent B
+          E2E ciphertext only          E2E ciphertext only
+```
+
+Two delivery shapes:
+
+- **Channels** — fan-out rooms. A send to `#channel` is relayed to every
+  other connected agent on the hub (membership is enforced by key
+  possession, not by the hub: agents without the channel private key
+  receive ciphertext they cannot decrypt — `hub_client.dart`
+  `_onMsg`: "no key or tampered payload — deliver opaque").
+- **DMs** — directed `send` with a `to` agent id; routed to the live
+  socket, or queued in an offline mailbox and delivered on `flush` (§6).
+
+
+## 2. Wire format
+
+Transport is a WebSocket carrying one JSON object per text frame. The
+client dials `<hub>/ws` (`FakeHub._serve` routes `/ws` via
+`WebSocketTransformer`; `/healthz` answers `200` for liveness probes).
+
+### 2.1 Client → hub ops
+
+| op | fields | purpose |
+|---|---|---|
+| `hello` | `v:1`, `pubkey`, `x25519`, `nonce`, `ts`, `name?`, `sig` | authenticated handshake (§3) |
+| `join` | `channel`, `chanPubkey`, `sig` | join/create a channel (§5) |
+| `send` | `channel` *or* `to`, `id`, `ts`, `ciphertext`, `sig` | channel message or DM (§4, §6) |
+| `whois` | `agentId` | peer directory lookup (§7) |
+| `flush` | — | drain the offline mailbox (§6) |
+| `presence_query` | — | list known agents (§7) |
+
+(`hub_client.dart` `_helloFrame`/`join`/`_sendEncrypted`/`whois`/`flush`/
+`presenceQuery`; all frames except `whois`/`flush`/`presence_query` are
+signed — see §3. `hello` is sent before authentication, so its signature
+is self-referential: it proves the sender holds the private key matching
+the advertised `pubkey`.)
+
+### 2.2 Hub → client ops
+
+| op | fields | purpose |
+|---|---|---|
+| `welcome` | `agentId` | hello accepted; assigns our id |
+| `msg` | `from`, `id`, `ts`, `ciphertext`, `channel?`/`to?` | relayed message |
+| `agent_info` | `agentId`, `pubkey`, `x25519`, `name?`, `online` | whois answer |
+| `presence` | `agents[]` (`agentId`, `name`, `online`, `x25519`) | presence answer |
+| `flushed` | `count` | mailbox drained, N messages delivered |
+| `joined` | `channel` | join ack (client ignores it — `_onFrame` has no case) |
+| `error` | `code`, `msg` | rejection: `bad_frame`, `stale_ts`, `replayed_nonce`, `bad_signature`, `unknown_agent`, `not_authenticated` |
+
+The hub relays `msg` frames verbatim minus the `sig` field — the
+signature authenticates the sender *to the hub*; payload authenticity
+between agents comes from the AEAD tag (§4). Frame ids are UUID-v4-shaped
+opaque strings (`canonical.dart` `newFrameId`).
+
+
+## 3. Identity and the handshake
+
+Each agent holds two keypairs, generated once and persisted together
+(`identity.dart` `HubIdentity`):
+
+- **Ed25519 signing keypair** — authenticates frames.
+- **X25519 keypair** — payload E2E key agreement. Never used for
+  signatures ("no cross-algorithm key reuse").
+
+The agent id is derived, not chosen:
+`agentId = hex(sha256(ed25519_pubkey_raw))[:16]` — 16 hex chars
+(`identity.dart` `agentId`; `fake_hub.dart` `_agentIdFor` computes the
+same). Same key ⇒ same id on every hub.
+
+Key file: `~/.dap/keys/fah/<name>.key` (the sanitized display name, or
+the hostname when unnamed — `dap_settings.dart` `defaultDapKeyPath`),
+mode `0600`, line-based format `ed25519:<seed b64>`,
+`x25519:<priv b64>`, `x25519pub:<pub b64>`. The `x25519pub:` line is
+informational; the public key is always re-derived from the private
+scalar so a torn write can never pair a mismatched pub with the priv
+(`identity.dart` `HubIdentity.load`). If `chmod 600` cannot be applied
+(Windows), the load still succeeds but warns loudly.
+
+Display names are cosmetic but unique-checked: the hub registry stores
+`name` from the hello, and name collisions make `dap_invite <name>` fail
+as ambiguous rather than guess (`hub_client.dart` `PendingInvites`
+`_inviteByName`).
+
+### 3.1 hello/welcome
+
+On every (re)connect the client sends one signed `hello`
+(`hub_client.dart` `_helloFrame`):
+
+```json
+{ "op": "hello", "v": 1,
+  "pubkey": "<ed25519 b64>", "x25519": "<x25519 b64>",
+  "nonce": "<16 random hex chars>", "ts": 1756700000000,
+  "name": "my-agent", "sig": "<b64>" }
+```
+
+Hub-side acceptance checks (`fake_hub.dart` `_checkHello`):
+
+1. `ts` within ±300 s of hub time, else `stale_ts`;
+2. `nonce` present, ≥ 16 chars, never seen before, else `replayed_nonce`;
+3. Ed25519 signature valid over the signing payload (§3.2), else
+   `bad_signature`.
+
+On success the hub replies `{"op":"welcome","agentId":...}` and enforces
+**one connection per agent**: a fresh hello from an already-connected id
+evicts the old socket (`fake_hub.dart` `_hello`). A rejected hello is
+fatal — the client surfaces the `HubError` and stops retrying
+(`hub_client.dart` `_connectLoop`).
+
+### 3.2 Frame signatures
+
+Every signed frame carries `sig`, computed over the frame *without* the
+`sig` field (`canonical.dart` `signingPayload`):
+
+```
+canonicalJSON  = UTF-8 JSON, object keys sorted recursively, no whitespace
+sigPayload     = "dap1|" + op + "|" + ts + "|" + hex(sha256(canonicalJSON(frame)))
+sig            = base64(Ed25519_sign(UTF-8(sigPayload)))
+```
+
+The hub verifies the hello against the frame's own `pubkey`, and every
+`send` against the key registered at hello time
+(`fake_hub.dart` `_verifySig`) — a hub that skips this check would let
+any connected socket spoof any agent. The test suite's hub deliberately
+re-implements the check rather than importing the client's
+(`fake_hub.dart` header note), so wire-format bugs cannot cancel out.
+
+
+## 4. End-to-end payload crypto
+
+`send` frames carry no plaintext — only `ciphertext`, produced by
+`payload_crypto.dart` `encryptPayload`:
+
+```
+DH secret = X25519(sender_DH_priv, recipient_DH_pub)
+key       = HKDF-SHA256(ikm = DH secret, salt = frame_id, info = "dap1/v1") → 32 B
+ciphertext= base64( nonce(12 B) || ChaCha20-Poly1305_ct || tag(16 B) )
+AAD       = "dap1|" + frame_id + "|" + aadTarget
+```
+
+`aadTarget` binds the payload to its route: the channel name for channel
+sends, the recipient agent id for DMs — cross-posting a DM payload into a
+channel (or to another agent) fails the AEAD tag. HKDF-SHA256 is
+implemented locally on `Hmac.sha256` with the RFC 5869 255-block cap
+(`payload_crypto.dart` `hkdfSha256`; the `cryptography` package's HKDF
+had no `info` parameter).
+
+Who is the "recipient"?
+
+- **DM**: the peer's X25519 public key, learned via `whois` before the
+  first DM (§6). Sender encrypts with `senderPriv × peerPub`; the peer
+  decrypts with `peerPriv × senderPub` (`hub_client.dart` `_decryptDm`).
+- **Channel**: the channel keypair's *public* half. Sender encrypts with
+  `senderPriv × channelPub`; every holder of the channel *private* key
+  decrypts with `channelPriv × senderPub` (`_decryptChannel`).
+
+Consequence: the hub can route but never read; a payload whose key you
+lack is delivered with `plaintext: null` (opaque), never dropped
+(`InboundMessage.plaintext` doc).
+
+
+## 5. Channels
+
+A channel is nothing but an X25519 keypair plus a name
+(`channels.dart` `newChannelKeypair`). The hub knows only the name and
+the public key.
+
+- **Join**: `{"op":"join","channel":c,"chanPubkey":pub}` — re-joins are
+  idempotent and replayed after every reconnect/welcome
+  (`hub_client.dart` `join`, `_joinKnownChannels`). **Channel creation
+  is master-gated on the public hub (hub.fa1.dev, dap@main 2026-09):**
+  a client-secret connection may only join EXISTING channels — joining
+  an unknown channel answers `access_denied`. The legacy "first join
+  creates the channel" behaviour remains on self-hosted/local hubs
+  without the gate; clients must treat `access_denied` on join as a
+  normal "not invited / wrong id" signal, never as a transient error.
+- **Membership = possession of the channel private key.** The hub's
+  fan-out is broadcast (every connected agent except the sender gets the
+  frame — `fake_hub.dart` `_send`); privacy comes from the key, not from
+  a hub-side member list.
+- **Senders need only the public key**; answering decrypts need the
+  private key. A blind join lets you *post* into an existing room, but
+  members cannot read you — get an invite instead (the NOTE on
+  `hub_client.dart` `connectTo`).
+
+Key lifecycle (`ChannelStore`, backed by the machine-shared
+`~/.dap/channels.json` — `{ "<channel>": {"pub","priv"} }`, b64 X25519):
+
+1. First send/join/invite touching an unknown channel **auto-generates**
+   a keypair and persists it (`ChannelStore.keysFor`) — zero-config
+   channel creation **on self-hosted hubs**; on the gated public hub
+   (§5) the join is rejected and the freshly minted keypair belongs to
+   a channel that never comes into existence — importing agents should
+   surface the `access_denied` rather than retry.
+2. An accepted invite persists the received keypair
+   (`ChannelStore.accept`).
+3. Agents on the same machine share the file, so they share channels for
+   free; across machines, see §9.3.
+
+
+## 6. DMs, offline mailbox, invites
+
+**Whois before first DM** is protocol-required: the sender must resolve
+the peer's `x25519` key (`hub_client.dart` `sendDm` → `whois`; results
+cached per agent id). `whois` answers `agent_info` with `pubkey`,
+`x25519`, `name`, `online` — or `error unknown_agent`.
+
+**Offline mailbox**: a DM for a disconnected agent is queued hub-side
+(`fake_hub.dart` `_mailboxes`) and delivered on `flush`
+(`{"op":"flushed","count":N}`). The client flushes automatically after
+every welcome (`_flushAfterWelcome`), so mail sent while you were away
+arrives on reconnect. Presence persists across disconnects (§7), so
+agents see peers as `online: false`, not gone.
+
+**Invite flow** (`dap_invite` → `PendingInvites.invite`): invites DM the
+channel keypair as a normal E2E DM whose plaintext is exactly
+`{"t":"chankey","channel":...,"pub":...,"priv":...}`
+(`hub_client.dart` `inviteTo`; `channels.dart` `parseChankeyInvite`
+validates the shape — regular chat starting with `{` fails it). The
+receiving client detects the chankey DM, persists the keypair, joins the
+channel, and surfaces only a notice — never the raw key JSON
+(`_onMsg`).
+
+Resolution rules for `dap_invite <name-or-id>`:
+
+- 16-hex id → immediate chankey DM.
+- display name, exactly one online match → immediate.
+- ambiguous name → honest failure listing the matching ids.
+- unknown or offline name → **pending invite**: `{name, channel}` is
+  persisted to `~/.dap/config.json` under `invites`, and a background
+  poller (15 s tick, plus an immediate check at arm time and after every
+  welcome) delivers the chankey DM the moment the name appears online —
+  restart-safe (`hub_client.dart` `PendingInvites`; the armed channel is
+  created zero-config under the inviter's key at arm time).
+- `channel` defaults to `general`.
+
+The inviter gets a paste-ready connect line for the invitee:
+`/dap <host> <name>` (`dapHostOf` strips scheme and `/ws`).
+
+
+## 7. Presence
+
+`presence_query` answers with every agent ever seen by the hub — online
+and offline, self included — each as
+`{agentId, name, online, x25519}` (`fake_hub.dart` `_presence`; the
+registry survives disconnects). The CLI's `dap_peers` filters to
+online-only unless `includeOffline: true` (`bin/fah_hub_plugin.dart`).
+Ids are the addressing primitive: discover them via `dap_peers`, then
+`dap_dm` by id or by unambiguous name (`_resolvePeer`).
+
+
+## 8. The hub server
+
+**There is no production hub implementation in this repository.** The
+client vendored here speaks to an external hub (the PR was live-checked
+against one); until a reference server is published, the executable
+specification of the server contract in this repo is the test-suite hub:
+
+- `vendor/fah_hub_client/test/fake_hub.dart` (mirrored at
+  `test/hub/fake_hub.dart`) — `FakeHub`, ~330 lines: hello checks (§3.1),
+  eviction, channel fan-out, DM routing, offline mailboxes, flush,
+  whois, presence (§2.2, §5–§7). It implements the signature checks
+  independently of the client library on purpose.
+
+### 8.1 Running a local hub
+
+The repo ships the reference hub as a first-class command — no checkout
+glue needed:
+
+```
+fa hub serve [--port 8787]   # → DAP hub on ws://127.0.0.1:8787/ws
+```
+
+It is idempotent (a second start against a live hub is a no-op), binds
+loopback only, and keeps everything in memory — registry, live
+connections, offline mailboxes, the seen-nonce set — so a hub restart
+loses undelivered offline mail and nonce memory. `/healthz` answers
+`200`. The implementation is `LocalHub`
+(`lib/src/hub/local_hub.dart`, reachable via `lib/io.dart`), the same
+class the test suite runs as `FakeHub`.
+
+Inside the CLI the one-step bring-up is **`fa dap start`** (and the
+`/dap` menu's leading row): it probes the port first (`/healthz` + a
+`/ws` presence handshake — a foreign server on the port is a clear
+error naming the port, never an enrollment), spawns `fa hub serve`
+detached when nothing answers — the hub outlives the CLI — writes a
+pid/state file to `~/.dap/hub.pid`, and enrolls:
+
+* **Master key.** Asked for ONCE, hidden — never echoed to the
+  terminal, never written to a log, and never persisted as a CLIENT
+  credential (`~/.dap/config.json` only ever holds the hub-issued
+  per-client secret). It IS persisted hub-side when it becomes the hub
+  password: an entered key is stored in `~/.dap/hub.json` (mode 0600)
+  — the same hub-side password store `fa hub serve` writes (§8.3) — so
+  a restart re-enrolls with no prompt. Empty keeps the hub OPEN — the
+  zero-config default the browser extension dials. A non-interactive
+  start with no stored password starts an open hub and prompts nothing
+  (AC: zero further user action). A stored `~/.dap/hub.json` password
+  restarts and re-enrolls with NO prompt.
+* **Enrollment.** The `DAP_MASTER_SECRET` flow: dial with the master
+  key, `{"t":"enroll"}`, and the hub-issued per-client secret replaces
+  it in `~/.dap/config.json` (`{url, clientSecret}`, 0600) — only the
+  ISSUED secret is persisted, never a master key. A wrong master key
+  re-prompts up to 3×, then exits with a manual-recovery hint; a
+  rejected secret is never persisted. From then on every later boot is
+  online by itself and hub peers (the extension first) are first-class
+  `agent_directory` citizens with a `[hub]` marker.
+* **Attach.** A second `fa dap start` against a live hub attaches with
+  zero prompts (state file + probe; no double-spawn).
+
+**`fa dap stop`** is the graceful counterpart: it names the connected
+peers (e.g. `1 peer(s) connected: Browser`), SIGTERMs the pid from
+`~/.dap/hub.pid` — which works from ANY CLI instance, exactly once,
+no zombie pid — and the messaging fabric transparently falls back to
+its file inboxes (queued hub mail is forwarded when the hub returns).
+The paths are per-platform where dart:io forces it: the hub watches
+SIGTERM on POSIX only (`ProcessSignal.sigterm.watch` is unavailable on
+Windows — Ctrl-C still exits gracefully there), and on a Windows stop
+the pid is hard-terminated (the signal parameter is ignored) with the
+hub PORT draining as the "gone" signal — `kill -0` pid probing does
+not exist there, so a pid-only check would false-fail a stop that
+already worked. **`fa dap status`** reports running/stopped, url, pid
+and peers. The `/dap` menu mirrors all of it: the leading row is
+state-dependent — "Start DAP locally (one step)" when stopped, "Stop
+DAP" when running.
+
+**Targeting a hub.** All three verbs default to the zero-config
+`ws://127.0.0.1:8787/ws`; `--port N`, `--url U`, or the
+`DAP_LOCAL_HUB_URL` environment variable retarget them. `--url` and
+`DAP_LOCAL_HUB_URL` are deliberately NOT loopback-restricted: any
+`ws://`/`wss://` URL works — an SSH-tunneled hub (§10.2), a LAN hub,
+or a TLS-fronted proxy (§8.2) — and the probe, enrollment and
+pid-state bookkeeping all follow that URL (`stop` matches the recorded
+pid state against the URL's port before signaling anything). Note the
+pid state file names ONE hub — the last one started — so stopping a
+differently-URLed hub says "no pid state — stop the hub process
+manually" rather than guessing.
+
+The hub layer of the messaging fabric has a kill switch: `fabric.hub:
+false` in `~/.fah/config.yaml` disables the hub primary even with the
+hub plugin enabled and `DAP_MASTER_SECRET` set — the fabric is the bare
+file layer and `agent_directory` reproduces the legacy listing
+byte-for-byte (same pattern as `images.registry: false`).
+
+`/dap start` in a live session keeps the older interactive shape: it
+generates a session master secret when none is set (export
+`DAP_MASTER_SECRET` to make one permanent), spawns the hub the same
+way, and connects in-session.
+
+#### Hub password
+
+Anyone on the machine can join an open loopback hub, so the hub can be
+password-protected. The password (the hub's *master secret*) resolves
+as `--secret` > the `DAP_HUB_SECRET` environment variable > the
+persisted `~/.dap/hub.json` state file. When none is set, the first
+interactive `fa hub serve` — and `/dap start` on an interactive host —
+offers to set one (empty answer = stay open); the answer is persisted
+and never asked again.
+
+On a protected hub every WebSocket upgrade must carry a credential:
+`Authorization: Bearer <secret>` from native clients, or the
+`?dap_token=<secret>` query parameter from browser clients (browser
+WebSocket cannot set headers). The master password itself authenticates
+and may enroll: a client connecting with it sends `{"t":"enroll"}` and
+receives a per-client secret, which the hub persists in the state file
+(agentId → secret) and accepts on later upgrades; enroll from a
+non-master connection is refused (`unauthorized`). A rejected upgrade
+answers `401` with `Connection: close` so HTTP keep-alive pools never
+replay a dead socket.
+
+The browser extension carries the password as the `secret` field of its
+`faDap` storage entry (the panel's Hub section has the field) and dials
+with the `dap_token` query param.
+
+For a shared deployment you need the same semantics behind a real
+socket: bind a public interface (or reverse-proxy to the loopback hub),
+and put TLS in front (§8.2). The stateless model means hubs are
+disposable: identities live on the agents, not the hub.
+
+### 8.2 TLS expectations
+
+The client dials exactly the URL it is given — `ws://` or `wss://`,
+path preserved (`dap_settings.dart` `normalizeDapHost` keeps an explicit
+`ws(s)://…/path` as-is; `WebSocket.connect` in `hub_client.dart`
+`_cycle`). The zero-config default `ws://127.0.0.1:8787/ws` is plaintext
+and loopback — fine for local development. For anything crossing a
+network, terminate TLS at a reverse proxy (nginx/Caddy) and point agents
+at `wss://hub.example.com/ws` — the shape used in the `hub:` config
+example (`hub_config.dart`); Dart's WebSocket client validates `wss://`
+against the system trust store, so use a real certificate.
+
+### 8.3 What the hub stores
+
+Per the reference model all runtime state is in memory — registry, live
+connections, offline mailboxes, the seen-nonce set — and the only
+durable agent state lives on the *agents* (§9.2). A hub restart is
+transparent apart from lost offline mail.
+
+One exception, opt-in: a password-protected hub persists its master
+secret and the enrolled per-client secrets in `~/.dap/hub.json` (mode
+0600, overridable via `DAP_HUB_STATE_FILE`) so restarts keep the
+password and the enrollments. An open hub writes nothing.
+
+
+## 9. Client configuration
+
+### 9.1 Configuration sources
+
+Precedence, highest first (`dap_settings.dart` `resolveDapSettings`,
+`hub_config.dart` `HubConfig.fromMap`):
+
+1. **Environment**: `DAP_HUB_URL`, `DAP_KEY_PATH`, `DAP_AGENT_NAME`,
+   `DAP_CHANNELS_FILE` — env beats the yaml section for url/keyPath/name
+   (`fromMap`: `environment[envUrl] ?? scalar('url')`). Scoped enrolled
+   connections also honor the optional non-secret `DAP_AGENT_INSTANCE`
+   identity discriminator (§15.4).
+2. **`.fah/packages.yaml`** `hub:` section:
+
+   ```yaml
+   hub:
+     url: wss://hub.internal:8443/ws
+     keyPath: ~/.fah/hub-key
+     name: my-agent
+     channels:         # channel -> X25519 pubkey b64 (encrypt-to)
+       general: Agh...
+     channelSecrets:   # channel -> X25519 privkey b64 (decrypt-with)
+       general: GhI...
+   ```
+
+   (`hub: false` or an empty value opts the plugin out entirely.)
+3. **`~/.dap/config.json`** — persisted by `dap_connect`/`/dap`:
+   `{"url": ..., "name": ..., "channels": [...], "invites": [...]}`.
+   The default-room list only grows (never un-remembered);
+   `invites` is the pending-invite queue (§6).
+4. **Defaults**: url `ws://127.0.0.1:8787/ws`; identity
+   `~/.dap/keys/fah/<name|hostname>.key` (auto-generated `0600` on first
+   use — a second agent on the machine needs nothing but
+   `DAP_AGENT_NAME`); channels `~/.dap/channels.json`.
+
+The plugin is registered by default in `bin/fah.dart`; a plain `fah`
+start connects in the background, and a failure against the untouched
+default URL prints one quiet hint line instead of an error (the default
+hub is usually just not running — `bin/fah_hub_plugin.dart` `_connect`).
+
+### 9.2 Files on disk (all under `~/.dap/`)
+
+| file | contents |
+|---|---|
+| `keys/fah/<name>.key` | identity, `0600` (§3) |
+| `channels.json` | channel name → `{pub, priv}`, machine-shared (§5) |
+| `config.json` | last hub url, display name, default rooms, pending `invites` (§6, §9.1) |
+
+### 9.3 Multi-machine channel-key distribution
+
+`channelSecrets` have to reach every machine that should *read* a
+channel. Three ways, in order of intent:
+
+1. **Invites (the intended flow).** `dap_invite <name> <channel>` sends
+   the keypair as an E2E DM over the hub itself — nothing to copy, works
+   for offline peers via the pending-invite queue (§6). Each machine's
+   `ChannelStore.accept` persists its own copy of the key.
+2. **Copy the channels file.** `~/.dap/channels.json` is deliberately
+   machine-shared plaintext: `scp` it to the second machine. This is the
+   same trust level as the invite path — possession of the private key
+   *is* membership, and whoever hands you the key introduces you
+   (`channels.dart` `ChannelStore.accept` doc).
+3. **Explicit config.** Put `channels:` + `channelSecrets:` in
+   `.fah/packages.yaml` (§9.1) — pre-shared out of band, per-project,
+   overrides the shared file.
+
+
+## 10. End-to-end walkthrough: zero to two agents talking
+
+### 10.1 One machine
+
+```bash
+# 1. Start a hub (§8.1) and note the url, e.g. ws://127.0.0.1:8787/ws
+DAP_HUB_URL=ws://127.0.0.1:8787/ws dart run tool/hub.dart
+
+# 2. Machine-local agent A
+DAP_HUB_URL=ws://127.0.0.1:8787/ws DAP_AGENT_NAME=alice dart run bin/fah.dart
+#   → [hub] connected as <alice-agentId>
+
+# 3. Second terminal — agent B (a second identity needs only a name)
+DAP_HUB_URL=ws://127.0.0.1:8787/ws DAP_AGENT_NAME=bob dart run bin/fah.dart
+```
+
+4. In alice's REPL: `dap_peers` → note bob's 16-hex id.
+5. `dap_dm to=<bob-id> text=hello bob` → bob's agent wakes at its next
+   turn boundary (inbound hub mail is steering input) and sees the
+   message; replies go through `dap_dm` back at alice — hub mail is
+   *not* answered with the normal reply path.
+
+Channel variant: `dap_invite nameOrId=bob` (channel defaults to
+`general`) → bob's client accepts the chankey DM, joins, and both can
+post/decrypt `#general`.
+
+### 10.2 Two machines
+
+1. Run the hub on machine A (or any host both can reach; §8.1 + §8.2 —
+   for a dev hub on a remote box, an SSH tunnel works:
+   `ssh -L 8787:127.0.0.1:8787 hostA` makes
+   `ws://127.0.0.1:8787/ws` valid on machine B too).
+2. On each machine: `export DAP_HUB_URL=wss://hub.example.com/ws` (or
+   the tunneled url) and a distinct `DAP_AGENT_NAME`; start `fah`.
+3. Identity is per-machine but stable: same name ⇒ same key file ⇒ same
+   agentId on every reconnect. Cross-machine, names are how you find
+   each other: `dap_peers` on either side lists both agents.
+4. DMs work immediately (keys are exchanged via whois over the hub).
+5. For a shared channel, one side creates it and invites the other —
+   `dap_invite <peer-name-or-id> project-x` — which ships the
+   `channelSecrets` across machines E2E (§9.3 path 1). No file copying
+   needed unless you prefer the explicit-config route.
+
+
+## 11. CLI surface
+
+| surface | tier | what it does |
+|---|---|---|
+| `/dap` | — | connection status: agentId, name, url |
+| `/dap <host> [name] [channel]` | — | retarget the live connection (host normalization: no scheme → `ws://`, no path → `/ws`) |
+| `dap_status` | read | full snapshot incl. hello/welcome counters |
+| `dap_peers` | read | presence list (`includeOffline`) |
+| `dap_dm` | exec | E2E direct message (id or unambiguous name) |
+| `dap_invite` | exec | chankey invite, offline-armed (§6) |
+| `dap_connect` | exec | runtime connect to any hub (persists to `~/.dap/config.json`) |
+
+(`bin/fah_hub_plugin.dart` `_dapTools`; read/exec tiers feed the normal
+approval gate. Inbound hub mail is drained into the agent loop at every
+turn boundary via the external-inbox seam — `hub_plugin.dart`
+`externalSteeringSource`.)
+
+## 12. Fabric integration (issue #27, phase 1)
+
+With DAP unlocked (`DAP_MASTER_SECRET` set) and the hub plugin enabled,
+the CLI composes the hub INTO the agent messaging fabric
+(`FallbackMessagingRepository`): hub-resolvable targets (16-hex peer
+ids, unambiguous display names, `#channels` — the same resolution
+`agent_message` uses) are delivered over DAP/1 first, the file inboxes
+stay the offline fallback. Mail sent while the hub path is unavailable
+queues in the file layer and is forwarded on the next connected call —
+the CLI's 2s inbox probe triggers the flush, so a reconnect drains the
+queue within one tick; inbound hub mail merges into the main inbox drain
+(deduped by message id, and by sender+time+body for the wire's
+re-wrapped frames). The plugin host's separate external inbox is skipped
+when the fabric owns delivery, so hub frames have exactly one consumer.
+Embedded hosts opt in through `AgentCliConfig.hubFabric`; subagent
+drains never touch the hub.
+
+Phase-1 scope notes: presence is online/offline only — a `busy` state
+(and richer discovery states) is phase 2. The DAP secret is stored in
+plaintext in `~/.dap/config.json` by `fa_hub_client`; Keychain-backed
+storage is not wired yet (pre-existing, not introduced here).
+
+## 13. App agents on the hub (issue #402)
+
+The macOS/iOS app's agent joins the SAME fabric as a live, addressable
+member. `flutter_app/lib/services/agent_network_controller.dart` wraps
+the harness `HubMessagingRepository` behind the app's
+`AgentNetworkService`: opt-in (the "Join as agent" row in the hub
+settings), at-most-once delivery, reconnect with backoff, and the
+session-scoped file fabric as the offline fallback — an unreachable hub
+boots the app fully usable and keeps retrying. The app agent registers
+under the name stored in its sandbox (`agent_network.json`), appears in
+`agent_directory` with a `[hub]` marker, and both directions of DM work
+against it: CLI peers reach it by name, and the app's roster view
+(composer in the same section) sends hub-ward. The LAN listener pairing
+(E2/A3) ships behind the same controller — the app connects to
+`ws://<mac>:<port>` with the pairing token once the LAN bind lands.
+
+## 14. fa_network bridging: channel ids are unstable
+
+When fa_network bridges a channel onto the hub (the relay joins a hub
+channel whose name is the fa_network channel id), remember that
+**fa_network channel ids are random 32-byte tokens** (`newToken()`), not
+deterministic derivations: deleting and recreating a channel mints a NEW
+id under the same display name, and every invite/bundle carrying the old
+id silently points at a dead hub channel (the relay only joins channels
+its store knows — frames to the stale id fan out on the hub but never
+reach fa_network).
+
+Consequences for invite producers and consumers:
+
+- Treat a network/channel invite as **point-in-time**. A stale invite is
+  indistinguishable from a working one on the hub side — always verify
+  liveness by resolving the channel list at join time:
+  `GET /api/networks/{networkId}/channels` (any member sessionToken,
+  guest included), match by channel **name** (stable), take the current
+  id. Name-based resolution at join is the recommended pattern; the id
+  in the invite is a fast path, not a contract.
+- The fanet1 envelope AAD binds to the channel **id**
+  (`dap1|<frameId>|<channelId>` — see
+  `flutter_app/lib/network/envelope_codec.dart`), so an id change also
+  re-keys every new frame; the app decrypts pre-recreation history via
+  its legacy display-name AAD fallback only while the name is unchanged.
+- Public (keyless) channels accept hub joins with an empty `chanPubkey`
+  (`{"op":"join","channel":<id>,"chanPubkey":""}`); payloads are raw
+  UTF-8 (no fanet1 wrapper) and render as plain text.
+
+### Scoped agent identity (one per project)
+
+The hub keeps ONE live connection per agent id and evicts the previous
+one. The vendored default identity (`~/.dap/keys/fah/<name>.key`) is
+shared by every process with the same display name, so two projects
+enrolled as the same agent kept evicting each other (gh-1825). Scoped
+(/network, enrolled-credential) connections therefore derive the
+identity key per PROJECT: `…/<name>-<sha256(cwd)[:10]>.key` — stable
+across restarts (offline mailbox preserved), distinct across working
+directories. `DAP_KEY_PATH` / `hub.keyPath` overrides are respected
+verbatim; concurrent sessions in ONE directory still share an identity
+(last connection wins) unless you give them distinct key paths.
+
+### Public showcase channels (fa_network interop)
+
+A PUBLIC channel has no chankey: payloads are `base64({"text": …})`
+(raw utf8 tolerated), not DAP/1 chankey E2E. The CLI joins public
+channels keyless (never minting a channel keypair), sends through
+`sendChannelEnvelope` with the public codec, and drains `#channel`
+inboxes alongside the agent DM inbox (draining only the agent id drops
+channel traffic entirely). Inbound public decoding requires
+fa_hub_client with the public-payload fallback (0.2.11+ /
+feat/public-channel-payloads); on older clients inbound public frames
+surface as "undecryptable".
+
+### Channel payload sender block (human attribution across the relay)
+
+App members write through the fa_network relay: on the hub wire the
+frame's `from` is the RELAY's agent id, so a bare payload leaves the
+human author invisible — agents greet the relay
+("Hello 3cfaee1aa054fe6e!"). Channel payloads therefore carry an
+OPTIONAL sender block next to the text (public base64 JSON and keyed
+fanet1 plaintext alike):
+
+```json
+{"text": "hello", "sender": {"name": "Uladzimir", "id": "<memberId>"}}
+```
+
+Producers embed the block when they know the author's display name
+(the app always does post-join); legacy payloads without it stay valid
+forever. Receivers unwrap it tolerantly (raw text passes through) and
+surface the name as the mail's `fromName` — the CLI steering line
+reads `from Uladzimir (<relay-agent-id>) in #channel: …`.
+
+### Enrolled hub credentials (the app's DAP tab)
+
+A bare invite link is enough only on hubs that accept the machine's
+default credential. Production hubs enroll NAME-BOUND agent secrets: a
+secret minted for one hub is rejected by another (HTTP 401), and the
+agent name must match the enrollment (`hello name does not match the
+enrolled secret`). Therefore `/network` accepts the WHOLE DAP block from
+Add an agent → DAP (or the one-line CLI command):
+
+```
+fa dap import 'wss://hub…/ws?channel=<id>' && DAP_HUB_URL=wss://hub…/ws DAP_CLIENT_SECRET='…' DAP_AGENT_NAME=<name> DAP_AGENT_INSTANCE=<instance> fa
+```
+
+The app's DAP action creates an additional independent credential instead of
+rotating earlier credentials for the same display name. It calls
+`POST /api/networks/{id}/agents/enrollments`, which requires a hub with the
+`enroll_create` operation; it never falls back to legacy `/agents/enroll`.
+A hub that answers `unknown op enroll_create` must be upgraded — the app
+reports that existing credentials were not changed. The action also emits
+`DAP_AGENT_INSTANCE`, the first 16 lowercase hex characters of SHA-256 over
+the UTF-8 client secret. This discriminator is not a secret;
+`DAP_AGENT_NAME` remains the unchanged display name.
+
+Paste it into the composer or `/network` — the invite, client secret,
+agent name and instance are parsed together (the command is never executed).
+CLI session/project memberships and native/plain-web app enrollment records
+retain the instance, so paste and every later reconnect select the same
+independent identity. The secret is stored `dapkey1.`-encrypted for
+session/project scopes and decrypted only into the live connection; at global
+scope it stays in memory (the legacy files have no per-hub credential field).
+Boot and resume reconnect with the stored credential automatically. After every
+join the wizard prints an explicit LIVE / NOT-live verdict — a stored
+membership is never presented as a working connection.
+
+The browser extension has ONE service-worker DAP runtime and one active
+enrollment/identity. Pasting another bundle replaces that enrollment; it does
+not host simultaneous same-name agents inside that worker. Use independent
+CLI or native/plain-web runtimes for simultaneous independent identities.
+
+## 15. Scoped channel membership + `/network` (issue #1825)
+
+Joining a DAP hub channel from the TUI takes three steps: `/network` →
+paste the invite → pick a scope. No shell, no restart, no file editing.
+
+### 15.1 The `/network` menu
+
+- **Join channel** (default): one paste field accepts every invite form —
+  `wss://hub/ws?channel=<id>`, the same with `#pub=P&priv=K`, a bare
+  `<channel-id>` (uses the configured hub), or the whole copied
+  `fa dap import '…'` command. Then one scope question:
+  **session** (default) / **project** / **global**. The join takes effect
+  IMMEDIATELY on the live connection.
+- **Channels**: joined channels with scope badges, `copy invite`
+  (app-compatible string; keyless form for public channels) and `leave`
+  per scope — leaving one scope keeps the others; leaving the last stops
+  delivery at once.
+- **Status**: hub url, connection state.
+
+Pasting an invite into the normal composer opens the SAME join wizard
+(prefilled) instead of sending it as an agent message (only unambiguous
+forms — full invite urls and `fa dap import …` — ever intercept; prose
+never does).
+
+**Trust model:** a joined channel is a shared trust domain — ANY member
+can steer this agent (the join UI says so). Scope is the blast-radius
+control: session < project < global.
+
+### 15.2 Scopes and stores
+
+| scope | store | reaches |
+|---|---|---|
+| session | `dap_channel_membership` custom record on the session JSONL (leave = tombstone record) | this session, re-joins on resume, follows the branch |
+| project | `<project>/.fah/dap.json` — MAY be committed (encrypted keys only) | every fa agent booted from that folder |
+| global | the legacy `~/.dap/config.json` + `~/.dap/channels.json` | every fa agent on the machine |
+| env | `DAP_CHANNELS_JSON` (no files at all) | the headless/CI boot |
+
+Effective membership = union deduped by `(hubUrl, channelId)` — the same
+channel at two scopes delivers each frame ONCE; the narrowest scope wins
+the key material.
+
+### 15.3 Key encryption (`dapkey1`)
+
+Session/project stores hold the channel private key ONLY as a
+`dapkey1.<base64url(json)>` envelope: PBKDF2-HMAC-SHA256 (iteration count
+in the envelope, sanity-bounded at 5 000 000 — a hostile `"iter"` is
+rejected before any KDF work) → ChaCha20-Poly1305, AAD `dapkey1`.
+Plaintext keys exist in memory, in the runtime overlay
+(`~/.dap/runtime/channels.json`, 0600 — ONE stable name per `$HOME`,
+rewritten atomically on every re-seed, never per-pid). Every normal and
+signal-graceful CLI shutdown calls the hub host's idempotent `dispose()`;
+pid guard files (no secret content) keep the shared overlay while another
+live agent uses it, and the last exiting agent deletes it. Stale guards
+and legacy per-pid overlays from older builds are swept at boot. A live
+pid is authoritative regardless of guard age (no wall-clock TTL: agents
+may run for days without rewriting their boot guard). Each guard also
+records the writer's process-start identity (`/proc/<pid>/stat` starttime
+on Linux, parsed `ps lstart` on macOS — process metadata, never secret
+material), so a guard whose pid is alive but whose recorded identity
+differs from the current incarnation is a RECYCLED pid: the writer
+crashed, the cleanup reclaims the guard, and the shared plaintext overlay
+is not pinned forever. Probe, listing, or identity-parse failures keep
+the keep-on-doubt behavior (the overlay survives); guards written by
+older builds (pid only) are kept on the same doubt. Embedded hosts with
+their own lifecycle must call `HubPluginHost.dispose()`.
+The pure-env CI path also carries plaintext values in process memory and
+its environment; those values are registered with both redaction systems.
+**Global scope is the deliberate exception** (see the table above): it
+persists the invite keypair PLAINTEXT, byte-equivalent with
+`fa dap import` — the REG-* interop tests pin that equivalence, and the
+legacy `~/.dap/channels.json` format has no envelope field. Passphrase
+resolution per channel:
+(1) `DAP_KEY_PASSPHRASE` env; (2) OS Keychain item
+`fa.dap.channel-key.<hubHost>.<channelId>` (macOS `security` CLI);
+(3) ONE interactive prompt, save-to-Keychain by default. Headless with
+neither env nor Keychain: loud one-line warning, the key stays in memory
+for that run, the primary job proceeds — never a prompt, never a block.
+
+### 15.4 Headless / CI provisioning
+
+All optional, all zero-prompt:
+
+- `DAP_HUB_URL` — the hub websocket url.
+- `DAP_CLIENT_SECRET` — the hub-issued per-client secret (enables the
+  plugin via the boot credential mirror; no `DAP_MASTER_SECRET` needed).
+- `DAP_AGENT_NAME` — the display name bound to that credential.
+- `DAP_AGENT_INSTANCE` — an optional NON-SECRET identity discriminator for
+  independent same-name agents.
+- `DAP_CHANNELS_JSON` —
+  `[{"channel":"<id>","pub":"…","priv":"…"}, …]`, joined AT BOOT before
+  the first turn. Keyless entries are public channels; `priv` may be
+  plaintext from the CI secret store OR a `dapkey1.` envelope (mixed sets
+  join together); an optional per-entry `hubUrl` overrides the default.
+- `DAP_KEY_PASSPHRASE` — decrypts envelope entries.
+
+For scoped enrolled connections, an absent or empty `DAP_AGENT_INSTANCE`
+keeps the legacy project-derived identity-key path byte-for-byte. A nonempty
+value is hashed WITHOUT the project cwd into the key-path suffix: one instance
+keeps the same Ed25519 identity and agentId across projects and restarts,
+while different instances produce different identities even when
+`DAP_AGENT_NAME` is identical. An explicit `DAP_KEY_PATH` still wins verbatim.
+Direct environment boots apply the discriminator before the first dial too,
+whether they carry a client secret or use the master-secret enrollment flow;
+no previously persisted membership is required. Independent enrollment
+configs can stay online simultaneously; reusing one config reconnects that
+same identity rather than minting another.
+
+Identity = session name: `fa --session goal_builder` already sets the hub
+display name to `goal_builder`, stable across resumes, addressable via
+`agent_message to: "goal_builder"`. Hub down or a rejected secret → a
+loud warning and the agent's primary job proceeds; the file-fabric
+fallback is unchanged.
+
+## App composer enrollment (gh-1825)
+
+The Flutter app accepts the same enrollment block as the CLI: paste the
+whole `fa dap import … && DAP_HUB_URL=… DAP_CLIENT_SECRET=…
+DAP_AGENT_NAME=… fa` block into the agent chat composer (a smart-pasted
+`.txt` attachment with exactly that payload is recognized too). The
+composer consumes the paste synchronously — no `sendText`, no analytics,
+no session record — and shows a localized joined/failed status.
+
+Native joins through the SAME hub repository that feeds the agent
+fabric, so inbound channel mail wakes the agent and
+`agent_message to: "#channel"` answers into the channel. Identity is
+scoped per project (stable across restarts, distinct across working
+directories); invite `pub`/`priv` are imported for private channels,
+public channels join keyless and speak the public showcase payload
+(`base64({"text": …})`, raw UTF-8 tolerated). The enrollment secret goes
+only to the WebSocket `Authorization` header and the dedicated
+enrollment store (Keychain/Keystore where available, with the explicitly
+unencrypted fallback below) — never to `SecretsExecutionEnv`, model
+context, or logs.
+Membership is restored on reconnect (rejoin precedes the outbound
+drain). Saving the manual `/settings` connection form clears the invite
+enrollment. One live hub connection per app agent: a new paste replaces
+the previous enrollment.
+
+Plain web builds join through the browser `WebHubTransport`
+(`web_socket_channel`, no `dart:io`): the enrollment secret rides the
+hub's browser bearer equivalent `?token=` (same server-side credential
+check as `Authorization: Bearer`; the credentialed URI is never logged
+or propagated into errors), and the identity persists in the
+IndexedDB-backed app sandbox through the same key-file codec as native.
+In the browser EXTENSION the join instead rides the service worker's
+existing DAP client (`hub.join` op + `joined`-ack polling): a
+panel-local socket would evict the worker's presence for the same
+agent, and the worker restores its persisted enrollment itself.
+
+### App enrollment secret storage
+
+Here `<scope>` is the first ten lowercase hex characters of
+`sha256(projectCwd)`, and the app-storage root is
+`ExecutionEnv.appStorageCwd` (never the mounted user project). The record
+name is `fa_dap_enrollment_<scope>`.
+
+| Platform / backend | Exact enrollment location | Secret protection at rest |
+|---|---|---|
+| macOS/iOS with an available Keychain | Keychain item `fa_dap_enrollment_<scope>` (service `fa.app`) | OS Keychain encryption; behavior is unchanged |
+| Android with an available Keystore | `fa_dap_enrollment_<scope>` in the app's Keystore-encrypted preferences | Android Keystore encryption; behavior is unchanged |
+| **Linux and Windows (always)**; also a native platform whose Keychain/Keystore probe is unavailable | `<app-storage-root>/fa_dap_enrollment_<scope>.json` (the application-support sandbox on Linux/Windows) | **PLAINTEXT, unencrypted JSON** |
+| **Plain web (always)** | Sandbox file `/fa_dap_enrollment_<scope>.json`, persisted inside the `sandbox` record of the origin's IndexedDB database **`fah_web_fs`**, object store **`snapshots`** | **PLAINTEXT, unencrypted JSON inside IndexedDB** |
+
+In either fallback, the invite's `priv` and the hub-issued `clientSecret`
+are written verbatim as JSON string fields whenever present; they are not
+ciphertext. App-sandbox or browser-origin isolation does not encrypt them.
+Linux, Windows, and web have no `KeychainStore` backend, so their successful
+composer join result explicitly warns that the invite private key and hub
+credential are stored unencrypted in the app sandbox (IndexedDB on web).
+The browser extension's service-worker-owned enrollment follows its own
+storage path rather than `DapEnrollmentStore`.

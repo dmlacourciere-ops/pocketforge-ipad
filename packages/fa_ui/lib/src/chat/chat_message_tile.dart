@@ -1,0 +1,1408 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show authExpiredProvider, stripAuthExpiredMarker;
+
+import '../theme/app_theme.dart';
+import 'chat_strings.dart';
+import 'fa_chat_service.dart';
+import 'fa_glyphs.dart';
+import 'markdown_style.dart';
+import 'media_player.dart';
+import 'media_tool_names.dart';
+import 'fa_chat_host.dart';
+import 'fa_kaomoji.dart';
+import 'upload_utils.dart' show isInlineImageMimeType, mimeTypeForUploadName;
+
+/// Builds the leading avatar for a transcript message [role] (`user` /
+/// `assistant` / `system` / `tool`); return null for roles without one.
+typedef FaChatAvatarBuilder =
+    Widget? Function(BuildContext context, String role);
+
+/// Called when the user taps an action button on a permission-denied card.
+/// [permission] is the service name (e.g. 'calendar', 'contacts', 'home').
+/// [action] is 'openSettings' or 'tryAgain'.
+typedef FaPermissionActionCallback =
+    void Function(String permission, String action);
+
+/// The default [ChatMessageTile.imageCacheWidth]: attachment thumbnails
+/// decode downscaled to 600px wide (a display/memory optimization; the
+/// stored/sent bytes stay full fidelity).
+const int kDefaultImagePreviewCacheWidth = 600;
+
+/// Max attachment thumbnails a user bubble renders inline (issue #461 E1):
+/// past this the bubble shows a `+N more` tile opening the gallery.
+const int _kMaxBubbleThumbs = 8;
+
+/// Called when the user taps the "Authorize" button on an auth-expired card.
+/// [providerId] is the provider identifier from [authExpiredProvider]
+/// (e.g. 'codemie').
+typedef FaAuthRecoveryCallback = void Function(String providerId);
+
+/// One transcript message, rendered the same way on every chat surface: the
+/// full chat screen (through its `flutter_chat_ui` builders) and the in-app
+/// Fa chat overlay both delegate to this widget, so user bubbles, assistant
+/// Markdown (with sandbox images), thinking notes, tool tiles and system
+/// lines never drift apart.
+///
+/// The chat screen passes [compact] = false (its list owns the outer
+/// spacing through the chat theme); the overlay passes true for the tighter
+/// padding its bottom panel needs.
+class ChatMessageTile extends StatelessWidget {
+  const ChatMessageTile({
+    super.key,
+    required this.message,
+    required this.images,
+    this.audioControllerFactory,
+    this.videoControllerFactory,
+    this.avatarBuilder,
+    this.onPermissionAction,
+    this.onAuthRecovery,
+    this.compact = false,
+    this.messageFontSize,
+    this.imageCacheWidth = kDefaultImagePreviewCacheWidth,
+    this.dynamicWidgetTileBuilder,
+    this.thinkingLive = false,
+  });
+
+  /// The message to render (`user` / `assistant` / `thinking` / `tool` /
+  /// `system` / `widget`).
+  final FaChatMessage message;
+
+  /// Sandbox image/byte loader shared by the surface (memoized — one per
+  /// transcript, see [SandboxImageResolver]).
+  final SandboxImageResolver images;
+
+  /// Playback engine factory for inline audio players; null uses the real
+  /// `audioplayers`-backed controller. Tests/goldens inject fakes.
+  final SandboxAudioControllerFactory? audioControllerFactory;
+
+  /// Playback engine factory for inline video players; null uses the real
+  /// `video_player`-backed controller. Tests/goldens inject fakes.
+  final SandboxVideoControllerFactory? videoControllerFactory;
+
+  /// Leading-widget builder for non-user bubbles (e.g. the host's brand
+  /// avatar for `assistant`); a null return (or a null builder) renders no
+  /// leading widget — the stock look.
+  final FaChatAvatarBuilder? avatarBuilder;
+
+  /// Called when the user taps a permission card action button ("Open
+  /// Settings" or "Try again"). The host should open system settings or
+  /// retry the permission request.
+  final FaPermissionActionCallback? onPermissionAction;
+
+  /// Called when the user taps the "Authorize" button on an auth-expired
+  /// card. The host should launch the provider's SSO/re-authorization flow.
+  final FaAuthRecoveryCallback? onAuthRecovery;
+
+  /// Tighter outer spacing for the in-app Fa overlay, whose panel already
+  /// pads the transcript list.
+  final bool compact;
+
+  /// Chat text-size override (the app's chat text setting): forwarded to
+  /// [fahMarkdownStyleSheet]; null renders at the theme's body size.
+  final double? messageFontSize;
+
+  /// Decode cap for user-attachment thumbnails: images decode downscaled
+  /// to this width (a display/memory budget — stored bytes stay full
+  /// fidelity); null decodes full resolution (the app's "high-quality
+  /// previews" setting resolves it, issue #207/#461).
+  final int? imageCacheWidth;
+
+  /// Renders a `widget`-role message as the host's live dynamic-message
+  /// tile; null (or a null return) renders the stock system tile. Every
+  /// transcript surface wires its own so the tile renders wherever the
+  /// transcript does (issue #336).
+  final FaDynamicWidgetTileBuilder? dynamicWidgetTileBuilder;
+
+  /// Whether the `thinking` row is the LIVE streaming block (issue
+  /// #1374): its kaomoji icon swaps on the shared ~0.9 s random cadence
+  /// only while the phase runs. Finished thinking notes stay on screen
+  /// with a frozen face (AC4 — no animation while idle); non-thinking
+  /// rows ignore the flag.
+  final bool thinkingLive;
+
+  @override
+  Widget build(BuildContext context) {
+    final tile = _roleTile(context);
+    if (!compact) return tile;
+    return _compactSpacing(tile);
+  }
+
+  /// The bare tile for the message's role: host dynamic-widget tiles for
+  /// `widget`, text bubbles for `user`/`assistant`, the thinking note, and
+  /// tool/system rows for everything else (incl. `widget` with no builder
+  /// or a null tile).
+  Widget _roleTile(BuildContext context) {
+    if (message.role == 'widget') return _dynamicTile(context);
+    if (message.role == 'user') return _textBubble(context, isUser: true);
+    if (message.role == 'assistant') return _textBubble(context, isUser: false);
+    if (message.role == 'thinking') return _thinkingTile(context);
+    return _toolOrSystemTile(context);
+  }
+
+  /// A `widget`-role message renders as the host's live dynamic-message
+  /// tile; a null builder or a null tile falls back to the stock system
+  /// tile (issue #336).
+  Widget _dynamicTile(BuildContext context) {
+    final dynamicTile = dynamicWidgetTileBuilder?.call(context, message);
+    return dynamicTile ?? _toolOrSystemTile(context);
+  }
+
+  /// Compact mode (the overlay panel) adds only a bottom gap: user bubbles
+  /// right-align with a leading gutter, assistant bubbles a trailing one.
+  Widget _compactSpacing(Widget tile) => switch (message.role) {
+    'user' => Align(
+      alignment: Alignment.centerRight,
+      child: Padding(
+        padding: const EdgeInsets.only(left: 48, bottom: 8),
+        child: tile,
+      ),
+    ),
+    'assistant' => Padding(
+      padding: const EdgeInsets.only(right: 24, bottom: 8),
+      child: tile,
+    ),
+    _ => Padding(padding: const EdgeInsets.only(bottom: 8), child: tile),
+  };
+
+  Widget _textBubble(BuildContext context, {required bool isUser}) {
+    // Empty assistant bubbles (model returned no text) render as nothing —
+    // they would otherwise show as a blank gray rectangle between tool calls.
+    if (message.content.trim().isEmpty && !isUser) {
+      return const SizedBox.shrink();
+    }
+    final withCopy = _wrapWithCopyButton(
+      context,
+      _bubbleContainer(context, isUser),
+      alwaysVisible: false,
+    );
+    return _withLeadingAvatar(context, isUser, withCopy);
+  }
+
+  /// The bubble body: width budget (user bubbles keep the compact fixed
+  /// cap, AI bubbles span up to 90% of the viewport), the role surface, and
+  /// the single SelectionArea over the Markdown body.
+  Widget _bubbleContainer(BuildContext context, bool isUser) {
+    final styleSheet = fahMarkdownStyleSheet(
+      Theme.of(context),
+      fontSize: messageFontSize,
+    );
+    final palette = fahChatColorsOf(context);
+    final border = Theme.of(context).dividerColor;
+    return Container(
+      // AI messages can carry long code/report text: let the bubble span
+      // 90% of the viewport instead of a cramped fixed 560px cap. User
+      // bubbles keep the compact fixed width.
+      constraints: BoxConstraints(
+        maxWidth: isUser ? 560 : MediaQuery.sizeOf(context).width * 0.9,
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: isUser ? palette.userBubble : palette.panel,
+        border: _bubbleBorder(context, palette, border, isUser),
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: _bubbleShadow(context, isUser),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Issue #461: the user's own attachments render INSIDE the
+          // bubble, above the text — thumbnails (wrapped grid when
+          // several), the unavailable-image placeholder, file chips.
+          if (isUser) _userAttachments(context),
+          SelectionArea(
+            // ONE selection region for the whole bubble: MarkdownBody's own
+            // `selectable: true` creates an independent region per block, so a
+            // drag stopped at every paragraph boundary. The SelectionArea
+            // handles selection; the body renders non-selectable Markdown.
+            child: MarkdownBody(
+              data: message.content,
+              styleSheet: styleSheet,
+              // Sandbox paths (`![alt](generated/x.png)`) load through the
+              // session env; taps open the fullscreen preview.
+              sizedImageBuilder: images.sizedImageBuilder(
+                onImageTap: (bytes) => showFahImagePreview(context, [bytes]),
+              ),
+              // Audio/video sandbox links open a small inline-player dialog.
+              onTapLink: (text, href, title) =>
+                  _onMarkdownLink(context, text, href, title),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Light theme: AI bubbles drop the border (the shadow carries the edge,
+  /// the prototype's card style); everything else keeps a hairline border.
+  Border? _bubbleBorder(
+    BuildContext context,
+    FahColors palette,
+    Color border,
+    bool isUser,
+  ) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    if (isLight && !isUser) return null;
+    return Border.all(color: isUser ? palette.userBubbleBorder : border);
+  }
+
+  /// The light-theme AI-bubble shadow pair; null keeps the flat look.
+  List<BoxShadow>? _bubbleShadow(BuildContext context, bool isUser) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    if (isLight && !isUser) {
+      return [
+        BoxShadow(
+          color: const Color(0xFF000000).withValues(alpha: 0.04),
+          blurRadius: 8,
+          offset: const Offset(0, 1),
+        ),
+        BoxShadow(
+          color: const Color(0xFF000000).withValues(alpha: 0.06),
+          blurRadius: 2,
+          offset: const Offset(0, 1),
+        ),
+      ];
+    }
+    return null;
+  }
+
+  /// User bubbles render lead-less; assistant bubbles carry the host
+  /// avatar (or the stock brand tile) guttered next to the bubble.
+  Widget _withLeadingAvatar(BuildContext context, bool isUser, Widget bubble) {
+    final avatar = isUser ? null : _assistantAvatar(context);
+    if (avatar == null) return bubble;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        avatar,
+        const SizedBox(width: 8),
+        Flexible(child: bubble),
+      ],
+    );
+  }
+
+  Widget _assistantAvatar(BuildContext context) =>
+      avatarBuilder?.call(context, message.role) ?? _defaultAiAvatar(context);
+
+  /// The attachment strip of a user bubble (issue #461): a wrapped grid of
+  /// tap-to-zoom thumbnails (one bigger thumb when single, `+N more` past
+  /// the cap), the labeled `[image unavailable]` placeholder when a raster
+  /// attachment's bytes are gone from the record, and a compact file chip
+  /// for non-image attachments.
+  Widget _userAttachments(BuildContext context) {
+    if (message.attachments.isEmpty) return const SizedBox.shrink();
+    final strings = FaChatStrings.of(context);
+    final palette = fahChatColorsOf(context);
+    final thumbs = <int, Uint8List>{
+      for (final (index, attachment) in message.attachments.indexed)
+        if (attachment.bytes != null) index: attachment.bytes!,
+    };
+    final gallery = [for (final bytes in thumbs.values) bytes];
+    final overflow = thumbs.length - _kMaxBubbleThumbs;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Wrap(
+        spacing: 6,
+        runSpacing: 6,
+        children: [
+          for (final (i, thumb)
+              in thumbs.entries.take(_kMaxBubbleThumbs).indexed)
+            GestureDetector(
+              onTap: () =>
+                  showFahImagePreview(context, gallery, initialIndex: i),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(10),
+                child: Image.memory(
+                  thumb.value,
+                  width: thumbs.length == 1 ? 200 : 84,
+                  height: thumbs.length == 1 ? 150 : 84,
+                  cacheWidth: imageCacheWidth,
+                  fit: BoxFit.cover,
+                  gaplessPlayback: true,
+                ),
+              ),
+            ),
+          if (overflow > 0)
+            GestureDetector(
+              onTap: () => showFahImagePreview(
+                context,
+                gallery,
+                initialIndex: _kMaxBubbleThumbs,
+              ),
+              child: _attachmentBox(
+                palette,
+                width: 84,
+                height: 84,
+                center: Text(
+                  strings.chatMoreAttachments(overflow),
+                  style: TextStyle(color: palette.dim, fontSize: 13),
+                ),
+              ),
+            ),
+          for (final attachment in message.attachments)
+            if (attachment.bytes == null)
+              _attachmentChip(context, palette, attachment, strings),
+        ],
+      ),
+    );
+  }
+
+  /// The chip for an attachment without inline bytes: the labeled
+  /// `[image unavailable]` placeholder when the path is a raster image
+  /// whose bytes were dropped from the record (never a silent gap), a
+  /// file chip with the name for every other attachment.
+  Widget _attachmentChip(
+    BuildContext context,
+    FahColors palette,
+    FaChatAttachment attachment,
+    FaChatStrings strings,
+  ) {
+    final path = attachment.path;
+    // Bytes-only records render as thumbnails, never as chips; a chip
+    // without a path cannot exist (issue #461 projection guarantees it).
+    if (path == null) return const SizedBox.shrink();
+    final isImage = isInlineImageMimeType(mimeTypeForUploadName(path));
+    return _attachmentBox(
+      palette,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            isImage
+                ? Icons.image_not_supported_outlined
+                : Icons.insert_drive_file_outlined,
+            size: 14,
+            color: palette.dim,
+          ),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              // A dropped raster keeps its name next to the l10n'd
+              // unavailable label; a non-image shows just the name.
+              isImage
+                  ? '${strings.chatImageUnavailable} · ${_baseName(path)}'
+                  : _baseName(path),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: palette.dim, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+    // ponytail: chip tap stays a no-op — opening a file preview from a
+    // transcript row needs a host callback; wire it when a surface asks.
+  }
+
+  /// The rounded attachment box shared by the placeholder/file chips and
+  /// the `+N more` tile.
+  Widget _attachmentBox(
+    FahColors palette, {
+    Widget? child,
+    Widget? center,
+    double width = 0,
+    double height = 0,
+  }) {
+    final box = Container(
+      width: width > 0 ? width : null,
+      height: height > 0 ? height : null,
+      padding: width > 0
+          ? null
+          : const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      alignment: center != null ? Alignment.center : null,
+      decoration: BoxDecoration(
+        color: palette.panelAlt.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: palette.dim.withValues(alpha: 0.3)),
+      ),
+      child: center ?? child,
+    );
+    return width > 0
+        ? box
+        : ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 280),
+            child: box,
+          );
+  }
+
+  /// The file name of a sandbox attachment path (`uploads/a/b.png` →
+  /// `b.png`).
+  String _baseName(String path) => path.split('/').last;
+
+  /// The default AI avatar: the Fa brand `>_` tile ([FaAiAvatar]) — the
+  /// launcher brand-tile language, not a stock sparkle. Shown when no
+  /// [avatarBuilder] is provided.
+  Widget _defaultAiAvatar(BuildContext context) {
+    return const FaAiAvatar(size: 28);
+  }
+
+  /// `onTapLink` for chat Markdown: audio/video sandbox links open a small
+  /// player dialog (flutter_markdown has no custom link renderer — only
+  /// images render inline). Other links stay dead, as before.
+  void _onMarkdownLink(
+    BuildContext context,
+    String text,
+    String? href,
+    String title,
+  ) {
+    if (href == null) return;
+    final kind = sandboxMediaKind(href);
+    if (kind == null) return;
+    showFahMediaDialog(
+      context,
+      bytes: images.load(href),
+      kind: kind,
+      audioControllerFactory: audioControllerFactory,
+      videoControllerFactory: videoControllerFactory,
+    );
+  }
+
+  /// Tool/thinking tiles hug the edges in compact mode (the overlay panel
+  /// already pads its transcript); the full chat screen adds outer room.
+  EdgeInsetsGeometry get _tileMargin => compact
+      ? EdgeInsets.zero
+      : const EdgeInsets.symmetric(vertical: 4, horizontal: 16);
+
+  Widget _thinkingTile(BuildContext context) {
+    final palette = fahChatColorsOf(context);
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    return Container(
+      margin: _tileMargin,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isLight
+            ? const Color(0xFFF9FAFB)
+            : palette.panelAlt.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(10),
+        border: isLight
+            ? null
+            : Border.all(
+                color: Theme.of(context).dividerColor.withValues(alpha: 0.5),
+              ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // The two-tone kaomoji face (issue #1374) replaces the
+          // head-with-gear: approved SVG sprite frames, random swap on
+          // the shared ~0.9 s cadence while the thinking phase streams.
+          KaomojiThinkingIcon(size: 16, active: thinkingLive),
+          const SizedBox(width: 6),
+          Expanded(
+            // Reasoning can run to thousands of lines (and small models
+            // sometimes loop there) — collapse like long tool output, but
+            // keep the NEWEST reasoning visible (the tail, not the head).
+            child: _CollapsibleToolOutput(
+              content: message.content,
+              showTail: true,
+              style: palette
+                  .mono(color: palette.dim, fontSize: 12)
+                  .copyWith(fontStyle: FontStyle.italic),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _toolOrSystemTile(BuildContext context) {
+    final toolName = message.toolName;
+    final content = message.content;
+    final isError = message.isError;
+    final palette = fahChatColorsOf(context);
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    final specialCard = _specialToolCard(
+      context,
+      palette,
+      toolName,
+      content,
+      isLight,
+    );
+    if (specialCard != null) return specialCard;
+    // generate_image results carry the saved sandbox path — show the image
+    // inline under the tool tile instead of waiting for the model to
+    // reference it. Errors ("Error: …") simply don't match.
+    final generatedImagePath = toolName == generateImageToolName
+        ? _generatedImagePath(content)
+        : null;
+    // speak/generate_music (and any non-read tool result mentioning a
+    // media path) get an inline audio/video player under the tile.
+    final toolMedia = _toolMedia(toolName, content, isError);
+    return Container(
+      margin: _tileMargin,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        // Light theme: very subtle gray bg without border; dark theme: bordered.
+        color: isLight ? const Color(0xFFF9FAFB) : palette.panelAlt,
+        borderRadius: BorderRadius.circular(10),
+        border: _toolTileBorder(context, palette, isError, isLight),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (toolName != null)
+            ..._toolTileHeader(
+              context,
+              palette,
+              toolName,
+              content,
+              isError,
+              isLight,
+            ),
+          _toolTileBody(context, palette, toolName, content, isError),
+          ..._toolTileMedia(
+            context,
+            generatedImagePath: generatedImagePath,
+            toolMedia: toolMedia,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// The two special tool surfaces checked BEFORE the generic tile:
+  /// permission-denied cards (orange badge + working action buttons) and
+  /// auth-expired cards (an Authorize button that re-launches the SSO
+  /// flow). Null renders the generic tile.
+  Widget? _specialToolCard(
+    BuildContext context,
+    FahColors palette,
+    String? toolName,
+    String content,
+    bool isLight,
+  ) {
+    // Permission-denied tool results get a special card: orange badge +
+    // action buttons (Open Settings / Try again) matching the prototype.
+    // We check the CONTENT, not just isError — some tools return the denial
+    // as a plain text result, not an error. AND the tool name: arbitrary
+    // tool results whose body text happens to mention 'X access required'
+    // (e.g. a `read` of a skill that documents the permission flow) keep
+    // the normal collapsible tile instead of hijacking the visual.
+    if (_isPermissionError(toolName: toolName, content: content)) {
+      return _permissionCard(
+        context,
+        palette,
+        content,
+        isLight,
+        onPermissionAction,
+      );
+    }
+    // Auth-expired provider errors (SSO session expired) get a special card
+    // with an Authorize button that re-launches the SSO flow.
+    final expiredProvider = authExpiredProvider(content);
+    if (expiredProvider != null) {
+      return _authExpiredCard(
+        context,
+        palette,
+        content,
+        isLight,
+        expiredProvider,
+        onAuthRecovery,
+      );
+    }
+    return null;
+  }
+
+  Border? _toolTileBorder(
+    BuildContext context,
+    FahColors palette,
+    bool isError,
+    bool isLight,
+  ) => isLight
+      ? _lightToolTileBorder(palette, isError)
+      : _darkToolTileBorder(context, palette, isError);
+
+  /// Light theme: errors get a faint error-tinted border, successes none
+  /// (the gray bg carries the edge).
+  Border? _lightToolTileBorder(FahColors palette, bool isError) =>
+      isError ? Border.all(color: palette.error.withValues(alpha: 0.3)) : null;
+
+  /// Dark theme: every tile bordered; errors more strongly tinted.
+  Border _darkToolTileBorder(
+    BuildContext context,
+    FahColors palette,
+    bool isError,
+  ) => Border.all(
+    color: isError
+        ? palette.error.withValues(alpha: 0.45)
+        : Theme.of(context).dividerColor,
+  );
+
+  /// The tool-call header row: pass/fail mark, verb'd display name,
+  /// dropdown affordance, and a raw-output copy button — plus the gap under
+  /// it when body text follows.
+  List<Widget> _toolTileHeader(
+    BuildContext context,
+    FahColors palette,
+    String toolName,
+    String content,
+    bool isError,
+    bool isLight,
+  ) {
+    return [
+      Row(
+        children: [
+          _toolStatusIcon(palette, isError, isLight),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              // Prototype style: "Checked Calendar" not "[ calendar ]".
+              // Capitalize the tool name and prefix with a verb.
+              _toolDisplayName(toolName),
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: isError ? palette.error : palette.indigo,
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+              ),
+            ),
+          ),
+          // Dropdown arrow like the prototype's tool rows.
+          Icon(
+            Icons.keyboard_arrow_down,
+            size: 16,
+            color: palette.dim.withValues(alpha: 0.5),
+          ),
+          const SizedBox(width: 8),
+          // Copy the RAW tool output (the whole body, not a
+          // selection) — tool output is the thing users most often
+          // need verbatim.
+          _CopyIconButton(
+            text: content,
+            color: palette.dim.withValues(alpha: 0.7),
+          ),
+        ],
+      ),
+      if (content.isNotEmpty) const SizedBox(height: 6),
+    ];
+  }
+
+  /// Pass/fail mark of a tool call: a red X on errors, an indigo (light) /
+  /// teal (dark) check otherwise.
+  Widget _toolStatusIcon(FahColors palette, bool isError, bool isLight) {
+    return Icon(
+      isError ? Icons.close : Icons.check,
+      size: 14,
+      color: _toolStatusColor(palette, isError, isLight),
+    );
+  }
+
+  Color _toolStatusColor(FahColors palette, bool isError, bool isLight) =>
+      isError ? palette.error : (isLight ? palette.indigo : palette.teal);
+
+  /// The tile body: system rows read like shell input (a teal `$` prompt
+  /// over dim mono), tool output is one selectable collapsible block, and
+  /// an empty tool output renders an explicit stub (issue #458).
+  Widget _toolTileBody(
+    BuildContext context,
+    FahColors palette,
+    String? toolName,
+    String content,
+    bool isError,
+  ) {
+    if (content.isEmpty) return _emptyToolOutput(context, palette, toolName);
+    return toolName == null
+        ? _systemNoteLine(palette, content)
+        // Tool output is selectable text (one region for the whole
+        // tile — the collapsible body used to swallow selection).
+        : _toolOutputBlock(palette, content, isError);
+  }
+
+  /// System rows (e.g. tool-call echoes) read like shell input: a teal `$`
+  /// prompt followed by dim mono text.
+  Widget _systemNoteLine(FahColors palette, String content) {
+    return Text.rich(
+      TextSpan(
+        children: [
+          TextSpan(
+            text: r'$ ',
+            style: palette.mono(color: palette.teal),
+          ),
+          TextSpan(
+            text: content,
+            style: palette.mono(color: palette.dim),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _toolOutputBlock(FahColors palette, String content, bool isError) {
+    return SelectionArea(
+      child: _CollapsibleToolOutput(
+        content: content,
+        style: palette.mono(color: palette.dim),
+        // Failed results start expanded (errors are why you look) with
+        // the tighter scroll cap.
+        initiallyExpanded: isError,
+        maxExpandedLines: isError
+            ? _CollapsibleToolOutput.errorCapLines
+            : _CollapsibleToolOutput.expandedLineCap,
+      ),
+    );
+  }
+
+  /// System rows with no content render nothing; an empty TOOL output gets
+  /// an explicit stub, no clamp UI (issue #458).
+  Widget _emptyToolOutput(
+    BuildContext context,
+    FahColors palette,
+    String? toolName,
+  ) {
+    if (toolName == null) return const SizedBox.shrink();
+    return Text(
+      FaChatStrings.of(context).chatNoOutput,
+      style: palette.mono(color: palette.dim, fontSize: 12),
+    );
+  }
+
+  /// The inline extras under the body: a generate_image result's saved
+  /// picture and a speak/generate_music (or media-path) player.
+  List<Widget> _toolTileMedia(
+    BuildContext context, {
+    required String? generatedImagePath,
+    required ({SandboxMediaKind kind, String path})? toolMedia,
+  }) {
+    return [
+      if (generatedImagePath != null)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 280),
+            child: images.image(
+              path: generatedImagePath,
+              onTap: (bytes) => showFahImagePreview(context, [bytes]),
+            ),
+          ),
+        ),
+      if (toolMedia != null)
+        Padding(
+          padding: const EdgeInsets.only(top: 6),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 360),
+            child: _toolMediaPlayer(toolMedia),
+          ),
+        ),
+    ];
+  }
+
+  Widget _toolMediaPlayer(({SandboxMediaKind kind, String path}) media) {
+    return switch (media.kind) {
+      SandboxMediaKind.audio => SandboxAudioPlayer(
+        bytes: images.load(media.path),
+        controllerFactory: audioControllerFactory,
+      ),
+      SandboxMediaKind.video => SandboxVideoPlayer(
+        path: media.path,
+        bytes: images.load(media.path),
+        controllerFactory: videoControllerFactory,
+      ),
+    };
+  }
+
+  /// Wraps [child] with a hover-revealed raw-copy button (desktop): the
+  /// icon appears at the bubble's top-right on pointer enter, clicking
+  /// copies the message's FULL raw content (markdown source, not the
+  /// rendered text).
+  Widget _wrapWithCopyButton(
+    BuildContext context,
+    Widget child, {
+    required bool alwaysVisible,
+  }) {
+    if (message.content.trim().isEmpty) return child;
+    return _HoverCopyWrap(
+      copy: message.content,
+      alwaysVisible: alwaysVisible,
+      child: child,
+    );
+  }
+}
+
+/// Hover-reveal copy affordance for a message: the button sits at the
+/// bubble's top-right, invisible until the pointer enters the area
+/// (desktop pattern; [alwaysVisible] shows it permanently).
+class _HoverCopyWrap extends StatefulWidget {
+  const _HoverCopyWrap({
+    required this.copy,
+    required this.alwaysVisible,
+    required this.child,
+  });
+
+  final String copy;
+  final bool alwaysVisible;
+  final Widget child;
+
+  @override
+  State<_HoverCopyWrap> createState() => _HoverCopyWrapState();
+}
+
+class _HoverCopyWrapState extends State<_HoverCopyWrap> {
+  bool _hovering = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final show = widget.alwaysVisible || _hovering;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovering = true),
+      onExit: (_) => setState(() => _hovering = false),
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          widget.child,
+          if (show)
+            Positioned(
+              // Sits half-outside the bubble's padding: breathing room
+              // from the text without covering the first line.
+              top: -6,
+              right: -6,
+              child: _CopyIconButton(
+                text: widget.copy,
+                color: FahColors.of(context).dim.withValues(alpha: 0.7),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The copy icon itself: Clipboard.setData + a transient "copied" tick.
+class _CopyIconButton extends StatefulWidget {
+  const _CopyIconButton({required this.text, required this.color});
+
+  final String text;
+  final Color color;
+
+  @override
+  State<_CopyIconButton> createState() => _CopyIconButtonState();
+}
+
+class _CopyIconButtonState extends State<_CopyIconButton> {
+  bool _copied = false;
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: widget.text));
+    if (!mounted) return;
+    setState(() => _copied = true);
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    if (mounted) setState(() => _copied = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final strings = FaChatStrings.of(context);
+    return Tooltip(
+      message: _copied
+          ? strings.chatMessageCopiedToClipboard
+          : strings.chatCopyMessageTooltip,
+      child: IconButton(
+        visualDensity: VisualDensity.compact,
+        constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+        padding: const EdgeInsets.all(5),
+        iconSize: 14,
+        color: widget.color,
+        onPressed: _copy,
+        icon: Icon(_copied ? Icons.check : Icons.copy_rounded),
+      ),
+    );
+  }
+}
+
+/// Extracts the saved sandbox path from a `generate_image` tool result
+/// (`Generated image saved to <path> (<n> bytes, …)`); null for errors
+/// or any other text.
+final _generatedImagePathPattern = RegExp(
+  r'Generated image saved to (\S+\.png)',
+);
+
+String? _generatedImagePath(String content) =>
+    _generatedImagePathPattern.firstMatch(content)?.group(1);
+
+/// Extracts the saved sandbox path from a `speak` / `generate_music`
+/// tool result (`Speech saved to <path> …` / `Music saved to <path> …`);
+/// null for errors or any other text.
+String? _generatedAudioPath(String toolName, String content) {
+  final prefix = switch (toolName) {
+    speakToolName => 'Speech saved to ',
+    generateMusicToolName => 'Music saved to ',
+    _ => null,
+  };
+  if (prefix == null || !content.startsWith(prefix)) return null;
+  return mediaPathInText(content, audioFileExtensions);
+}
+
+/// The sandbox media path a successful tool result should render an
+/// inline player for: explicit for `speak`/`generate_music`, otherwise
+/// any path-like token with a media extension (`.mp3/.wav/.m4a` → audio,
+/// `.mp4/.mov/.webm` → video). The `read` tool is NEVER sniffed — it
+/// legitimately prints file paths as text (same exclusion as images).
+({SandboxMediaKind kind, String path})? _toolMedia(
+  String? toolName,
+  String content,
+  bool isError,
+) {
+  if (toolName == null || toolName == 'read' || isError) return null;
+  final audioPath = _generatedAudioPath(toolName, content);
+  if (audioPath != null) {
+    return (kind: SandboxMediaKind.audio, path: audioPath);
+  }
+  final fallbackAudio = mediaPathInText(content, audioFileExtensions);
+  if (fallbackAudio != null) {
+    return (kind: SandboxMediaKind.audio, path: fallbackAudio);
+  }
+  final videoPath = mediaPathInText(content, videoFileExtensions);
+  if (videoPath != null) {
+    return (kind: SandboxMediaKind.video, path: videoPath);
+  }
+  return null;
+}
+
+/// Converts a tool name to a prototype-style display string:
+/// "calendar_events" → "Checked Calendar", "read" → "Read file", etc.
+String _toolDisplayName(String toolName) {
+  const verbMap = {
+    'read': 'Read',
+    'write': 'Wrote',
+    'edit': 'Patched',
+    'bash': 'Ran',
+    'calendar_events': 'Checked Calendar',
+    'calendar_calendars': 'Checked Calendar',
+    'calendar_add': 'Added to Calendar',
+    'calendar_update': 'Updated Calendar',
+    'calendar_delete': 'Deleted from Calendar',
+    'home_devices': 'Listed Devices',
+    'home_turn_on': 'Turned On',
+    'home_turn_off': 'Turned Off',
+    'home_set': 'Set',
+    'generate_image': 'Generated Image',
+    'speak': 'Generated Speech',
+    'generate_music': 'Generated Music',
+    'generate_video': 'Generated Video',
+    'open_app': 'Opened App',
+    'search': 'Searched',
+    'web_search': 'Searched',
+    'web_fetch': 'Fetched',
+  };
+  final verb = verbMap[toolName];
+  if (verb != null) return verb;
+  // Fallback: capitalize each word.
+  return toolName
+      .split('_')
+      .map((w) => w.isEmpty ? w : '${w[0].toUpperCase()}${w.substring(1)}')
+      .join(' ');
+}
+
+/// Whether a tool error is a permission/access denial (calendar, contacts,
+/// Tool names whose denial surface renders as a permission card instead of
+/// a generic tool tile. Adding a new OS-permission tool = adding it here.
+const _permissionToolNames = <String>{
+  // Calendar (EventKit).
+  'calendar_events',
+  'calendar_calendars',
+  'calendar_add',
+  'calendar_update',
+  'calendar_delete',
+  // Home (HomeKit).
+  'home_devices',
+  'home_turn_on',
+  'home_turn_off',
+  'home_set',
+  // Health (HealthKit).
+  'health_summary',
+  // Contacts.
+  'contacts_search',
+  'contacts_add',
+  'contacts_call',
+  'contacts_sms',
+  // Notifications / microphone / media library (future agents).
+  'notify',
+  'microphone',
+  'media',
+};
+
+/// True for tool results that should render as the orange permission card:
+/// the tool is one that can require an OS permission AND the content text
+/// matches the permission-denial signature.
+bool _isPermissionError({required String? toolName, required String content}) {
+  final isPermissionTool =
+      toolName == null || _permissionToolNames.contains(toolName);
+  if (!isPermissionTool) return false;
+  final lower = content.toLowerCase();
+  return lower.contains('access') &&
+      (lower.contains('required') ||
+          lower.contains('denied') ||
+          lower.contains('permission'));
+}
+
+/// A permission-denied card matching the prototype: orange badge +
+/// explanatory text + action buttons that actually work.
+Widget _permissionCard(
+  BuildContext context,
+  FahColors palette,
+  String content,
+  bool isLight,
+  FaPermissionActionCallback? onAction,
+) {
+  final theme = Theme.of(context);
+  // Extract the permission name from the error message.
+  final match = RegExp(
+    r'(\w+)\s+access',
+    caseSensitive: false,
+  ).firstMatch(content);
+  final permName = match?.group(1) ?? 'Calendar';
+  return Container(
+    margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: isLight ? Colors.white : palette.panelAlt,
+      borderRadius: BorderRadius.circular(12),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: 0.04),
+          blurRadius: 8,
+          offset: const Offset(0, 1),
+        ),
+      ],
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Orange badge.
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF59E0B).withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.lock_outline, size: 14, color: palette.pending),
+              const SizedBox(width: 4),
+              Text(
+                '$permName access required',
+                style: TextStyle(
+                  color: palette.pending,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        // Title.
+        Text(
+          "I can't access your $permName yet.",
+          style: theme.textTheme.titleSmall?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Body text.
+        Text(
+          content,
+          style: theme.textTheme.bodySmall?.copyWith(color: palette.dim),
+        ),
+        const SizedBox(height: 16),
+        // Action buttons.
+        Row(
+          children: [
+            FilledButton.icon(
+              onPressed: () => onAction?.call(permName, 'openSettings'),
+              icon: const Icon(Icons.lock_open, size: 16),
+              label: const Text('Open Settings'),
+              style: FilledButton.styleFrom(
+                backgroundColor: palette.indigo,
+                foregroundColor: Colors.white,
+              ),
+            ),
+            const SizedBox(width: 8),
+            OutlinedButton.icon(
+              onPressed: () => onAction?.call(permName, 'tryAgain'),
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Try again'),
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(color: palette.borderBright),
+              ),
+            ),
+          ],
+        ),
+      ],
+    ),
+  );
+}
+
+/// An auth-expired card for provider SSO sessions that have expired:
+/// red badge + explanatory text + Authorize button. Mirrors the
+/// permission-denied card pattern.
+///
+/// Issue #692 A: the raw provider error carries CLI-centric recovery text
+/// ("Re-authorize … (CLI: /provider codemie sso)") — dead guidance on an
+/// app host. The card strips the `(CLI: …)` hint; when the host wires
+/// [onAuthorize], the button plus an explicit action line replace it (the
+/// CLI host keeps its own renderer and its own hint — unchanged).
+Widget _authExpiredCard(
+  BuildContext context,
+  FahColors palette,
+  String content,
+  bool isLight,
+  String providerId,
+  FaAuthRecoveryCallback? onAuthorize,
+) {
+  final theme = Theme.of(context);
+  final displayText = authExpiredDisplayText(content);
+  return Container(
+    margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: isLight ? Colors.white : palette.panelAlt,
+      borderRadius: BorderRadius.circular(12),
+      boxShadow: [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: 0.04),
+          blurRadius: 8,
+          offset: const Offset(0, 1),
+        ),
+      ],
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Red badge.
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: palette.error.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(6),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.key_off, size: 14, color: palette.error),
+              const SizedBox(width: 4),
+              Text(
+                'Session expired',
+                style: TextStyle(
+                  color: palette.error,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 12),
+        // Title.
+        Text(
+          'Your $providerId session has expired.',
+          style: theme.textTheme.titleSmall?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // Body text.
+        Text(
+          displayText,
+          style: theme.textTheme.bodySmall?.copyWith(color: palette.dim),
+        ),
+        // Host action line (issue #692 A): only when the host wired a
+        // recovery action — the button below IS the path, the line says
+        // what to do after it.
+        if (onAuthorize != null) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Tap Authorize to sign in again, then resend your message.',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: palette.dim,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+        const SizedBox(height: 16),
+        // Authorize button.
+        FilledButton.icon(
+          onPressed: () => onAuthorize?.call(providerId),
+          icon: const Icon(Icons.login, size: 16),
+          label: const Text('Authorize'),
+          style: FilledButton.styleFrom(
+            backgroundColor: palette.indigo,
+            foregroundColor: Colors.white,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+/// The auth-expired surface body (card AND the chat's error banner,
+/// issue #692): the raw provider error minus the `[[auth-expired:…]]`
+/// marker and any `(CLI: …)` recovery hint. The CLI instruction is dead
+/// text on app hosts (mobile/desktop/overlay), where the surface's own
+/// Authorize button is the actionable path.
+String authExpiredDisplayText(String content) {
+  var text = stripAuthExpiredMarker(content);
+  text = text.replaceAll(RegExp(r'\s*\(CLI:[^)]*\)'), '');
+  return text.trim();
+}
+
+/// Tool-output block that caps long dumps (file reads, big writes) at a
+/// three-line preview with an inline expand/collapse toggle (issue #458) —
+/// the transcript stays scannable while the full output remains one tap
+/// away. Failed results start expanded (errors are why you look) with a
+/// tighter scroll cap; the expanded/collapsed choice is per-card and
+/// never persisted.
+class _CollapsibleToolOutput extends StatefulWidget {
+  const _CollapsibleToolOutput({
+    required this.content,
+    required this.style,
+    this.showTail = false,
+    this.initiallyExpanded = false,
+    this.maxExpandedLines = expandedLineCap,
+  });
+
+  final String content;
+  final TextStyle style;
+
+  /// Collapse to the LAST lines instead of the first — used for thinking
+  /// bubbles, where the newest reasoning matters more than the preamble.
+  final bool showTail;
+
+  /// Start expanded (failed tool results); per-card ephemeral state.
+  final bool initiallyExpanded;
+
+  /// The expanded view grows to at most this many lines and scrolls
+  /// beyond — smaller outputs render at natural height.
+  final int maxExpandedLines;
+
+  /// Collapsed cards show this many source lines plus a `+N lines` hint.
+  static const int collapsedLineCount = 3;
+
+  /// A single monster line wraps far past the preview — past this many
+  /// chars the card offers the toggle even when the line count is small.
+  static const int longCharThreshold = 700;
+
+  /// Success-expanded hard max: scrollable beyond 200 lines.
+  static const int expandedLineCap = 200;
+
+  /// Failed results start expanded but capped tighter (errors are why you
+  /// look — capped, not unlimited).
+  static const int errorCapLines = 20;
+
+  @override
+  State<_CollapsibleToolOutput> createState() => _CollapsibleToolOutputState();
+}
+
+class _CollapsibleToolOutputState extends State<_CollapsibleToolOutput> {
+  late bool _expanded = widget.initiallyExpanded;
+
+  @override
+  void didUpdateWidget(covariant _CollapsibleToolOutput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // A recycled slot showing a different message resets the ephemeral
+    // state — a failed result always opens expanded.
+    if (oldWidget.content != widget.content ||
+        oldWidget.initiallyExpanded != widget.initiallyExpanded) {
+      _expanded = widget.initiallyExpanded;
+    }
+  }
+
+  bool get _isLong {
+    return widget.content.split('\n').length >
+            _CollapsibleToolOutput.collapsedLineCount ||
+        widget.content.length > _CollapsibleToolOutput.longCharThreshold;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_isLong) {
+      return Text(widget.content, style: widget.style);
+    }
+    final palette = FahColors.of(context);
+    final strings = FaChatStrings.of(context);
+    final lines = widget.content.split('\n');
+    final count = _CollapsibleToolOutput.collapsedLineCount;
+    final total = lines.length;
+    final clamped = total > count;
+    final body = _expanded
+        // Expanded: the full output, scrollable past the hard cap instead
+        // of growing without bound. The cap never exceeds the available
+        // height (shrink-wraps when the text is smaller either way).
+        ? LayoutBuilder(
+            builder: (context, constraints) {
+              final cap = widget.maxExpandedLines * _lineHeight;
+              // A Column parent hands out unbounded height; fall back to
+              // a viewport fraction so a huge dump never towers over the
+              // screen either way.
+              final available = constraints.maxHeight.isFinite
+                  ? constraints.maxHeight
+                  : MediaQuery.sizeOf(context).height * 0.8;
+              final maxHeight = cap < available ? cap : available;
+              return ConstrainedBox(
+                constraints: BoxConstraints(maxHeight: maxHeight),
+                child: SingleChildScrollView(
+                  child: Text(widget.content, style: widget.style),
+                ),
+              );
+            },
+          )
+        : Text(
+            // Clamp on line boundaries, so styles within a line survive;
+            // maxLines also clips a wrapped monster line to the preview.
+            (widget.showTail && clamped
+                    ? lines.sublist(total - count)
+                    : lines.take(count))
+                .join('\n'),
+            maxLines: count,
+            overflow: TextOverflow.ellipsis,
+            style: widget.style,
+          );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        body,
+        const SizedBox(height: 4),
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => setState(() => _expanded = !_expanded),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                _expanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                size: 14,
+                color: palette.indigo,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                _expanded
+                    ? strings.chatShowLess
+                    : clamped
+                    ? strings.chatClampHint(total - count)
+                    : strings.chatShowMore,
+                style: palette.mono(color: palette.indigo, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Rough line height of [style] for the expanded scroll cap; the box
+  /// shrink-wraps smaller outputs, so an estimate only moves the point
+  /// where the card starts to scroll.
+  double get _lineHeight => (widget.style.fontSize ?? 14) * 1.4;
+}

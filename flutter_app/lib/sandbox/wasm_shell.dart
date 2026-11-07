@@ -1,0 +1,2590 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io' as io;
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+// dart:io side (host VMs only; the web build never imports this file —
+// wasm_run pulls dart:ffi): the low-disk probe for the job log ceiling.
+import 'package:flutter_agent_harness/io.dart' show diskFreeBytes;
+import 'package:http/http.dart' as http;
+import 'package:path/path.dart' as p;
+import 'package:wasm_run/wasm_run.dart';
+
+import 'package:fa/sandbox/glob_expand.dart';
+import 'package:fa/services/app_log.dart';
+import 'package:fa/sandbox/sandbox_builtins.dart';
+import 'package:fa/sandbox/sandbox_host_paths.dart';
+import 'package:fa/sandbox/sandbox_pip.dart';
+import 'package:fa/sandbox/sandbox_registry.dart';
+import 'package:fa/sandbox/shell_job.dart';
+import 'package:fa/sandbox/shell_parser.dart';
+import 'package:fa/sandbox/shell_script.dart';
+import 'package:fa/sandbox/python_http_bridge.dart';
+import 'package:fa/sandbox/wasm_shell_builtins.dart';
+import 'package:fa/sandbox/wasm_shell_git.dart';
+import 'package:fa/sandbox/wasm_shell_ssh.dart';
+
+part 'wasm_shell_cat.dart';
+part 'wasm_shell_grep.dart';
+part 'wasm_shell_stages.dart';
+part 'wasm_shell_tier4.dart';
+
+/// Normalized builtin handler of `_builtinRoutes` (#1713 route table).
+typedef _BuiltinRoute =
+    Future<Result<StageResult, ExecutionError>> Function(
+      WasiSandboxShell,
+      Stage,
+      ShellExecOptions?,
+      String?,
+    );
+
+/// A [Shell] backed by a sandbox of permissive WASI binaries.
+///
+/// This avoids the GPL licensing and portability problems of BusyBox by using
+/// pre-built, MIT-licensed binaries:
+///   - `coreutils.wasm` for the POSIX utility set
+///   - `rg.wasm` for ripgrep
+///   - `find.wasm` for uutils find
+///   - `sed.wasm` for the uutils sed stream editor
+///   - `awk.wasm` for goawk
+///   - `tar.wasm` for tar archive creation/extraction
+///   - `gzip.wasm` for gzip compression/decompression
+///   - `zip.wasm` for zip archive creation/extraction
+///   - `lua.wasm` for the Lua interpreter (gopher-lua, Lua 5.1)
+///
+/// `tree`, `file`, and `xz`/`bzip2` decompression (`unxz`/`bunzip2`) are
+/// Dart builtins shared with the web shell (see `sandbox_builtins.dart`);
+/// `base64` and the `md5sum`/`sha*sum` checksums are already served by the
+/// `coreutils.wasm` applets, so they are not duplicated as builtins.
+///
+/// `pip`/`pip3` are pip-lite Dart builtins (see `sandbox_pip.dart`): they
+/// install pure-Python wheels from PyPI into the python site-packages at
+/// `/usr/local/lib/python3.14/site-packages`, which is exported to the
+/// interpreter as `PYTHONPATH` on every python launch.
+///
+/// A tiny shell parser supports pipelines, `\u0026\u0026` / `||`, `;`, and
+/// redirects. Each stage runs in its own WASM instance, so there is no need
+/// for `fork`, `exec`, or process-level pipes — WASM does not expose those on
+/// iOS/Android/Web.
+final class WasiSandboxShell implements Shell, BackgroundShell, GitShellHost {
+  /// Creates a shell backed by the provided WASM modules.
+  ///
+  /// The heavy interpreter modules ([python], [qjs], [sqlite3], [lua]) are
+  /// optional (issue #640): `load()` leaves them null and passes a
+  /// [moduleLoader], so a 29 MB `python.wasm` is compiled on the first
+  /// `python` invocation instead of blocking app boot. Callers that compile
+  /// everything up front (tests) may keep passing all four.
+  WasiSandboxShell({
+    required this.coreutils,
+    required this.rg,
+    required this.find,
+    required this.sed,
+    required this.awk,
+    required this.tar,
+    required this.gzip,
+    required this.zip,
+    this.python,
+    this.qjs,
+    this.sqlite3,
+    this.lua,
+    this.workingDirectory,
+    this.sandboxHostPath,
+    http.Client? httpClient,
+    this.moduleLoader,
+    Map<String, WasmModule>? lazyModuleCache,
+  }) : _httpClient = httpClient ?? http.Client(),
+       _lazyModules = lazyModuleCache ?? <String, WasmModule>{},
+       _currentDir = workingDirectory ?? '/' {
+    _sweepStalePipeDirs();
+  }
+
+  /// `coreutils` multicall module.
+  final WasmModule coreutils;
+
+  /// Best-effort sweep of pipe dirs leaked by a previous crash (issue
+  /// #1156 review): the `finally` cleanup cannot run when the app is
+  /// killed mid-command, so dirs older than an hour are removed at shell
+  /// construction — no live job can own them yet. Never throws.
+  static const Duration _stalePipeDirAge = Duration(hours: 1);
+
+  void _sweepStalePipeDirs() {
+    final root = sandboxHostPath;
+    if (root == null || root.isEmpty) return;
+    try {
+      final tmp = io.Directory('$root/.fah/tmp');
+      if (!tmp.existsSync()) return;
+      final cutoff = DateTime.now().subtract(_stalePipeDirAge);
+      for (final entry in tmp.listSync()) {
+        if (entry is! io.Directory) continue;
+        if (!entry.uri.pathSegments.any((s) => s.startsWith('pipe-'))) {
+          continue;
+        }
+        final modified = entry.statSync().modified;
+        if (modified.isBefore(cutoff)) {
+          entry.deleteSync(recursive: true);
+        }
+      }
+    } on Object {
+      // Sweep is opportunistic; a failure must never block the shell.
+    }
+  }
+
+  /// ripgrep module.
+  final WasmModule rg;
+
+  /// find module.
+  final WasmModule find;
+
+  /// sed module.
+  final WasmModule sed;
+
+  /// awk module.
+  final WasmModule awk;
+
+  /// tar module.
+  final WasmModule tar;
+
+  /// gzip module.
+  final WasmModule gzip;
+
+  /// zip/unzip module.
+  final WasmModule zip;
+
+  /// CPython module (Python 3.14, WASI build). Null until the lazy
+  /// loader compiles `python.wasm` on first use (issue #640).
+  final WasmModule? python;
+
+  /// QuickJS module (JavaScript engine, WASI build). Lazily compiled.
+  final WasmModule? qjs;
+
+  /// SQLite CLI module (WASI build from the official amalgamation).
+  /// Lazily compiled.
+  final WasmModule? sqlite3;
+
+  /// Lua interpreter module (gopher-lua, Lua 5.1, WASI build).
+  /// Lazily compiled.
+  final WasmModule? lua;
+
+  /// Default working directory used when [ShellExecOptions.cwd] is omitted.
+  final String? workingDirectory;
+
+  /// Host directory exposed to the WASM guest at `/`.
+  @override
+  final String? sandboxHostPath;
+
+  /// Lazily-built matcher for the "inside [sandboxHostPath]" convention
+  /// shared with `SandboxedExecutionEnv._map` (gh-1274 review); null when
+  /// no host root is configured.
+  SandboxHostRoot? _hostRoot;
+  bool _hostRootReady = false;
+
+  SandboxHostRoot? get _sandboxHostRoot {
+    if (!_hostRootReady) {
+      _hostRootReady = true;
+      final host = sandboxHostPath;
+      if (host != null && host.isNotEmpty) _hostRoot = SandboxHostRoot(host);
+    }
+    return _hostRoot;
+  }
+
+  /// Compiles a bundled `assets/wasm/<name>` module on demand (issue #640).
+  /// Null when all modules were supplied eagerly (tests).
+  final Future<WasmModule> Function(String assetName)? moduleLoader;
+
+  /// Interpreter modules compiled so far, keyed by asset name. A failed
+  /// lazy compile is not cached: the next invocation retries. Job-local
+  /// clones ([_forJob]) SHARE this map with their parent — it memoizes
+  /// immutable compiled modules, not mutable interpreter state, so a
+  /// compile paid anywhere (foreground, job, sibling job) is reused
+  /// everywhere (gh-1224).
+  final Map<String, WasmModule> _lazyModules;
+
+  final http.Client _httpClient;
+
+  bool _pythonStdlibReady = false;
+
+  /// Whether the host HTTP bridge modules were materialized into
+  /// site-packages (issue #337 AC1).
+  bool _pythonBridgeReady = false;
+
+  /// Extracts the bundled CPython standard library into the sandbox at
+  /// `/usr/local/lib` (CPython's default WASI prefix) on first use.
+  Future<void> _ensurePythonStdlib() async {
+    if (_pythonStdlibReady) return;
+    final host = sandboxHostPath;
+    if (host == null || host.isEmpty) {
+      _pythonStdlibReady = true;
+      return;
+    }
+    final marker = io.File('$host/usr/local/lib/python3.14/json/__init__.py');
+    if (!marker.existsSync()) {
+      final data = await rootBundle.load('assets/wasm/python_stdlib.zip');
+      final zip = ZipDecoder().decodeBytes(
+        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+      );
+      for (final file in zip.files) {
+        if (!file.isFile) continue;
+        // Archive entries are `lib/python3.14/...`; the WASI build expects the
+        // stdlib at /usr/local/lib/python3.14.
+        final out = io.File('$host/usr/local/${file.name}');
+        await out.parent.create(recursive: true);
+        await out.writeAsBytes(file.content as List<int>);
+      }
+    }
+    await _ensurePythonBridge(host);
+    _pythonStdlibReady = true;
+  }
+
+  /// Materializes the python HTTP bridge modules (issue #337 AC1) into
+  /// site-packages: CPython's `site` imports `sitecustomize` at startup and
+  /// it patches `http.client`/`urllib3` to route requests through the host
+  /// network via [FaHttpBridge] (the WASI build has no sockets and no ssl).
+  Future<void> _ensurePythonBridge(String host) async {
+    if (_pythonBridgeReady) return;
+    final sitePackages = '$host/usr/local/lib/python3.14/site-packages';
+    await io.Directory(sitePackages).create(recursive: true);
+    await io.File(
+      '$sitePackages/fa_http.py',
+    ).writeAsString(kFaHttpPy, flush: true);
+    await io.File(
+      '$sitePackages/sitecustomize.py',
+    ).writeAsString(kFaSitecustomizePy, flush: true);
+    _pythonBridgeReady = true;
+  }
+
+  /// Current working directory of the shell, mutated by the `cd` builtin.
+  /// Initialized from [workingDirectory] and persisted across [exec] calls.
+  String _currentDir;
+
+  /// Variables set by the `export` builtin, persisted across [exec] calls and
+  /// visible to later WASM commands and builtins.
+  final Map<String, String> _shellEnv = <String, String>{};
+
+  late final GitSandboxCommands _git = GitSandboxCommands(this);
+
+  /// Host path for a sandbox-absolute path (public surface for git commands).
+  @override
+  String hostPathOf(String sandboxPath) => _hostPath(sandboxPath);
+
+  /// Resolves a sandbox path against [cwd] (public surface for git commands).
+  String resolveSandboxPathFor(String path, String cwd) =>
+      _resolveSandboxPath(path, cwd);
+
+  /// Current working directory of the shell (public surface for git commands).
+  @override
+  String get shellCwd => _currentDir;
+
+  /// HTTP client used by network builtins (public surface for git commands).
+  @override
+  http.Client get shellHttpClient => _httpClient;
+
+  /// Runs a sandbox command (public surface for git commands, e.g. tar).
+  @override
+  Future<Result<StageResult, ExecutionError>> runSandboxCommand(
+    String command,
+    List<String> args,
+  ) => _runCommand(
+    command: command,
+    args: args,
+    options: null,
+    inputSource: null,
+    captureStdout: true,
+    captureStderr: true,
+  );
+
+  Future<Result<StageResult, ExecutionError>> _gitBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) => _git.run(stage, options);
+
+  /// Loads the shell from the Flutter asset bundle.
+  ///
+  /// The eight light POSIX modules compile eagerly (they back every basic
+  /// command); the four heavy interpreters — `python.wasm` (~29 MB),
+  /// `qjs.wasm`, `sqlite3.wasm`, `lua.wasm` — do NOT (issue #640):
+  /// JIT-compiling them at boot exhausted the Android `untrusted_app` VM
+  /// limits (Rust PanicException → black screen). They are compiled on the
+  /// first invocation of the respective command via [moduleLoader].
+  static Future<WasiSandboxShell> load({
+    String? workingDirectory,
+    String? sandboxHostPath,
+    http.Client? httpClient,
+  }) async {
+    Future<WasmModule> loadAsset(String name) async {
+      final byteData = await rootBundle.load('assets/wasm/$name');
+      final bytes = byteData.buffer.asUint8List(
+        byteData.offsetInBytes,
+        byteData.lengthInBytes,
+      );
+      // The bundled WASI binaries are built without SIMD; only enable the
+      // baseline SIMD proposal so validation passes on hosts that support it.
+      return compileWasmModule(
+        bytes,
+        config: const ModuleConfig(
+          wasmtime: ModuleConfigWasmtime(wasmSimd: false),
+        ),
+      );
+    }
+
+    return WasiSandboxShell(
+      coreutils: await loadAsset('coreutils.wasm'),
+      rg: await loadAsset('rg.wasm'),
+      find: await loadAsset('find.wasm'),
+      sed: await loadAsset('sed.wasm'),
+      awk: await loadAsset('awk.wasm'),
+      tar: await loadAsset('tar.wasm'),
+      gzip: await loadAsset('gzip.wasm'),
+      zip: await loadAsset('zip.wasm'),
+      workingDirectory: workingDirectory,
+      sandboxHostPath: sandboxHostPath,
+      httpClient: httpClient,
+      moduleLoader: loadAsset,
+    );
+  }
+
+  /// Applets exported by the `coreutils.wasm` multicall binary:
+  /// [mobileCoreutilsApplets] from the central registry
+  /// (`sandbox_registry.dart`).
+  static const Set<String> _coreutilsApplets = mobileCoreutilsApplets;
+
+  /// Shell builtins implemented in Dart ([mobileBuiltinCommands] from the
+  /// central registry). These do not need a WASM module and do not increase
+  /// the IPA size.
+  static const Set<String> _builtinCommands = mobileBuiltinCommands;
+
+  /// Whether [command] can be resolved to a WASM applet or a builtin.
+  bool _isCommandAvailable(String command) {
+    return _coreutilsApplets.contains(command) ||
+        mobileModuleCommands.contains(command) ||
+        _builtinCommands.contains(command);
+  }
+
+  /// Resolves a command to the eagerly compiled module (null for the four
+  /// lazily compiled interpreters) and the exact argv that selects it.
+  ({WasmModule? module, List<String> argv}) _resolve(String command) {
+    if (_coreutilsApplets.contains(command)) {
+      return (module: coreutils, argv: [command]);
+    }
+    return _resolveRegistered(command) ?? (module: coreutils, argv: [command]);
+  }
+
+  /// Whether [command] runs the CPython stage (stdlib extraction and the
+  /// HTTP bridge attach to it regardless of how the module was compiled).
+  static bool _isPythonCommand(String command) =>
+      command == 'python' || command == 'python3';
+
+  /// Resolves a stage command to its WASM module, lazily compiling the
+  /// heavy interpreter modules on first use (issue #640). A failed lazy
+  /// compile surfaces as `Err` with a clear message — the stage maps it to
+  /// exit code 1 + stderr, never a host crash.
+  Future<Result<WasmModule, String>> _moduleFor(String command) async {
+    final resolved = _resolve(command);
+    final eager = resolved.module;
+    if (eager != null) return Ok(eager);
+    final asset = switch (command) {
+      'python' || 'python3' => 'python.wasm',
+      'qjs' || 'js' => 'qjs.wasm',
+      'sqlite3' => 'sqlite3.wasm',
+      _ => 'lua.wasm',
+    };
+    final cached = _lazyModules[asset];
+    if (cached != null) return Ok(cached);
+    final loader = moduleLoader;
+    if (loader == null) {
+      return Err('$command: $asset was not compiled (no lazy loader)');
+    }
+    try {
+      debugPrint('[wasm_shell] lazily compiling $asset for $command...');
+      return Ok(_lazyModules[asset] = await loader(asset));
+    } on Object catch (e) {
+      debugPrint('[wasm_shell] lazy compile of $asset failed: $e');
+      return Err('$command: failed to load $asset: $e');
+    }
+  }
+
+  /// Route table: builtin → handler (#1713, the #558 pattern); aliases
+  /// (`[`/`test`, `pip`/`pip3`, `xz`/`unxz`, …) get their own entries.
+  /// `(s, st, o, src)` = shell, stage, options, inputSource.
+  static final Map<String, _BuiltinRoute> _builtinRoutes = {
+    'cat': (s, st, o, src) => s._catBuiltin(st, o, src),
+    'curl': (s, st, o, src) => s._curlBuiltin(st, o, src),
+    'wget': (s, st, o, src) => s._wgetBuiltin(st, o),
+    'git': (s, st, o, src) => s._gitBuiltin(st, o),
+    'jq': (s, st, o, src) => s._jqBuiltin(st, o, src),
+    'yq': (s, st, o, src) => s._yqBuiltin(st, o, src),
+    'env': (s, st, o, src) => s._envBuiltin(st, o),
+    'test': (s, st, o, src) => s._testBuiltin(st),
+    '[': (s, st, o, src) => s._testBuiltin(st),
+    'which': (s, st, o, src) => s._whichBuiltin(st),
+    'command': (s, st, o, src) => s._commandBuiltin(st),
+    'whoami': (s, st, o, src) => s._whoamiBuiltin(),
+    'xargs': (s, st, o, src) => s._xargsBuiltin(st, o, src),
+    'tr': (s, st, o, src) => s._trBuiltin(st, src),
+    'cd': (s, st, o, src) => s._cdBuiltin(st, o),
+    'pwd': (s, st, o, src) => s._pwdBuiltin(o),
+    'export': (s, st, o, src) => s._exportBuiltin(st),
+    'unset': (s, st, o, src) => s._unsetBuiltin(st),
+    'grep': (s, st, o, src) => s._grepBuiltin(st, o, src),
+    'du': (s, st, o, src) => s._duBuiltin(st, o),
+    'stat': (s, st, o, src) => s._statBuiltin(st, o),
+    'tac': (s, st, o, src) => s._tacBuiltin(st, o, src),
+    'expr': (s, st, o, src) => s._exprBuiltin(st),
+    'id': (s, st, o, src) => s._idBuiltin(st),
+    'relpath': (s, st, o, src) => s._relpathBuiltin(st, o),
+    'diff': (s, st, o, src) => s._diffBuiltin(st, o, src),
+    'patch': (s, st, o, src) => s._patchBuiltin(st, o, src),
+    'nslookup': (s, st, o, src) => s._nslookupBuiltin(st, o),
+    'dig': (s, st, o, src) => s._digBuiltin(st, o),
+    'whois': (s, st, o, src) => s._whoisBuiltin(st, o),
+    'ssh': (s, st, o, src) => s._sshBuiltin(st, o, src),
+    'scp': (s, st, o, src) => s._scpBuiltin(st, o),
+    'sftp': (s, st, o, src) => s._sftpBuiltin(st, o, src),
+    'tree': (s, st, o, src) => s._treeBuiltin(st, o),
+    'file': (s, st, o, src) => s._fileBuiltin(st, o),
+    'xz': (s, st, o, src) => s._xzBuiltin(st, o, decompress: false),
+    'unxz': (s, st, o, src) => s._xzBuiltin(st, o, decompress: true),
+    'bzip2': (s, st, o, src) => s._bzip2Builtin(st, o, decompress: false),
+    'bunzip2': (s, st, o, src) => s._bzip2Builtin(st, o, decompress: true),
+    'pip': (s, st, o, src) => s._pipBuiltin(st, o),
+    'pip3': (s, st, o, src) => s._pipBuiltin(st, o),
+  };
+
+  /// Dispatches a builtin command to its Dart implementation.
+  Future<Result<StageResult, ExecutionError>> _runBuiltin({
+    required Stage stage,
+    required ShellExecOptions? options,
+    required String? inputSource,
+  }) async {
+    final handler = _builtinRoutes[stage.command];
+    if (handler == null) {
+      return Err(
+        ExecutionError(
+          ExecutionErrorCode.unknown,
+          'Unknown builtin: ${stage.command}',
+        ),
+      );
+    }
+    return handler(this, stage, options, inputSource);
+  }
+
+  /// Runs either a builtin command or a WASM stage with stdin/source handling.
+  Future<Result<StageResult, ExecutionError>> _runCommand({
+    required String command,
+    required List<String> args,
+    required ShellExecOptions? options,
+    required String? inputSource,
+    required bool captureStdout,
+    required bool captureStderr,
+  }) async {
+    if (_builtinCommands.contains(command)) {
+      return _runBuiltin(
+        stage: Stage(command: command, args: args),
+        options: options,
+        inputSource: inputSource,
+      );
+    }
+    // Issue #1335: an unadvertised command must fail loudly like the web
+    // MemoryShell does, not fall through to coreutils.wasm with an
+    // unrecognized argv[0] (silent empty output). The registry sets are the
+    // same truth `which` advertises, so execution and `which` now agree.
+    if (!_isCommandAvailable(command)) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('$command: command not found\n'),
+          exitCode: 127,
+        ),
+      );
+    }
+    // tar_util.wasm has no `--version` — it exits 1 with a usage error on
+    // the version probe (issue #1156 row 9); answer directly instead.
+    // Only the long flag: GNU tar's `-V` is `--label`, not a version flag.
+    if (command == 'tar' && args.contains('--version')) {
+      return Ok(
+        StageResult(
+          stdout: utf8.encode('tar 1.35 (Fa sandbox)\n'),
+          stderr: const [],
+          exitCode: 0,
+        ),
+      );
+    }
+    // gh-1444 C1: a cat whose operands touch pointer semantics is served
+    // by the Dart builtin (the file seam follows `.pointer` siblings; the
+    // coreutils.wasm applet cannot). Plain cats keep the applet path so
+    // the host-cwd argument projection below keeps applying.
+    if (command == 'cat' &&
+        await _catNeedsPointerSeam(args, options, inputSource)) {
+      return _runBuiltin(
+        stage: Stage(command: command, args: args),
+        options: options,
+        inputSource: inputSource,
+      );
+    }
+    final cwd = _effectiveCwd(options);
+    final cwdArgs = _rewriteRelativeArgs(command, args, cwd);
+    final effectiveArgs = inputSource != null && command != 'rg'
+        ? [...cwdArgs, inputSource]
+        : cwdArgs;
+    return _runStage(
+      command: command,
+      args: effectiveArgs,
+      options: options,
+      captureStdout: captureStdout,
+      captureStderr: captureStderr,
+    );
+  }
+
+  @override
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  }) async {
+    final token = options?.cancelToken;
+    if (token != null && token.isCancelled) {
+      return const Err(ExecutionError(ExecutionErrorCode.aborted, 'aborted'));
+    }
+
+    late final ShellScript script;
+    try {
+      // The WASI shell honors `2>&1`/`>&2` (issue #1156 AC2/AC2b); shells
+      // that never did keep the parse-rejection default.
+      script = parseShellScript(command, allowFdDuplication: true);
+    } on ShellParseException catch (e) {
+      return Err(ExecutionError(ExecutionErrorCode.unknown, 'parse error: $e'));
+    }
+
+    // One output accumulator per exec: pipelines APPEND to it (POSIX — the
+    // output of `echo a; echo b` is both lines, not the last one).
+    _lastStdout = '';
+    _lastStderr = '';
+    final result = await runShellScript(script, _scriptRunner, options);
+    if (result.isErr) return Err(result.errorOrNull!);
+
+    return Ok(
+      ShellExecResult(
+        stdout: _lastStdout ?? '',
+        stderr: _lastStderr ?? '',
+        exitCode: result.valueOrNull!,
+      ),
+    );
+  }
+
+  @override
+  bool get backgroundJobsSupported => true;
+
+  @override
+  Future<Result<ShellJob, ExecutionError>> startShellJob(
+    String command, {
+    required String id,
+    required String logPath,
+    ShellExecOptions? options,
+  }) async {
+    final token = options?.cancelToken;
+    final cancelled = _cancelledJobError(token);
+    if (cancelled != null) {
+      return Err(cancelled);
+    }
+    final prep = await _buildJobLog(id, logPath, options);
+    if (prep.isErr) return Err(prep.errorOrNull!);
+    final (:ceiling, :logFile) = prep.valueOrNull!;
+    return Ok(
+      _wireJob(
+        command,
+        id: id,
+        logPath: logPath,
+        logFile: logFile,
+        ceiling: ceiling,
+        options: options,
+        token: token,
+      ),
+    );
+  }
+
+  /// Issue #925: same guarded eager open as LocalShell.startShellJob.
+  /// `File.openWrite` under a try/catch is false safety — the open starts
+  /// eagerly but its failure is async and unowned, so open-class errors
+  /// (missing dir, permissions, ENOSPC) escaped to the zone mid-job.
+  Future<Result<io.RandomAccessFile, ExecutionError>> _openJobLog(
+    String logPath,
+  ) async {
+    try {
+      return Ok(await io.File(logPath).open(mode: io.FileMode.append));
+    } on Object catch (error) {
+      return Err(
+        ExecutionError(
+          ExecutionErrorCode.spawnError,
+          'cannot open job log file $logPath: $error',
+          cause: error,
+        ),
+      );
+    }
+  }
+
+  /// Builds the job over the opened log, wires the cancel token, and
+  /// detaches the script run. SandboxShellJob serializes writers
+  /// (RandomAccessFile allows one op at a time) and consumes write errors.
+  /// [ceiling] is built by the caller before the log opens; [options] still
+  /// carries the exec side (cwd/env/timeout) into the job-local run.
+  SandboxShellJob _wireJob(
+    String command, {
+    required String id,
+    required String logPath,
+    required io.RandomAccessFile logFile,
+    required JobLogCeiling ceiling,
+    required ShellExecOptions? options,
+    required CancelToken? token,
+  }) {
+    final job = SandboxShellJob(
+      id: id,
+      command: command,
+      logPath: logPath,
+      logWriter: logFile.writeString,
+      ceiling: ceiling,
+      applyLogOp: (op) async {
+        if (op.offset == null) {
+          await logFile.writeString(op.text);
+          return;
+        }
+        // In-place overwrite of the marker+tail region at the advancing
+        // offset, truncated to the new region end — the file stays exactly
+        // bounded (append-mode RAF honors setPosition/truncate).
+        await logFile.setPosition(op.offset!);
+        await logFile.writeString(op.text);
+        await logFile.truncate(op.offset! + utf8.encode(op.text).length);
+      },
+      closeLog: () async {
+        // Issue #925: a broken log sink must not break the settle path.
+        try {
+          await logFile.flush();
+        } on Object {}
+        try {
+          await logFile.close();
+        } on Object {}
+      },
+    );
+    // An outer abort stops the job too (same contract as the local shell).
+    token?.onCancel.then((_) => job.stop());
+    unawaited(
+      _forJob()
+          .exec(
+            command,
+            options: ShellExecOptions(
+              cwd: options?.cwd,
+              env: options?.env,
+              timeout: options?.timeout,
+              cancelToken: job.cancelToken,
+              onStdout: job.writeLog,
+              onStderr: job.writeLog,
+            ),
+          )
+          .then(job.completeWith),
+    );
+    return job;
+  }
+
+  /// A job-local clone: shares the WASM modules, HTTP client, and sandbox
+  /// host path, owns the mutable interpreter state (cwd, shell vars, output
+  /// capture stack), so a detached job never clobbers the foreground shell
+  /// or a sibling job. The lazy loader and the compiled-module cache are
+  /// shared too (gh-1224): dropping them turned every interpreter on the
+  /// clone into a permanent `no lazy loader` stub; the cache memoizes
+  /// immutable modules, so sharing it keeps compile-once-per-app-run
+  /// semantics across foreground and jobs.
+  WasiSandboxShell _forJob() {
+    final clone = WasiSandboxShell(
+      coreutils: coreutils,
+      rg: rg,
+      find: find,
+      sed: sed,
+      awk: awk,
+      tar: tar,
+      gzip: gzip,
+      zip: zip,
+      python: python,
+      qjs: qjs,
+      sqlite3: sqlite3,
+      lua: lua,
+      workingDirectory: _currentDir,
+      sandboxHostPath: sandboxHostPath,
+      httpClient: _httpClient,
+      moduleLoader: moduleLoader,
+      lazyModuleCache: _lazyModules,
+    );
+    clone._shellEnv.addAll(_shellEnv);
+    return clone;
+  }
+
+  /// Script interpreter callbacks (control flow + command substitution are
+  /// implemented once in `shell_script.dart` and shared with MemoryShell).
+  late final ShellScriptRunner _scriptRunner = ShellScriptRunner(
+    runPipeline: (pipeline, options, depth) async {
+      final result = await _runPipeline(pipeline, options, depth);
+      if (result.isErr) return Err(result.errorOrNull!);
+      return Ok(result.valueOrNull!.exitCode);
+    },
+    environment: _effectiveEnv,
+    setVariable: (name, value) => _shellEnv[name] = value,
+    capture: _capture,
+    saveOutputs: () =>
+        ShellOutputSnapshot(stdout: _lastStdout, stderr: _lastStderr),
+    restoreOutputs: (snapshot) {
+      _lastStdout = snapshot.stdout;
+      _lastStderr = snapshot.stderr;
+    },
+    allowFdDuplication: true,
+  );
+
+  final ShellOutputCapture _capture = ShellOutputCapture();
+
+  String? _lastStdout;
+  String? _lastStderr;
+
+  Future<Result<ShellExecResult, ExecutionError>> _runPipeline(
+    Pipeline pipeline,
+    ShellExecOptions? options, [
+    int depth = 0,
+  ]) async {
+    // Per-execution pipe dir (issue #1156 E3/AC3): stale or concurrent
+    // `.fah_pipe_N` files at the sandbox root cross-contaminated jobs and
+    // polluted iOS's root — every invocation now owns a unique dir, so
+    // pipe state dies with it.
+    final pipeDir =
+        '/.fah/tmp/pipe-'
+        '${DateTime.now().microsecondsSinceEpoch}-${_pipeSeq++}';
+    final tempFiles = <io.File>[];
+    String? previousOutputFile;
+    try {
+      for (var i = 0; i < pipeline.stages.length; i++) {
+        final outcome = await _runPipelineStage(
+          pipeline.stages[i],
+          index: i,
+          isLast: i == pipeline.stages.length - 1,
+          options: options,
+          depth: depth,
+          inputSource: previousOutputFile,
+          tempFiles: tempFiles,
+          pipeDir: pipeDir,
+        );
+        if (outcome.isErr) {
+          return Err(outcome.errorOrNull!);
+        }
+        previousOutputFile = '$pipeDir/pipe_$i';
+      }
+    } finally {
+      await _cleanup(tempFiles);
+      try {
+        final dir = io.Directory(_hostPath(pipeDir));
+        if (await dir.exists()) await dir.delete(recursive: true);
+      } on Object {
+        // ignore cleanup failures
+      }
+    }
+
+    return Ok(
+      ShellExecResult(
+        stdout: _lastStdout ?? '',
+        stderr: _lastStderr ?? '',
+        exitCode: _lastStageExitCode ?? 0,
+      ),
+    );
+  }
+
+  /// Monotonic discriminator for per-execution pipe dirs (see _runPipeline).
+  int _pipeSeq = 0;
+
+  /// Expands and runs one pipeline stage, then stores its output into its
+  /// redirect target, the accumulator, or the execution's pipe file.
+  Future<Result<StageResult, ExecutionError>> _runPipelineStage(
+    Stage stage, {
+    required int index,
+    required bool isLast,
+    required ShellExecOptions? options,
+    required int depth,
+    required String? inputSource,
+    required List<io.File> tempFiles,
+    required String pipeDir,
+  }) async {
+    // Expand `$VAR`/`$(...)` references at execution time so earlier
+    // statements in the same command line (e.g. `export A=1 && echo $A`)
+    // are visible, then pathname-expand unquoted glob words against the
+    // sandbox fs (gh-1393 WS-1: bash-identical globbing — no match keeps
+    // the literal word).
+    final expansion = await _expandStage(stage, options, depth);
+    if (expansion.isErr) {
+      return Err(expansion.errorOrNull!);
+    }
+    final expandedStage = expansion.valueOrNull!;
+
+    final redirects = collectStageRedirects(expandedStage.redirects);
+    final input = await _stageInputSource(
+      redirects,
+      inputSource,
+      index,
+      options,
+      tempFiles,
+      pipeDir,
+    );
+
+    final result = await _runCommand(
+      command: expandedStage.command,
+      args: expandedStage.args,
+      options: options,
+      inputSource: input,
+      captureStdout: true,
+      captureStderr: true,
+    );
+    if (result.isErr) {
+      return Err(result.errorOrNull!);
+    }
+    final data = result.valueOrNull!;
+    _lastStageExitCode = data.exitCode;
+
+    return _finishStage(
+      data: data,
+      redirects: redirects,
+      index: index,
+      isLast: isLast,
+      options: options,
+      tempFiles: tempFiles,
+      pipeDir: pipeDir,
+    );
+  }
+
+  /// Writes a stage's stdout to its `>`/`>>` redirect target, the output
+  /// accumulator (last stage), or the execution's pipe file. `2>&1` with a
+  /// file target appends [stderrBytes] to the same file.
+  Future<void> _writeStageStdout(
+    List<int> stdoutBytes,
+    List<int> stderrBytes,
+    StageRedirects redirects, {
+    required int index,
+    required bool isLast,
+    required ShellExecOptions? options,
+    required List<io.File> tempFiles,
+    required String pipeDir,
+  }) async {
+    final stdoutFile = redirects.stdoutFile;
+    if (stdoutFile != null) {
+      final target = _resolveSandboxPath(stdoutFile, _effectiveCwd(options));
+      await _writeRedirectBytes(
+        stdoutBytes,
+        target,
+        append: redirects.appendStdout,
+      );
+      if (redirects.dupStderrIntoStdout && stderrBytes.isNotEmpty) {
+        await _writeRedirectBytes(stderrBytes, target, append: true);
+      }
+    } else if (isLast) {
+      _captureStageStdout(stdoutBytes);
+    }
+    if (isLast) return;
+    await _writePipeFile(stdoutBytes, '$index', tempFiles, pipeDir);
+  }
+
+  /// Appends the final stage's stdout text to the exec accumulator and the
+  /// output capture (command substitution / background-log consumers).
+  void _captureStageStdout(List<int> bytes) {
+    final text = utf8.decode(bytes, allowMalformed: true);
+    if (text.isEmpty) return;
+    _lastStdout = (_lastStdout ?? '') + text;
+    _capture.feed(text);
+  }
+
+  /// Writes a stage's stderr to its redirect target or the accumulator.
+  /// `>&2`/`1>&2` with a file target appends [stdoutBytes] to the same file.
+  Future<void> _storeStageStderr(
+    List<int> stderrBytes,
+    List<int> stdoutBytes,
+    StageRedirects redirects, {
+    required bool isLast,
+    required ShellExecOptions? options,
+  }) async {
+    final stderrFile = redirects.stderrFile;
+    if (stderrFile != null) {
+      final target = _resolveSandboxPath(stderrFile, _effectiveCwd(options));
+      await _writeRedirectBytes(
+        stderrBytes,
+        target,
+        append: redirects.appendStderr,
+      );
+      if (redirects.dupStdoutIntoStderr && stdoutBytes.isNotEmpty) {
+        await _writeRedirectBytes(stdoutBytes, target, append: true);
+      }
+      return;
+    }
+    final text = utf8.decode(stderrBytes, allowMalformed: true);
+    if (isLast && text.isNotEmpty) {
+      _lastStderr = (_lastStderr ?? '') + text;
+    }
+  }
+
+  /// Directory lister for glob expansion (gh-1393 WS-1): a guest sandbox
+  /// path in, its entries out; `null` when the path is not a directory (or
+  /// is unreadable — the walker treats that as "no candidates").
+  Future<List<GlobEntry>?> _globListDir(String guestPath) async {
+    final dir = io.Directory(_hostPath(guestPath));
+    try {
+      final entries = <GlobEntry>[];
+      await for (final entity in dir.list(followLinks: true)) {
+        final name = p.basename(entity.path);
+        if (name == '.' || name == '..') continue;
+        entries.add(GlobEntry(name, isDir: entity is io.Directory));
+      }
+      return entries;
+    } on Object {
+      return null;
+    }
+  }
+
+  /// Writes [bytes] to a redirect target inside the sandbox. I/O failures
+  /// surface as [_RedirectWriteError] carrying a clean, sandbox-path-only
+  /// message (issue #1156 E2/E4).
+  ///
+  /// `/dev/null` is a null sink (gh-1393 WS-1): bytes are discarded and
+  /// NOTHING materializes — the redirect writer used to create a real
+  /// `/dev/null` file (plus its `dev/` parent) in the sandbox root, which
+  /// then showed up in listings.
+  Future<void> _writeRedirectBytes(
+    List<int> bytes,
+    String sandboxFile, {
+    required bool append,
+  }) async {
+    if (isNullDevicePath(sandboxFile)) return;
+    final file = _hostFile(sandboxFile);
+    try {
+      await file.parent.create(recursive: true);
+      if (append) {
+        await file.writeAsBytes(bytes, mode: io.FileMode.append);
+      } else {
+        await file.writeAsBytes(bytes);
+      }
+    } on io.FileSystemException catch (error) {
+      // toString() carries the OS phrase (`Permission denied`) — message
+      // alone is just `Cannot open file`.
+      throw _RedirectWriteError(
+        sandboxFile,
+        _sanitizeSandboxText(error.toString()),
+      );
+    }
+  }
+
+  /// Persists a non-final stage's stdout into the execution's unique pipe
+  /// dir (see [_runPipeline]); the caller feeds the sandbox path to the
+  /// next stage.
+  Future<io.File> _writePipeFile(
+    List<int> bytes,
+    String name,
+    List<io.File> tempFiles,
+    String pipeDir,
+  ) async {
+    final temp = _hostFile('$pipeDir/pipe_$name');
+    await temp.parent.create(recursive: true);
+    await temp.writeAsBytes(bytes);
+    tempFiles.add(temp);
+    return temp;
+  }
+
+  Future<void> _cleanup(List<io.File> files) async {
+    for (final file in files) {
+      try {
+        if (await file.exists()) await file.delete();
+      } on Object {
+        // ignore cleanup failures
+      }
+    }
+  }
+
+  /// Strips the host sandbox root from error text so messages speak the
+  /// sandbox paths the agent used (issue #1156 E4).
+  String _sanitizeSandboxText(String text) {
+    final host = sandboxHostPath;
+    if (host == null || host.isEmpty) return text;
+    return text.replaceAll(host, '');
+  }
+
+  int? _lastStageExitCode;
+
+  io.File _hostFile(String sandboxPath) {
+    final host = sandboxHostPath ?? '';
+    final stripped = sandboxPath.startsWith('/')
+        ? sandboxPath.substring(1)
+        : sandboxPath;
+    return io.File('$host/$stripped');
+  }
+
+  String _hostPath(String sandboxPath) {
+    final host = sandboxHostPath ?? '';
+    // Idempotent for paths already inside the sandbox host directory: the
+    // harness layer hands git/ssh its own *host* cwd (gh-1274), and mapping
+    // it again would produce a nested `<sandbox>/<host-path>` mirror. Like
+    // SandboxedExecutionEnv._map, a sandbox-virtual path that textually
+    // begins with the host root is treated as already mapped; both
+    // readings stay inside the sandbox.
+    if (_sandboxHostRoot?.contains(sandboxPath) ?? false) {
+      return sandboxPath;
+    }
+    final stripped = sandboxPath.startsWith('/')
+        ? sandboxPath.substring(1)
+        : sandboxPath;
+    return host.isEmpty ? stripped : '$host/$stripped';
+  }
+
+  /// Effective environment visible to WASM commands, builtins, and variable
+  /// expansion: sandbox defaults, persistent `export`ed variables, and any
+  /// per-call overrides (later wins).
+  Map<String, String> _effectiveEnv(ShellExecOptions? options) {
+    final cwd = _effectiveCwd(options);
+    return <String, String>{
+      'HOME': '/',
+      'PATH': '/bin',
+      'PWD': cwd,
+      'SHELL': '/bin/sh',
+      'TERM': 'dumb',
+      'USER': io.Platform.environment['USER'] ?? 'Fa',
+      ..._shellEnv,
+      ...?options?.env,
+      // POSIX `$?` (issue #1335): the last completed stage's exit code.
+      // Placed after every spread so it always reports the real status; the
+      // `env` builtin and the WASI spawn env filter it out.
+      '?': '${_lastStageExitCode ?? 0}',
+    };
+  }
+
+  /// Normalizes a sandbox path: collapses `.` and `..` segments and always
+  /// returns an absolute path starting at the sandbox root `/`.
+  String _normalizeSandboxPath(String path) => normalizeLexicalPath(path);
+
+  /// Effective guest cwd for an exec: the shell-tracked [_currentDir],
+  /// unless the caller explicitly asked for a DIFFERENT cwd.
+  ///
+  /// The harness layer reports the *host* sandbox directory as the env cwd
+  /// (`/var/mobile/Containers/…/fah_sandbox` on iOS — gh-1274) and passes
+  /// it into EVERY `ShellExecOptions` as the exec anchor. Treating that
+  /// anchor as a per-exec cwd reset made `cd` a silent no-op across execs
+  /// (gh-1393 WS-1): `cd /tmp && qjs run.js` ran the next exec back at the
+  /// root. A cwd that maps to the sandbox root `/` IS that anchor — it
+  /// keeps the shell-tracked directory (which starts at `/`, so a fresh
+  /// shell behaves identically). Any other cwd is an explicit per-exec
+  /// request and wins verbatim (mapped host→sandbox when inside the root).
+  /// A cwd inside [sandboxHostPath] is mapped back to its sandbox-absolute
+  /// form via the shared [SandboxHostRoot] convention — hardened against
+  /// trailing separators and symlink/case spelling variants (gh-1274
+  /// review); anything outside the sandbox is left unchanged.
+  String _effectiveCwd(ShellExecOptions? options) {
+    var cwd = _currentDir;
+    final root = _sandboxHostRoot;
+    final requested = options?.cwd;
+    if (requested != null) {
+      final mapped = root?.stripToSandboxPath(requested) ?? requested;
+      if (mapped != '/') cwd = mapped;
+    }
+    return cwd;
+  }
+
+  /// Resolves [path] against [cwd] inside the sandbox, returning an absolute
+  /// sandbox path.
+  ///
+  /// Absolute paths are first mapped through [_toGuestPath]: the harness
+  /// projects the sandbox as *host* paths (the env cwd, `write`/`edit`
+  /// results, `FileInfo.path` — all under [sandboxHostPath]), and agents
+  /// paste those strings into arguments and redirect targets. Left verbatim
+  /// they address a path the WASI guest cannot see, so `ls` (which rewrote
+  /// its operand) shows a file `cat <absolute>` cannot read — the
+  /// file-visibility split of issue #1335.
+  String _resolveSandboxPath(String path, String cwd) {
+    if (path.startsWith('/')) {
+      return _normalizeSandboxPath(_toGuestPath(path));
+    }
+    // A cwd the host-root mapping somehow missed would re-leak host paths
+    // into the join; normalize the result through the same mapping.
+    return _normalizeSandboxPath(_toGuestPath('$cwd/$path'));
+  }
+
+  /// Maps an absolute path into the WASI guest namespace: a host-projection
+  /// path under [sandboxHostPath] becomes its sandbox-absolute form
+  /// (`<host>/f` → `/f`); guest-side paths pass through unchanged.
+  String _toGuestPath(String path) =>
+      _sandboxHostRoot?.stripToSandboxPath(path) ?? path;
+
+  /// Rewrites relative path arguments to absolute sandbox paths based on
+  /// [cwd]. The WASI guest is rooted at `/`, so `cat file.txt` run after
+  /// `cd /work` would otherwise look for `/file.txt`. Operand classification
+  /// routes through [pathPositionalCommands] / [nonPathFlagValues]
+  /// (wasm_shell_builtins.dart, issue #558 family).
+  List<String> _rewriteRelativeArgs(
+    String command,
+    List<String> args,
+    String cwd,
+  ) {
+    if (command == 'dd') return _rewriteDdArgs(args, cwd);
+    return _rewritePositionalArgs(command, args, cwd);
+  }
+
+  /// `dd` uses `if=`/`of=` key=value operands instead of bare paths.
+  List<String> _rewriteDdArgs(List<String> args, String cwd) =>
+      args.map((arg) => _rewriteDdArg(arg, cwd)).toList();
+
+  List<String> _rewritePositionalArgs(
+    String command,
+    List<String> args,
+    String cwd,
+  ) {
+    final skipFlags = nonPathFlagValues[command] ?? const <String>{};
+    final result = <String>[];
+    var positionalIndex = 0;
+    for (var i = 0; i < args.length; i++) {
+      final arg = args[i];
+      if (!_isPathArg(args, i, skipFlags)) {
+        result.add(arg);
+        continue;
+      }
+      positionalIndex++;
+      // sed/awk: the first positional argument is the script, not a path.
+      if (_isScriptArg(command, positionalIndex)) {
+        result.add(arg);
+        continue;
+      }
+      result.add(_maybeRewritePath(command, arg, cwd));
+    }
+    return result;
+  }
+
+  /// Whether args[i] is a positional operand: not a flag and not the value
+  /// of a flag listed in [nonPathFlagValues] for this command.
+  bool _isPathArg(List<String> args, int i, Set<String> skipFlags) {
+    final arg = args[i];
+    if (arg.startsWith('-') && arg != '-') return false;
+    return !_isFlagValue(args, i, skipFlags);
+  }
+
+  bool _isFlagValue(List<String> args, int i, Set<String> skipFlags) =>
+      i > 0 && skipFlags.contains(args[i - 1]);
+
+  bool _isScriptArg(String command, int positionalIndex) =>
+      positionalIndex == 1 && (command == 'sed' || command == 'awk');
+
+  String _rewriteDdArg(String arg, String cwd) {
+    final idx = arg.indexOf('=');
+    if (idx <= 0) return arg;
+    final key = arg.substring(0, idx);
+    if (key != 'if' && key != 'of') return arg;
+    final value = arg.substring(idx + 1);
+    if (value.isEmpty) return arg;
+    return '$key=${_resolveSandboxPath(value, cwd)}';
+  }
+
+  String _maybeRewritePath(String command, String arg, String cwd) {
+    if (_isVerbatimArg(arg)) return arg;
+    // Absolute operands resolve through _resolveSandboxPath too: a
+    // host-projection path (the shape the env cwd and file-tool results
+    // hand the agent) maps back into the guest namespace instead of
+    // reaching the WASI guest verbatim and failing ENOENT there
+    // (issue #1335).
+    return _rewriteRelativePath(command, arg, cwd);
+  }
+
+  /// Operands that must never be touched: empty and the stdin/stdout `-`.
+  bool _isVerbatimArg(String arg) => arg.isEmpty || arg == '-';
+
+  String _rewriteRelativePath(String command, String arg, String cwd) {
+    // Explicit relative paths are always resolved.
+    if (arg.startsWith('./') || arg.startsWith('../')) {
+      return _resolveSandboxPath(arg, cwd);
+    }
+    if (pathPositionalCommands.contains(command)) {
+      return _resolveSandboxPath(arg, cwd);
+    }
+    return _rewriteExistingPath(command, arg, cwd);
+  }
+
+  String _rewriteExistingPath(String command, String arg, String cwd) {
+    // Heuristic for commands with mixed argument kinds (e.g. rg, python -c):
+    // rewrite a word only when it names an existing file or directory.
+    // Anything else (URLs, inline code, patterns) must stay verbatim -
+    // rewriting `https://...` inside `python3 -c` used to corrupt it into
+    // `https:/...` and break every network call (issue #337).
+    final resolved = _resolveSandboxPath(arg, cwd);
+    if (io.FileSystemEntity.typeSync(_hostPath(resolved)) !=
+        io.FileSystemEntityType.notFound) {
+      return resolved;
+    }
+    return arg;
+  }
+
+  Future<Result<StageResult, ExecutionError>> _runStage({
+    required String command,
+    required List<String> args,
+    required ShellExecOptions? options,
+    required bool captureStdout,
+    required bool captureStderr,
+  }) async {
+    final loaded = await _moduleFor(command);
+    if (loaded.isErr) {
+      // Issue #640: a failed lazy compile of an interpreter must degrade to
+      // a normal failed command (exit 1 + stderr), never crash the host.
+      final message = loaded.errorOrNull!;
+      _lastStageExitCode = 1;
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('${_sanitizeSandboxText(message)}\n'),
+          exitCode: 1,
+        ),
+      );
+    }
+    final module = loaded.valueOrNull!;
+    final argv = [..._resolve(command).argv, ...args];
+
+    final env = await _stageEnv(command, options);
+    if (env.isErr) return Err(env.errorOrNull!);
+    final built = await _buildStageInstance(
+      module: module,
+      command: command,
+      argv: argv,
+      env: env.valueOrNull!,
+      captureStdout: captureStdout,
+      captureStderr: captureStderr,
+    );
+    if (built.isErr) {
+      final error = built.errorOrNull!;
+      // Errors speak sandbox paths, never the host root (issue #1156 E4).
+      return Err(
+        ExecutionError(
+          error.code,
+          _sanitizeSandboxText(error.message),
+          cause: error.cause,
+        ),
+      );
+    }
+    final instance = built.valueOrNull!;
+
+    final bridge = _stageBridge(command, captureStdout);
+    // gh-1444 AC8: python launches print the platform-libraries warning on
+    // every run — the line filter drops it from the captured stderr.
+    final noiseFilter = _isPythonCommand(command)
+        ? WasiPythonNoiseFilter()
+        : null;
+    final io = _StageIo();
+    final stdoutSub = _subscribeStdout(
+      instance,
+      io,
+      bridge,
+      options?.onStdout,
+      captureStdout,
+    );
+    final stderrSub = _subscribeStderr(
+      instance,
+      io,
+      options?.onStderr,
+      captureStderr,
+      noiseFilter: noiseFilter,
+    );
+    // Not captured = not subscribed = nothing can arrive: done up front so
+    // the drain's quiet window only covers streams that can still emit.
+    if (stdoutSub == null) io.stdoutDone = true;
+    if (stderrSub == null) io.stderrDone = true;
+    final run = await _runWasiStart(
+      instance,
+      io,
+      bridge,
+      stdoutSub: stdoutSub,
+      stderrSub: stderrSub,
+      options: options,
+    );
+
+    final outcome = resolveStageOutcome(
+      callbackError: io.callbackError,
+      timedOut: run.timedOut,
+      runError: run.runError,
+      timeout: run.timeout,
+      cancelled: options?.cancelToken?.isCancelled ?? false,
+      hasOutput: io.hasOutput,
+    );
+    if (outcome.isErr) {
+      final error = outcome.errorOrNull!;
+      // Errors speak sandbox paths, never the host root (issue #1156 E4).
+      // gh-1444 AC5: timeout/abort errors carry the captured partial
+      // output (tail-capped like LocalShell) so the honest "timed out
+      // after Ns" result shows WHERE the command was when the cap hit.
+      return Err(
+        ExecutionError(
+          error.code,
+          _sanitizeSandboxText(error.message),
+          cause: error.cause,
+          stdout: _tailCapture(
+            utf8.decode(io.stdoutBuffer, allowMalformed: true),
+          ),
+          stderr: _tailCapture(
+            utf8.decode(io.stderrBuffer, allowMalformed: true),
+          ),
+        ),
+      );
+    }
+    _lastStageExitCode = outcome.valueOrNull!;
+
+    // The python noise filter holds back a trailing partial line — flush
+    // whatever survives into the captured stderr once the run settled.
+    final tail = noiseFilter?.flush();
+    if (tail != null && tail.isNotEmpty) {
+      io.stderrBuffer.addAll(tail);
+    }
+
+    return Ok(
+      StageResult(
+        stdout: io.stdoutBuffer,
+        stderr: io.stderrBuffer,
+        exitCode: _lastStageExitCode ?? 0,
+      ),
+    );
+  }
+
+  /// Tail-caps a killed stage's captured output for the error fields
+  /// (gh-1444 AC5), matching LocalShell's `_captureMax` budget so every
+  /// backend inherits the same bounded-retention contract.
+  static const _captureMax = 64 * 1024;
+
+  static String _tailCapture(String text) {
+    if (text.length <= _captureMax) return text;
+    return '…[truncated]${text.substring(text.length - _captureMax)}';
+  }
+
+  /// Prepares the stage environment: unpacks the python stdlib on first
+  /// python use and exposes pip site-packages to the interpreter.
+  Future<Result<Map<String, String>, ExecutionError>> _stageEnv(
+    String command,
+    ShellExecOptions? options,
+  ) async {
+    if (!_isPythonCommand(command)) return Ok(_effectiveEnv(options));
+    try {
+      await _ensurePythonStdlib();
+    } on Object catch (e) {
+      return Err(
+        ExecutionError(
+          ExecutionErrorCode.unknown,
+          'python stdlib setup failed: $e',
+        ),
+      );
+    }
+    final env = _effectiveEnv(options);
+    // Let the interpreter import pip-installed wheels (an explicit user
+    // PYTHONPATH, e.g. via `export`, wins).
+    env.putIfAbsent('PYTHONPATH', () => _pythonSitePackages);
+    return Ok(env);
+  }
+
+  /// Builds the WASM instance for one stage, mapping builder failures to a
+  /// spawn error.
+  Future<Result<WasmInstance, ExecutionError>> _buildStageInstance({
+    required WasmModule module,
+    required String command,
+    required List<String> argv,
+    required Map<String, String> env,
+    required bool captureStdout,
+    required bool captureStderr,
+  }) async {
+    final builder = module.builder(
+      wasiConfig: WasiConfig(
+        args: argv,
+        // `'?'` (and any future special parameter) must not reach the WASI
+        // process environment: WASI env names are identifiers.
+        env: env.entries
+            .where((e) => exportEnvVarName.hasMatch(e.key))
+            .map((e) => EnvVariable(name: e.key, value: e.value))
+            .toList(),
+        preopenedDirs: _stagePreopenedDirs(),
+        webBrowserFileSystem: const <String, WasiDirectory>{},
+        captureStdout: captureStdout,
+        captureStderr: captureStderr,
+        inheritStdin: false,
+        inheritEnv: false,
+        inheritArgs: false,
+      ),
+    );
+
+    debugPrint('[wasm_shell] building instance for $command...');
+    try {
+      final instance = await builder.build();
+      debugPrint('[wasm_shell] instance built, subscribing to stdio...');
+      return Ok(instance);
+    } on Object catch (error) {
+      debugPrint('[wasm_shell] build failed: $error');
+      return Err(
+        ExecutionError(
+          ExecutionErrorCode.spawnError,
+          'Failed to build WASM instance: $error',
+          cause: error,
+        ),
+      );
+    }
+  }
+
+  /// The sandbox root is preopened at `/` so guests see the workspace FS.
+  List<PreopenedDir> _stagePreopenedDirs() {
+    final preopenedDirs = <PreopenedDir>[];
+    final hostSandbox = sandboxHostPath;
+    if (hostSandbox != null && hostSandbox.isNotEmpty) {
+      preopenedDirs.add(
+        PreopenedDir(wasmGuestPath: '/', hostPath: hostSandbox),
+      );
+    }
+    return preopenedDirs;
+  }
+
+  /// Python stages route HTTP through the host bridge (issue #337 AC1):
+  /// `fa_http` control lines are stripped from the captured stdout and the
+  /// requests are served against the real network by [FaHttpBridge].
+  FaHttpBridge? _stageBridge(String command, bool captureStdout) {
+    final enabled =
+        _isPythonCommand(command) &&
+        captureStdout &&
+        (sandboxHostPath?.isNotEmpty ?? false);
+    return enabled
+        ? FaHttpBridge(
+            sandboxRoot: sandboxHostPath!,
+            httpClient: _httpClient,
+            // gh-1444 AC3: bridged python requests that die on the
+            // transport are logged, not just folded into the OSError.
+            logFailure: (line) => AppLog.i('bridge', line),
+          )
+        : null;
+  }
+
+  StreamSubscription<Uint8List>? _subscribeStdout(
+    WasmInstance instance,
+    _StageIo io,
+    FaHttpBridge? bridge,
+    void Function(String)? onStdout,
+    bool captureStdout,
+  ) {
+    return captureStdout
+        ? instance.stdout.listen(
+            (chunk) {
+              debugPrint('[wasm_shell] stdout chunk: ${chunk.length} bytes');
+              final clean = bridge?.filter(chunk) ?? chunk;
+              if (clean.isNotEmpty) {
+                io.collect(
+                  io.stdoutBuffer,
+                  Uint8List.fromList(clean),
+                  onStdout,
+                );
+              }
+            },
+            onDone: () {
+              io.stdoutDone = true;
+              debugPrint('[wasm_shell] stdout done');
+            },
+          )
+        : null;
+  }
+
+  StreamSubscription<Uint8List>? _subscribeStderr(
+    WasmInstance instance,
+    _StageIo io,
+    void Function(String)? onStderr,
+    bool captureStderr, {
+    WasiPythonNoiseFilter? noiseFilter,
+  }) {
+    return captureStderr
+        ? instance.stderr.listen(
+            (chunk) {
+              debugPrint('[wasm_shell] stderr chunk: ${chunk.length} bytes');
+              if (noiseFilter == null) {
+                io.collect(io.stderrBuffer, chunk, onStderr);
+              } else {
+                final clean = Uint8List.fromList(noiseFilter.process(chunk));
+                if (clean.isNotEmpty) {
+                  io.collect(io.stderrBuffer, clean, onStderr);
+                }
+              }
+            },
+            onDone: () {
+              io.stderrDone = true;
+              debugPrint('[wasm_shell] stderr done');
+            },
+          )
+        : null;
+  }
+
+  /// Races the WASI start against the timeout, then drains the stdio
+  /// streams (bounded), cancels the subscriptions, disposes the instance
+  /// and flushes the bridge tail.
+  Future<({Object? runError, bool timedOut, Duration timeout})> _runWasiStart(
+    WasmInstance instance,
+    _StageIo io,
+    FaHttpBridge? bridge, {
+    required StreamSubscription<Uint8List>? stdoutSub,
+    required StreamSubscription<Uint8List>? stderrSub,
+    required ShellExecOptions? options,
+  }) async {
+    // gh-1444 C5: the flat 30s default killed every fs-wide scan (`find /`,
+    // 184 `timeout 0:00:30` lines in one session log). The mobile sandbox
+    // default is now 120s — honest timeout text + captured partial output
+    // (see resolveStageOutcome/_runStage) tell the model what happened.
+    final timeout = options?.timeout ?? const Duration(seconds: 120);
+    debugPrint('[wasm_shell] starting _start with timeout $timeout...');
+    var timedOut = false;
+    final timeoutFuture = Future<void>.delayed(timeout, () => timedOut = true);
+
+    Object? runError;
+    final runCompleter = Completer<void>();
+    try {
+      Future<void>(() async {
+        try {
+          await instance.runWasiStartAsync();
+          debugPrint('[wasm_shell] _start completed');
+        } on Object catch (e) {
+          // gh-1444 AC7: a normal exit status (proc_exit 1/2 — a grep miss,
+          // a failing test) is debug noise, not a harness fault; the log
+          // line must not say "error" for it (app.log triage greps it).
+          debugPrint(wasmStartLogLine(e));
+          runError = e;
+        } finally {
+          if (!runCompleter.isCompleted) runCompleter.complete();
+        }
+      });
+      await Future.any<void>([runCompleter.future, timeoutFuture]);
+    } finally {
+      // Issue #1156 (the iOS silent-dead mechanism): `_start` completing
+      // does not mean the stdio streams have delivered their buffered
+      // chunks — cancelling immediately swallows fast-exit output (jq/qjs/
+      // echo rows came up empty). Give the streams a bounded quiet window
+      // to land their bytes; never wait on a stream that never closes.
+      await _drainStageStdio(io);
+      debugPrint('[wasm_shell] cancelling stdio subscriptions...');
+      await stdoutSub?.cancel();
+      await stderrSub?.cancel();
+      instance.dispose();
+    }
+
+    io.stdoutBuffer.addAll(bridge?.flush() ?? const <int>[]);
+
+    debugPrint('[wasm_shell] run finished timedOut=$timedOut error=$runError');
+    return (runError: runError, timedOut: timedOut, timeout: timeout);
+  }
+
+  /// Quiet-window stdio drain: waits until no new bytes have arrived for
+  /// [_drainQuiet] (or [_drainBudget] elapses — WASM streams may simply
+  /// never close), so buffered output of fast-exiting guests is captured
+  /// before the subscriptions are cancelled. Skipped entirely once both
+  /// streams report done — no window can be swallowed after close.
+  static const Duration _drainTick = Duration(milliseconds: 20);
+  static const Duration _drainQuiet = Duration(milliseconds: 40);
+  static const Duration _drainBudget = Duration(seconds: 2);
+
+  Future<void> _drainStageStdio(_StageIo io) async {
+    if (io.stdoutDone && io.stderrDone) return;
+    final sw = Stopwatch()..start();
+    var stableFor = Duration.zero;
+    var last = io.stdoutBuffer.length + io.stderrBuffer.length;
+    while (stableFor < _drainQuiet && sw.elapsed < _drainBudget) {
+      await Future<void>.delayed(_drainTick);
+      if (io.stdoutDone && io.stderrDone) return;
+      final now = io.stdoutBuffer.length + io.stderrBuffer.length;
+      if (now == last) {
+        stableFor += _drainTick;
+      } else {
+        last = now;
+        stableFor = Duration.zero;
+      }
+    }
+  }
+
+  /// Parses the exit code from a wasmtime I32Exit trap (the shared grammar
+  /// lives in wasm_shell_builtins.dart so the AC7 log-line classifier and
+  /// this resolver cannot drift).
+  ///
+  /// Returns `null` when [error] cannot be parsed as a normal WASI exit.
+  static int? _parseExitCode(Object? error) => parseWasiExitCode(error);
+
+  /// Pure post-run outcome resolution for one WASM stage (issue #475).
+  ///
+  /// Public and static so the CRAP-descent unit tests exercise it without
+  /// building a WASM instance. Order is load-bearing: callback errors win,
+  /// then timeout, then cancellation, then exit-code resolution.
+  static Result<int, ExecutionError> resolveStageOutcome({
+    required ExecutionError? callbackError,
+    required bool timedOut,
+    required Object? runError,
+    required Duration timeout,
+    required bool cancelled,
+    required bool hasOutput,
+  }) {
+    if (callbackError != null) return Err(callbackError);
+    if (timedOut) {
+      return Err(
+        ExecutionError(ExecutionErrorCode.timeout, 'timeout: $timeout'),
+      );
+    }
+    if (cancelled) {
+      return const Err(ExecutionError(ExecutionErrorCode.aborted, 'aborted'));
+    }
+    final exitCode = _parseExitCode(runError);
+    if (exitCode != null) return Ok(exitCode);
+    if (!hasOutput) {
+      return Err(
+        ExecutionError(
+          ExecutionErrorCode.unknown,
+          runError.toString(),
+          cause: runError,
+        ),
+      );
+    }
+    // Output was produced but no exit code could be parsed: surface a
+    // generic failure instead of the raw trap.
+    return Ok(1);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Builtin command implementations
+  // ---------------------------------------------------------------------------
+
+  Future<Result<StageResult, ExecutionError>> _testBuiltin(Stage stage) async {
+    final rawArgs = stage.args.toList();
+    final error = validateTestInvocation(stage.command, rawArgs);
+    if (error != null) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('$error\n'),
+          exitCode: 2,
+        ),
+      );
+    }
+    if (stage.command == '[') rawArgs.removeLast();
+    try {
+      final value = await TestEvaluator(
+        fileExists: (path) async {
+          try {
+            return await io.File(
+              _hostFile(_resolveSandboxPath(path, _currentDir)).path,
+            ).exists();
+          } on Object {
+            return false;
+          }
+        },
+        dirExists: (path) async {
+          try {
+            return await io.Directory(
+              _hostFile(_resolveSandboxPath(path, _currentDir)).path,
+            ).exists();
+          } on Object {
+            return false;
+          }
+        },
+        fileSize: (path) async {
+          try {
+            return await io.File(
+              _hostFile(_resolveSandboxPath(path, _currentDir)).path,
+            ).length();
+          } on Object {
+            return 0;
+          }
+        },
+      ).evaluate(rawArgs);
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: const [],
+          exitCode: value ? 0 : 1,
+        ),
+      );
+    } on TestExpressionError catch (e) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('test: ${e.message}\n'),
+          exitCode: 2,
+        ),
+      );
+    } on FormatException catch (e) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('test: integer expected: $e\n'),
+          exitCode: 2,
+        ),
+      );
+    }
+  }
+
+  Future<Result<StageResult, ExecutionError>> _whichBuiltin(Stage stage) async {
+    if (stage.args.isEmpty) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('which: missing argument\n'),
+          exitCode: 1,
+        ),
+      );
+    }
+    final name = stage.args.first;
+    if (_isCommandAvailable(name)) {
+      return Ok(
+        StageResult(
+          stdout: utf8.encode('/bin/$name\n'),
+          stderr: const [],
+          exitCode: 0,
+        ),
+      );
+    }
+    return Ok(
+      StageResult(
+        stdout: const [],
+        stderr: utf8.encode('which: $name: not found\n'),
+        exitCode: 1,
+      ),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _commandBuiltin(
+    Stage stage,
+  ) async {
+    if (stage.args.length >= 2 && stage.args[0] == '-v') {
+      return Ok(await _commandNameResult(stage.args[1]));
+    }
+    return Ok(
+      StageResult(
+        stdout: const [],
+        stderr: utf8.encode('command: unsupported usage\n'),
+        exitCode: 1,
+      ),
+    );
+  }
+
+  /// The `command -v <name>` arm (gh-1848 split): `/bin/<name>` when the
+  /// command is available, a `not found` line with exit 1 otherwise.
+  Future<StageResult> _commandNameResult(String name) async {
+    if (_isCommandAvailable(name)) {
+      return StageResult(
+        stdout: utf8.encode('/bin/$name\n'),
+        stderr: const [],
+        exitCode: 0,
+      );
+    }
+    return StageResult(
+      stdout: const [],
+      stderr: utf8.encode('command: $name: not found\n'),
+      exitCode: 1,
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _envBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final env = _effectiveEnv(options);
+    final (:assignments, :remaining) = splitEnvArgs(stage.args);
+
+    if (remaining.isNotEmpty) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode(
+            "env: '${remaining.first}': No such file or directory\n",
+          ),
+          exitCode: 127,
+        ),
+      );
+    }
+
+    final merged = <String, String>{...env, ...assignments};
+    // gh-1444 AC4: rostered secret vars render as PRESENT/ABSENT lines —
+    // presence is verifiable, values never render.
+    return Ok(
+      StageResult(
+        stdout: utf8.encode(renderEnvListingWithSecretPresence(merged)),
+        stderr: const [],
+        exitCode: 0,
+      ),
+    );
+  }
+
+  /// Wires the shared [SandboxBuiltins] to the sandbox host filesystem,
+  /// resolving paths against [cwd]. DNS and whois use the dart:io transports
+  /// ([_systemDnsQuery], [_tcpWhois]).
+  SandboxBuiltins _sandboxBuiltins(String cwd, {Duration? timeout}) {
+    return SandboxBuiltins(
+      httpClient: _httpClient,
+      dnsQuery: _systemDnsQuery,
+      whoisConnector: (query, server) =>
+          _tcpWhois(query, server, timeout: timeout),
+      // gh-1444 AC3: curl/wget transport failures land in app.log with a
+      // `[bridge]` line, not just in the tool result.
+      logFailure: (line) => AppLog.i('bridge', line),
+      readTextFile: (path) => _readSandboxText(_resolveSandboxPath(path, cwd)),
+      writeBinaryFile: (path, bytes) =>
+          _writeSandboxBytes(_resolveSandboxPath(path, cwd), bytes),
+      readBinaryFile: (path) =>
+          _readSandboxBytes(_resolveSandboxPath(path, cwd)),
+      listDirectory: (path) => _listSandboxDir(_resolveSandboxPath(path, cwd)),
+      removeFile: (path) => _removeSandboxFile(_resolveSandboxPath(path, cwd)),
+    );
+  }
+
+  /// Host read for the sandbox file at sandbox-absolute [path], `null` when
+  /// it does not exist.
+  Future<String?> _readSandboxText(String path) async {
+    final file = _hostFile(path);
+    if (!await file.exists()) return null;
+    return file.readAsString();
+  }
+
+  /// Host write for the sandbox file at sandbox-absolute [path].
+  Future<void> _writeSandboxBytes(String path, List<int> bytes) async {
+    final file = _hostFile(path);
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(bytes);
+  }
+
+  /// Host binary read for the sandbox file at sandbox-absolute [path],
+  /// `null` when it does not exist.
+  Future<List<int>?> _readSandboxBytes(String path) async {
+    final file = _hostFile(path);
+    if (!await file.exists()) return null;
+    return file.readAsBytes();
+  }
+
+  /// Host listing of the sandbox directory at sandbox-absolute [path]:
+  /// `null` when it is not a directory, empty when unreadable.
+  Future<List<SandboxDirEntry>?> _listSandboxDir(String path) async {
+    final host = _hostPath(path);
+    if (io.FileSystemEntity.typeSync(host) !=
+        io.FileSystemEntityType.directory) {
+      return null;
+    }
+    final entries = <SandboxDirEntry>[];
+    try {
+      await for (final entity in io.Directory(host).list(followLinks: false)) {
+        entries.add((
+          name: p.basename(entity.path),
+          isDirectory: entity is io.Directory,
+        ));
+      }
+    } on Object {
+      // Unreadable directories list as empty.
+    }
+    return entries;
+  }
+
+  /// Host delete of the sandbox file at sandbox-absolute [path], no-op when
+  /// it does not exist.
+  Future<void> _removeSandboxFile(String path) async {
+    final file = _hostFile(path);
+    if (await file.exists()) await file.delete();
+  }
+
+  /// Resolves DNS through the dart:io system resolver for A/AAAA/PTR (like
+  /// native nslookup) and falls back to DNS-over-HTTPS for the record types
+  /// `InternetAddress.lookup` cannot answer.
+  Future<SandboxDnsResult> _systemDnsQuery(String name, String type) async {
+    switch (type) {
+      case 'A' || 'AAAA':
+        return _systemLookupQuery(name, type);
+      case 'PTR':
+        return _systemPtrQuery(name);
+      default:
+        return SandboxBuiltins.dohQuery(_httpClient, name, type);
+    }
+  }
+
+  /// `A`/`AAAA` lookup through the system resolver: the answers keep only
+  /// the requested address family.
+  Future<SandboxDnsResult> _systemLookupQuery(String name, String type) async {
+    final addresses = await io.InternetAddress.lookup(name);
+    final wantV4 = type == 'A';
+    return SandboxDnsResult(
+      status: 0,
+      resolver: 'system resolver',
+      answers: [
+        for (final address in addresses)
+          if ((address.type == io.InternetAddressType.IPv4) == wantV4)
+            SandboxDnsRecord(
+              name: name,
+              type: wantV4 ? 1 : 28,
+              ttl: 0,
+              data: address.address,
+            ),
+      ],
+    );
+  }
+
+  /// `PTR` lookup through the system resolver; the query name must be a
+  /// reverse-zone form (`4.3.2.1.in-addr.arpa`).
+  Future<SandboxDnsResult> _systemPtrQuery(String name) async {
+    final ip = SandboxBuiltins.ipv4FromPtrName(name);
+    if (ip == null) {
+      throw FormatException('unsupported PTR query name: $name');
+    }
+    final reversed = await io.InternetAddress(ip).reverse();
+    return SandboxDnsResult(
+      status: 0,
+      resolver: 'system resolver',
+      answers: [
+        SandboxDnsRecord(name: name, type: 12, ttl: 0, data: reversed.host),
+      ],
+    );
+  }
+
+  /// Runs one raw whois exchange with [server] over TCP port 43.
+  Future<String> _tcpWhois(
+    String query,
+    String server, {
+    Duration? timeout,
+  }) async {
+    final socket = await io.Socket.connect(
+      server,
+      43,
+      timeout: timeout ?? const Duration(seconds: 15),
+    );
+    try {
+      socket.write('$query\r\n');
+      await socket.flush();
+      return await utf8.decoder.bind(socket).join();
+    } finally {
+      socket.destroy();
+    }
+  }
+
+  Ok<StageResult, ExecutionError> _builtinOk(SandboxBuiltinResult result) {
+    return Ok(
+      StageResult(
+        stdout: result.stdout,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+      ),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _curlBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    // Byte path: piped binaries (`cat img | curl -d @-`) must not go
+    // through a UTF-8 decode (a FormatException there used to escape the
+    // Result contract and abort the pipeline - issue #337 review).
+    final stdinBytes = await _inputBytes(inputSource);
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).curl(stage.args, stdinBytes: stdinBytes, timeout: options?.timeout);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _jqBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).jq(stage.args, stdin: await _stdinFromSource(stage, inputSource));
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _yqBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).yq(stage.args, stdin: await _stdinFromSource(stage, inputSource));
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _treeBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).tree(stage.args);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _fileBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).file(stage.args);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _xzBuiltin(
+    Stage stage,
+    ShellExecOptions? options, {
+    required bool decompress,
+  }) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).xz(stage.args, decompress: decompress);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _bzip2Builtin(
+    Stage stage,
+    ShellExecOptions? options, {
+    required bool decompress,
+  }) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).bzip2(stage.args, decompress: decompress);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _diffBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final builtins = _sandboxBuiltins(_effectiveCwd(options));
+    // Only a `-` operand reads the piped/redirected input; plain
+    // `diff a b` ignores stdin like GNU diff.
+    final stdin = stage.args.contains('-') && inputSource != null
+        ? await builtins.readTextFile(inputSource)
+        : null;
+    final result = await builtins.diff(stage.args, stdin: stdin);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _patchBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final builtins = _sandboxBuiltins(_effectiveCwd(options));
+    final stdin = inputSource != null
+        ? await builtins.readTextFile(inputSource)
+        : null;
+    final result = await builtins.patch(stage.args, stdin: stdin);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _nslookupBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).nslookup(stage.args, timeout: options?.timeout);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _digBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).dig(stage.args, timeout: options?.timeout);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _whoisBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+      timeout: options?.timeout,
+    ).whois(stage.args, timeout: options?.timeout);
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _sshBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final result = await WasmSshCommands(this)
+        .builtinsFor(_effectiveCwd(options))
+        .ssh(
+          stage.args,
+          stdin: await _inputBytes(inputSource),
+          env: _effectiveEnv(options),
+          timeout: options?.timeout,
+        );
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _scpBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await WasmSshCommands(this)
+        .builtinsFor(_effectiveCwd(options))
+        .scp(
+          stage.args,
+          env: _effectiveEnv(options),
+          timeout: options?.timeout,
+        );
+    return _builtinOk(result);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _sftpBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final cwd = _effectiveCwd(options);
+    final result = await WasmSshCommands(this)
+        .builtinsFor(cwd)
+        .sftp(
+          stage.args,
+          stdin: await _inputBytes(inputSource),
+          env: _effectiveEnv(options),
+          cwd: cwd,
+          timeout: options?.timeout,
+        );
+    return _builtinOk(result);
+  }
+
+  /// Reads the piped/redirected input as raw bytes; [inputSource] is an
+  /// absolute sandbox path (pipe temp file).
+  Future<List<int>?> _inputBytes(String? inputSource) async {
+    if (inputSource == null) return null;
+    final file = _hostFile(_resolveSandboxPath(inputSource, _currentDir));
+    if (!await file.exists()) return null;
+    return file.readAsBytes();
+  }
+
+  /// Reads the piped/redirected input for jq/yq when no file argument is
+  /// given; [inputSource] is an absolute sandbox path (pipe temp file).
+  Future<String?> _stdinFromSource(Stage stage, String? inputSource) async {
+    // Builtins decide themselves whether a positional argument is an input
+    // file (`jq FILTER file`) or something else (`curl -d @-`); the piped
+    // stage input is always available to them.
+    if (inputSource == null) return null;
+    final file = _hostFile(_resolveSandboxPath(inputSource, _currentDir));
+    if (!await file.exists()) return null;
+    return file.readAsString();
+  }
+
+  Future<Result<StageResult, ExecutionError>> _whoamiBuiltin() async {
+    final user =
+        io.Platform.environment['USER'] ??
+        io.Platform.environment['USERNAME'] ??
+        'Fa';
+    return Ok(
+      StageResult(
+        stdout: utf8.encode('$user\n'),
+        stderr: const [],
+        exitCode: 0,
+      ),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _cdBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final target = stage.args.isEmpty ? '/' : stage.args.first;
+    final cwd = _effectiveCwd(options);
+    final resolved = _resolveSandboxPath(target, cwd);
+    try {
+      final dir = io.Directory(_hostPath(resolved));
+      if (!dir.existsSync()) {
+        return Ok(
+          StageResult(
+            stdout: const [],
+            stderr: utf8.encode('cd: $target: No such file or directory\n'),
+            exitCode: 1,
+          ),
+        );
+      }
+      _currentDir = resolved;
+      return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+    } on Object catch (e) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('cd: $target: $e\n'),
+          exitCode: 1,
+        ),
+      );
+    }
+  }
+
+  Future<Result<StageResult, ExecutionError>> _pwdBuiltin(
+    ShellExecOptions? options,
+  ) async {
+    final cwd = _effectiveCwd(options);
+    return Ok(
+      StageResult(stdout: utf8.encode('$cwd\n'), stderr: const [], exitCode: 0),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _exportBuiltin(
+    Stage stage,
+  ) async {
+    if (stage.args.isEmpty) {
+      return Ok(
+        StageResult(
+          stdout: utf8.encode(formatExportListings(_shellEnv)),
+          stderr: const [],
+          exitCode: 0,
+        ),
+      );
+    }
+    applyExportArgs(_shellEnv, stage.args);
+    return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+  }
+
+  Future<Result<StageResult, ExecutionError>> _wgetBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final result = await _sandboxBuiltins(
+      _effectiveCwd(options),
+    ).wget(stage.args, timeout: options?.timeout);
+    return _builtinOk(result);
+  }
+
+  /// Site-packages directory pip installs into and python imports from
+  /// (CPython WASI convention under the `/usr/local` prefix).
+  static const _pythonSitePackages = '/usr/local/lib/python3.14/site-packages';
+
+  /// Runs the pip-lite builtin: downloads pure-Python wheels from PyPI in
+  /// Dart and unzips them into [_pythonSitePackages] (see `sandbox_pip.dart`).
+  Future<Result<StageResult, ExecutionError>> _pipBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final host = sandboxHostPath;
+    if (host == null || host.isEmpty) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('pip: sandbox filesystem unavailable\n'),
+          exitCode: 1,
+        ),
+      );
+    }
+    final pip = SandboxPipBuiltins(
+      httpClient: _httpClient,
+      sitePackagesPath: _pythonSitePackages,
+      writeBinaryFile: _pipWriteBinary,
+      listDirectory: _pipListDirectory,
+      readTextFile: _pipReadTextFile,
+      removeFile: _pipRemoveFile,
+      removeDirectory: _pipRemoveDirectory,
+    );
+    return _builtinOk(await pip.run(stage.args, timeout: options?.timeout));
+  }
+
+  Future<void> _pipWriteBinary(String path, List<int> bytes) async {
+    final file = _hostFile(path);
+    await file.parent.create(recursive: true);
+    await file.writeAsBytes(bytes);
+  }
+
+  Future<List<SandboxDirEntry>?> _pipListDirectory(String path) async {
+    final dir = io.Directory(_hostPath(path));
+    if (!await dir.exists()) return null;
+    final entries = <SandboxDirEntry>[];
+    await for (final entity in dir.list(followLinks: false)) {
+      entries.add((
+        name: p.basename(entity.path),
+        isDirectory: entity is io.Directory,
+      ));
+    }
+    return entries;
+  }
+
+  Future<String?> _pipReadTextFile(String path) async {
+    final file = _hostFile(path);
+    if (!await file.exists()) return null;
+    return file.readAsString();
+  }
+
+  Future<void> _pipRemoveFile(String path) async {
+    final file = _hostFile(path);
+    if (await file.exists()) await file.delete();
+  }
+
+  Future<void> _pipRemoveDirectory(String path) async {
+    final dir = io.Directory(_hostPath(path));
+    if (await dir.exists()) await dir.delete(recursive: true);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _duBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final parsed = parseDuArgs(stage.args);
+    final cwd = _effectiveCwd(options);
+    final lines = <String>[];
+    for (final path in parsed.paths) {
+      final resolved = _resolveSandboxPath(path, cwd);
+      final host = _hostPath(resolved);
+      if (io.FileSystemEntity.typeSync(host) ==
+          io.FileSystemEntityType.notFound) {
+        return Ok(
+          StageResult(
+            stdout: const [],
+            stderr: utf8.encode('du: $path: No such file or directory\n'),
+            exitCode: 1,
+          ),
+        );
+      }
+      final bytes = await _duSize(host, recursive: !parsed.summarize);
+      lines.add('${formatDuSize(bytes, human: parsed.human)}\t$resolved');
+    }
+    return Ok(
+      StageResult(
+        stdout: utf8.encode('${lines.join('\n')}\n'),
+        stderr: const [],
+        exitCode: 0,
+      ),
+    );
+  }
+
+  Future<int> _duSize(String hostPath, {required bool recursive}) async {
+    final type = io.FileSystemEntity.typeSync(hostPath);
+    if (type == io.FileSystemEntityType.file) {
+      return io.File(hostPath).length();
+    }
+    if (type != io.FileSystemEntityType.directory) return 0;
+    if (!recursive) {
+      // Non-recursive du still counts the directory itself only.
+      return 4096;
+    }
+    var total = 0;
+    try {
+      await for (final entity in io.Directory(
+        hostPath,
+      ).list(recursive: true, followLinks: false)) {
+        if (entity is io.File) {
+          try {
+            total += await entity.length();
+          } on Object {
+            // Skip unreadable files.
+          }
+        }
+      }
+    } on Object {
+      // Skip unreadable directories.
+    }
+    return total;
+  }
+
+  Future<Result<StageResult, ExecutionError>> _tacBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    final cwd = _effectiveCwd(options);
+    final files = scanFlags(stage.args, const FlagSpec()).positional;
+    if (files.isEmpty && inputSource != null) files.add(inputSource);
+    if (files.isEmpty) {
+      return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+    }
+    final out = StringBuffer();
+    for (final file in files) {
+      final hostFile = io.File(_hostPath(_resolveSandboxPath(file, cwd)));
+      if (!hostFile.existsSync()) {
+        return Ok(
+          StageResult(
+            stdout: const [],
+            stderr: utf8.encode('tac: $file: No such file or directory\n'),
+            exitCode: 1,
+          ),
+        );
+      }
+      out.write(reverseLines(await hostFile.readAsString()));
+    }
+    return Ok(
+      StageResult(
+        stdout: utf8.encode(out.toString()),
+        stderr: const [],
+        exitCode: 0,
+      ),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _exprBuiltin(Stage stage) async {
+    try {
+      final value = _evalExpr(stage.args);
+      // GNU expr: exit status is 1 when the result is 0 or the empty string.
+      final exitCode = value == '0' || value.isEmpty ? 1 : 0;
+      return Ok(
+        StageResult(
+          stdout: utf8.encode('$value\n'),
+          stderr: const [],
+          exitCode: exitCode,
+        ),
+      );
+    } on FormatException catch (e) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('expr: ${e.message}\n'),
+          exitCode: 2,
+        ),
+      );
+    }
+  }
+
+  String _evalExpr(List<String> args) {
+    if (args.isEmpty) throw const FormatException('missing operand');
+    final stringFn = _evalStringFn(args);
+    if (stringFn != null) return stringFn;
+    return _ExprEvaluator(args).evaluate();
+  }
+
+  /// String functions handled before integer parsing: `length`, `substr`.
+  String? _evalStringFn(List<String> args) {
+    if (args[0] == 'length') {
+      if (args.length != 2) throw const FormatException('syntax error');
+      return '${args[1].length}';
+    }
+    if (args[0] == 'substr') return _evalSubstr(args);
+    return null;
+  }
+
+  /// POSIX `substr`: 1-based position and length, clamped to the string.
+  String _evalSubstr(List<String> args) {
+    if (args.length != 4) throw const FormatException('syntax error');
+    final str = args[1];
+    final pos = int.tryParse(args[2]);
+    final len = int.tryParse(args[3]);
+    if (pos == null || len == null) {
+      throw const FormatException('non-numeric argument');
+    }
+    final start = (pos - 1).clamp(0, str.length);
+    final end = (start + len).clamp(0, str.length);
+    return str.substring(start, end);
+  }
+
+  Future<Result<StageResult, ExecutionError>> _idBuiltin(Stage stage) async {
+    return Ok(
+      StageResult(
+        stdout: utf8.encode(idOutput(stage.args)),
+        stderr: const [],
+        exitCode: 0,
+      ),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _unsetBuiltin(Stage stage) async {
+    for (final arg in stage.args) {
+      _shellEnv.remove(arg);
+    }
+    return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+  }
+
+  Future<Result<StageResult, ExecutionError>> _relpathBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+  ) async {
+    final paths = nonFlagArgs(stage.args);
+    if (paths.isEmpty) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('relpath: missing operand\n'),
+          exitCode: 1,
+        ),
+      );
+    }
+    final cwd = _effectiveCwd(options);
+    final from = _resolveSandboxPath(paths[0], cwd);
+    final start = paths.length > 1 ? _resolveSandboxPath(paths[1], cwd) : cwd;
+    final relative = sandboxRelativePath(from, start);
+    return Ok(
+      StageResult(
+        stdout: utf8.encode('$relative\n'),
+        stderr: const [],
+        exitCode: 0,
+      ),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _trBuiltin(
+    Stage stage,
+    String? inputSource,
+  ) async {
+    if (inputSource == null) {
+      return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+    }
+    final file = _hostFile(inputSource);
+    if (!await file.exists()) {
+      return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+    }
+    final invocation = parseTrArgs(stage.args);
+    final error = validateTrInvocation(invocation);
+    if (error != null) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('$error\n'),
+          exitCode: 2,
+        ),
+      );
+    }
+    final output = applyTr(await file.readAsString(), invocation);
+    return Ok(
+      StageResult(stdout: utf8.encode(output), stderr: const [], exitCode: 0),
+    );
+  }
+
+  Future<Result<StageResult, ExecutionError>> _xargsBuiltin(
+    Stage stage,
+    ShellExecOptions? options,
+    String? inputSource,
+  ) async {
+    if (inputSource == null) {
+      return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+    }
+    final file = _hostFile(inputSource);
+    if (!await file.exists()) {
+      return Ok(const StageResult(stdout: [], stderr: [], exitCode: 0));
+    }
+    final plan = parseXargsArgs(stage.args);
+    if (plan.commandIndex >= stage.args.length) {
+      return Ok(
+        StageResult(
+          stdout: const [],
+          stderr: utf8.encode('xargs: missing command\n'),
+          exitCode: 1,
+        ),
+      );
+    }
+    final command = stage.args[plan.commandIndex];
+    final initialArgs = stage.args.sublist(plan.commandIndex + 1);
+    final invocations = xargsInvocations(
+      initialArgs,
+      await file.readAsLines(),
+      plan.placeholder,
+    );
+    final stdout = <int>[];
+    final stderr = <int>[];
+    var exitCode = 0;
+    for (final args in invocations) {
+      final result = await _runCommand(
+        command: command,
+        args: args,
+        options: options,
+        inputSource: null,
+        captureStdout: true,
+        captureStderr: true,
+      );
+      if (result.isErr) return result;
+      final data = result.valueOrNull!;
+      stdout.addAll(data.stdout);
+      stderr.addAll(data.stderr);
+      if (data.exitCode != 0) exitCode = data.exitCode;
+    }
+    return Ok(StageResult(stdout: stdout, stderr: stderr, exitCode: exitCode));
+  }
+}

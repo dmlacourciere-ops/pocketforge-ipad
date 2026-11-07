@@ -1,0 +1,515 @@
+// l10n:ignore-file — OAuth flow screens — en-only by design
+import 'dart:async';
+import 'dart:io' show Platform;
+
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/material.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_agent_harness/io.dart'
+    if (dart.library.html) 'package:fa/services/oauth_cli_flow_stubs.dart';
+import 'package:url_launcher/url_launcher.dart' as url_launcher;
+
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/services/last_connection.dart';
+import 'package:fa/services/provider_auth_surface.dart';
+import 'package:fa/ui/screens/chatgpt_oauth_webview.dart';
+import 'package:fa_ui/fa_ui.dart';
+
+/// Runs the full ChatGPT OAuth flow:
+///
+/// **macOS** — a local callback server (`ChatGptOAuthLocalCallbackServer`) is
+/// started, the system browser is opened so the user authenticates with their
+/// ChatGPT account, and the redirect to `http://127.0.0.1:<port>/auth/callback`
+/// is caught by the server. This mirrors the CLI flow.
+///
+/// **iOS** — the system auth session first (`ASWebAuthenticationSession`
+/// via the shared surface's `fah/web_auth_session` channel, issue #861):
+/// the flow binds the REAL loopback callback server (the CLI shape), the
+/// session sheet opens the authorize URL, and the final
+/// `http://localhost:<port>/auth/callback` redirect loads the server for
+/// real — Safari-grade context, so passkey prompts raised by the page
+/// (including the "Continue with Google" hop) reach Face ID. When the
+/// session cannot start (`sessionUnavailable`), the flow falls back to
+/// [ChatGptOAuthWebViewPage] (an embedded WebView — passkeys unavailable,
+/// stated up front by the page's notice) which intercepts the
+/// `http://localhost:1455/auth/callback` redirect and hands back the
+/// state-validated `code`; the token exchange runs in Dart either way.
+///
+/// Both hops funnel into the same shared tail: the credentials are saved as a
+/// custom provider with `providerKind: 'chatgpt-codex'` and the encoded
+/// credentials as the API key. The entry name comes from the OAuth account's
+/// email, so several ChatGPT accounts coexist as separate entries, each with
+/// its own entry-scoped key slot (the CLI contract).
+///
+/// Returns `true` when the flow completed and the service was reconfigured,
+/// `false` when the user cancelled.
+Future<bool> runChatGptOAuthFlow({
+  required BuildContext context,
+  required ProviderRegistry registry,
+  required AgentService? service,
+  required LastConnectionStore lastConnectionStore,
+  SessionKeysStore? sessionKeysStore,
+  KeychainStore? keychainStore,
+  Future<ChatGptOAuthCredentials?> Function()? chatGptOAuthFlowFn,
+  bool Function()? platformSupportedFn,
+
+  /// iOS hop seams (tests); production passes the defaults.
+  bool Function()? iosFn,
+  ChatGptCodeExchange? exchangeFn,
+  Future<String?> Function(BuildContext, Uri, String)? pushWebView,
+  ChatGptSystemAuthSession? systemSessionFn,
+}) async {
+  // Issue #586 (CodeMie): the caller's context can be disposed by a
+  // transcript rebuild mid-flow — anchor the flow on the ROOT navigator.
+  final flowContext = Navigator.of(context, rootNavigator: true).context;
+  final sessionKeys = sessionKeysStore ?? SessionKeysScope.maybeOf(flowContext);
+  final keychain = keychainStore ?? const KeychainStore();
+  final refusal = _unsupportedMessage(platformSupportedFn);
+  if (refusal != null) return _refuse(flowContext, refusal);
+
+  final credentials = await _acquireCredentials(
+    flowContext,
+    chatGptOAuthFlowFn: chatGptOAuthFlowFn,
+    iosFn: iosFn,
+    exchangeFn: exchangeFn,
+    pushWebView: pushWebView,
+    systemSessionFn: systemSessionFn,
+  );
+  if (credentials == null || !flowContext.mounted) return false;
+
+  final encoded = credentials.encode();
+  final provider = await _saveCredentials(
+    registry,
+    keychain,
+    sessionKeys,
+    credentials,
+    encoded,
+  );
+  await _connect(
+    service,
+    lastConnectionStore,
+    AgentConfig(
+      providerKind: 'chatgpt-codex',
+      modelId: provider.modelId,
+      baseUrl: chatGptCodexBaseUrl,
+      apiKey: encoded,
+    ),
+  );
+  return true;
+}
+
+const _webUnsupportedMessage =
+    'ChatGPT sign-in needs the desktop or mobile app '
+    '(a localhost callback server or the in-app sign-in browser). '
+    'Use OpenAI with an API key in the web build.';
+
+const _otherPlatformUnsupportedMessage =
+    'ChatGPT sign-in ships on macOS and iOS. '
+    'Use OpenAI with an API key on this platform.';
+
+/// Why ChatGPT sign-in cannot run on this surface, or null when it can:
+/// the web build has no OAuth browser surface, and the sign-in hop ships
+/// on macOS (local callback server) and iOS (in-app WebView interception)
+/// only.
+String? _unsupportedMessage(bool Function()? platformSupportedFn) {
+  if (kIsWeb) return _webUnsupportedMessage;
+  final supported =
+      platformSupportedFn?.call() ?? (Platform.isMacOS || Platform.isIOS);
+  if (supported) return null;
+  return _otherPlatformUnsupportedMessage;
+}
+
+/// The honest unsupported-surface snackbar; the flow always returns
+/// `false`.
+bool _refuse(BuildContext context, String message) {
+  if (context.mounted) {
+    showFahErrorSnack(context, message);
+  }
+  return false;
+}
+
+/// Runs the injected flow (tests) or the real per-surface hop — resolved
+/// through the shared platform matrix (`resolveProviderAuthSurface`,
+/// issue #861): iOS the system auth session with the in-app WebView as
+/// the fallback, everything else the CLI flow (local callback server +
+/// system browser).
+Future<ChatGptOAuthCredentials?> _acquireCredentials(
+  BuildContext context, {
+  Future<ChatGptOAuthCredentials?> Function()? chatGptOAuthFlowFn,
+  bool Function()? iosFn,
+  ChatGptCodeExchange? exchangeFn,
+  Future<String?> Function(BuildContext, Uri, String)? pushWebView,
+  ChatGptSystemAuthSession? systemSessionFn,
+}) async {
+  if (chatGptOAuthFlowFn != null) return chatGptOAuthFlowFn();
+  // iosFn overrides the platform wholesale (the test seam runs iOS hops
+  // on a macOS host) — the two must stay mutually exclusive.
+  final isIos = iosFn?.call() ?? Platform.isIOS;
+  final surface = resolveProviderAuthSurface(
+    provider: ProviderAuthId.chatgpt,
+    isMacOS: !isIos && Platform.isMacOS,
+    isIOS: isIos,
+    isWeb: kIsWeb,
+  );
+  return _acquireViaResolvedSurface(
+    context,
+    surface.primary,
+    exchangeFn: exchangeFn,
+    pushWebView: pushWebView,
+    systemSessionFn: systemSessionFn,
+  );
+}
+
+/// The hop for the resolved [kind]: the iOS system session (the WebView
+/// fallback lives inside it), the embedded WebView — unreachable today,
+/// the web build is refused before the matrix is consulted, but should a
+/// surface ever resolve here, run the same WebView hop whose notice
+/// keeps the degradation honest — and everything else the CLI flow.
+Future<ChatGptOAuthCredentials?> _acquireViaResolvedSurface(
+  BuildContext context,
+  ProviderAuthSurfaceKind kind, {
+  ChatGptCodeExchange? exchangeFn,
+  Future<String?> Function(BuildContext, Uri, String)? pushWebView,
+  ChatGptSystemAuthSession? systemSessionFn,
+}) async {
+  if (kind == ProviderAuthSurfaceKind.systemAuthSession) {
+    return _acquireViaSystemSession(
+      context,
+      exchangeFn: exchangeFn,
+      pushWebView: pushWebView,
+      systemSessionFn: systemSessionFn,
+    );
+  }
+  if (kind == ProviderAuthSurfaceKind.embeddedWebView) {
+    return _acquireViaEmbeddedWebView(
+      context,
+      pushWebView: pushWebView,
+      exchangeFn: exchangeFn,
+    );
+  }
+  showFahSnack(
+    context,
+    'Opening browser for ChatGPT sign-in…',
+    duration: const Duration(seconds: 3),
+  );
+  return runChatGptOAuthCliFlow(
+    onStatus: (msg) => debugPrint('[ChatGPT OAuth] $msg'),
+    // Desktop host: always launch — the CLI's headless auto-detect must
+    // not gate the flow here (gh-1450).
+    shouldOpenBrowserFn: () => true,
+    openBrowserFn: (url) async {
+      return url_launcher.launchUrl(
+        Uri.parse(url),
+        mode: url_launcher.LaunchMode.externalApplication,
+      );
+    },
+  );
+}
+
+/// The system-auth-session arm (gh-1848 split): a working session returns
+/// its credentials; a session that could not start degrades to the in-app
+/// WebView (no passkeys; the page's notice says so before it renders).
+Future<ChatGptOAuthCredentials?> _acquireViaSystemSession(
+  BuildContext context, {
+  ChatGptCodeExchange? exchangeFn,
+  Future<String?> Function(BuildContext, Uri, String)? pushWebView,
+  ChatGptSystemAuthSession? systemSessionFn,
+}) async {
+  final session = await (systemSessionFn ?? systemAuthSessionChatGptSignIn)(
+    exchangeFn: exchangeFn,
+    onExchangeError: (message) => _refuse(context, message),
+  );
+  if (!session.sessionUnavailable) return session.credentials;
+  if (!context.mounted) return null;
+  return _acquireIosCredentials(
+    context,
+    pushWebView: pushWebView ?? _pushChatGptOAuthWebView,
+    exchangeFn: exchangeFn,
+  );
+}
+
+/// The embedded-WebView arm (gh-1848 split): same hop, no session first.
+Future<ChatGptOAuthCredentials?> _acquireViaEmbeddedWebView(
+  BuildContext context, {
+  Future<String?> Function(BuildContext, Uri, String)? pushWebView,
+  ChatGptCodeExchange? exchangeFn,
+}) async {
+  if (!context.mounted) return null;
+  return _acquireIosCredentials(
+    context,
+    pushWebView: pushWebView ?? _pushChatGptOAuthWebView,
+    exchangeFn: exchangeFn,
+  );
+}
+
+/// The loopback redirect the iOS WebView intercepts. The port is never
+/// bound — the Codex OAuth client registers the loopback redirect with a
+/// variable port (standard for native clients), so the canonical codex
+/// port keeps the URL predictable.
+const _iosCallbackPort = 1455;
+
+/// The shape of [exchangeChatGptAuthorizationCode] without its test-only
+/// `client` parameter.
+typedef ChatGptCodeExchange =
+    Future<ChatGptOAuthCredentials> Function({
+      required String code,
+      required String redirectUri,
+      required String codeVerifier,
+    });
+
+/// The iOS system-auth-session hop (issue #861, the CodeMie pattern): the
+/// REAL loopback callback server is bound (the CLI redirect shape, AC4),
+/// the `fah/web_auth_session` sheet opens the authorize URL in a
+/// Safari-grade context (passkey prompts — including the Google hop —
+/// reach Face ID), and the final `http://localhost:<port>/auth/callback`
+/// redirect loads the server for real; the sheet is then dismissed via the
+/// channel's `cancel`. No `callbackScheme` interception — the code
+/// arrives through the local server, exactly like the desktop flow.
+///
+/// [onExchangeError] surfaces a failed token exchange (the caller shows
+/// the named snackbar). Returns the exchanged credentials, or a record
+/// with [sessionUnavailable] set when the session could not even start
+/// (the caller falls back to the in-app WebView). Null credentials with
+/// `sessionUnavailable == false` means the user cancelled, the callback
+/// was invalid, or the exchange failed.
+Future<({ChatGptOAuthCredentials? credentials, bool sessionUnavailable})>
+systemAuthSessionChatGptSignIn({
+  ChatGptCodeExchange? exchangeFn,
+  void Function(String message)? onExchangeError,
+}) async {
+  final server = ChatGptOAuthLocalCallbackServer();
+  final String redirectUri;
+  try {
+    redirectUri = await server.start();
+  } on Object catch (error) {
+    debugPrint('[ChatGPT OAuth] loopback callback server failed: $error');
+    return (credentials: null, sessionUnavailable: true);
+  }
+  final verifier = generateChatGptPkceVerifier();
+  final state = generateChatGptState();
+  final authorizeUrl = buildChatGptAuthorizeUrl(
+    redirectUri: redirectUri,
+    codeChallenge: generateChatGptPkceChallenge(verifier),
+    state: state,
+  );
+  var sessionFailed = false;
+  unawaited(
+    systemAuthSessionChannel
+        .invokeMethod<String>('authenticate', {'url': authorizeUrl.toString()})
+        .then((_) => server.close()) // user dismissed the sheet
+        .onError((Object error, _) {
+          debugPrint('[ChatGPT OAuth] auth session failed: $error');
+          sessionFailed = true;
+          return server.close();
+        }),
+  );
+  final callback = await server.waitForCallback();
+  // Dismiss the sheet (it stays up — the http redirect cannot close it).
+  unawaited(
+    systemAuthSessionChannel
+        .invokeMethod<void>('cancel')
+        .onError((_, _) => null),
+  );
+  if (sessionFailed) {
+    return (credentials: null, sessionUnavailable: true);
+  }
+  if (callback == null || callback.error != null) {
+    return (credentials: null, sessionUnavailable: false); // cancelled/failed
+  }
+  if (callback.state != state ||
+      callback.code == null ||
+      callback.code!.isEmpty) {
+    return (credentials: null, sessionUnavailable: false);
+  }
+  try {
+    return (
+      credentials: await (exchangeFn ?? exchangeChatGptAuthorizationCode)(
+        code: callback.code!,
+        redirectUri: redirectUri,
+        codeVerifier: verifier,
+      ),
+      sessionUnavailable: false,
+    );
+  } on Object catch (error) {
+    onExchangeError?.call(
+      'ChatGPT sign-in failed at the token exchange: $error',
+    );
+    return (credentials: null, sessionUnavailable: false);
+  }
+}
+
+/// The shape of [systemAuthSessionChatGptSignIn] — the flow's injectable
+/// seam for it (tests; production passes the default).
+typedef ChatGptSystemAuthSession =
+    Future<({ChatGptOAuthCredentials? credentials, bool sessionUnavailable})>
+    Function({
+      ChatGptCodeExchange? exchangeFn,
+      void Function(String message)? onExchangeError,
+    });
+
+/// The iOS WebView fallback acquisition hop (issue #773): assemble the
+/// PKCE authorize URL from the harness functions only, let
+/// [ChatGptOAuthWebViewPage] intercept the loopback redirect (no port
+/// bound), then exchange the code in Dart. A cancellation returns null
+/// with no partial state; an exchange failure surfaces a named error and
+/// the flow re-arms on the next run (every run generates a fresh state +
+/// verifier).
+Future<ChatGptOAuthCredentials?> _acquireIosCredentials(
+  BuildContext context, {
+  required Future<String?> Function(BuildContext, Uri, String) pushWebView,
+  ChatGptCodeExchange? exchangeFn,
+}) async {
+  final redirectUri = 'http://localhost:$_iosCallbackPort/auth/callback';
+  final verifier = generateChatGptPkceVerifier();
+  final state = generateChatGptState();
+  final code = await pushWebView(
+    context,
+    buildChatGptAuthorizeUrl(
+      redirectUri: redirectUri,
+      codeChallenge: generateChatGptPkceChallenge(verifier),
+      state: state,
+    ),
+    state,
+  );
+  if (code == null) return null; // user cancelled / timed out
+  try {
+    return await (exchangeFn ?? exchangeChatGptAuthorizationCode)(
+      code: code,
+      redirectUri: redirectUri,
+      codeVerifier: verifier,
+    );
+  } on Object catch (error) {
+    if (context.mounted) {
+      _refuse(context, 'ChatGPT sign-in failed at the token exchange: $error');
+    }
+    return null;
+  }
+}
+
+/// The production WebView hop: pushes [ChatGptOAuthWebViewPage], which pops
+/// with the intercepted authorization code (null on cancel/timeout).
+Future<String?> _pushChatGptOAuthWebView(
+  BuildContext context,
+  Uri authorizeUrl,
+  String expectedState,
+) => Navigator.of(context).push<String?>(
+  MaterialPageRoute(
+    builder: (_) => ChatGptOAuthWebViewPage(
+      authorizeUrl: authorizeUrl.toString(),
+      expectedState: expectedState,
+    ),
+  ),
+);
+
+/// Reuses the signed-in account's entry (re-auth refreshes it in place)
+/// or adds a de-duplicated one, remembers the session key, and persists
+/// the entry-scoped secure copy.
+Future<CustomProvider> _saveCredentials(
+  ProviderRegistry registry,
+  KeychainStore keychain,
+  SessionKeysStore? sessionKeys,
+  ChatGptOAuthCredentials credentials,
+  String encoded,
+) async {
+  // The entry name IS the signed-in account's email. Re-auth: an entry
+  // for THIS account (email + endpoint) already exists — keep its name so
+  // the flow refreshes it in place. Without an email claim the account
+  // identity is unknown — a name match is never treated as re-auth.
+  // Otherwise a new account gets a de-duplicated name (-2…), so two
+  // accounts never share one entry.
+  final email = jwtEmailClaim(credentials.idToken);
+  final identity = email ?? 'ChatGPT';
+  final provider =
+      _existingEntry(registry, email, identity) ??
+      await registry.add(
+        name: _uniqueEntryName(registry, identity),
+        baseUrl: chatGptCodexBaseUrl,
+        // The bundled Codex default — the same entry codex-rs surfaces as
+        // recommended (chatGptCodexDefaultModel is derived, not const).
+        modelId: chatGptCodexDefaultModel,
+        // Persist the provider identity: the model-list dispatch rides the
+        // codex wire for this entry even after its URL is edited/proxied.
+        kind: chatgptCodexDispatchHint,
+      );
+
+  // Session key for the running app (Keychain-backed when available).
+  registry.rememberKey(provider.id, encoded);
+  await _persistEntryKey(
+    keychain,
+    sessionKeys,
+    chatgptEntryKeyName(provider.name),
+    encoded,
+  );
+  return provider;
+}
+
+/// The registry entry for THIS account (email + endpoint). Without an
+/// email claim the account identity is unknown — a name match is never
+/// treated as re-auth.
+CustomProvider? _existingEntry(
+  ProviderRegistry registry,
+  String? email,
+  String identity,
+) => email == null
+    ? null
+    : registry.providers
+          .where((p) => p.name == identity && p.baseUrl == chatGptCodexBaseUrl)
+          .firstOrNull;
+
+/// A name no other ChatGPT entry uses (`-2`, `-3`, … suffixes), so two
+/// accounts never share one entry.
+String _uniqueEntryName(ProviderRegistry registry, String identity) {
+  var name = identity;
+  var suffix = 2;
+  while (registry.providers.any(
+    (p) => p.name == name && p.baseUrl == chatGptCodexBaseUrl,
+  )) {
+    name = '$identity-${suffix++}';
+  }
+  return name;
+}
+
+/// Keychain first (the entry-scoped CLI contract); the saved-keys store
+/// as the portable fallback.
+Future<void> _persistEntryKey(
+  KeychainStore keychain,
+  SessionKeysStore? sessionKeys,
+  String keyName,
+  String encoded,
+) async {
+  var persisted = false;
+  if (await keychain.isAvailable()) {
+    persisted = await keychain.set(keyName, encoded);
+  }
+  if (!persisted) {
+    await sessionKeys?.set(keyName, encoded);
+  }
+}
+
+/// Hands the restored credentials to the running service (when there is
+/// one) and persists the last connection.
+Future<void> _connect(
+  AgentService? service,
+  LastConnectionStore lastConnectionStore,
+  AgentConfig config,
+) async {
+  if (service != null) await service.reconfigure(config);
+  await lastConnectionStore.saveFromConfig(config);
+}
+
+/// Secure-store name of a ChatGPT entry's OAuth credentials blob:
+/// `FA_KEY_CHATGPT_COM_<SANITIZED_ENTRY_NAME>`. Byte-identical with the
+/// CLI's `CustomProviderRegistry.keyNameFor(chatGptCodexBaseUrl,
+/// providerName: entryName)` (same sanitizer: uppercase, `[^A-Z0-9]+` →
+/// `_`, trim edge underscores) so both surfaces read the same Keychain
+/// entry and a refresh-token rotation stays inside the account's slot.
+String chatgptEntryKeyName(String entryName) {
+  const host = 'CHATGPT_COM'; // chatgpt.com, from chatGptCodexBaseUrl
+  final sanitized = entryName
+      .toUpperCase()
+      .replaceAll(RegExp(r'[^A-Z0-9]+'), '_')
+      .replaceAll(RegExp(r'^_+|_+$'), '');
+  return sanitized.isEmpty || sanitized == host
+      ? 'FA_KEY_$host'
+      : 'FA_KEY_${host}_$sanitized';
+}

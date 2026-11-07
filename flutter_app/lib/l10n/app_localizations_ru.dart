@@ -1,0 +1,2781 @@
+// ignore: unused_import
+import 'package:intl/intl.dart' as intl;
+import 'app_localizations.dart';
+
+// ignore_for_file: type=lint
+
+/// The translations for Russian (`ru`).
+class AppLocalizationsRu extends AppLocalizations {
+  AppLocalizationsRu([String locale = 'ru']) : super(locale);
+
+  @override
+  String get appTitle => 'Fa';
+
+  @override
+  String get approvalAllowOnce => 'Разрешить один раз';
+
+  @override
+  String approvalAllowToolTitle(Object tool) {
+    return 'Разрешить $tool?';
+  }
+
+  @override
+  String get approvalAlwaysAllow => 'Всегда разрешать';
+
+  @override
+  String get approvalDeny => 'Запретить';
+
+  @override
+  String get attachedEmpty => 'Сообщений пока нет — напишите ниже';
+
+  @override
+  String get attachedToCli => 'подключено к fa cli';
+
+  @override
+  String get sendToCli => 'Сообщение в сессию fa cli…';
+
+  @override
+  String get sessionFolderPersonal => 'Личное';
+
+  @override
+  String get sessionInfoNameLabel => 'Имя сессии';
+
+  @override
+  String get newSessionFolderTitle => 'Новая сессия — папка';
+
+  @override
+  String newSessionCurrentFolder(Object folder) {
+    return 'Текущая папка ($folder)';
+  }
+
+  @override
+  String get approvalModeAlwaysAsk => 'Всегда спрашивать';
+
+  @override
+  String get approvalModeAlwaysAskHint =>
+      'Каждый вызов инструмента требует разрешения.';
+
+  @override
+  String get approvalModeTitle => 'Разрешения инструментов';
+
+  @override
+  String get approvalModeWrite => 'Запись';
+
+  @override
+  String get approvalModeWriteHint =>
+      'Чтение файлов выполняется свободно; запись, правки и команды оболочки требуют разрешения.';
+
+  @override
+  String get approvalModeYolo => 'YOLO';
+
+  @override
+  String get approvalModeYoloHint =>
+      'Все инструменты запускаются без запроса (разрушительные команды оболочки всё равно спрашивают).';
+
+  @override
+  String approvalTierLabel(Object tier) {
+    return 'Уровень: $tier';
+  }
+
+  @override
+  String appsAskFaAbout(Object name) {
+    return 'Спросить Fa о $name';
+  }
+
+  @override
+  String get appsAskFaHint => 'например: сделай кнопки больше и фиолетовыми';
+
+  @override
+  String get appsAskFaSubtitle =>
+      'Fa получит ваше сообщение, состояние приложения и скриншот.';
+
+  @override
+  String get appsAskFaTooltip => 'Спросить Fa об этом приложении';
+
+  @override
+  String get appsChatEmptyHint =>
+      'Пока пусто — спросите Fa об этом приложении.';
+
+  @override
+  String get appsCollapseChatTooltip => 'Свернуть чат';
+
+  @override
+  String get appsDismissReplyTooltip => 'Скрыть';
+
+  @override
+  String get appsEmptyState =>
+      'Пока нет приложений. Попросите Fa создать одно —\nоно появится в папке apps/.';
+
+  @override
+  String get appsFaStatusThinking => 'думает…';
+
+  @override
+  String get appsFaStatusWorking => 'Fa работает…';
+
+  @override
+  String get appsFaStatusWriting => 'пишет…';
+
+  @override
+  String get appsFollowUpHint => 'Уточнить…';
+
+  @override
+  String get appsGridTitle => 'Приложения';
+
+  @override
+  String get appsHideAppsTooltip => 'Скрыть приложения';
+
+  @override
+  String appsLoadError(Object error) {
+    return 'Не удалось загрузить приложения: $error';
+  }
+
+  @override
+  String widgetsCatalogInstallFailed(Object error) {
+    return 'Не удалось установить: $error';
+  }
+
+  @override
+  String get widgetsCatalogNotInstalled => 'Виджет ещё не установлен.';
+
+  @override
+  String get widgetsCatalogOffline =>
+      'Офлайн — показан последний известный каталог.';
+
+  @override
+  String widgetsCatalogLoadFailed(Object error) {
+    return 'Не удалось загрузить каталог виджетов.\n$error';
+  }
+
+  @override
+  String get widgetsCatalogFilterAll => 'Все';
+
+  @override
+  String get widgetsCatalogRetry => 'Повторить';
+
+  @override
+  String get appsOpenChatTooltip => 'Открыть чат';
+
+  @override
+  String get appsOpenFullChatTooltip => 'Открыть полный чат';
+
+  @override
+  String get appsOpenTrajectoryTooltip => 'Открыть траекторию';
+
+  @override
+  String get appsPermissionCalendar => 'Календарь';
+
+  @override
+  String get appsPermissionCalendarDesc =>
+      'jsr.fa.calendar — чтение событий системного календаря';
+
+  @override
+  String get appsPermissionContacts => 'Контакты';
+
+  @override
+  String get appsPermissionContactsDesc =>
+      'jsr.fa.contacts — адресная книга (скоро)';
+
+  @override
+  String get appsPermissionHealth => 'Здоровье';
+
+  @override
+  String get appsPermissionHealthDesc =>
+      'jsr.fa.health — данные о здоровье (скоро)';
+
+  @override
+  String get appsPermissionHomekit => 'HomeKit';
+
+  @override
+  String get appsPermissionHomekitDesc =>
+      'jsr.fa.homekit — устройства умного дома (скоро)';
+
+  @override
+  String get appsPermissionKeys => 'Ключи хоста';
+
+  @override
+  String get appsPermissionKeysDesc =>
+      'jsr.fa.keys — доступ к API-ключам, сохранённым в Fa, и запрос новых';
+
+  @override
+  String get appsPermissionTheme => 'Темы оформления';
+
+  @override
+  String get appsPermissionThemeDesc =>
+      'jsr.fa.theme — список тем и применение (каждый запрос подтверждается пользователем)';
+
+  @override
+  String get appsPermissionLlm => 'LLM';
+
+  @override
+  String get appsPermissionLlmDesc =>
+      'jsr.fa.llm — разрешить приложению обращаться к подключённой модели';
+
+  @override
+  String get appsPermissionMedia => 'Медиа';
+
+  @override
+  String get appsPermissionMediaDesc =>
+      'jsr.fa.media — генерация изображений, речи и музыки';
+
+  @override
+  String get appsPermissionMicrophone => 'Микрофон';
+
+  @override
+  String get appsPermissionMicrophoneDesc =>
+      'jsr.fa.asr — запись аудио и распознавание речи';
+
+  @override
+  String get appsPermissionNetwork => 'Сеть';
+
+  @override
+  String get appsPermissionNetworkDesc =>
+      'jsr.fetchJson — разрешить приложению вызывать HTTP API';
+
+  @override
+  String get appsPermissionNotifications => 'Уведомления';
+
+  @override
+  String get appsPermissionNotificationsDesc =>
+      'jsr.fa.notify — локальные уведомления';
+
+  @override
+  String get appsPermissionsDone => 'Готово';
+
+  @override
+  String appsPermissionsTitle(Object name) {
+    return 'Разрешения $name';
+  }
+
+  @override
+  String get appsPermissionsTooltip => 'Разрешения приложения';
+
+  @override
+  String get appsCloseTooltip => 'Закрыть приложение';
+
+  @override
+  String get appsRefreshTooltip => 'Обновить';
+
+  @override
+  String get appsReloadTooltip => 'Перезагрузить приложение';
+
+  @override
+  String get appsSendToFa => 'Отправить Fa';
+
+  @override
+  String get appsSendTooltip => 'Отправить';
+
+  @override
+  String get appsShowAppsTooltip => 'Показать приложения';
+
+  @override
+  String appsStartError(Object error, Object name) {
+    return 'Не удалось запустить $name:\n$error';
+  }
+
+  @override
+  String get appsStopTooltip => 'Остановить';
+
+  @override
+  String get askAnswerAction => 'Ответить';
+
+  @override
+  String get askBack => 'Назад';
+
+  @override
+  String get askCancel => 'Отмена';
+
+  @override
+  String get askNext => 'Далее';
+
+  @override
+  String get askOtherLabel => 'Другое (введите свой вариант)';
+
+  @override
+  String askQuestionProgress(Object index, Object total) {
+    return 'Вопрос $index из $total';
+  }
+
+  @override
+  String get askQuestionTitle => 'Вопрос';
+
+  @override
+  String get askRecommended => 'Рекомендуется';
+
+  @override
+  String get askYourAnswerLabel => 'Ваш ответ';
+
+  @override
+  String get cacheBrowserSubtitle =>
+      'Веса on-device моделей хранятся в кэше браузера. Удаление освобождает место; модель скачается снова при следующем использовании.';
+
+  @override
+  String cacheDeleteTitle(Object name) {
+    return 'Удалить $name?';
+  }
+
+  @override
+  String cacheDeleteTooltip(Object name) {
+    return 'Удалить $name';
+  }
+
+  @override
+  String cacheDeleteWeightsBrowser(Object size) {
+    return 'Удаляет скачанные веса ($size) из кэша браузера. Модель скачается снова при следующем использовании.';
+  }
+
+  @override
+  String cacheEntryCached(Object bytes, Object size) {
+    return '$size · в кэше $bytes';
+  }
+
+  @override
+  String get cacheNoModels => 'Модели ещё не загружены.';
+
+  @override
+  String cacheNoticeDeleteFailed(Object error, Object name) {
+    return 'Не удалось удалить $name: $error';
+  }
+
+  @override
+  String cacheNoticeDeleted(Object name) {
+    return '$name удалена.';
+  }
+
+  @override
+  String cacheNoticeLoadedModel(Object name) {
+    return '$name была загружена — она скачается снова при следующем использовании.';
+  }
+
+  @override
+  String get chatAbortTooltip => 'Прервать';
+
+  @override
+  String chatAttachError(Object error, Object name) {
+    return 'Не удалось прикрепить $name: $error';
+  }
+
+  @override
+  String get chatAttachFile => 'Прикрепить файл';
+
+  @override
+  String chatAttachNoName(Object name) {
+    return 'Не удалось прикрепить «$name»: нет подходящего имени файла.';
+  }
+
+  @override
+  String get chatAttachTooltip => 'Прикрепить';
+
+  @override
+  String get chatCamera => 'Камера';
+
+  @override
+  String get chatCollapse => 'Свернуть';
+
+  @override
+  String get chatCopiedToClipboard => 'Сессия скопирована в буфер обмена';
+
+  @override
+  String get chatCopySessionTooltip => 'Копировать сессию';
+
+  @override
+  String get chatFilesTooltip => 'Файлы';
+
+  @override
+  String get chatGallery => 'Галерея';
+
+  @override
+  String get chatInputHint => 'Введите сообщение';
+
+  @override
+  String get chatMicDenied =>
+      'Доступ к микрофону запрещён. Разрешите его в системных настройках конфиденциальности (Конфиденциальность и безопасность → Микрофон) и попробуйте снова.';
+
+  @override
+  String chatMicError(Object error) {
+    return 'Ошибка голосового ввода: $error';
+  }
+
+  @override
+  String get chatMicStopTooltip => 'Остановить запись';
+
+  @override
+  String get chatMicTooltip => 'Голосовой ввод';
+
+  @override
+  String get chatModelSwitchTooltip => 'Сменить модель';
+
+  @override
+  String get chatRemoveAttachment => 'Удалить вложение';
+
+  @override
+  String chatSendError(Object error) {
+    return 'Не удалось отправить: $error';
+  }
+
+  @override
+  String get chatSendTooltip => 'Отправить';
+
+  @override
+  String get chatSessionsTooltip => 'Сессии и модель';
+
+  @override
+  String get chatSettingsTooltip => 'Настройки подключения';
+
+  @override
+  String chatShowAll(Object count) {
+    return 'Показать все ($count)';
+  }
+
+  @override
+  String chatUploadFailed(Object error) {
+    return 'Ошибка загрузки: $error';
+  }
+
+  @override
+  String get commonCancel => 'Отмена';
+
+  @override
+  String get commonDelete => 'Удалить';
+
+  @override
+  String get filePreviewCannotRead => 'Не удалось прочитать файл';
+
+  @override
+  String get filePreviewCannotStat => 'Не удалось получить сведения о файле';
+
+  @override
+  String get filePreviewDecodeError => 'Не удалось декодировать изображение';
+
+  @override
+  String get filePreviewLoadError => 'Не удалось загрузить файл';
+
+  @override
+  String get filePreviewNoPreview => 'Предпросмотр недоступен';
+
+  @override
+  String get filePreviewEdit => 'Изменить';
+
+  @override
+  String get filePreviewSave => 'Сохранить';
+
+  @override
+  String get filePreviewSaved => 'Сохранено';
+
+  @override
+  String get filePreviewSaveError => 'Ошибка сохранения';
+
+  @override
+  String get filePreviewTabPreview => 'Просмотр';
+
+  @override
+  String get filePreviewTabSource => 'Исходный код';
+
+  @override
+  String get filePreviewTooLarge => 'Файл слишком большой для предпросмотра';
+
+  @override
+  String filePreviewTruncated(Object size) {
+    return 'Показаны первые $size — вывод обрезан';
+  }
+
+  @override
+  String get filesBackTooltip => 'Назад к файлам';
+
+  @override
+  String get filesEmptyFileName => '(пустое имя файла)';
+
+  @override
+  String get filesEmptyFolder => 'Пустая папка';
+
+  @override
+  String get filesFolderAccessDenied =>
+      'Не удалось получить доступ к этой папке.';
+
+  @override
+  String filesFolderPickerError(Object error) {
+    return 'Не удалось открыть выбор папки: $error';
+  }
+
+  @override
+  String filesICloudSyncDone(Object files, Object size, Object when) {
+    return 'Синхронизировано файлов: $files ($size) — последняя синхронизация $when';
+  }
+
+  @override
+  String filesICloudSyncFailed(Object error) {
+    return 'Ошибка синхронизации iCloud: $error';
+  }
+
+  @override
+  String get filesICloudSyncTooltip =>
+      'Синхронизировать сессии и приложения с iCloud';
+
+  @override
+  String get filesICloudSyncUnavailable =>
+      'Синхронизация iCloud недоступна — включите iCloud Drive для Fa в Настройки → Apple ID → iCloud';
+
+  @override
+  String get filesListFolderError => 'Не удалось прочитать содержимое папки';
+
+  @override
+  String filesMountUnavailableTooltip(Object path) {
+    return 'Ранее использованная папка недоступна: $path — нажмите, чтобы выбрать снова';
+  }
+
+  @override
+  String get filesOpenFolderError => 'Не удалось открыть папку';
+
+  @override
+  String get filesOpenProjectFolderTooltip => 'Открыть папку проекта…';
+
+  @override
+  String get filesPanelTitle => 'Файлы';
+
+  @override
+  String get filesRefreshTooltip => 'Обновить';
+
+  @override
+  String get filesRetryButton => 'Повторить';
+
+  @override
+  String filesUnmountTooltip(Object path) {
+    return 'Отключить $path';
+  }
+
+  @override
+  String get filesUpTooltip => 'Вверх';
+
+  @override
+  String filesUploadFailed(Object error) {
+    return 'Ошибка загрузки: $error';
+  }
+
+  @override
+  String filesUploadFailures(Object count, Object names) {
+    return ', не удалось ($count): $names';
+  }
+
+  @override
+  String filesUploadSummary(Object failures, num uploaded) {
+    String _temp0 = intl.Intl.pluralLogic(
+      uploaded,
+      locale: localeName,
+      other: 'Загружено $uploaded файла',
+      many: 'Загружено $uploaded файлов',
+      few: 'Загружено $uploaded файла',
+      one: 'Загружен $uploaded файл',
+    );
+    return '$_temp0$failures';
+  }
+
+  @override
+  String get filesUploadTooltip => 'Загрузить файлы сюда';
+
+  @override
+  String get keysAddButton => 'Добавить ключ';
+
+  @override
+  String get keysAddDialogTitle => 'Добавить ключ';
+
+  @override
+  String get keysAddNameDuplicate => 'Ключ с таким именем уже существует.';
+
+  @override
+  String get keysAddNameHint => 'GITHUB_TOKEN';
+
+  @override
+  String get keysAddNameInvalid =>
+      'Используйте A–Z, 0–9 и подчёркивания, начиная с буквы.';
+
+  @override
+  String get keysAddNameLabel => 'Имя';
+
+  @override
+  String get keysDeleteBody =>
+      'Сохранённое значение удаляется с этого устройства. Значение из файла .env, если оно есть, снова вступит в силу.';
+
+  @override
+  String keysDeleteTitle(Object name) {
+    return 'Удалить $name?';
+  }
+
+  @override
+  String get keysSectionNote =>
+      'Значения никогда не показываются. Сохранённые ключи хранятся на этом устройстве; сессионные исчезают после перезагрузки.';
+
+  @override
+  String get keysSectionTitle => 'Ключи';
+
+  @override
+  String get keysSetButton => 'Задать';
+
+  @override
+  String keysSetDialogTitle(Object name) {
+    return 'Задать $name';
+  }
+
+  @override
+  String get keysSourceEnv => 'файл .env';
+
+  @override
+  String get keysSourceNone => 'не задан';
+
+  @override
+  String get keysSourceProviderSession => 'ключ провайдера · эта сессия';
+
+  @override
+  String get keysSourceSaved => 'сохранён';
+
+  @override
+  String get keysValueHint => 'Вставьте значение ключа';
+
+  @override
+  String get keysValueLabel => 'Значение';
+
+  @override
+  String get launcherChatActionsTooltip => 'Действия чата';
+
+  @override
+  String get faEntryHintTooltip =>
+      'Касание: продолжить активный чат · Долгое нажатие: новый чат';
+
+  @override
+  String get launcherChatEmptyHint => 'Пока пусто — спросите Fa о чём угодно.';
+
+  @override
+  String get launcherDissolveFolder => 'Убрать папку';
+
+  @override
+  String get launcherFolderDefaultName => 'Папка';
+
+  @override
+  String get launcherFolderNameHint => 'Название папки';
+
+  @override
+  String get launcherOpenApp => 'Открыть';
+
+  @override
+  String launcherOpenAppError(Object error) {
+    return 'Не удалось открыть приложение: $error';
+  }
+
+  @override
+  String get launcherRenameFolderTooltip => 'Переименовать папку';
+
+  @override
+  String get launcherRestoreDemoApp => 'Восстановить эталонную версию';
+
+  @override
+  String get launcherRestoreDemoAppDone =>
+      'Код приложения восстановлен (данные сохранены)';
+
+  @override
+  String get launcherRemoveWidget => 'Удалить виджет';
+
+  @override
+  String launcherRemoveWidgetTitle(String name) {
+    return 'Удалить $name?';
+  }
+
+  @override
+  String get launcherRemoveWidgetBody =>
+      'Файлы виджета удаляются; его данные (storage.json) сохраняются — при повторной установке состояние восстановится.';
+
+  @override
+  String get launcherSearchHint => 'Поиск виджетов…';
+
+  @override
+  String get launcherTabWidgets => 'Виджеты';
+
+  @override
+  String get launcherLoadUnpacked => 'Загрузить папку';
+
+  @override
+  String get unpackedLoadTitle => 'Загрузить распакованный виджет';
+
+  @override
+  String unpackedLoadIdLine(Object id) {
+    return 'id: $id';
+  }
+
+  @override
+  String get unpackedLoadNetworkNote =>
+      'Виджет объявляет доступ к сети — он может выполнять запросы из сети (jsr.fetchJson).';
+
+  @override
+  String unpackedLoadCommandsNote(Object commands) {
+    return 'Команды оболочки, которые он может запускать (jsr.exec): $commands';
+  }
+
+  @override
+  String unpackedLoadReplaceNote(Object source, Object version) {
+    return 'Виджет с таким id уже существует ($source, v$version). Замена перезапишет его код; данные (storage.json) сохранятся.';
+  }
+
+  @override
+  String get unpackedLoadConfirm => 'Загрузить';
+
+  @override
+  String get unpackedLoadReplaceConfirm => 'Заменить';
+
+  @override
+  String get unpackedLoadErrorTitle => 'Виджет не загружен';
+
+  @override
+  String unpackedLoadDone(Object name) {
+    return '$name загружен из папки';
+  }
+
+  @override
+  String unpackedLoadFailed(Object error) {
+    return 'Не удалось загрузить: $error';
+  }
+
+  @override
+  String get unpackedSourceChip => 'распакован';
+
+  @override
+  String get unpackedSourceBadgeTooltip =>
+      'Загружен из локальной папки (распакованный)';
+
+  @override
+  String get unpackedSourceCatalog => 'установлен из каталога';
+
+  @override
+  String get unpackedSourceUnpacked => 'загружен из локальной папки';
+
+  @override
+  String get unpackedSourceAgent => 'создан агентом';
+
+  @override
+  String unpackedSourceUnknown(Object source) {
+    return 'установлен из неизвестного источника ($source)';
+  }
+
+  @override
+  String get settingsResetApps => 'Сбросить приложения';
+
+  @override
+  String get settingsResetAppsHint =>
+      'Вернуть приложения-виджеты к изначальному состоянию';
+
+  @override
+  String get settingsResetAppsConfirmTitle => 'Сбросить все приложения?';
+
+  @override
+  String get settingsResetAppsConfirmBody =>
+      'Будут удалены ВСЕ виджеты, которые вы скачали из каталога или создали, вместе со ВСЕМИ их данными (сохранённое состояние, настройки, хранилище). Сетка приложений станет пустой — скачать заново можно во вкладке Get widgets. Действие необратимо.';
+
+  @override
+  String settingsResetAppsDone(int count) {
+    return 'Приложения сброшены — удалено виджетов: $count';
+  }
+
+  @override
+  String get appsCatalogCreatedByMe => 'Создано мной';
+
+  @override
+  String get commonError => 'Что-то пошло не так';
+
+  @override
+  String get launcherTabGetWidgets => 'Каталог виджетов';
+
+  @override
+  String get launcherRestoreDemoAppFailed =>
+      'Не удалось восстановить приложение';
+
+  @override
+  String get launcherSeedErrorCopy => 'Скопировать ошибку';
+
+  @override
+  String get launcherSeedErrorHint =>
+      'Отправьте эту ошибку Fa — он сможет починить приложение.';
+
+  @override
+  String get launcherSeedErrorTitle => 'Приложение не установилось';
+
+  @override
+  String get launcherManifestErrorTitle => 'Не удалось загрузить приложение';
+
+  @override
+  String get appsManifestErrorLabel => 'Ошибка манифеста';
+
+  @override
+  String get launcherTileSizeIcon => 'Иконка (1×1)';
+
+  @override
+  String get launcherTileSizeLarge => 'Большой (4×4)';
+
+  @override
+  String get launcherTileSizeMedium => 'Средний (4×2)';
+
+  @override
+  String get launcherTileSizeReset => 'По умолчанию';
+
+  @override
+  String get launcherTileSizeSmall => 'Маленький (2×2)';
+
+  @override
+  String get launcherTileSizeTall => 'Высокий (1×2)';
+
+  @override
+  String get launcherTileSizeWide => 'Широкий (2×1)';
+
+  @override
+  String get launcherTileSizeColumn => 'Столбик (1×3)';
+
+  @override
+  String get launcherTileSizeRow => 'Строка (3×1)';
+
+  @override
+  String get mediaFileMissing => 'Медиафайл не найден';
+
+  @override
+  String get mediaModelsApiKeyNameHelper =>
+      'Имя сохранённого ключа (см. «Ключи») — никогда сам ключ. Пусто — ключ основного подключения.';
+
+  @override
+  String get mediaModelsApiKeyNameLabel => 'Имя ключа API (необязательно)';
+
+  @override
+  String get mediaModelsCapabilitiesNote =>
+      'Модели этого эндпоинта поддерживают:';
+
+  @override
+  String get mediaModelsClearButton => 'Сбросить';
+
+  @override
+  String mediaModelsEditTitle(Object slot) {
+    return 'Изменить: $slot';
+  }
+
+  @override
+  String get mediaModelsFallbackSummary => 'Как основное подключение';
+
+  @override
+  String get mediaModelsMainConnection => 'Основное подключение';
+
+  @override
+  String mediaModelsOverrideSummary(Object host, Object modelId) {
+    return '$modelId · $host';
+  }
+
+  @override
+  String get mediaModelsSectionNote =>
+      'Запросы изображений, аудио, видео и транскрипции используют основное подключение, если слот не переопределён.';
+
+  @override
+  String get mediaModelsSectionTitle => 'Медиамодели';
+
+  @override
+  String get mediaModelsSlotAudioTts => 'Синтез речи';
+
+  @override
+  String get mediaModelsSlotImageGeneration => 'Генерация изображений';
+
+  @override
+  String get mediaModelsSlotMusicGeneration => 'Генерация музыки';
+
+  @override
+  String get mediaModelsSlotTranscription => 'Транскрипция';
+
+  @override
+  String get mediaModelsSlotVideoGeneration => 'Генерация видео';
+
+  @override
+  String get mediaModelsSlotVision => 'Зрение (чтение изображений)';
+
+  @override
+  String get mediaMuteTooltip => 'Выключить звук';
+
+  @override
+  String get mediaPauseTooltip => 'Пауза';
+
+  @override
+  String get mediaPlayTooltip => 'Воспроизвести';
+
+  @override
+  String get mediaUnmuteTooltip => 'Включить звук';
+
+  @override
+  String get mediaVideoUnsupportedWeb =>
+      'Воспроизведение видео не поддерживается в веб-сборке';
+
+  @override
+  String get modelPresetBudgetDescription =>
+      'Самый дешёвый надёжный набор на каждый день — быстрый чат и все медиа через OpenRouter';
+
+  @override
+  String get modelPresetBudgetName => 'Оптимальный по цене';
+
+  @override
+  String get modelPresetQualityDescription =>
+      'Топовый чат и флагманская генерация изображений — самый сильный набор на OpenRouter';
+
+  @override
+  String get modelPresetQualityName => 'Качество';
+
+  @override
+  String get modelPresetsApplied => 'Применено';
+
+  @override
+  String get modelPresetsChatLabel => 'Чат';
+
+  @override
+  String modelPresetsKeyMissing(Object provider) {
+    return 'Для этого пресета нужен ключ API $provider.';
+  }
+
+  @override
+  String get modelPresetsSectionTitle => 'Пресеты моделей';
+
+  @override
+  String get modelPresetsSetKey => 'Задать ключ';
+
+  @override
+  String get onboardingAiDisclaimer =>
+      'Ответы дают сторонние ИИ-провайдеры, которых вы подключаете. ИИ может ошибаться и быть неполным — всегда проверяйте важную информацию.';
+
+  @override
+  String get onboardingAiDisclaimerTitle => 'ИИ может ошибаться';
+
+  @override
+  String get onboardingFeatureApps =>
+      'Создаёт настоящие мини-приложения с живыми виджетами прямо на домашнем экране';
+
+  @override
+  String get onboardingFeatureAutomation =>
+      'Автоматизирует календарь, напоминания и умный дом';
+
+  @override
+  String get onboardingFeatureMedia =>
+      'Генерирует изображения, музыку и видео по запросу';
+
+  @override
+  String get onboardingGetStarted => 'Начать';
+
+  @override
+  String get onboardingModelsBody =>
+      'Один тап применяет целый набор — чат плюс модели для изображений, музыки и видео. Всё можно изменить позже в настройках.';
+
+  @override
+  String get onboardingModelsSetUpLater => 'Настроить позже';
+
+  @override
+  String get onboardingModelsTitle => 'Выберите модели';
+
+  @override
+  String get onboardingNext => 'Далее';
+
+  @override
+  String get onboardingPermissionCalendar => 'Календарь';
+
+  @override
+  String get onboardingPermissionCalendarDesc => 'Планирование событий';
+
+  @override
+  String get onboardingPermissionContacts => 'Контакты';
+
+  @override
+  String get onboardingPermissionContactsDesc => 'Звонки и сообщения';
+
+  @override
+  String get onboardingPermissionHealth => 'Здоровье';
+
+  @override
+  String get onboardingPermissionHealthDesc => 'Сводки активности';
+
+  @override
+  String get onboardingPermissionHome => 'Дом';
+
+  @override
+  String get onboardingPermissionHomeDesc => 'Управление умным домом';
+
+  @override
+  String get onboardingPermissionMicrophone => 'Микрофон';
+
+  @override
+  String get onboardingPermissionMicrophoneDesc => 'Голосовой ввод';
+
+  @override
+  String get onboardingPermissionNotifications => 'Уведомления';
+
+  @override
+  String get onboardingPermissionNotificationsDesc =>
+      'Напоминания и оповещения';
+
+  @override
+  String get onboardingPermissionsBody =>
+      'Всё это необязательно — основной чат работает и без этого. Fa спрашивает разрешение только в контексте, когда функции оно действительно нужно, а изменить решение можно в любой момент в системных настройках.';
+
+  @override
+  String get onboardingPermissionsTitle => 'Разрешения — на ваших условиях';
+
+  @override
+  String get onboardingPrivacyKeysDesc =>
+      'Ключи API хранятся в системной связке ключей (iOS/macOS) или локальном защищённом хранилище — никогда в журналах чата.';
+
+  @override
+  String get onboardingPrivacyKeysTitle => 'Ключи под замком';
+
+  @override
+  String get onboardingPrivacyOnDeviceDesc =>
+      'Ваши переписки и файлы остаются на этом устройстве.';
+
+  @override
+  String get onboardingPrivacyOnDeviceTitle =>
+      'Чаты и файлы остаются на устройстве';
+
+  @override
+  String get onboardingPrivacyPolicyLink => 'Политика конфиденциальности';
+
+  @override
+  String get onboardingPrivacyProvidersDesc =>
+      'Контент отправляется только тем ИИ-провайдерам, которых вы явно подключили.';
+
+  @override
+  String get onboardingPrivacyProvidersTitle => 'Провайдеров выбираете вы';
+
+  @override
+  String get onboardingPrivacyTitle => 'Ваши данные остаются вашими';
+
+  @override
+  String get onboardingSkip => 'Пропустить';
+
+  @override
+  String get onboardingWelcomeBody =>
+      'Общайтесь с ИИ-агентом, который делает реальную работу, а не просто разговаривает.';
+
+  @override
+  String get onboardingWelcomeTitle => 'Знакомьтесь, Fa';
+
+  @override
+  String quickStartCachedLabel(Object bytes, Object size) {
+    return '$size · $bytes в кеше';
+  }
+
+  @override
+  String get quickStartLoading => 'Загрузка модели…';
+
+  @override
+  String get quickStartSubtitle =>
+      'Уже на этом устройстве — один тап, ключ API не нужен.';
+
+  @override
+  String get quickStartTitle => 'Загруженные модели';
+
+  @override
+  String get quickStartUse => 'Использовать';
+
+  @override
+  String get secretRequestInvalidName =>
+      'Только UPPER_SNAKE: A–Z, 0–9, _, начиная с буквы';
+
+  @override
+  String get secretRequestNameLabel => 'Имя ключа';
+
+  @override
+  String get secretRequestNotNow => 'Не сейчас';
+
+  @override
+  String get secretRequestSave => 'Сохранить';
+
+  @override
+  String get secretRequestTitle => 'Fa нужен ключ';
+
+  @override
+  String get secretRequestValueLabel => 'Значение ключа';
+
+  @override
+  String get settingsAddProvider => 'Добавить провайдера';
+
+  @override
+  String get settingsApiKeyHint => 'Вставьте ключ провайдера';
+
+  @override
+  String get settingsApiKeyLabel => 'Ключ API';
+
+  @override
+  String get settingsApiKeyLocalHelper =>
+      'Оставьте пустым для локальных серверов (llama.cpp, Ollama, LM Studio)';
+
+  @override
+  String get settingsApiKeyOptionalLabel => 'Ключ API (необязательно)';
+
+  @override
+  String get settingsApiKeyRequired => 'Требуется ключ API';
+
+  @override
+  String get settingsApplyButton => 'Применить';
+
+  @override
+  String get settingsBaseUrlHelper => 'OpenAI-совместимая конечная точка';
+
+  @override
+  String get settingsBaseUrlLabel => 'Базовый URL';
+
+  @override
+  String get settingsBaseUrlRequired => 'Требуется базовый URL';
+
+  @override
+  String get settingsCliOnlyTitle => 'Настройки только в CLI';
+
+  @override
+  String get settingsCliOnlyLead =>
+      'Эти настройки доступны в CLI и его файле конфигурации — приложение не может их предоставить:';
+
+  @override
+  String get settingsCliOnlyMcpServers => 'Серверы MCP';
+
+  @override
+  String get settingsCliOnlyTtsrRules => 'Правила потока (TTSR)';
+
+  @override
+  String get settingsCliOnlyCubeSandbox => 'Песочница Cube';
+
+  @override
+  String get settingsCliOnlyPromptOverrides => 'Переопределение промптов';
+
+  @override
+  String get settingsCliOnlyAgentMode => 'Режим агента';
+
+  @override
+  String get settingsCliOnlyMemoryStores => 'Хранилища памяти';
+
+  @override
+  String get settingsCancelButton => 'Отмена';
+
+  @override
+  String get settingsCoderBadge => 'для кода';
+
+  @override
+  String get settingsCorsNoteCustom =>
+      'Любая OpenAI-совместимая конечная точка. Провайдер должен разрешать браузерные (CORS) запросы — api.anthropic.com их не разрешает, поэтому к моделям Anthropic обращайтесь через OpenRouter.';
+
+  @override
+  String get settingsCopyDebugLogs => 'Скопировать логи отладки';
+
+  @override
+  String get settingsSendTestCrashReport => 'Отправить тестовый краш-репорт';
+
+  @override
+  String get settingsTestCrashReportNoFirebase =>
+      'Crashlytics не инициализирован на этом устройстве';
+
+  @override
+  String get settingsTestCrashReportSent =>
+      'Тестовый репорт отправлен — проверьте консоль Firebase через пару минут';
+
+  @override
+  String get settingsDebugLogsCopied =>
+      'Логи отладки скопированы в буфер обмена';
+
+  @override
+  String get settingsCorsNoteOllama =>
+      'Запросы идут напрямую из браузера на ollama.com, который сейчас не отправляет заголовки CORS, — вызовы из браузера завершаются ошибкой. Используйте здесь OpenRouter или выберите Ollama в мобильном/десктопном приложении.';
+
+  @override
+  String get settingsDefaultChatModelTitle => 'Модель чата по умолчанию';
+
+  @override
+  String get settingsDapAddConnection => 'Добавить подключение';
+
+  @override
+  String get settingsDapAgentIdLabel => 'ID агента';
+
+  @override
+  String get settingsDapAgentNameLabel => 'Имя агента';
+
+  @override
+  String get settingsDapPasswordLabel => 'Пароль хаба';
+
+  @override
+  String get settingsDapChannelsEmpty =>
+      'Каналов пока нет — они появятся здесь, когда агент присоединится к каналу (dap_invite / dap_connect).';
+
+  @override
+  String get settingsDapChannelsTitle => 'Каналы';
+
+  @override
+  String get settingsDapEditConnection => 'Изменить подключение';
+
+  @override
+  String get settingsDapMakeActive => 'Сделать активным';
+
+  @override
+  String get settingsDapActiveChip => 'Активно';
+
+  @override
+  String get settingsDapSavedTitle => 'Сохранённые подключения';
+
+  @override
+  String get settingsDapSavedHint =>
+      'Закладки хабов. Нажмите, чтобы переключить агента на этот хаб — переключение происходит сразу.';
+
+  @override
+  String get settingsDapRemoveSaved => 'Удалить';
+
+  @override
+  String get settingsDapEnvNote =>
+      'Переменные DAP_HUB_URL или DAP_AGENT_NAME заданы в окружении — env имеет приоритет над сохранённым подключением.';
+
+  @override
+  String get settingsDapHubHint =>
+      'Агенты Fa находят друг друга и обмениваются сообщениями';
+
+  @override
+  String get settingsDapHubIntro =>
+      'Хаб — место встречи ваших агентов Fa: CLI, это приложение и браузерное расширение. Подключитесь один раз — и этот агент станет доступен по имени: другие смогут найти его и отправлять ему сообщения.';
+
+  @override
+  String get settingsAgentNetworkJoin => 'Включить агента в сети';
+
+  @override
+  String get settingsAgentNetworkJoinHint =>
+      'Агент подключается к хабу как живой участник — CLI-пиры и другие приложения пишут ему напрямую.';
+
+  @override
+  String get settingsAgentNetworkUrl => 'Адрес хаба';
+
+  @override
+  String get settingsAgentNetworkToken => 'Токен пейринга';
+
+  @override
+  String get settingsAgentNetworkName => 'Имя агента';
+
+  @override
+  String get settingsAgentNetworkSave => 'Сохранить';
+
+  @override
+  String get settingsAgentNetworkConnected => 'Подключён';
+
+  @override
+  String get settingsAgentNetworkConnecting => 'Подключение…';
+
+  @override
+  String get settingsAgentNetworkOffline => 'Не в сети';
+
+  @override
+  String get settingsAgentNetworkPeers => 'Пиры';
+
+  @override
+  String get settingsAgentNetworkNoPeers => 'Пиров пока не видно';
+
+  @override
+  String get settingsAgentNetworkDmHint => 'Написать пиру…';
+
+  @override
+  String get settingsAgentNetworkSend => 'Отправить ЛС';
+
+  @override
+  String get settingsAgentNetworkUnsupported =>
+      'Членство агента в сети недоступно на этой платформе.';
+
+  @override
+  String get settingsAgentNetworkSaved => 'Настройки сети агента сохранены';
+
+  @override
+  String get settingsDapIdentityTitle => 'Как вас видят другие агенты';
+
+  @override
+  String get settingsDapIdentityHint =>
+      'Имя — это адрес для других агентов. ID выводится из ключа этого устройства.';
+
+  @override
+  String get settingsDapInboundTitle => 'Входящие сообщения';
+
+  @override
+  String get settingsDapInboundHint =>
+      'Куда попадают сообщения от других агентов';
+
+  @override
+  String get settingsDapInboundDedicated =>
+      'Отдельная сессия агента (рекомендуется)';
+
+  @override
+  String get settingsDapInboundCurrent => 'Текущая открытая сессия';
+
+  @override
+  String get settingsDapInboundNamed => 'Выбранная вами сессия';
+
+  @override
+  String get settingsDapInboundBadgeTooltip =>
+      'В эту сессию приходят сообщения от других агентов';
+
+  @override
+  String get settingsDapHubTitle => 'Сеть агентов';
+
+  @override
+  String get settingsDapNameHint => 'alice';
+
+  @override
+  String get settingsDapPasswordHint =>
+      'Оставьте пустым, чтобы сохранить текущий';
+
+  @override
+  String get settingsDapProbeButton => 'Проверить подключение';
+
+  @override
+  String get settingsDapStatusConnected => 'Подключено';
+
+  @override
+  String get settingsDapStatusOffline => 'Недоступен';
+
+  @override
+  String get settingsDapStatusUnknown => 'Не проверено';
+
+  @override
+  String get settingsDapUnsupported =>
+      'DAP-хаб не поддерживается на этой платформе.';
+
+  @override
+  String get settingsDapUrlHint =>
+      'hub.example.com или ws://hub.example.com/ws';
+
+  @override
+  String get settingsDapUrlLabel => 'URL хаба';
+
+  @override
+  String get settingsDapUrlRequired => 'Требуется URL хаба';
+
+  @override
+  String get settingsDapLoadFailed =>
+      'Не удалось прочитать DAP-конфигурацию на этой машине.';
+
+  @override
+  String get settingsDapSaveFailed =>
+      'Не удалось сохранить подключение — проверьте URL хаба.';
+
+  @override
+  String get settingsDeleteButton => 'Удалить';
+
+  @override
+  String get settingsDeleteProviderBody =>
+      'Провайдер удаляется из списка выбора. Текущее подключение не затрагивается.';
+
+  @override
+  String settingsDeleteProviderTitle(Object name) {
+    return 'Удалить $name?';
+  }
+
+  @override
+  String get settingsDownloadingWeights => 'Скачивание весов модели…';
+
+  @override
+  String get settingsEditButton => 'Изменить';
+
+  @override
+  String get settingsEditProviderTitle => 'Изменить провайдера';
+
+  @override
+  String get settingsEditorKeyNote =>
+      'Имя, URL и модель сохраняются; ключ хранится в памяти только для этого сеанса — он не записывается на диск.';
+
+  @override
+  String get settingsEditorKeyNoteSecure =>
+      'Имя, URL и модель сохраняются; ключ хранится в защищённом хранилище ключей устройства (Keychain/Keystore), пока оно доступно.';
+
+  @override
+  String get settingsEditorKeepKeyNote =>
+      'Для этого провайдера сохранён ключ — оставьте поле пустым, чтобы не менять его.';
+
+  @override
+  String get settingsKeyNoteCustom =>
+      'Определение провайдера (имя, URL, модель) сохраняется — без секретов. Ключ API хранится в памяти только в течение этого сеанса и исчезает после перезагрузки.';
+
+  @override
+  String get settingsKeyNoteCustomSecure =>
+      'Определение провайдера (имя, URL, модель) сохраняется — без секретов. Сохранённые ключи хранятся в защищённом хранилище ключей устройства (Keychain/Keystore), пока оно доступно; несохранённый ключ остаётся в памяти только на этот сеанс.';
+
+  @override
+  String get settingsKeyNoteHosted =>
+      'Только в памяти: ваш ключ нигде не сохраняется и исчезает после перезагрузки. Запросы идут напрямую из браузера к провайдеру — ничего не проксируется и не хранится.';
+
+  @override
+  String get settingsKeyNoteHostedSecure =>
+      'Сохранённые ключи хранятся в защищённом хранилище ключей устройства (Keychain/Keystore), пока оно доступно; ключ, только введённый в форму, остаётся в памяти на этот сеанс. Запросы идут напрямую из приложения к провайдеру — ничего не проксируется.';
+
+  @override
+  String get settingsLoadingModel => 'Загрузка модели…';
+
+  @override
+  String get settingsModelIdLabel => 'ID модели';
+
+  @override
+  String get settingsModelIdOptionalLabel => 'ID модели (необязательно)';
+
+  @override
+  String get settingsModelIdRequired => 'Требуется ID модели';
+
+  @override
+  String get settingsModelsFetching => 'Загрузка списка моделей с эндпоинта…';
+
+  @override
+  String get settingsModelsGroupTitle => 'Модели';
+
+  @override
+  String get settingsNameRequired => 'Требуется имя';
+
+  @override
+  String get settingsOnDeviceModelLabel => 'Модель на устройстве';
+
+  @override
+  String get settingsPickModelTitle => 'Выбор модели';
+
+  @override
+  String get settingsPickProviderTitle => 'Выбор провайдера';
+
+  @override
+  String get settingsPresetCustom => 'Пользовательский';
+
+  @override
+  String get settingsPresetOllama => 'Ollama';
+
+  @override
+  String get settingsPresetOpenrouter => 'OpenRouter';
+
+  @override
+  String get settingsPresetTransformersJs => 'На устройстве (transformers.js)';
+
+  @override
+  String get settingsPresetWebllm => 'На устройстве (WebLLM)';
+
+  @override
+  String get settingsProviderLabel => 'Провайдер';
+
+  @override
+  String settingsProviderModelSummary(Object model, Object provider) {
+    return '$model · $provider';
+  }
+
+  @override
+  String get settingsProviderNameHint => 'Мой провайдер';
+
+  @override
+  String get settingsProviderNameLabel => 'Имя';
+
+  @override
+  String get settingsProvidersSectionTitle => 'Провайдеры';
+
+  @override
+  String get settingsSaveButton => 'Сохранить';
+
+  @override
+  String settingsStaleModelCache(Object model) {
+    return 'Ранее использованная модель ($model) удалена из кеша — выберите модель, чтобы скачать её снова.';
+  }
+
+  @override
+  String get settingsSkillsAccess => 'Доступ к навыкам';
+
+  @override
+  String get settingsSkillsAccessHint =>
+      'Использовать навыки Claude, Copilot или Codex из папки проекта (.claude, .github, .codex)';
+
+  @override
+  String get settingsSkillsToggles => 'Встроенные навыки';
+
+  @override
+  String get settingsSkillsTogglesHint =>
+      'Включайте и отключайте навыки, встроенные в Fa';
+
+  @override
+  String get skillsAccessAsk => 'Спрашивать';
+
+  @override
+  String get skillsAccessAllowed => 'Разрешено';
+
+  @override
+  String get skillsAccessDenied => 'Запрещено';
+
+  @override
+  String get skillsAccessDialogTitle =>
+      'Использовать существующие навыки агентов?';
+
+  @override
+  String get skillsAccessDialogBody =>
+      'В проекте могут быть навыки Claude, Copilot или Codex (папки .claude, .github, .codex) — инструкции, оставленные другими инструментами на этом устройстве. Fa может использовать их в ваших задачах.';
+
+  @override
+  String get skillsAccessAllow => 'Разрешить';
+
+  @override
+  String get skillsAccessNotNow => 'Не сейчас';
+
+  @override
+  String get settingsThemeDark => 'Тёмная';
+
+  @override
+  String get settingsThemeLabel => 'Тема';
+
+  @override
+  String get settingsChatTextLabel => 'Размер текста в чате';
+
+  @override
+  String get settingsImagePreviewsLabel =>
+      'Превью изображений в высоком качестве';
+
+  @override
+  String get settingsImagePreviewsHelper =>
+      'Декодировать превью изображений в чате в полном разрешении. Выкл. — быстрое уменьшение до 600px.';
+
+  @override
+  String get settingsThemeLight => 'Светлая';
+
+  @override
+  String get settingsThemeSystem => 'Как в системе';
+
+  @override
+  String get settingsStartChat => 'Начать чат';
+
+  @override
+  String get settingsTitle => 'Настройки';
+
+  @override
+  String get settingsToolsBadge => 'инструменты через промпт';
+
+  @override
+  String get settingsTransformersJsNote =>
+      'Работает полностью офлайн после скачивания · требуется WebGPU (Chrome/Edge/новые Safari) · весы скачиваются один раз с HuggingFace (публичный репозиторий, токен не нужен) и кешируются в браузере';
+
+  @override
+  String get settingsVisionBadge => 'зрение';
+
+  @override
+  String get settingsWebllmNote =>
+      'Работает полностью офлайн после скачивания · требуется WebGPU (Chrome/Edge/новые Safari) · веса ~0.5-4 ГБ кешируются в браузере';
+
+  @override
+  String get taskModelSameAsMain => 'Как основная';
+
+  @override
+  String get taskModelSave => 'Сохранить';
+
+  @override
+  String get taskModelSectionTitle => 'Модели для задач';
+
+  @override
+  String get taskModelSmolDescription => 'Для саммари и сабагентов';
+
+  @override
+  String get taskModelSmolTitle => 'Быстрая модель';
+
+  @override
+  String get taskModelUseMain => 'Использовать основную';
+
+  @override
+  String get setupAppBarTitle => 'Подключение к Fa';
+
+  @override
+  String sidebarAllApps(Object count) {
+    return 'Все приложения ($count)';
+  }
+
+  @override
+  String get sidebarAppsHeader => 'Приложения';
+
+  @override
+  String get sidebarCancel => 'Отмена';
+
+  @override
+  String get sidebarDelete => 'Удалить';
+
+  @override
+  String get sidebarDeleteUnavailable =>
+      'Удаление недоступно — сессия живёт в хост-приложении';
+
+  @override
+  String sidebarDeletePersistedContent(Object id) {
+    return 'Сессия $id';
+  }
+
+  @override
+  String get sidebarDeleteSessionContent =>
+      'Сохранённая сессия будет удалена безвозвратно.';
+
+  @override
+  String sidebarDeleteSessionFailed(Object error) {
+    return 'Не удалось удалить сессию: $error';
+  }
+
+  @override
+  String get sidebarDeleteSessionTitle => 'Удалить сессию?';
+
+  @override
+  String get sidebarDeleteSessionTooltip => 'Удалить сессию';
+
+  @override
+  String get sidebarLoadSessionsError => 'Не удалось загрузить сессии';
+
+  @override
+  String get sidebarModelHeader => 'Модель';
+
+  @override
+  String get sidebarNewSessionTooltip => 'Новая сессия';
+
+  @override
+  String get sidebarNoActiveSession => 'Нет активной сессии';
+
+  @override
+  String get sidebarNoModel => 'нет модели';
+
+  @override
+  String get sidebarNoSessions => 'Пока нет сессий';
+
+  @override
+  String get sidebarOnThisDevice => 'На этом устройстве';
+
+  @override
+  String get sidebarOpenAppsGridTooltip => 'Открыть все приложения';
+
+  @override
+  String get sidebarProviderAnthropic => 'Anthropic';
+
+  @override
+  String get sidebarProviderGoogle => 'Google';
+
+  @override
+  String get sidebarProviderOnDeviceWebllm => 'На устройстве (WebLLM)';
+
+  @override
+  String get sidebarProviderOpenaiCompatible => 'OpenAI-совместимый API';
+
+  @override
+  String get sidebarRefreshAppsTooltip => 'Обновить приложения';
+
+  @override
+  String get sidebarRefreshSessionsTooltip => 'Обновить сессии';
+
+  @override
+  String get sidebarRenameClear => 'Сбросить';
+
+  @override
+  String get sidebarRenameDialogTitle => 'Переименовать сессию';
+
+  @override
+  String get sidebarRenameHint => 'Пустое имя вернёт название по умолчанию.';
+
+  @override
+  String get sidebarRenameNameLabel => 'Название';
+
+  @override
+  String get sidebarRenameSessionTooltip => 'Переименовать сессию';
+
+  @override
+  String get sidebarRetry => 'Повторить';
+
+  @override
+  String sidebarSessionTitle(Object id) {
+    return 'сессия $id';
+  }
+
+  @override
+  String get sidebarSearchHint => 'Поиск по сессиям';
+
+  @override
+  String get sidebarSearchClearTooltip => 'Очистить поиск';
+
+  @override
+  String sidebarSearchNoMatches(Object query) {
+    return 'Нет сессий по запросу «$query»';
+  }
+
+  @override
+  String get sidebarSessionsHeader => 'Сессии';
+
+  @override
+  String sidebarSubagentSessionCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count агентов',
+      many: '$count агентов',
+      few: '$count агента',
+      one: '$count агент',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String sidebarSubagentTitle(String id) {
+    return 'субагент $id';
+  }
+
+  @override
+  String get tjsCacheTitle => 'Загруженные модели (transformers.js)';
+
+  @override
+  String get tjsCacheWebOnly =>
+      'On-device модели (transformers.js) доступны только в веб-сборке.';
+
+  @override
+  String uploadTooLarge(Object max, Object total) {
+    return 'Загрузка слишком большая: $total превышает лимит $max на один пакет.';
+  }
+
+  @override
+  String get webllmCacheManagedByOs =>
+      'На этой платформе on-device модели управляются хранилищем ОС/приложения.';
+
+  @override
+  String get webllmCacheTitle => 'Загруженные модели';
+
+  @override
+  String get settingsVisionLabel => 'Поддерживает изображения (vision)';
+
+  @override
+  String get settingsIconsPerRow => 'Иконок в ряд';
+
+  @override
+  String get settingsIconsPerRowHint =>
+      'Колонок в сетке домашнего экрана; Авто — 4 на телефоне, 6 на широких';
+
+  @override
+  String get settingsIconsPerRowAuto => 'Авто';
+
+  @override
+  String get settingsShowOnboarding => 'Показать приветствие';
+
+  @override
+  String get chatSteerTooltip => 'Отправить сейчас (прервать)';
+
+  @override
+  String bootstrapSessionStartError(Object error) {
+    return 'Не удалось запустить сессию: $error';
+  }
+
+  @override
+  String get bootstrapRetry => 'Повторить';
+
+  @override
+  String get workspaceDialogTitle => 'Сессия';
+
+  @override
+  String get workspaceDialogChangeFolder => 'Сменить папку…';
+
+  @override
+  String get workspaceDialogClearFolder => 'Использовать личную папку';
+
+  @override
+  String get workspaceDialogClose => 'Закрыть';
+
+  @override
+  String get workspaceDialogCurrentFolder => 'Папка сессии';
+
+  @override
+  String get workspaceDialogHostPath => 'Путь на хосте';
+
+  @override
+  String get workspaceDialogMountHint =>
+      'Файлы по /project/... в агенте указывают на эту папку на вашем Mac.';
+
+  @override
+  String get workspaceDialogUnsupported =>
+      'Проектные папки сейчас доступны только на macOS.';
+
+  @override
+  String get workspaceDialogPersonal => 'Личная (папка не выбрана)';
+
+  @override
+  String get workspaceDialogMailbox => 'Ваш mailbox';
+
+  @override
+  String get workspaceDialogMailboxHint =>
+      'Другие инстансы Fa могут писать этой сессии на этот адрес.';
+
+  @override
+  String get workspaceDialogMailboxCopy => 'Копировать';
+
+  @override
+  String get workspaceDialogMailboxCopied => 'Адрес mailbox скопирован';
+
+  @override
+  String get workspaceDialogRestrictTools =>
+      'Ограничить инструменты этой папкой';
+
+  @override
+  String get workspaceDialogRestrictToolsHint =>
+      'Отключает всё, что читало или писало бы за пределами смонтированной папки. Попытки выйти за рамки будут блокироваться (и в будущем — просить вашего подтверждения через диалог).';
+
+  @override
+  String get toolsAvailabilityTitle => 'Инструменты';
+
+  @override
+  String get toolsAvailabilityHint =>
+      'Включайте и отключайте инструменты Fa — применяется сразу, без перезапуска.';
+
+  @override
+  String get settingsRedaction => 'Скрытие секретов';
+
+  @override
+  String get settingsRedactionHint =>
+      'Маскирует API-ключи и секреты во всём, что Fa отправляет или сохраняет. Применяется сразу, без перезапуска.';
+
+  @override
+  String toolsAvailabilityUnavailable(Object reason) {
+    return 'Недоступно: $reason';
+  }
+
+  @override
+  String get githubAccountSection => 'GitHub-аккаунт';
+
+  @override
+  String get githubAccountHint =>
+      'Подключите GitHub, чтобы публиковать виджеты в каталог fa_widgets.';
+
+  @override
+  String get githubConnect => 'Подключить GitHub';
+
+  @override
+  String get githubDisconnect => 'Отключить';
+
+  @override
+  String get githubDisconnectConfirm =>
+      'Уже открытые PR останутся на GitHub — остановится только отслеживание статуса.';
+
+  @override
+  String get githubTokenHint => 'GitHub-токен со scope public_repo';
+
+  @override
+  String get githubConnectTokenTab => 'Токен';
+
+  @override
+  String get githubConnectDeviceTab => 'Код устройства';
+
+  @override
+  String get githubConnectDeviceInstructions =>
+      'Введите этот код на github.com/login/device — он разрешит Fa создавать публичные репозитории виджетов от вашего имени.';
+
+  @override
+  String get githubCopyCode => 'Скопировать код';
+
+  @override
+  String get githubOpenDevicePage => 'Открыть github.com/login/device';
+
+  @override
+  String get githubConnectValidating => 'Проверка…';
+
+  @override
+  String get myPublications => 'Мои публикации';
+
+  @override
+  String get publicationsEmpty => 'Пока ничего не опубликовано.';
+
+  @override
+  String get publicationsRefresh => 'Обновить';
+
+  @override
+  String get publicationsOffline =>
+      'Нет сети — показаны последние известные состояния.';
+
+  @override
+  String get publicationStateOpen => 'Открыт';
+
+  @override
+  String get publicationStatePublished => 'Опубликован';
+
+  @override
+  String get publicationStateRejected => 'Отклонён';
+
+  @override
+  String get publicationStateUnknown => 'Неизвестно';
+
+  @override
+  String get widgetStatusNotPublished => 'Не опубликован';
+
+  @override
+  String get widgetStatusValidating => 'Проверка…';
+
+  @override
+  String get widgetStatusInvalid => 'Ошибка валидации';
+
+  @override
+  String get widgetStatusFailed => 'Не удалось опубликовать';
+
+  @override
+  String get widgetStatusErrors => 'Ошибки валидатора:';
+
+  @override
+  String get widgetStatusOpenRun => 'Открыть CI-запуск';
+
+  @override
+  String get widgetDetailVersion => 'Версия';
+
+  @override
+  String get widgetDetailAuthor => 'Автор';
+
+  @override
+  String publicationSubmittedAt(Object date) {
+    return 'Отправлено $date';
+  }
+
+  @override
+  String publicationComments(num count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count комментария',
+      many: '$count комментариев',
+      few: '$count комментария',
+      one: '1 комментарий',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String publishWidgetTitle(Object name) {
+    return 'Публикация «$name»';
+  }
+
+  @override
+  String get publishPreflightFailed => 'Исправьте перед публикацией:';
+
+  @override
+  String get publishRepoNameLabel => 'Имя репозитория';
+
+  @override
+  String get publishButton => 'Опубликовать';
+
+  @override
+  String get publishInProgress => 'Публикация…';
+
+  @override
+  String get publishSuccess => 'Pull request открыт:';
+
+  @override
+  String get publishDone => 'Готово';
+
+  @override
+  String get launcherPublishWidget => 'Опубликовать…';
+
+  @override
+  String get githubTokenNoRepoScope =>
+      'Этот токен не может создавать репозитории — для публикации нужны права на repo. Используй classic PAT со скоупом public_repo (или fine-grained PAT с All repositories + Administration + Contents read/write). Вход по Device code часто даёт токен без прав на репозитории.';
+
+  @override
+  String get githubDeviceFallbackWarn =>
+      'Важно: этот вход через устройство использует публичный app «Copilot Plugin» — GitHub ограничивает его токены правами «только идентификация», публиковать они не могут. Чтобы публиковать по device code, зарегистрируй свой GitHub OAuth App (Settings → Developer settings → OAuth Apps, в поле Authorization callback URL укажи https://fa1.dev/oauth/callback) и сохрани его client id в Settings → Keys как github_oauth_client_id — либо собери приложение с --dart-define=FA_GITHUB_CLIENT_ID=<id>. А пока подключайся classic PAT (public_repo) на вкладке Token.';
+
+  @override
+  String get githubConnectWebTab => 'Браузер';
+
+  @override
+  String get githubBrowserHint =>
+      'Открывает github.com в браузере. После «Authorize» страница fa1.dev покажет одноразовый код — вставь его ниже. Нужен свой OAuth App: его client id в Keys как github_oauth_client_id и secret как github_oauth_client_secret.';
+
+  @override
+  String get githubBrowserOpen => 'Открыть GitHub снова';
+
+  @override
+  String get githubBrowserCodeHint => 'Одноразовый код с fa1.dev';
+
+  @override
+  String sessionDrivenElsewhere(String host, int pid) {
+    return 'Сессией управляет $host (pid $pid) — вы просматриваете. Ваши сообщения будут переданы живому агенту.';
+  }
+
+  @override
+  String sessionTooLargeTitle(String size) {
+    return 'Сессия ($size МБ) превышает бюджет мгновенного открытия — открыть её безопасно не удалось.';
+  }
+
+  @override
+  String get sessionMintFailed => 'Не удалось создать новую сессию.';
+
+  @override
+  String sessionBootSkippedOversize(String name, String size) {
+    return 'Открыта новая сессия — «$name» ($size МБ) превышает бюджет мгновенного открытия.';
+  }
+
+  @override
+  String get sessionBootSkippedOpen => 'Открыть частями';
+
+  @override
+  String get dynamicMessagesButtonTooltip => 'Динамические сообщения';
+
+  @override
+  String get dynamicMessagesSheetTitle => 'Динамические сообщения';
+
+  @override
+  String get dynamicMessagesLive => 'активен';
+
+  @override
+  String dynamicMessagesEventCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count события',
+      many: '$count событий',
+      few: '$count события',
+      one: '1 событие',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String dynamicMessagesSaved(String appId) {
+    return 'Сохранено в приложениях как «$appId»';
+  }
+
+  @override
+  String get dynamicMessagesSaveFailed =>
+      'Не удалось сохранить это динамическое сообщение как приложение.';
+
+  @override
+  String get dynamicTileSaveAsApp => 'Сохранить как приложение';
+
+  @override
+  String get dynamicTilePermissions => 'Разрешения';
+
+  @override
+  String get dynamicTileError => 'Ошибка виджета';
+
+  @override
+  String get dynamicTileOverflow =>
+      'Виджет шире области чата — содержимое справа обрезано. Агента попросили перестроить виджет по ширине.';
+
+  @override
+  String get dynamicTileRetry => 'Повторить';
+
+  @override
+  String get dynamicTileMenu => 'Ещё действия';
+
+  @override
+  String get dynamicTileOpenAsApp => 'Открыть как приложение (без сохранения)';
+
+  @override
+  String get dynamicTileOpenUnavailable =>
+      'Виджет не запускается — ошибка загрузки. Сначала повторите запуск в чате.';
+
+  @override
+  String get themeConsentTitle => 'Применить тему?';
+
+  @override
+  String themeConsentBody(String app, String pack) {
+    return 'Приложение $app просит применить тему \"$pack\".';
+  }
+
+  @override
+  String get themeConsentContrast =>
+      'Внимание: часть цветовых пар темы ниже контрастности WCAG AA (4,5:1).';
+
+  @override
+  String get themeConsentApply => 'Применить';
+
+  @override
+  String get themeConsentDeny => 'Оставить текущую';
+
+  @override
+  String get themePacksTitle => 'Темы оформления';
+
+  @override
+  String get themePacksSubtitle =>
+      'Установка .zip с theme.json, выбор активной темы и удаление';
+
+  @override
+  String get themePackDefault => 'Стандартный вид Fa';
+
+  @override
+  String get themePackImport => 'Импортировать тему';
+
+  @override
+  String get themePackDelete => 'Удалить';
+
+  @override
+  String get themePackActiveChip => 'активна';
+
+  @override
+  String get themePackWallpaperChip => 'обои';
+
+  @override
+  String themePackImported(String name) {
+    return 'Тема \"$name\" установлена';
+  }
+
+  @override
+  String get settingsCompactionLabel => 'Компакция';
+
+  @override
+  String get settingsCompactionHelper =>
+      'Как сжимается контекст при приближении к окну модели. Применяется при следующей компакции.';
+
+  @override
+  String get settingsCompactionStructured =>
+      'Структурированная (рекомендуется)';
+
+  @override
+  String get settingsCompactionStructuredHint =>
+      'Скрывает использованные записи на месте с раскрываемыми контрольными точками — для judge-прохода нужна настроенная модель.';
+
+  @override
+  String get settingsCompactionClassic => 'Классическая (устаревшая 1.0)';
+
+  @override
+  String get settingsCompactionClassicHint =>
+      'Сжатие с потерями в виде резюме префикса — без дополнительных вызовов модели.';
+
+  @override
+  String get settingsCompactionSourceProject =>
+      'действует из проекта .fah/config.yaml';
+
+  @override
+  String get settingsCompactionSourceUser =>
+      'действует из пользовательского ~/.fah/config.yaml';
+
+  @override
+  String get settingsCompactionSourceFallback =>
+      'структурированная по умолчанию — compaction в конфигах не задан';
+
+  @override
+  String get settingsCompactionWebNote =>
+      'На вебе настройка недоступна — здесь нет файла конфигурации, применяется структурированный движок.';
+
+  @override
+  String settingsCompactionSaved(String file) {
+    return 'Сохранено в $file — применится при следующей компакции.';
+  }
+
+  @override
+  String settingsCompactionSaveFailed(String error) {
+    return 'Не удалось сохранить движок компакции: $error';
+  }
+
+  @override
+  String get settingsCompactionDocs => 'Документация по компакции';
+
+  @override
+  String get settingsQueueTitle => 'Очередь провайдеров';
+
+  @override
+  String get settingsQueueHelper =>
+      'Упорядоченная цепочка провайдеров: когда текущий умирает (квота, авторизация, сеть, таймаут, битый поток, 5xx, плохой finish), следующий перехватывает работу, а победитель закрепляется на сессию. Применяется со следующего запуска.';
+
+  @override
+  String get settingsQueueEmpty =>
+      'Очередь не задана — применяется одиночный провайдер/модель. Добавьте запись, чтобы собрать цепочку.';
+
+  @override
+  String get settingsQueueScopeEnv =>
+      'действует из переменной окружения FA_PROVIDERS_QUEUE — правьте её (здесь только чтение)';
+
+  @override
+  String get settingsQueueUnsupported =>
+      'Недоступно в вебе — здесь нет конфига и переменных окружения.';
+
+  @override
+  String get settingsQueueAdd => 'Добавить запись';
+
+  @override
+  String get settingsQueueAddTitle => 'Новая запись очереди';
+
+  @override
+  String get settingsQueueMoveUp => 'Выше';
+
+  @override
+  String get settingsQueueMoveDown => 'Ниже';
+
+  @override
+  String get settingsQueueRemove => 'Удалить';
+
+  @override
+  String settingsQueueSaved(String file) {
+    return 'Очередь сохранена в $file — применится со следующего запуска.';
+  }
+
+  @override
+  String settingsQueueSaveFailed(String error) {
+    return 'Не удалось сохранить очередь: $error';
+  }
+
+  @override
+  String get themePackImportFailed => 'Тема отклонена';
+
+  @override
+  String get settingsMobileAutomation => 'Автоматизация устройства';
+
+  @override
+  String get mobileConsentTitle => 'Автоматизация устройства';
+
+  @override
+  String get mobileConsentWhat =>
+      'Включив эту функцию, вы разрешаете службе специальных возможностей Fa читать содержимое экрана и выполнять нажатия и ввод текста от вашего имени, чтобы Fa мог управлять приложениями и настройками за вас.';
+
+  @override
+  String get mobileConsentOffByDefault =>
+      'По умолчанию служба выключена — ничего не работает, пока вы не включите её здесь.';
+
+  @override
+  String get mobileConsentDisableHint =>
+      'Отключить её можно в любой момент одним касанием в настройках Fa.';
+
+  @override
+  String get mobileConsentPrivacy =>
+      'Данные не покидают устройство: наружу отправляются только ваши сообщения — напрямую в настроенную модель.';
+
+  @override
+  String get mobileConsentEnable => 'Включить — открыть настройки системы';
+
+  @override
+  String get mobileConsentDisable => 'Выключить';
+
+  @override
+  String get mobileConsentStatusOn =>
+      'Служба специальных возможностей: включена';
+
+  @override
+  String get mobileConsentStatusOff =>
+      'Служба специальных возможностей: выключена';
+
+  @override
+  String get mobileConsentStoreUnavailable =>
+      'Автоматизация устройства недоступна в этой сборке Fa.';
+
+  @override
+  String get storeBannerTitle => 'Fa в App Store';
+
+  @override
+  String get storeBannerBody =>
+      'Релиз в App Store платный — он финансирует разработку. Бета в TestFlight бесплатна навсегда.';
+
+  @override
+  String get storeBannerAndroidSoon => 'Android: скоро';
+
+  @override
+  String get storeBannerCta => 'Открыть в App Store';
+
+  @override
+  String get storeBannerBeta =>
+      'или присоединяйтесь к бесплатной бете в TestFlight';
+
+  @override
+  String get storeBannerDismiss => 'Скрыть';
+
+  @override
+  String get networkModeLocal => 'Локально';
+
+  @override
+  String get networkModeNetwork => 'Сеть';
+
+  @override
+  String get networkWelcomeTitle => 'Добро пожаловать в сети Fa';
+
+  @override
+  String get networkWelcomeBody =>
+      'Присоединитесь к существующей сети или создайте свою — каналы и витрины откроются здесь.';
+
+  @override
+  String get networkNeedsPasswordTitle => 'Этой сети нужен ваш пароль';
+
+  @override
+  String get networkNeedsPasswordBody =>
+      'Синхронизация аккаунта нашла эту сеть, но её пароль сохранится только после первого входа. Введите его, чтобы открыть сеть.';
+
+  @override
+  String get networkNetworksTitle => 'Сети';
+
+  @override
+  String get networkBackTooltip => 'Назад';
+
+  @override
+  String get networkSearchHint => 'Поиск сетей';
+
+  @override
+  String get networkSignInTitle => 'Войти';
+
+  @override
+  String get networkSignInHelper =>
+      'Войдите через аккаунт ai-native.cloud, чтобы создавать сети и управлять ими.';
+
+  @override
+  String networkSignInWithProvider(Object provider) {
+    return 'Продолжить через $provider';
+  }
+
+  @override
+  String get networkSignInWaiting => 'Завершите вход в браузере…';
+
+  @override
+  String get networkSignInDeveloperSection => 'Разработчик (только локально)';
+
+  @override
+  String get networkSignInMobileNote =>
+      'Вход через провайдера здесь недоступен, пока редирект fa:// не добавлен в список разрешённых на сервере — пока работает только вход для разработчика ниже.';
+
+  @override
+  String get networkSessionExpired => 'Сессия истекла — войдите снова.';
+
+  @override
+  String get networkLoginLabel => 'Логин';
+
+  @override
+  String get networkSignOut => 'Выйти';
+
+  @override
+  String get networkAccountFallback => 'Аккаунт';
+
+  @override
+  String get networkPublicSection => 'Публичные сети';
+
+  @override
+  String networkPublicMembers(Object count) {
+    return 'Участников: $count';
+  }
+
+  @override
+  String get networkEmptyTitle => 'Пока нет сетей';
+
+  @override
+  String get networkJoinFirst => 'Присоединитесь к своей первой сети';
+
+  @override
+  String get networkNoMatches => 'Ничего не найдено';
+
+  @override
+  String get networkCreateNetwork => 'Создать сеть';
+
+  @override
+  String get networkNameLabel => 'Название';
+
+  @override
+  String get networkPasswordLabel => 'Пароль';
+
+  @override
+  String get networkCreate => 'Создать';
+
+  @override
+  String get networkJoinTitle => 'Присоединиться к сети';
+
+  @override
+  String get networkQuickSwitcherTitle => 'Быстрый переход';
+
+  @override
+  String get networkJoinLinkLabel => 'Ссылка-приглашение';
+
+  @override
+  String get networkJoinFill => 'Заполнить';
+
+  @override
+  String get networkIdLabel => 'Идентификатор или название сети';
+
+  @override
+  String get networkDisplayNameLabel => 'Отображаемое имя';
+
+  @override
+  String get networkDisplayNameLocked =>
+      'Отображаемое имя привязано к вашему аккаунту.';
+
+  @override
+  String get networkJoinRequired =>
+      'Укажите идентификатор или название сети и пароль.';
+
+  @override
+  String networkJoinInvalidCredentials(Object message) {
+    return 'Неверные учётные данные — $message';
+  }
+
+  @override
+  String networkJoinRetryAfter(Object seconds) {
+    return ' Повторите через $seconds с.';
+  }
+
+  @override
+  String get networkJoin => 'Присоединиться';
+
+  @override
+  String get networkSelectChannel => 'Выберите канал';
+
+  @override
+  String get networkReconnecting =>
+      'Переподключение — сообщения будут отправлены после восстановления связи.';
+
+  @override
+  String get networkReconnectNow => 'Переподключиться сейчас';
+
+  @override
+  String networkMessageHint(Object channel) {
+    return 'Написать в $channel';
+  }
+
+  @override
+  String get networkNewChannel => 'Новый канал';
+
+  @override
+  String networkOnlineCount(Object count) {
+    return '$count в сети';
+  }
+
+  @override
+  String get networkRosterTitle => 'Участники';
+
+  @override
+  String get networkRosterLoading => 'Загрузка участников…';
+
+  @override
+  String get networkRosterEmpty => 'Пока нет участников.';
+
+  @override
+  String get networkPresenceOnline => 'В сети';
+
+  @override
+  String get networkPresenceOffline => 'Не в сети';
+
+  @override
+  String get networkPresenceBusy => 'Занят';
+
+  @override
+  String get networkMemberOwner => 'Владелец';
+
+  @override
+  String get networkMemberAdmin => 'Администратор';
+
+  @override
+  String get networkMemberMember => 'Участник';
+
+  @override
+  String get networkMemberGuest => 'Гость';
+
+  @override
+  String get networkMemberAgent => 'Агент';
+
+  @override
+  String get networkMemberUnknown => 'Неизвестно';
+
+  @override
+  String get networkAccessWholeNetwork => 'Вся сеть';
+
+  @override
+  String networkAccessChannels(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count канала',
+      many: '$count каналов',
+      few: '$count канала',
+      one: '$count канал',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get networkAccessThisChannelOnly => 'Только этот канал';
+
+  @override
+  String networkAccessThisChannelAndOthers(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'Этот канал + ещё $count канала',
+      many: 'Этот канал + ещё $count каналов',
+      few: 'Этот канал + ещё $count канала',
+      one: 'Этот канал + ещё $count канал',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String networkAccessOtherChannels(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count других канала',
+      many: '$count других каналов',
+      few: '$count других канала',
+      one: '$count другой канал',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get networkDropAgent => 'Удалить агента…';
+
+  @override
+  String get networkDropAgentTitle => 'Удалить этого агента?';
+
+  @override
+  String networkDropAgentBody(String displayName) {
+    return '\"$displayName\" будет удалён из сети и потеряет доступ. Это действие нельзя отменить.';
+  }
+
+  @override
+  String get networkDropAgentConfirm => 'Удалить агента';
+
+  @override
+  String get networkChannelsSection => 'Каналы';
+
+  @override
+  String get networkShowcasesSection => 'Витрины';
+
+  @override
+  String get networkShowcaseReadOnly =>
+      'Только чтение — нажмите, чтобы войти в сеть и писать.';
+
+  @override
+  String get networkShowcaseMemberReadOnly =>
+      'Писать в эту витрину могут только владелец и администраторы.';
+
+  @override
+  String get networkConnecting => 'Подключение…';
+
+  @override
+  String get networkNoChannels => 'Нет каналов';
+
+  @override
+  String get networkChannelOptions => 'Параметры канала';
+
+  @override
+  String get networkRenameChannel => 'Переименовать канал…';
+
+  @override
+  String get networkRenameChannelTitle => 'Переименовать канал';
+
+  @override
+  String get networkRename => 'Переименовать';
+
+  @override
+  String get networkChannelNameRequired =>
+      'Название канала не должно быть пустым.';
+
+  @override
+  String get networkDeleteChannel => 'Удалить канал…';
+
+  @override
+  String get networkDeleteChannelTitle => 'Удалить этот канал?';
+
+  @override
+  String get networkDeleteChannelBody =>
+      'Канал и все его сообщения будут удалены для всех. Это действие нельзя отменить.';
+
+  @override
+  String get networkChannelDeleted => 'Канал удалён';
+
+  @override
+  String get networkAddAgent => 'Добавить агента…';
+
+  @override
+  String get networkShowcasePublic => 'Витрина (публичный)';
+
+  @override
+  String get networkAddAgentTitle => 'Добавить агента';
+
+  @override
+  String get networkAddAgentWarning =>
+      'Передавайте эту строку только напрямую — любой, у кого она есть, сможет читать канал.';
+
+  @override
+  String get networkAddAgentNoKeys =>
+      'На этом устройстве нет ключей для этого канала.';
+
+  @override
+  String get networkAddAgentNoChannelKeys =>
+      'В кошельке нет ключей каналов — агент увидит каналы только после инвайта ключа';
+
+  @override
+  String get networkChannelKeyMissing =>
+      'Чтобы читать и писать в этом закрытом канале, на устройстве нужен его ключ.';
+
+  @override
+  String get networkChannelKeyImport => 'Импортировать ключ канала';
+
+  @override
+  String get networkChannelKeyInviteLabel => 'Приглашение с ключом канала';
+
+  @override
+  String get networkChannelKeyImportHint =>
+      'Вставьте приглашение в закрытый канал с устройства, где уже есть ключ.';
+
+  @override
+  String get networkChannelKeyWrongChannel =>
+      'Это приглашение относится к другому каналу.';
+
+  @override
+  String get networkChannelKeyWrongHub =>
+      'Это приглашение относится к другому хабу.';
+
+  @override
+  String get networkChannelKeyMismatch =>
+      'Открытый и закрытый ключи приглашения не соответствуют друг другу.';
+
+  @override
+  String get networkChannelKeyImportFailed =>
+      'Не удалось импортировать ключ канала. Повторите попытку.';
+
+  @override
+  String get networkAddAgentScopeChannel => 'Этот канал';
+
+  @override
+  String get networkAddAgentScopeNetwork => 'Вся сеть';
+
+  @override
+  String get networkAddAgentFormatLink => 'Ссылка (приложение)';
+
+  @override
+  String get networkAddAgentFormatCli => 'CLI-команда';
+
+  @override
+  String get networkAddAgentFormatEnv => 'Env (CI)';
+
+  @override
+  String get networkAddAgentFormatDap => 'DAP';
+
+  @override
+  String get networkAddAgentDapHint =>
+      'Скопируйте этот блок и вставьте его в чат fa (CLI, macOS, iOS или web) — агент автоматически присоединится к каналу.';
+
+  @override
+  String dapEnrollmentJoined(String channel) {
+    return 'Подключились к DAP-каналу #$channel. Сообщения канала теперь поступают этому агенту.';
+  }
+
+  @override
+  String dapEnrollmentJoinedPlaintext(String channel) {
+    return 'Подключились к DAP-каналу #$channel. Сообщения канала теперь поступают этому агенту. Предупреждение о хранении: закрытый ключ приглашения и учётные данные хаба хранятся в ОТКРЫТОМ ВИДЕ (без шифрования) в песочнице приложения (в web — IndexedDB).';
+  }
+
+  @override
+  String dapEnrollmentFailed(String channel) {
+    return 'Не удалось подключиться к DAP-каналу #$channel. Проверьте приглашение и соединение с хабом, затем повторите попытку.';
+  }
+
+  @override
+  String get dapEnrollmentUnsupported =>
+      'Подключение к DAP не поддерживается на этой платформе — используйте нативное приложение или fa CLI.';
+
+  @override
+  String get networkAddAgentEnroll => 'Заэнроллить агента';
+
+  @override
+  String get networkAddAgentEnrollHint =>
+      'Выдача создаёт независимый отзываемый секрет: агенты с одинаковым именем могут подключаться одновременно. Секрет показывается ОДИН раз: скопируйте его сейчас.';
+
+  @override
+  String get networkAddAgentEnrollNeedSignIn =>
+      'Войдите в сеть, чтобы выдавать доступ агентам';
+
+  @override
+  String get networkAddAgentNameInvalid => '3–64 символа: a-z, 0-9, дефис';
+
+  @override
+  String get networkAddAgentEnvHint =>
+      'Env-переменные для CI-раннера (GitHub Actions) — ссылка уже несёт id сети и пароль (или ключи канала), ничего дописывать не нужно. Зарезервировано под будущий сетевой режим CLI — десктопные и мобильные агенты используют ссылку.';
+
+  @override
+  String get networkAddAgentNetworkHint =>
+      'Агент входит полным участником и видит все каналы сети.';
+
+  @override
+  String get networkAddAgentNetworkNoPassword =>
+      'Пароль сети недоступен на этом устройстве — при входе ссылка запросит его.';
+
+  @override
+  String get networkAddAgentCliHint =>
+      'Команда работает для хабов с прямым DAP-доступом (например, локальный стенд); CLI-вход на production fa_network — в разработке.';
+
+  @override
+  String get networkAddAgentNetworkCliHint =>
+      'CLI-подключение к сети пока не готово — используйте ссылку.';
+
+  @override
+  String get networkInviteCopied => 'Приглашение скопировано в буфер обмена.';
+
+  @override
+  String get networkCopy => 'Копировать';
+
+  @override
+  String get networkClose => 'Закрыть';
+
+  @override
+  String get networkWalletTooltip => 'Кошелёк';
+
+  @override
+  String get networkWalletExport => 'Экспортировать кошелёк';
+
+  @override
+  String get networkWalletImport => 'Импортировать кошелёк';
+
+  @override
+  String get networkWalletExported =>
+      'Кошелёк экспортирован — JSON скопирован в буфер обмена.';
+
+  @override
+  String networkWalletExportFailed(Object error) {
+    return 'Не удалось экспортировать: $error';
+  }
+
+  @override
+  String get networkWalletImported => 'Кошелёк импортирован.';
+
+  @override
+  String get networkPassphraseLabel => 'Парольная фраза';
+
+  @override
+  String get networkPassphraseRepeatLabel => 'Повторите парольную фразу';
+
+  @override
+  String get networkPassphraseEmpty => 'Парольная фраза не должна быть пустой.';
+
+  @override
+  String get networkPassphraseMismatch => 'Парольные фразы не совпадают.';
+
+  @override
+  String get networkExport => 'Экспортировать';
+
+  @override
+  String get networkImport => 'Импортировать';
+
+  @override
+  String get networkWalletJsonLabel => 'JSON экспортированного кошелька';
+
+  @override
+  String get networkWalletImportWarning =>
+      'Импорт заменит кошелёк на этом устройстве.';
+
+  @override
+  String get networkNameHint => 'Отображаемое имя — станет lowercase-slug';
+
+  @override
+  String get networkPasswordHint => '8–128 символов';
+
+  @override
+  String get networkNameInvalid =>
+      'После слага нужно 3–64 символа (буквы, цифры, дефисы)';
+
+  @override
+  String get networkPasswordInvalid => 'Пароль: 8–128 символов';
+
+  @override
+  String get networkListPublic => 'Показывать в публичном каталоге';
+
+  @override
+  String get networkDelete => 'Удалить сеть…';
+
+  @override
+  String get networkDeleteTitle => 'Удалить эту сеть?';
+
+  @override
+  String get networkDeleteBody =>
+      'Сеть, её каналы и все сообщения будут удалены для всех. Это действие нельзя отменить.';
+
+  @override
+  String get networkDeleted => 'Сеть удалена';
+
+  @override
+  String networkSlugPreview(Object slug) {
+    return 'Будет создана как: $slug';
+  }
+
+  @override
+  String get networkSignInToCreate => 'Войдите, чтобы создать сеть';
+
+  @override
+  String get networkShowcaseUnavailable => 'Эта сеть недоступна публично';
+
+  @override
+  String get networkShowcaseReadOnlyBadge => 'только чтение';
+
+  @override
+  String get networkBackToNetworks => 'Назад к сетям';
+
+  @override
+  String get networkAddAgentPublicHint =>
+      'Эту ссылку видят все — канал публичный. Агенты подключаются без ключей.';
+}

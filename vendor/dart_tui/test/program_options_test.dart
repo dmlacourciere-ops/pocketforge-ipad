@@ -1,0 +1,266 @@
+// Integration tests for Program ProgramOption functions.
+//
+// These tests run headless (no TTY): withInput(null) disables stdin,
+// withOutput(sink) captures ANSI output.
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:dart_tui/dart_tui.dart';
+import 'package:test/test.dart';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Minimal model that quits immediately from init.
+final class _ImmediateQuit extends Model {
+  @override
+  Cmd? init() => () => quit();
+
+  @override
+  (Model, Cmd?) update(Msg msg) => (this, null);
+
+  @override
+  View view() => newView('');
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+void main() {
+  group('kitty keyboard protocol', () {
+    test('startup sets the disambiguate flag, shutdown resets it', () async {
+      final chunks = <String>[];
+      final controller = StreamController<List<int>>();
+      controller.stream.listen((d) => chunks.add(utf8.decode(d)));
+      final sink = IOSink(controller.sink);
+
+      await Program(options: [withInput(null), withOutput(sink)]).run(
+        _ImmediateQuit(),
+      );
+
+      await sink.flush();
+      final out = chunks.join();
+      await sink.close();
+      await controller.close();
+
+      // CSI = 1 ; 1 u — kitty keyboard "disambiguate escape codes": terminals
+      // that support it report Shift+Enter / Ctrl+Enter etc. as CSI-u
+      // sequences instead of swallowing them (legacy CR). Terminals without
+      // support ignore the sequence and stay legacy.
+      expect(out, contains('\x1b[=1;1u'));
+      // CSI = 0 ; 1 u — reset the flags on shutdown, so the shell after exit
+      // keeps its own keyboard state.
+      expect(out, contains('\x1b[=0;1u'));
+    });
+  });
+
+  group('withAltScreen()', () {
+    test('emits alt-screen enter sequence', () async {
+      final chunks = <String>[];
+      final controller = StreamController<List<int>>();
+      controller.stream.listen((d) => chunks.add(utf8.decode(d)));
+      final sink = IOSink(controller.sink);
+
+      await Program(
+        options: [
+          withInput(null),
+          withOutput(sink),
+          withAltScreen(),
+        ],
+      ).run(_ImmediateQuit());
+
+      await sink.flush();
+      final out = chunks.join();
+      await sink.close();
+      await controller.close();
+
+      // ?1049h = enter alt screen
+      expect(out, contains('\x1b[?1049h'));
+    });
+  });
+
+  group('withReportFocus()', () {
+    test('emits focus-reporting enable sequence', () async {
+      final chunks = <String>[];
+      final controller = StreamController<List<int>>();
+      controller.stream.listen((d) => chunks.add(utf8.decode(d)));
+      final sink = IOSink(controller.sink);
+
+      await Program(
+        options: [
+          withInput(null),
+          withOutput(sink),
+          withReportFocus(),
+        ],
+      ).run(_ImmediateQuit());
+
+      await sink.flush();
+      final out = chunks.join();
+      await sink.close();
+      await controller.close();
+
+      // ?1004h = enable focus reporting
+      expect(out, contains('\x1b[?1004h'));
+    });
+  });
+
+  group('withTickInterval()', () {
+    test('program exits cleanly with tick interval enabled', () async {
+      // If the tick mechanism crashes, the future will throw.
+      await Program(
+        options: [
+          withInput(null),
+          withTickInterval(const Duration(milliseconds: 5)),
+        ],
+      ).run(_ImmediateQuit());
+    });
+  });
+
+  group('withHideCursor()', () {
+    test('withHideCursor(false) does NOT emit hide-cursor sequence', () async {
+      final chunks = <String>[];
+      final controller = StreamController<List<int>>();
+      controller.stream.listen((d) => chunks.add(utf8.decode(d)));
+      final sink = IOSink(controller.sink);
+
+      await Program(
+        options: [
+          withInput(null),
+          withOutput(sink),
+          withHideCursor(false),
+        ],
+      ).run(_ImmediateQuit());
+
+      await sink.flush();
+      final out = chunks.join();
+      await sink.close();
+      await controller.close();
+
+      // ?25l = hide cursor — should NOT appear
+      expect(out, isNot(contains('\x1b[?25l')));
+    });
+  });
+
+  group('withWindowSize()', () {
+    test('WindowSizeMsg has the injected dimensions', () async {
+      int? receivedWidth;
+      int? receivedHeight;
+
+      final model = _WindowSizeCapture(
+        onSize: (w, h) {
+          receivedWidth = w;
+          receivedHeight = h;
+        },
+      );
+
+      await Program(
+        options: [
+          withInput(null),
+          withWindowSize(120, 40),
+        ],
+      ).run(model);
+
+      expect(receivedWidth, 120);
+      expect(receivedHeight, 40);
+    });
+    test('changed WindowSizeMsg invalidates the cell renderer (E1 wiring)',
+        () async {
+      final chunks = <String>[];
+      final controller = StreamController<List<int>>();
+      controller.stream.listen((data) => chunks.add(utf8.decode(data)));
+      final sink = IOSink(controller.sink);
+
+      final model = _ResizeRepaintModel();
+      await Program(
+        options: [
+          withInput(null),
+          withOutput(sink),
+          withWindowSize(100, 40),
+          withCellRenderer(),
+        ],
+      ).run(model);
+
+      await sink.flush();
+      final out = chunks.join();
+      await sink.close();
+      await controller.close();
+
+      // Both WindowSizeMsgs reached the model — the program invalidates
+      // the renderer without swallowing the message.
+      expect(model.sizeMsgs, 2);
+      // The post-resize frame is a FULL repaint: the clear pass
+      // (CUP + EL) reappears and no stale-row diff walk (row 3) remains.
+      final resized = out.substring(out.indexOf('a4') + 2);
+      expect(resized, contains('\x1b[1;1H\x1b[K'));
+      expect(resized, contains('\x1b[2;1H\x1b[K'));
+      expect(resized, contains('b2'));
+      expect(resized, isNot(contains('\x1b[3;1H')));
+    });
+  });
+
+  group('withLogFile()', () {
+    test('writes rendered output to the selected file', () async {
+      final directory = await Directory.systemTemp.createTemp('dart_tui_log_');
+      addTearDown(() => directory.delete(recursive: true));
+      final logFile = File('${directory.path}/program.log');
+
+      await Program(
+        options: [withInput(null), withLogFile(logFile)],
+      ).run(_ImmediateQuit());
+
+      expect(await logFile.readAsString(), isNotEmpty);
+    });
+  });
+}
+
+// ── Aux models ────────────────────────────────────────────────────────────────
+
+final class _WindowSizeCapture extends Model {
+  _WindowSizeCapture({required this.onSize});
+  final void Function(int w, int h) onSize;
+  bool _received = false;
+
+  @override
+  (Model, Cmd?) update(Msg msg) {
+    if (msg is WindowSizeMsg && !_received) {
+      _received = true;
+      onSize(msg.width, msg.height);
+      return (this, () => quit());
+    }
+    return (this, null);
+  }
+
+  @override
+  View view() => newView('');
+}
+
+/// Paints a 4-row grid, then re-enqueues a smaller WindowSizeMsg; the
+/// program must invalidate the renderer so the shrunk 2-row view is ONE
+/// full repaint (issue #274 E1).
+final class _ResizeRepaintModel extends Model {
+  int sizeMsgs = 0;
+  bool _rearmed = false;
+
+  @override
+  (Model, Cmd?) update(Msg msg) {
+    if (msg is WindowSizeMsg) {
+      sizeMsgs++;
+      if (!_rearmed) {
+        _rearmed = true;
+        return (this, () => WindowSizeMsg(80, 24));
+      }
+      // Defer quit past the next batch so the resized frame still renders
+      // (a sync quit drains in the same batch and skips the final paint).
+      return (
+        this,
+        () async {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          return quit();
+        }
+      );
+    }
+    return (this, null);
+  }
+
+  @override
+  View view() => sizeMsgs > 1 ? newView('b1\nb2') : newView('a1\na2\na3\na4');
+}

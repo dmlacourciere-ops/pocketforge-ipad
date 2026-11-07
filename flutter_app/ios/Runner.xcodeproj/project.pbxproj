@@ -1,0 +1,2063 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 54;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */ = {isa = PBXBuildFile; fileRef = 1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */; };
+		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
+		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
+		74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74858FAE1ED2DC5600515810 /* AppDelegate.swift */; };
+		7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */; };
+		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
+		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
+		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
+		C10AB27F146B70668D41A3EC /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BFE5323F7E0489BA9D3E73E7 /* Pods_RunnerTests.framework */; };
+		C92C85E2CF0506ED8435817E /* Pods_Runner.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 02E8A8560C4C1820E9F97BD4 /* Pods_Runner.framework */; };
+		DCFF73552C1DA1B3C635D3F7 /* GoogleService-Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = 1BF290752CC42685CC316A4B /* GoogleService-Info.plist */; };
+		FA51AC0100000000000000A1 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = FA51AC0200000000000000A1 /* PrivacyInfo.xcprivacy */; };
+		FA51AC0300000000000000B1 /* FaLiveActivityBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA51AC0300000000000000E1 /* FaLiveActivityBundle.swift */; };
+		FA51AC0300000000000000B2 /* FaLiveActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA51AC0300000000000000E2 /* FaLiveActivityWidget.swift */; };
+		FA51AC0300000000000000B3 /* FaLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA51AC0300000000000000E3 /* FaLiveActivityAttributes.swift */; };
+		FA51AC0300000000000000B4 /* FaLiveActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA51AC0300000000000000E3 /* FaLiveActivityAttributes.swift */; };
+		FA51AC0300000000000000B5 /* FaLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = FA51AC0300000000000000E5 /* FaLiveActivity.appex */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		331C8085294A63A400263BE5 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 97C146E61CF9000F007C117D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 97C146ED1CF9000F007C117D;
+			remoteInfo = Runner;
+		};
+		FA51AC0300000000000000C1 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 97C146E61CF9000F007C117D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = FA51AC0300000000000000A1;
+			remoteInfo = FaLiveActivity;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		9705A1C41CF9048500538489 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA51AC0300000000000000D1 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				FA51AC0300000000000000B5 /* FaLiveActivity.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		02E8A8560C4C1820E9F97BD4 /* Pods_Runner.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Runner.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GeneratedPluginRegistrant.h; sourceTree = "<group>"; };
+		1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = GeneratedPluginRegistrant.m; sourceTree = "<group>"; };
+		1BF290752CC42685CC316A4B /* GoogleService-Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; name = "GoogleService-Info.plist"; path = "GoogleService-Info.plist"; sourceTree = "<group>"; };
+		331C807B294A618700263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
+		331C8081294A63A400263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = AppFrameworkInfo.plist; path = Flutter/AppFrameworkInfo.plist; sourceTree = "<group>"; };
+		5C4E07E7CF6180BBB3E8A83C /* Pods-Runner.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.profile.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.profile.xcconfig"; sourceTree = "<group>"; };
+		74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Runner-Bridging-Header.h"; sourceTree = "<group>"; };
+		74858FAE1ED2DC5600515810 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
+		7945E307007D51737297DE4B /* Pods-RunnerTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.debug.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.debug.xcconfig"; sourceTree = "<group>"; };
+		7AFA3C8E1D35360C0083082E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Release.xcconfig; path = Flutter/Release.xcconfig; sourceTree = "<group>"; };
+		7D87BE4E81230B93211A29E6 /* Pods-Runner.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.debug.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"; sourceTree = "<group>"; };
+		84E463338CB8EC68B6E14C39 /* Pods-RunnerTests.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.profile.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.profile.xcconfig"; sourceTree = "<group>"; };
+		8B4308847983EF7130B0C988 /* Pods-RunnerTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.release.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.release.xcconfig"; sourceTree = "<group>"; };
+		9740EEB21CF90195004384FC /* Debug.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Debug.xcconfig; path = Flutter/Debug.xcconfig; sourceTree = "<group>"; };
+		9740EEB31CF90195004384FC /* Generated.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Generated.xcconfig; path = Flutter/Generated.xcconfig; sourceTree = "<group>"; };
+		97C146EE1CF9000F007C117D /* Runner.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Runner.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		97C146FB1CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/Main.storyboard; sourceTree = "<group>"; };
+		97C146FD1CF9000F007C117D /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
+		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		BCBEE745F947ABC7FBA98CFA /* Pods-Runner.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.release.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"; sourceTree = "<group>"; };
+		BFE5323F7E0489BA9D3E73E7 /* Pods_RunnerTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_RunnerTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		FA51AC0200000000000000A1 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		FA51AC0300000000000000E1 /* FaLiveActivityBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaLiveActivityBundle.swift; sourceTree = "<group>"; };
+		FA51AC0300000000000000E2 /* FaLiveActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaLiveActivityWidget.swift; sourceTree = "<group>"; };
+		FA51AC0300000000000000E3 /* FaLiveActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FaLiveActivityAttributes.swift; sourceTree = "<group>"; };
+		FA51AC0300000000000000E4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		FA51AC0300000000000000E5 /* FaLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FaLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		97C146EB1CF9000F007C117D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C92C85E2CF0506ED8435817E /* Pods_Runner.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		E6EC706D9541C2CE3A68089C /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C10AB27F146B70668D41A3EC /* Pods_RunnerTests.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA51AC0300000000000000A3 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		331C8082294A63A400263BE5 /* RunnerTests */ = {
+			isa = PBXGroup;
+			children = (
+				331C807B294A618700263BE5 /* RunnerTests.swift */,
+			);
+			path = RunnerTests;
+			sourceTree = "<group>";
+		};
+		9740EEB11CF90186004384FC /* Flutter */ = {
+			isa = PBXGroup;
+			children = (
+				3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */,
+				9740EEB21CF90195004384FC /* Debug.xcconfig */,
+				7AFA3C8E1D35360C0083082E /* Release.xcconfig */,
+				9740EEB31CF90195004384FC /* Generated.xcconfig */,
+			);
+			name = Flutter;
+			sourceTree = "<group>";
+		};
+		97C146E51CF9000F007C117D = {
+			isa = PBXGroup;
+			children = (
+				9740EEB11CF90186004384FC /* Flutter */,
+				97C146F01CF9000F007C117D /* Runner */,
+				FA51AC0300000000000000F1 /* FaLiveActivity */,
+				97C146EF1CF9000F007C117D /* Products */,
+				331C8082294A63A400263BE5 /* RunnerTests */,
+				CAE2343A8C2C302FCFD3AE7E /* Pods */,
+				BFD5D21450427D9733956D04 /* Frameworks */,
+			);
+			sourceTree = "<group>";
+		};
+		97C146EF1CF9000F007C117D /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				97C146EE1CF9000F007C117D /* Runner.app */,
+				331C8081294A63A400263BE5 /* RunnerTests.xctest */,
+				FA51AC0300000000000000E5 /* FaLiveActivity.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		97C146F01CF9000F007C117D /* Runner */ = {
+			isa = PBXGroup;
+			children = (
+				97C146FA1CF9000F007C117D /* Main.storyboard */,
+				97C146FD1CF9000F007C117D /* Assets.xcassets */,
+				97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */,
+				97C147021CF9000F007C117D /* Info.plist */,
+				FA51AC0200000000000000A1 /* PrivacyInfo.xcprivacy */,
+				1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */,
+				1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */,
+				74858FAE1ED2DC5600515810 /* AppDelegate.swift */,
+				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
+				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
+				1BF290752CC42685CC316A4B /* GoogleService-Info.plist */,
+			);
+			path = Runner;
+			sourceTree = "<group>";
+		};
+		BFD5D21450427D9733956D04 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				02E8A8560C4C1820E9F97BD4 /* Pods_Runner.framework */,
+				BFE5323F7E0489BA9D3E73E7 /* Pods_RunnerTests.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		CAE2343A8C2C302FCFD3AE7E /* Pods */ = {
+			isa = PBXGroup;
+			children = (
+				7D87BE4E81230B93211A29E6 /* Pods-Runner.debug.xcconfig */,
+				BCBEE745F947ABC7FBA98CFA /* Pods-Runner.release.xcconfig */,
+				5C4E07E7CF6180BBB3E8A83C /* Pods-Runner.profile.xcconfig */,
+				7945E307007D51737297DE4B /* Pods-RunnerTests.debug.xcconfig */,
+				8B4308847983EF7130B0C988 /* Pods-RunnerTests.release.xcconfig */,
+				84E463338CB8EC68B6E14C39 /* Pods-RunnerTests.profile.xcconfig */,
+			);
+			name = Pods;
+			path = Pods;
+			sourceTree = "<group>";
+		};
+		FA51AC0300000000000000F1 /* FaLiveActivity */ = {
+			isa = PBXGroup;
+			children = (
+				FA51AC0300000000000000E1 /* FaLiveActivityBundle.swift */,
+				FA51AC0300000000000000E2 /* FaLiveActivityWidget.swift */,
+				FA51AC0300000000000000E3 /* FaLiveActivityAttributes.swift */,
+				FA51AC0300000000000000E4 /* Info.plist */,
+			);
+			path = FaLiveActivity;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		331C8080294A63A400263BE5 /* RunnerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 331C8087294A63A400263BE5 /* Build configuration list for PBXNativeTarget "RunnerTests" */;
+			buildPhases = (
+				580DF1486E41D413629A3464 /* [CP] Check Pods Manifest.lock */,
+				331C807D294A63A400263BE5 /* Sources */,
+				331C807F294A63A400263BE5 /* Resources */,
+				E6EC706D9541C2CE3A68089C /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				331C8086294A63A400263BE5 /* PBXTargetDependency */,
+			);
+			name = RunnerTests;
+			productName = RunnerTests;
+			productReference = 331C8081294A63A400263BE5 /* RunnerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		97C146ED1CF9000F007C117D /* Runner */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 97C147051CF9000F007C117D /* Build configuration list for PBXNativeTarget "Runner" */;
+			buildPhases = (
+				1107A6CF08BFEF057E6C06DC /* [CP] Check Pods Manifest.lock */,
+				9740EEB61CF901F6004384FC /* Run Script */,
+				97C146EA1CF9000F007C117D /* Sources */,
+				97C146EB1CF9000F007C117D /* Frameworks */,
+				97C146EC1CF9000F007C117D /* Resources */,
+				9705A1C41CF9048500538489 /* Embed Frameworks */,
+				FA51AC0300000000000000D1 /* Embed App Extensions */,
+				3B06AD1E1E4923F5004D2608 /* Thin Binary */,
+				435B4573797A9630476F73DC /* [CP] Copy Pods Resources */,
+				1CF8EB95A6AD08AFC97EC864 /* Crashlytics: upload dSYMs */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				FA51AC0300000000000000C2 /* PBXTargetDependency */,
+			);
+			name = Runner;
+			productName = Runner;
+			productReference = 97C146EE1CF9000F007C117D /* Runner.app */;
+			productType = "com.apple.product-type.application";
+		};
+		FA51AC0300000000000000A1 /* FaLiveActivity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = FA51AC03000000000000001D /* Build configuration list for PBXNativeTarget "FaLiveActivity" */;
+			buildPhases = (
+				FA51AC0300000000000000A2 /* Sources */,
+				FA51AC0300000000000000A3 /* Frameworks */,
+				FA51AC0300000000000000A4 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FaLiveActivity;
+			productName = FaLiveActivity;
+			productReference = FA51AC0300000000000000E5 /* FaLiveActivity.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		97C146E61CF9000F007C117D /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1510;
+				ORGANIZATIONNAME = "";
+				TargetAttributes = {
+					331C8080294A63A400263BE5 = {
+						CreatedOnToolsVersion = 14.0;
+						TestTargetID = 97C146ED1CF9000F007C117D;
+					};
+					97C146ED1CF9000F007C117D = {
+						CreatedOnToolsVersion = 7.3.1;
+						LastSwiftMigration = 1100;
+					};
+					FA51AC0300000000000000A1 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = 97C146E91CF9000F007C117D /* Build configuration list for PBXProject "Runner" */;
+			compatibilityVersion = "Xcode 9.3";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 97C146E51CF9000F007C117D;
+			productRefGroup = 97C146EF1CF9000F007C117D /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				97C146ED1CF9000F007C117D /* Runner */,
+				331C8080294A63A400263BE5 /* RunnerTests */,
+				FA51AC0300000000000000A1 /* FaLiveActivity */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		331C807F294A63A400263BE5 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		97C146EC1CF9000F007C117D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */,
+				3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */,
+				97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */,
+				97C146FC1CF9000F007C117D /* Main.storyboard in Resources */,
+				FA51AC0100000000000000A1 /* PrivacyInfo.xcprivacy in Resources */,
+				DCFF73552C1DA1B3C635D3F7 /* GoogleService-Info.plist in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA51AC0300000000000000A4 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		1107A6CF08BFEF057E6C06DC /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-Runner-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		1CF8EB95A6AD08AFC97EC864 /* Crashlytics: upload dSYMs */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Resources/DWARF/${TARGET_NAME}",
+				"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Info.plist",
+				"${PROJECT_DIR}/Runner/GoogleService-Info.plist",
+			);
+			name = "Crashlytics: upload dSYMs";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "DSYM=\"${DWARF_DSYM_FOLDER_PATH}/${DWARF_DSYM_FILE_NAME}/Contents/Resources/DWARF/${TARGET_NAME}\"\nif [ ! -f \"$DSYM\" ]; then\n  echo \"note: no dSYM for this build (debug/simulator) — skipping Crashlytics upload\"\nelif [ -f \"${PODS_ROOT}/FirebaseCrashlytics/upload-symbols\" ]; then\n  \"${PODS_ROOT}/FirebaseCrashlytics/upload-symbols\" -gsp \"${PROJECT_DIR}/Runner/GoogleService-Info.plist\" -p ios \"$DSYM\"\nelse\n  echo \"warning: FirebaseCrashlytics upload-symbols not found — skipping dSYM upload\"\nfi";
+			showEnvVarsInLog = 0;
+		};
+		3B06AD1E1E4923F5004D2608 /* Thin Binary */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"${TARGET_BUILD_DIR}/${INFOPLIST_PATH}",
+			);
+			name = "Thin Binary";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" embed_and_thin";
+		};
+		435B4573797A9630476F73DC /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		580DF1486E41D413629A3464 /* [CP] Check Pods Manifest.lock */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
+				"${PODS_ROOT}/Manifest.lock",
+			);
+			name = "[CP] Check Pods Manifest.lock";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(DERIVED_FILE_DIR)/Pods-RunnerTests-checkManifestLockResult.txt",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		9740EEB61CF901F6004384FC /* Run Script */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Run Script";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" build";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		331C807D294A63A400263BE5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		97C146EA1CF9000F007C117D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */,
+				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
+				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
+				FA51AC0300000000000000B4 /* FaLiveActivityAttributes.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FA51AC0300000000000000A2 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				FA51AC0300000000000000B1 /* FaLiveActivityBundle.swift in Sources */,
+				FA51AC0300000000000000B2 /* FaLiveActivityWidget.swift in Sources */,
+				FA51AC0300000000000000B3 /* FaLiveActivityAttributes.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		331C8086294A63A400263BE5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 97C146ED1CF9000F007C117D /* Runner */;
+			targetProxy = 331C8085294A63A400263BE5 /* PBXContainerItemProxy */;
+		};
+		FA51AC0300000000000000C2 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = FA51AC0300000000000000A1 /* FaLiveActivity */;
+			targetProxy = FA51AC0300000000000000C1 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXVariantGroup section */
+		97C146FA1CF9000F007C117D /* Main.storyboard */ = {
+			isa = PBXVariantGroup;
+			children = (
+				97C146FB1CF9000F007C117D /* Base */,
+			);
+			name = Main.storyboard;
+			sourceTree = "<group>";
+		};
+		97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */ = {
+			isa = PBXVariantGroup;
+			children = (
+				97C147001CF9000F007C117D /* Base */,
+			);
+			name = LaunchScreen.storyboard;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
+
+/* Begin XCBuildConfiguration section */
+		249021D3217E4FDB00AE95B9 /* Profile */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++0x";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_C_LANGUAGE_STANDARD = gnu99;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Profile;
+		};
+		249021D4217E4FDB00AE95B9 /* Profile */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 7AFA3C8E1D35360C0083082E /* Release.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Distribution: Uladzimir Klyshevich (YP9HC3USZ3)";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = YP9HC3USZ3;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
+				INFOPLIST_FILE = Runner/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-Wl,-force_load,$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64/libwasm_run_dart.a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDataDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDownloadDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionWebSocketDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_10z9f5k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_17ap02x",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1ldqghh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1mbt9g9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1q0i84",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_e3qsqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xr62hr",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xx612k",
+					"-Wl,-exported_symbol,_drop_dart_object",
+					"-Wl,-exported_symbol,_drop_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_drop_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_drop_opaque_CallStack",
+					"-Wl,-exported_symbol,_drop_opaque_Global",
+					"-Wl,-exported_symbol,_drop_opaque_Memory",
+					"-Wl,-exported_symbol,_drop_opaque_Table",
+					"-Wl,-exported_symbol,_drop_opaque_WFunc",
+					"-Wl,-exported_symbol,_free_WireSyncReturn",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i8",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u8",
+					"-Wl,-exported_symbol,_get_dart_object",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Func",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Global",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Memory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_SharedMemory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Table",
+					"-Wl,-exported_symbol,_inflate_WasmVal_externRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_funcRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_v128",
+					"-Wl,-exported_symbol,_init_frb_dart_api_dl",
+					"-Wl,-exported_symbol,_new_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_new_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_new_CallStack",
+					"-Wl,-exported_symbol,_new_Global",
+					"-Wl,-exported_symbol,_new_Memory",
+					"-Wl,-exported_symbol,_new_StringList_0",
+					"-Wl,-exported_symbol,_new_Table",
+					"-Wl,-exported_symbol,_new_WFunc",
+					"-Wl,-exported_symbol,_new_box_autoadd_WFunc_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_atomics_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_bool_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_compiled_module_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_memory_ty_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmi_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmtime_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_table_args_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u32_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u64_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_usize_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_config_native_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_stack_limits_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_instance_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_module_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_shared_memory_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_val_0",
+					"-Wl,-exported_symbol,_new_dart_opaque",
+					"-Wl,-exported_symbol,_new_list_env_variable_0",
+					"-Wl,-exported_symbol,_new_list_module_import_0",
+					"-Wl,-exported_symbol,_new_list_preopened_dir_0",
+					"-Wl,-exported_symbol,_new_list_value_ty_0",
+					"-Wl,-exported_symbol,_new_list_wasm_val_0",
+					"-Wl,-exported_symbol,_new_uint_8_list_0",
+					"-Wl,-exported_symbol,_share_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_share_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_share_opaque_CallStack",
+					"-Wl,-exported_symbol,_share_opaque_Global",
+					"-Wl,-exported_symbol,_share_opaque_Memory",
+					"-Wl,-exported_symbol,_share_opaque_Table",
+					"-Wl,-exported_symbol,_share_opaque_WFunc",
+					"-Wl,-exported_symbol,_store_dart_post_cobject",
+					"-Wl,-exported_symbol,_wire_add__method__Atomics",
+					"-Wl,-exported_symbol,_wire_add_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_and__method__Atomics",
+					"-Wl,-exported_symbol,_wire_atomic_notify__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait32__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait64__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomics__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_call_function_handle__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_parallel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_compare_exchange__method__Atomics",
+					"-Wl,-exported_symbol,_wire_compile_wasm",
+					"-Wl,-exported_symbol,_wire_compile_wasm_sync",
+					"-Wl,-exported_symbol,_wire_consume_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_function__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_global__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_shared_memory__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_create_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_data_pointer__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_data_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_dispose__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_exports__method__WasmRunInstanceId",
+					"-Wl,-exported_symbol,_wire_fill_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_fuel_consumed__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_function_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer_and_length__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_pages__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_module_exports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_module_imports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_size__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_grow_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_link_imports__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_load__method__Atomics",
+					"-Wl,-exported_symbol,_wire_module_builder",
+					"-Wl,-exported_symbol,_wire_or__method__Atomics",
+					"-Wl,-exported_symbol,_wire_parse_wat_format",
+					"-Wl,-exported_symbol,_wire_read_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_stdio_stream__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_store__method__Atomics",
+					"-Wl,-exported_symbol,_wire_sub__method__Atomics",
+					"-Wl,-exported_symbol,_wire_swap__method__Atomics",
+					"-Wl,-exported_symbol,_wire_ty__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_wasm_features_for_config",
+					"-Wl,-exported_symbol,_wire_wasm_runtime_features",
+					"-Wl,-exported_symbol,_wire_worker_execution__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_write_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_xor__method__Atomics",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-Wl,-force_load,$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64_x86_64-simulator/libwasm_run_dart.a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDataDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDownloadDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionWebSocketDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_10z9f5k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_17ap02x",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1ldqghh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1mbt9g9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1q0i84",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_e3qsqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xr62hr",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xx612k",
+					"-Wl,-exported_symbol,_drop_dart_object",
+					"-Wl,-exported_symbol,_drop_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_drop_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_drop_opaque_CallStack",
+					"-Wl,-exported_symbol,_drop_opaque_Global",
+					"-Wl,-exported_symbol,_drop_opaque_Memory",
+					"-Wl,-exported_symbol,_drop_opaque_Table",
+					"-Wl,-exported_symbol,_drop_opaque_WFunc",
+					"-Wl,-exported_symbol,_free_WireSyncReturn",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i8",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u8",
+					"-Wl,-exported_symbol,_get_dart_object",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Func",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Global",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Memory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_SharedMemory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Table",
+					"-Wl,-exported_symbol,_inflate_WasmVal_externRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_funcRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_v128",
+					"-Wl,-exported_symbol,_init_frb_dart_api_dl",
+					"-Wl,-exported_symbol,_new_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_new_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_new_CallStack",
+					"-Wl,-exported_symbol,_new_Global",
+					"-Wl,-exported_symbol,_new_Memory",
+					"-Wl,-exported_symbol,_new_StringList_0",
+					"-Wl,-exported_symbol,_new_Table",
+					"-Wl,-exported_symbol,_new_WFunc",
+					"-Wl,-exported_symbol,_new_box_autoadd_WFunc_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_atomics_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_bool_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_compiled_module_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_memory_ty_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmi_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmtime_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_table_args_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u32_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u64_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_usize_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_config_native_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_stack_limits_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_instance_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_module_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_shared_memory_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_val_0",
+					"-Wl,-exported_symbol,_new_dart_opaque",
+					"-Wl,-exported_symbol,_new_list_env_variable_0",
+					"-Wl,-exported_symbol,_new_list_module_import_0",
+					"-Wl,-exported_symbol,_new_list_preopened_dir_0",
+					"-Wl,-exported_symbol,_new_list_value_ty_0",
+					"-Wl,-exported_symbol,_new_list_wasm_val_0",
+					"-Wl,-exported_symbol,_new_uint_8_list_0",
+					"-Wl,-exported_symbol,_share_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_share_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_share_opaque_CallStack",
+					"-Wl,-exported_symbol,_share_opaque_Global",
+					"-Wl,-exported_symbol,_share_opaque_Memory",
+					"-Wl,-exported_symbol,_share_opaque_Table",
+					"-Wl,-exported_symbol,_share_opaque_WFunc",
+					"-Wl,-exported_symbol,_store_dart_post_cobject",
+					"-Wl,-exported_symbol,_wire_add__method__Atomics",
+					"-Wl,-exported_symbol,_wire_add_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_and__method__Atomics",
+					"-Wl,-exported_symbol,_wire_atomic_notify__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait32__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait64__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomics__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_call_function_handle__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_parallel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_compare_exchange__method__Atomics",
+					"-Wl,-exported_symbol,_wire_compile_wasm",
+					"-Wl,-exported_symbol,_wire_compile_wasm_sync",
+					"-Wl,-exported_symbol,_wire_consume_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_function__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_global__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_shared_memory__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_create_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_data_pointer__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_data_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_dispose__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_exports__method__WasmRunInstanceId",
+					"-Wl,-exported_symbol,_wire_fill_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_fuel_consumed__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_function_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer_and_length__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_pages__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_module_exports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_module_imports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_size__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_grow_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_link_imports__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_load__method__Atomics",
+					"-Wl,-exported_symbol,_wire_module_builder",
+					"-Wl,-exported_symbol,_wire_or__method__Atomics",
+					"-Wl,-exported_symbol,_wire_parse_wat_format",
+					"-Wl,-exported_symbol,_wire_read_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_stdio_stream__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_store__method__Atomics",
+					"-Wl,-exported_symbol,_wire_sub__method__Atomics",
+					"-Wl,-exported_symbol,_wire_swap__method__Atomics",
+					"-Wl,-exported_symbol,_wire_ty__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_wasm_features_for_config",
+					"-Wl,-exported_symbol,_wire_wasm_runtime_features",
+					"-Wl,-exported_symbol,_wire_worker_execution__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_write_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_xor__method__Atomics",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "ea16775c-88f7-44ed-993b-37eab38096bb";
+				STRIP_STYLE = "non-global";
+				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Profile;
+		};
+		331C8088294A63A400263BE5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 7945E307007D51737297DE4B /* Pods-RunnerTests.debug.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app.RunnerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Runner.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Runner";
+			};
+			name = Debug;
+		};
+		331C8089294A63A400263BE5 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 8B4308847983EF7130B0C988 /* Pods-RunnerTests.release.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app.RunnerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Runner.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Runner";
+			};
+			name = Release;
+		};
+		331C808A294A63A400263BE5 /* Profile */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 84E463338CB8EC68B6E14C39 /* Pods-RunnerTests.profile.xcconfig */;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app.RunnerTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Runner.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Runner";
+			};
+			name = Profile;
+		};
+		97C147031CF9000F007C117D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = AppIcon;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++0x";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_C_LANGUAGE_STANDARD = gnu99;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		97C147041CF9000F007C117D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = AppIcon;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++0x";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Developer";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_C_LANGUAGE_STANDARD = gnu99;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		97C147061CF9000F007C117D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 9740EEB21CF90195004384FC /* Debug.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development: Uladzimir Klyshevich (5LDXYCWY26)";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = YP9HC3USZ3;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
+				INFOPLIST_FILE = Runner/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-Wl,-force_load,$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64/libwasm_run_dart.a",
+					"-Wl,-u,__NativeCupertinoHttp_NSURLSessionDataDelegate",
+					"-Wl,-u,__NativeCupertinoHttp_NSURLSessionDownloadDelegate",
+					"-Wl,-u,__NativeCupertinoHttp_NSURLSessionWebSocketDelegate",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_10z9f5k",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_17ap02x",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_18v1jvf",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1ldqghh",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1lx650f",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1mbt9g9",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1q0i84",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1tz5yf",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_bklti2",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_e3qsqz",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_fjrv01",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_h68abb",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_jyim80",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_l2g8ke",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_ly2579",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_ovsamd",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_xr62hr",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_xx612k",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_15f11yh",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_16sve1d",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_18kzm6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_18qun1e",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_18v1jvf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1b3bb6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1dqvvol",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1lx650f",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1otpo83",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1pl9qdv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1s56lr9",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1tz5yf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_6enxqz",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_9o8504",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_bklti2",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_fjrv01",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_gwxhxt",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_h68abb",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_jyim80",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_k73ff5",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_l2g8ke",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_ly2579",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_n8yd09",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_o762yo",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_og5b6y",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_ovsamd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_pfv6jd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_r8gdi7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_tg5tbv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_xtuoz7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_xx612k",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_15f11yh",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_16sve1d",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_18kzm6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_18qun1e",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_18v1jvf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1b3bb6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1dqvvol",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1lx650f",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1otpo83",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1pl9qdv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1s56lr9",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1tz5yf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_6enxqz",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_9o8504",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_bklti2",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_fjrv01",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_gwxhxt",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_h68abb",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_jyim80",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_k73ff5",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_l2g8ke",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_ly2579",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_n8yd09",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_o762yo",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_og5b6y",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_ovsamd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_pfv6jd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_r8gdi7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_tg5tbv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_xtuoz7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_xx612k",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-Wl,-force_load,$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64_x86_64-simulator/libwasm_run_dart.a",
+					"-Wl,-u,__NativeCupertinoHttp_NSURLSessionDataDelegate",
+					"-Wl,-u,__NativeCupertinoHttp_NSURLSessionDownloadDelegate",
+					"-Wl,-u,__NativeCupertinoHttp_NSURLSessionWebSocketDelegate",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_10z9f5k",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_17ap02x",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_18v1jvf",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1ldqghh",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1lx650f",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1mbt9g9",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1q0i84",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_1tz5yf",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_bklti2",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_e3qsqz",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_fjrv01",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_h68abb",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_jyim80",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_l2g8ke",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_ly2579",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_ovsamd",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_xr62hr",
+					"-Wl,-u,__NativeCupertinoHttp_protocolTrampoline_xx612k",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_15f11yh",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_16sve1d",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_18kzm6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_18qun1e",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_18v1jvf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1b3bb6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1dqvvol",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1lx650f",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1otpo83",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1pl9qdv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1s56lr9",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_1tz5yf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_6enxqz",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_9o8504",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_bklti2",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_fjrv01",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_gwxhxt",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_h68abb",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_jyim80",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_k73ff5",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_l2g8ke",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_ly2579",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_n8yd09",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_o762yo",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_og5b6y",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_ovsamd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_pfv6jd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_r8gdi7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_tg5tbv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_xtuoz7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapBlockingBlock_xx612k",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_15f11yh",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_16sve1d",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_18kzm6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_18qun1e",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_18v1jvf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1b3bb6a",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1dqvvol",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1lx650f",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1otpo83",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1pl9qdv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1s56lr9",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_1tz5yf",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_6enxqz",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_9o8504",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_bklti2",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_fjrv01",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_gwxhxt",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_h68abb",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_jyim80",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_k73ff5",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_l2g8ke",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_ly2579",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_n8yd09",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_o762yo",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_og5b6y",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_ovsamd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_pfv6jd",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_r8gdi7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_tg5tbv",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_xtuoz7",
+					"-Wl,-u,__NativeCupertinoHttp_wrapListenerBlock_xx612k",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "51d11693-6218-49f9-80bf-1efe3fab85cd";
+				STRIP_STYLE = "non-global";
+				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Debug;
+		};
+		97C147071CF9000F007C117D /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 7AFA3C8E1D35360C0083082E /* Release.xcconfig */;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;
+				CODE_SIGN_IDENTITY = "iPhone Distribution: Uladzimir Klyshevich (YP9HC3USZ3)";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = YP9HC3USZ3;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GCC_SYMBOLS_PRIVATE_EXTERN = NO;
+				INFOPLIST_FILE = Runner/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-force_load",
+					"$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64/libwasm_run_dart.a",
+				);
+				"OTHER_LDFLAGS[sdk=iphoneos*]" = (
+					"$(inherited)",
+					"-Wl,-force_load,$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64/libwasm_run_dart.a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDataDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDownloadDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionWebSocketDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_10z9f5k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_17ap02x",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1ldqghh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1mbt9g9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1q0i84",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_e3qsqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xr62hr",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xx612k",
+					"-Wl,-exported_symbol,_drop_dart_object",
+					"-Wl,-exported_symbol,_drop_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_drop_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_drop_opaque_CallStack",
+					"-Wl,-exported_symbol,_drop_opaque_Global",
+					"-Wl,-exported_symbol,_drop_opaque_Memory",
+					"-Wl,-exported_symbol,_drop_opaque_Table",
+					"-Wl,-exported_symbol,_drop_opaque_WFunc",
+					"-Wl,-exported_symbol,_free_WireSyncReturn",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i8",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u8",
+					"-Wl,-exported_symbol,_get_dart_object",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Func",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Global",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Memory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_SharedMemory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Table",
+					"-Wl,-exported_symbol,_inflate_WasmVal_externRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_funcRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_v128",
+					"-Wl,-exported_symbol,_init_frb_dart_api_dl",
+					"-Wl,-exported_symbol,_new_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_new_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_new_CallStack",
+					"-Wl,-exported_symbol,_new_Global",
+					"-Wl,-exported_symbol,_new_Memory",
+					"-Wl,-exported_symbol,_new_StringList_0",
+					"-Wl,-exported_symbol,_new_Table",
+					"-Wl,-exported_symbol,_new_WFunc",
+					"-Wl,-exported_symbol,_new_box_autoadd_WFunc_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_atomics_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_bool_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_compiled_module_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_memory_ty_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmi_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmtime_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_table_args_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u32_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u64_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_usize_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_config_native_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_stack_limits_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_instance_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_module_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_shared_memory_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_val_0",
+					"-Wl,-exported_symbol,_new_dart_opaque",
+					"-Wl,-exported_symbol,_new_list_env_variable_0",
+					"-Wl,-exported_symbol,_new_list_module_import_0",
+					"-Wl,-exported_symbol,_new_list_preopened_dir_0",
+					"-Wl,-exported_symbol,_new_list_value_ty_0",
+					"-Wl,-exported_symbol,_new_list_wasm_val_0",
+					"-Wl,-exported_symbol,_new_uint_8_list_0",
+					"-Wl,-exported_symbol,_share_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_share_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_share_opaque_CallStack",
+					"-Wl,-exported_symbol,_share_opaque_Global",
+					"-Wl,-exported_symbol,_share_opaque_Memory",
+					"-Wl,-exported_symbol,_share_opaque_Table",
+					"-Wl,-exported_symbol,_share_opaque_WFunc",
+					"-Wl,-exported_symbol,_store_dart_post_cobject",
+					"-Wl,-exported_symbol,_wire_add__method__Atomics",
+					"-Wl,-exported_symbol,_wire_add_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_and__method__Atomics",
+					"-Wl,-exported_symbol,_wire_atomic_notify__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait32__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait64__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomics__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_call_function_handle__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_parallel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_compare_exchange__method__Atomics",
+					"-Wl,-exported_symbol,_wire_compile_wasm",
+					"-Wl,-exported_symbol,_wire_compile_wasm_sync",
+					"-Wl,-exported_symbol,_wire_consume_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_function__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_global__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_shared_memory__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_create_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_data_pointer__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_data_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_dispose__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_exports__method__WasmRunInstanceId",
+					"-Wl,-exported_symbol,_wire_fill_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_fuel_consumed__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_function_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer_and_length__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_pages__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_module_exports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_module_imports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_size__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_grow_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_link_imports__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_load__method__Atomics",
+					"-Wl,-exported_symbol,_wire_module_builder",
+					"-Wl,-exported_symbol,_wire_or__method__Atomics",
+					"-Wl,-exported_symbol,_wire_parse_wat_format",
+					"-Wl,-exported_symbol,_wire_read_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_stdio_stream__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_store__method__Atomics",
+					"-Wl,-exported_symbol,_wire_sub__method__Atomics",
+					"-Wl,-exported_symbol,_wire_swap__method__Atomics",
+					"-Wl,-exported_symbol,_wire_ty__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_wasm_features_for_config",
+					"-Wl,-exported_symbol,_wire_wasm_runtime_features",
+					"-Wl,-exported_symbol,_wire_worker_execution__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_write_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_xor__method__Atomics",
+				);
+				"OTHER_LDFLAGS[sdk=iphonesimulator*]" = (
+					"$(inherited)",
+					"-Wl,-force_load,$(SRCROOT)/../../vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/ios-arm64_x86_64-simulator/libwasm_run_dart.a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDataDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionDownloadDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_NSURLSessionWebSocketDelegate",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_10z9f5k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_17ap02x",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1ldqghh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1mbt9g9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1q0i84",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_e3qsqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xr62hr",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_protocolTrampoline_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapBlockingBlock_xx612k",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_15f11yh",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_16sve1d",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18kzm6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18qun1e",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_18v1jvf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1b3bb6a",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1dqvvol",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1lx650f",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1otpo83",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1pl9qdv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1s56lr9",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_1tz5yf",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_6enxqz",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_9o8504",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_bklti2",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_fjrv01",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_gwxhxt",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_h68abb",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_jyim80",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_k73ff5",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_l2g8ke",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ly2579",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_n8yd09",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_o762yo",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_og5b6y",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_ovsamd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_pfv6jd",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_r8gdi7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_tg5tbv",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xtuoz7",
+					"-Wl,-exported_symbol,__NativeCupertinoHttp_wrapListenerBlock_xx612k",
+					"-Wl,-exported_symbol,_drop_dart_object",
+					"-Wl,-exported_symbol,_drop_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_drop_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_drop_opaque_CallStack",
+					"-Wl,-exported_symbol,_drop_opaque_Global",
+					"-Wl,-exported_symbol,_drop_opaque_Memory",
+					"-Wl,-exported_symbol,_drop_opaque_Table",
+					"-Wl,-exported_symbol,_drop_opaque_WFunc",
+					"-Wl,-exported_symbol,_free_WireSyncReturn",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_f64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_i8",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u16",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u32",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u64",
+					"-Wl,-exported_symbol,_free_zero_copy_buffer_u8",
+					"-Wl,-exported_symbol,_get_dart_object",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Func",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Global",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Memory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_SharedMemory",
+					"-Wl,-exported_symbol,_inflate_ExternalValue_Table",
+					"-Wl,-exported_symbol,_inflate_WasmVal_externRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_f64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_funcRef",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i32",
+					"-Wl,-exported_symbol,_inflate_WasmVal_i64",
+					"-Wl,-exported_symbol,_inflate_WasmVal_v128",
+					"-Wl,-exported_symbol,_init_frb_dart_api_dl",
+					"-Wl,-exported_symbol,_new_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_new_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_new_CallStack",
+					"-Wl,-exported_symbol,_new_Global",
+					"-Wl,-exported_symbol,_new_Memory",
+					"-Wl,-exported_symbol,_new_StringList_0",
+					"-Wl,-exported_symbol,_new_Table",
+					"-Wl,-exported_symbol,_new_WFunc",
+					"-Wl,-exported_symbol,_new_box_autoadd_WFunc_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_atomics_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_bool_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_compiled_module_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_memory_ty_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmi_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_module_config_wasmtime_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_table_args_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u32_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_u64_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_usize_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_config_native_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasi_stack_limits_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_instance_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_module_id_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_run_shared_memory_0",
+					"-Wl,-exported_symbol,_new_box_autoadd_wasm_val_0",
+					"-Wl,-exported_symbol,_new_dart_opaque",
+					"-Wl,-exported_symbol,_new_list_env_variable_0",
+					"-Wl,-exported_symbol,_new_list_module_import_0",
+					"-Wl,-exported_symbol,_new_list_preopened_dir_0",
+					"-Wl,-exported_symbol,_new_list_value_ty_0",
+					"-Wl,-exported_symbol,_new_list_wasm_val_0",
+					"-Wl,-exported_symbol,_new_uint_8_list_0",
+					"-Wl,-exported_symbol,_share_opaque_ArcRwLockSharedMemory",
+					"-Wl,-exported_symbol,_share_opaque_ArcStdSyncMutexModule",
+					"-Wl,-exported_symbol,_share_opaque_CallStack",
+					"-Wl,-exported_symbol,_share_opaque_Global",
+					"-Wl,-exported_symbol,_share_opaque_Memory",
+					"-Wl,-exported_symbol,_share_opaque_Table",
+					"-Wl,-exported_symbol,_share_opaque_WFunc",
+					"-Wl,-exported_symbol,_store_dart_post_cobject",
+					"-Wl,-exported_symbol,_wire_add__method__Atomics",
+					"-Wl,-exported_symbol,_wire_add_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_and__method__Atomics",
+					"-Wl,-exported_symbol,_wire_atomic_notify__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait32__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomic_wait64__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_atomics__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_call_function_handle__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_parallel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_call_function_handle_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_compare_exchange__method__Atomics",
+					"-Wl,-exported_symbol,_wire_compile_wasm",
+					"-Wl,-exported_symbol,_wire_compile_wasm_sync",
+					"-Wl,-exported_symbol,_wire_consume_fuel__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_function__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_global__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_create_shared_memory__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_create_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_data_pointer__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_data_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_dispose__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_exports__method__WasmRunInstanceId",
+					"-Wl,-exported_symbol,_wire_fill_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_fuel_consumed__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_function_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_data_pointer_and_length__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_pages__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_memory_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_module_exports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_module_imports__method__CompiledModule",
+					"-Wl,-exported_symbol,_wire_get_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_size__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_get_table_type__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_grow_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_grow_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_instantiate_sync__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_link_imports__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_load__method__Atomics",
+					"-Wl,-exported_symbol,_wire_module_builder",
+					"-Wl,-exported_symbol,_wire_or__method__Atomics",
+					"-Wl,-exported_symbol,_wire_parse_wat_format",
+					"-Wl,-exported_symbol,_wire_read_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_global_value__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_set_table__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_size__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_stdio_stream__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_store__method__Atomics",
+					"-Wl,-exported_symbol,_wire_sub__method__Atomics",
+					"-Wl,-exported_symbol,_wire_swap__method__Atomics",
+					"-Wl,-exported_symbol,_wire_ty__method__WasmRunSharedMemory",
+					"-Wl,-exported_symbol,_wire_wasm_features_for_config",
+					"-Wl,-exported_symbol,_wire_wasm_runtime_features",
+					"-Wl,-exported_symbol,_wire_worker_execution__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_write_memory__method__WasmRunModuleId",
+					"-Wl,-exported_symbol,_wire_xor__method__Atomics",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "ea16775c-88f7-44ed-993b-37eab38096bb";
+				STRIP_STYLE = "non-global";
+				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = Release;
+		};
+		FA51AC03000000000000001A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 9740EEB31CF90195004384FC /* Generated.xcconfig */;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "Apple Development: Uladzimir Klyshevich (5LDXYCWY26)";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = YP9HC3USZ3;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FaLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app.FaLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		FA51AC03000000000000001B /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 9740EEB31CF90195004384FC /* Generated.xcconfig */;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "iPhone Distribution: Uladzimir Klyshevich (YP9HC3USZ3)";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = YP9HC3USZ3;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FaLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app.FaLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "FaLiveActivity Profile";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		FA51AC03000000000000001C /* Profile */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 9740EEB31CF90195004384FC /* Generated.xcconfig */;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "iPhone Distribution: Uladzimir Klyshevich (YP9HC3USZ3)";
+				CODE_SIGN_STYLE = Manual;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = YP9HC3USZ3;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FaLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.fa1.app.FaLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "FaLiveActivity Profile";
+				SKIP_INSTALL = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Profile;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		331C8087294A63A400263BE5 /* Build configuration list for PBXNativeTarget "RunnerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				331C8088294A63A400263BE5 /* Debug */,
+				331C8089294A63A400263BE5 /* Release */,
+				331C808A294A63A400263BE5 /* Profile */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		97C146E91CF9000F007C117D /* Build configuration list for PBXProject "Runner" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				97C147031CF9000F007C117D /* Debug */,
+				97C147041CF9000F007C117D /* Release */,
+				249021D3217E4FDB00AE95B9 /* Profile */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		97C147051CF9000F007C117D /* Build configuration list for PBXNativeTarget "Runner" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				97C147061CF9000F007C117D /* Debug */,
+				97C147071CF9000F007C117D /* Release */,
+				249021D4217E4FDB00AE95B9 /* Profile */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		FA51AC03000000000000001D /* Build configuration list for PBXNativeTarget "FaLiveActivity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FA51AC03000000000000001A /* Debug */,
+				FA51AC03000000000000001B /* Release */,
+				FA51AC03000000000000001C /* Profile */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 97C146E61CF9000F007C117D /* Project object */;
+}

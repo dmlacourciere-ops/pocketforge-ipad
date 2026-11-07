@@ -1,0 +1,760 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+
+import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
+import 'package:fa/apps/manifest_i18n.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:http/http.dart' as http;
+
+/// Base URL of the fa_widgets rolling release. Asset names from
+/// `catalog.json` (`zip.file`, `icon` gallery copy) join against it.
+const String kDefaultWidgetsBaseUrl =
+    'https://github.com/IstiN/fa_widgets/releases/latest/download/';
+
+/// Raw mirror of the fa_widgets repo (catalog + per-widget sources/icons).
+/// raw.githubusercontent.com sends `access-control-allow-origin: *` and
+/// serves UTF-8 sources — used for in-app gallery icons and web fetches.
+const String kDefaultWidgetsRawBaseUrl =
+    'https://raw.githubusercontent.com/IstiN/fa_widgets/main/';
+
+/// How long a fetched catalog stays trusted before the next fetch revalidates.
+const Duration kCatalogCacheTtl = Duration(hours: 6);
+
+/// Joins a catalog [base] URL with a relative [assetPath], collapsing
+/// redundant slashes so exactly one separates them — regardless of whether
+/// [base] ends with `/` or [assetPath] starts with one. Single source of
+/// truth for every release-asset URL (catalog.json, per-widget zips):
+/// the historical bug appended `/catalog.json` to [kDefaultWidgetsBaseUrl],
+/// which already ends with `download/`, producing
+/// `.../releases/latest/download//catalog.json` (double slash).
+Uri catalogAssetUri(String base, String assetPath) {
+  var normalizedBase = base;
+  while (normalizedBase.endsWith('/')) {
+    normalizedBase = normalizedBase.substring(0, normalizedBase.length - 1);
+  }
+  var normalizedPath = assetPath;
+  while (normalizedPath.startsWith('/')) {
+    normalizedPath = normalizedPath.substring(1);
+  }
+  return Uri.parse('$normalizedBase/$normalizedPath');
+}
+
+/// Everything that can go wrong while consuming the widgets catalog:
+/// fetch/decode failures, archive hash mismatches, hostile zip layouts.
+class CatalogError implements Exception {
+  CatalogError(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// One widget entry of `catalog.json` (schemaVersion 1).
+class CatalogEntry {
+  CatalogEntry({
+    required this.id,
+    required this.name,
+    required this.version,
+    required this.description,
+    required this.author,
+    required this.tags,
+    required this.minRuntime,
+    required this.iconFile,
+    required this.network,
+    required this.allowedCommands,
+    required this.zipFile,
+    required this.zipSha256,
+    required this.zipSizeBytes,
+    this.nameText,
+    this.descriptionText,
+    this.platforms = const [],
+    this.previewManifestUrl,
+    this.previewJsUrl,
+  });
+
+  factory CatalogEntry.fromJson(Map<String, dynamic> json) {
+    final permissions = json['permissions'];
+    final zip = json['zip'];
+    final preview = json['preview'];
+    final rawPlatforms = json['platforms'];
+    // Localization comes from the additive nameI18n/descriptionI18n keys
+    // (same schema as the widget manifest); file refs cannot resolve
+    // before install, they simply fall through to the next locale
+    // candidate at display time.
+    final nameText = LocalizedText.parse(json['name'], json['nameI18n']);
+    final descriptionText = LocalizedText.parse(
+      json['description'],
+      json['descriptionI18n'],
+    );
+    return CatalogEntry(
+      id: json['id'] as String? ?? '',
+      name: nameText.resolve(null),
+      version: json['version'] as String? ?? '',
+      description: descriptionText.resolve(null),
+      nameText: nameText,
+      descriptionText: descriptionText,
+      author: json['author'] as String? ?? '',
+      tags: [
+        for (final tag in (json['tags'] as List? ?? const []))
+          if (tag is String) tag,
+      ],
+      minRuntime: json['minRuntime'] as String? ?? '',
+      iconFile: json['icon'] is String ? json['icon'] as String : null,
+      network: permissions is Map ? permissions['network'] == true : false,
+      allowedCommands: [
+        for (final command
+            in ((permissions?['allowedCommands'] as List?) ?? const []))
+          if (command is String) command,
+      ],
+      zipFile: zip is Map ? zip['file'] as String? ?? '' : '',
+      zipSha256: zip is Map ? zip['sha256'] as String? ?? '' : '',
+      zipSizeBytes: zip is Map ? (zip['sizeBytes'] as int? ?? 0) : 0,
+      platforms: [
+        if (rawPlatforms is List)
+          for (final platform in rawPlatforms)
+            if (platform is String) platform,
+      ],
+      previewManifestUrl: preview is Map
+          ? preview['manifest'] as String?
+          : null,
+      previewJsUrl: preview is Map ? preview['js'] as String? : null,
+    );
+  }
+
+  final String id;
+  final String name;
+  final String version;
+  final String description;
+
+  /// The parsed localized values behind [name]/[description] (null when
+  /// this entry was built directly with plain strings).
+  final LocalizedText? nameText;
+  final LocalizedText? descriptionText;
+
+  /// The catalog name resolved for [locale] (device locale → `en` →
+  /// first declared → scalar fallback).
+  String displayName(String? locale) =>
+      (nameText ?? LocalizedText.parse(name)).resolve(locale);
+
+  /// The catalog description resolved for [locale] (see [displayName]).
+  String displayDescription(String? locale) =>
+      (descriptionText ?? LocalizedText.parse(description)).resolve(locale);
+
+  final String author;
+  final List<String> tags;
+
+  /// Platform restriction tags (e.g. `ios`, `macos`) for widgets that only
+  /// run on specific platforms; empty means the widget runs everywhere.
+  final List<String> platforms;
+
+  /// Minimum `js_widget_runtime`; informational (the app pins the package).
+  final String minRuntime;
+
+  /// Zip-relative icon file inside the archive; null when absent.
+  final String? iconFile;
+
+  /// Declared permissions (all default-denied at runtime regardless).
+  final bool network;
+  final List<String> allowedCommands;
+
+  /// Flat release-asset name of the zip artifact.
+  final String zipFile;
+
+  /// Hex sha256 over the exact published zip bytes.
+  final String zipSha256;
+  final int zipSizeBytes;
+
+  /// Raw source URLs (CORS-friendly) for the manifest and the widget JS.
+  /// CORE widgets point at the fa_widgets repo mirror
+  /// (`raw.githubusercontent.com/IstiN/fa_widgets/main/widgets/…`);
+  /// EXTERNAL-kind widgets point at their origin repo pinned by commit
+  /// sha. This is the ONLY way to reach a widget's sources from a
+  /// browser — do NOT reconstruct them from the id.
+  final String? previewManifestUrl;
+  final String? previewJsUrl;
+
+  /// Gallery download URL for this entry's archive.
+  Uri get downloadUrl => catalogAssetUri(kDefaultWidgetsBaseUrl, zipFile);
+}
+
+/// The outcome of a catalog fetch: entries plus how trustworthy they are.
+class CatalogFetchResult {
+  const CatalogFetchResult({
+    required this.entries,
+    required this.stale,
+    this.error,
+  });
+
+  /// Entries sorted by id (the publisher already sorts, but never trust).
+  final List<CatalogEntry> entries;
+
+  /// True when a network failure forced a cached snapshot older than its
+  /// TTL — UI should show an offline banner while still listing entries.
+  final bool stale;
+
+  /// The failure behind [stale], when there was one.
+  final Object? error;
+}
+
+/// Reads the fa_widgets release catalog and unpacks widget archives into
+/// memory for [AppsStore] to install through its ownership-aware path.
+///
+/// - TTL-cached in `apps/.catalog_cache.json` so launches stay fast and an
+///   offline start still renders the last known gallery ([stale] flag).
+/// - Archives must contain ONE root folder named `<id>/`; anything escaping
+///   it (absolute paths, `..`, foreign roots) aborts with [CatalogError].
+/// - Bytes are verified against the catalog's sha256 BEFORE unpacking.
+class CatalogService {
+  CatalogService(
+    this._env, {
+    http.Client? httpClient,
+    Uri? baseUrl,
+    Uri? rawBaseUrl,
+    bool? isWeb,
+    DateTime Function()? clock,
+  }) : _client = httpClient ?? http.Client(),
+       _isWeb = isWeb ?? kIsWeb,
+       // Platform-aware default: release-assets.githubusercontent.com (the
+       // redirect target of the rolling release) sends NO CORS headers, so
+       // the web build's BrowserClient dies with `ClientException:
+       // Load failed`. raw.githubusercontent.com sends
+       // `access-control-allow-origin: *` — on web BOTH the catalog and the
+       // widget sources come from the repo mirror that the fa_widgets
+       // publish workflow re-commits on every push to main ([skip ci]).
+       // Native keeps the rolling release (immutable-ish zips + sha256).
+       _baseUrl =
+           baseUrl?.toString() ??
+           ((isWeb ?? kIsWeb)
+               ? kDefaultWidgetsRawBaseUrl
+               : kDefaultWidgetsBaseUrl),
+       _rawBaseUrl = rawBaseUrl?.toString() ?? kDefaultWidgetsRawBaseUrl,
+       _clock = clock ?? DateTime.now;
+
+  /// Env-relative cache file (inside the shared `apps/` workspace folder).
+  /// `_v2`: v1 caches were written from `response.body`, which the http
+  /// package decodes as latin1 when the release asset has no charset —
+  /// non-ASCII descriptions ("→", Cyrillic) came out mojibake. The v2 name
+  /// purges those poisoned snapshots; decoding now goes through
+  /// `utf8.decode(response.bodyBytes)`.
+  static const String cacheFile = 'apps/.catalog_cache_v2.json';
+
+  /// Statement-level relative import the boot assembler inlines — byte
+  /// for byte `WidgetManifest._importRegex` (js_widget_runtime), mirrored
+  /// here so the install fetches exactly the files boot will inline. A
+  /// drift is caught end-to-end by the closure tests, which run the
+  /// runtime assembler over the installed files.
+  static final RegExp _importRegex = RegExp(
+    r'''^[ \t]*import\s+(?:[\w${},* ]+\s+from\s+)?['"](\.[^'"]+)['"]\s*;?[ \t]*$''',
+    multiLine: true,
+  );
+
+  /// `jsr.include('path')` calls — byte for byte
+  /// `WidgetManifest._includeRegex`.
+  static final RegExp _includeRegex = RegExp(
+    r'''jsr\.include\(\s*['"]([^'"]+)['"]\s*\)''',
+  );
+
+  /// Safety bound for the closure walk. The runtime assembler stops
+  /// inlining at depth 5 per chain and the fetch-once worklist already
+  /// bounds the walk by the file count, so this only fires on a
+  /// pathological (machine-generated) graph.
+  static const int _maxClosureDepth = 32;
+
+  final ExecutionEnv _env;
+  final http.Client _client;
+  final bool _isWeb;
+  final String _baseUrl;
+  final String _rawBaseUrl;
+  final DateTime Function() _clock;
+
+  /// Fetches the catalog, consulting the TTL cache first. [force] skips the
+  /// freshness check (the UI's pull-to-refresh). Network failure with a
+  /// usable cache yields a [CatalogFetchResult.stale] snapshot; without one
+  /// it throws [CatalogError].
+  Future<CatalogFetchResult> fetchCatalog({bool force = false}) async {
+    if (!force) {
+      final cached = await _readCache();
+      if (cached != null) {
+        final age = _clock().difference(cached.$1);
+        if (age < kCatalogCacheTtl) {
+          return CatalogFetchResult(entries: cached.$2, stale: false);
+        }
+      }
+    }
+    try {
+      final response = await _client.get(
+        catalogAssetUri(_baseUrl, 'catalog.json'),
+      );
+      if (response.statusCode != 200) {
+        throw CatalogError('catalog HTTP ${response.statusCode}');
+      }
+      final decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      if (decoded is! Map<String, dynamic>) {
+        throw CatalogError('catalog.json is not an object');
+      }
+      final entries = await _parseEntries(decoded);
+      await _writeCache(decoded);
+      return CatalogFetchResult(entries: entries, stale: false);
+    } on CatalogError catch (error) {
+      final cached = await _readCache();
+      if (cached != null) {
+        return CatalogFetchResult(
+          entries: cached.$2,
+          stale: true,
+          error: error,
+        );
+      }
+      rethrow;
+    } on Object catch (error) {
+      // Transport-level failure (offline, DNS, timeout…).
+      final cached = await _readCache();
+      if (cached != null) {
+        return CatalogFetchResult(
+          entries: cached.$2,
+          stale: true,
+          error: error,
+        );
+      }
+      throw CatalogError('catalog fetch failed: $error');
+    }
+  }
+
+  /// Downloads and verifies one widget, returning its files as
+  /// `<relative-path> → bytes`. Native downloads the release zip and
+  /// refuses anything whose extraction could escape `apps/<id>/`; web
+  /// fetches the raw per-id sources instead (see [_downloadWidgetFromSource]).
+  Future<Map<String, Uint8List>> downloadWidget(CatalogEntry entry) async {
+    if (_isWeb) return _downloadWidgetFromSource(entry);
+    if (entry.zipFile.isEmpty || entry.zipFile.contains('/')) {
+      throw CatalogError('bad asset name "${entry.zipFile}"');
+    }
+    final bytes = await _fetchWidgetZip(entry);
+    return _extractWidgetFiles(entry, bytes);
+  }
+
+  /// Fetches the widget release zip bytes (non-200 and transport
+  /// failures become [CatalogError]) and verifies it against the
+  /// catalog's `zip.sha256` when the entry carries one.
+  Future<Uint8List> _fetchWidgetZip(CatalogEntry entry) async {
+    final Uint8List bytes;
+    try {
+      final response = await _client.get(entry.downloadUrl);
+      if (response.statusCode != 200) {
+        throw CatalogError('${entry.id} HTTP ${response.statusCode}');
+      }
+      bytes = response.bodyBytes;
+    } on CatalogError {
+      rethrow;
+    } on Object catch (error) {
+      throw CatalogError('${entry.id} download failed: $error');
+    }
+    _verifyZipDigest(entry, bytes);
+    return bytes;
+  }
+
+  /// Verifies the zip bytes against the catalog's `zip.sha256` when the
+  /// entry carries one.
+  void _verifyZipDigest(CatalogEntry entry, Uint8List bytes) {
+    final digest = sha256.convert(bytes).toString();
+    if (entry.zipSha256.isNotEmpty && digest != entry.zipSha256) {
+      throw CatalogError('${entry.id} zip sha256 mismatch');
+    }
+  }
+
+  /// Extracts the verified zip into `<relative-path> → bytes`, refusing
+  /// any entry that could escape `apps/<id>/` and archives that miss
+  /// `manifest.json`/`widget.js`.
+  Map<String, Uint8List> _extractWidgetFiles(
+    CatalogEntry entry,
+    Uint8List bytes,
+  ) {
+    final root = '${entry.id}/';
+    final archive = ZipDecoder().decodeBytes(bytes);
+    final files = <String, Uint8List>{};
+    for (final file in archive.files) {
+      if (file.isFile == false) continue;
+      final relative = _widgetRelativePath(entry, file.name, root);
+      if (relative == null) continue;
+      _checkWidgetRelativePath(entry, file.name, relative);
+      files[relative] = Uint8List.fromList(file.content as List<int>);
+    }
+    _checkWidgetArchiveFiles(entry, files);
+    return files;
+  }
+
+  /// The archive-level contract: the widget cannot boot without
+  /// `manifest.json` and `widget.js`.
+  void _checkWidgetArchiveFiles(
+    CatalogEntry entry,
+    Map<String, Uint8List> files,
+  ) {
+    if (!files.containsKey('manifest.json') ||
+        !files.containsKey('widget.js')) {
+      throw CatalogError('${entry.id}: archive misses manifest/widget.js');
+    }
+  }
+
+  /// The `<id>/`-relative path of a zip entry, or null for the root
+  /// directory entry itself. Throws [CatalogError] for entries outside
+  /// the root.
+  String? _widgetRelativePath(CatalogEntry entry, String name, String root) {
+    if (!name.startsWith(root)) {
+      throw CatalogError(
+        '${entry.id}: zip entry outside the $root root: "$name"',
+      );
+    }
+    final relative = name.substring(root.length);
+    return relative.isEmpty ? null : relative;
+  }
+
+  /// Throws when a zip entry's relative path could escape the widget
+  /// root: absolute, backslash-carrying, or any `..` segment.
+  void _checkWidgetRelativePath(
+    CatalogEntry entry,
+    String name,
+    String relative,
+  ) {
+    if (relative.startsWith('/') ||
+        relative.contains('\\') ||
+        relative.split('/').any((segment) => segment == '..')) {
+      throw CatalogError('${entry.id}: unsafe zip entry "$name"');
+    }
+  }
+
+  /// Web install path: fetches the widget's sources over the CORS-friendly
+  /// raw URLs the catalog carries in `preview.manifest` / `preview.js`,
+  /// because the release zip URL is unreachable from a browser (no CORS
+  /// headers on release-assets.githubusercontent.com). The preview URLs
+  /// MUST be used verbatim: EXTERNAL-kind widgets (pinned source repos,
+  /// #232) have NO sources under `fa_widgets/widgets/<id>/` at all — their
+  /// preview URLs point at the origin repo pinned by commit sha. The icon
+  /// is always mirrored into fa_widgets itself, so it joins against
+  /// [_rawBaseUrl] exactly like the in-app gallery already does.
+  ///
+  /// Integrity trade-off, stated plainly: the catalog's `zip.sha256` covers
+  /// the published ZIP BYTES, not the individual sources, so it CANNOT be
+  /// verified on this path — trust rests on the same catalog that already
+  /// vouches for the zip hash, plus the publish workflow building both from
+  /// one tree. To compensate, malformed content fails LOUDLY (never
+  /// installs): every file must be served with HTTP 200, the manifest must
+  /// decode to a JSON object, and widget.js must be non-empty.
+  ///
+  /// Multi-file widgets install WHOLE (gh-1831): the entry is inlined at
+  /// boot by relative `import './x.js'` / `jsr.include('…')` statements
+  /// (js_widget_runtime `WidgetManifest.readJs`), so any referenced sibling
+  /// that never lands makes the widget evaluate to an empty script —
+  /// fa-craft's `import './game/main.js';` fetched 200, installed, and
+  /// still never opened. After the entry download, the transitive source
+  /// closure is resolved with the SAME import/include grammar the runtime
+  /// assembler applies, every referenced file is fetched from the pinned
+  /// preview directory, and a missing referenced file fails the install
+  /// (same never-installs-a-broken-widget contract). The closure mirrors
+  /// `WidgetManifest`'s resolution rules — `test/` pins the pair through
+  /// the assembler itself.
+  Future<Map<String, Uint8List>> _downloadWidgetFromSource(
+    CatalogEntry entry,
+  ) async {
+    final id = entry.id;
+    final urls = _widgetPreviewUrls(entry);
+    _addWidgetIconUrl(entry, urls);
+    final files = <String, Uint8List>{};
+    await _fetchWidgetSources(id, urls, files);
+    _checkWidgetManifest(id, files);
+    if (files['widget.js']!.isEmpty) {
+      throw CatalogError('$id: widget.js is empty');
+    }
+    await _downloadSourceClosure(entry, files);
+    return files;
+  }
+
+  /// The two preview URLs every web install needs — `manifest.json` and
+  /// `widget.js` — parsed and scheme-checked. The preview URLs MUST be
+  /// used verbatim: EXTERNAL-kind widgets (pinned source repos, #232)
+  /// have NO sources under `fa_widgets/widgets/<id>/` at all — their
+  /// preview URLs point at the origin repo pinned by commit sha.
+  Map<String, Uri> _widgetPreviewUrls(CatalogEntry entry) {
+    final urls = <String, Uri>{};
+    for (final pair in {
+      'manifest.json': entry.previewManifestUrl,
+      'widget.js': entry.previewJsUrl,
+    }.entries) {
+      urls[pair.key] = _previewUrlOrThrow(entry.id, pair.key, pair.value);
+    }
+    return urls;
+  }
+
+  /// Parses and scheme-checks one preview URL (absolute http/https
+  /// only) — anything else cannot install from source on web.
+  Uri _previewUrlOrThrow(String id, String name, String? raw) {
+    final uri = raw == null ? null : Uri.tryParse(raw);
+    if (uri == null || !_isFetchablePreviewUrl(uri)) {
+      throw CatalogError(
+        '$id: catalog entry has no usable preview URL for $name '
+        '— cannot install from source on web',
+      );
+    }
+    return uri;
+  }
+
+  /// Whether [uri] can be fetched from a browser at all.
+  static bool _isFetchablePreviewUrl(Uri uri) =>
+      uri.isAbsolute && (uri.isScheme('https') || uri.isScheme('http'));
+
+  /// Mirrors the widget icon into the URL map (joined against
+  /// [_rawBaseUrl] exactly like the in-app gallery — the icon is always
+  /// served from fa_widgets itself), validating the widget id and the
+  /// icon name first.
+  void _addWidgetIconUrl(CatalogEntry entry, Map<String, Uri> urls) {
+    final id = entry.id;
+    final icon = entry.iconFile;
+    if (icon == null) return;
+    if (_unsafeWidgetSegment(id)) {
+      throw CatalogError('bad widget id "$id"');
+    }
+    if (_unsafeWidgetSegment(icon)) {
+      throw CatalogError('$id: unsafe icon name "$icon"');
+    }
+    urls[icon] = catalogAssetUri(_rawBaseUrl, 'widgets/$id/$icon');
+  }
+
+  /// A widget-id / file-name segment that could escape the widget
+  /// directory: empty, `..`, or carrying a path separator.
+  static bool _unsafeWidgetSegment(String segment) =>
+      segment.isEmpty ||
+      segment == '..' ||
+      segment.contains('/') ||
+      segment.contains('\\');
+
+  /// Fetches every [urls] entry over the shared HTTP client into
+  /// [files]. Non-200 and transport failures throw LOUDLY (never
+  /// installs): every file must be served with HTTP 200.
+  Future<void> _fetchWidgetSources(
+    String id,
+    Map<String, Uri> urls,
+    Map<String, Uint8List> files,
+  ) async {
+    for (final source in urls.entries) {
+      final http.Response response;
+      try {
+        response = await _client.get(source.value);
+      } on Object catch (error) {
+        throw CatalogError('$id: ${source.key} fetch failed: $error');
+      }
+      if (response.statusCode != 200) {
+        throw CatalogError('$id: ${source.key} HTTP ${response.statusCode}');
+      }
+      files[source.key] = response.bodyBytes;
+    }
+  }
+
+  /// The loud-content check: the manifest must decode to a JSON object
+  /// (a malformed manifest fails the install instead of booting a
+  /// broken widget).
+  void _checkWidgetManifest(String id, Map<String, Uint8List> files) {
+    try {
+      final manifest = jsonDecode(utf8.decode(files['manifest.json']!));
+      if (manifest is! Map<String, dynamic>) {
+        throw const FormatException('not a JSON object');
+      }
+    } on Object {
+      throw CatalogError('$id: manifest.json is not a valid JSON object');
+    }
+  }
+
+  /// Resolves and fetches the transitive relative-import / `jsr.include`
+  /// closure of the already-fetched entry (gh-1831). [files] gains every
+  /// referenced sibling under its app-relative path; the FIRST missing
+  /// referenced file throws [CatalogError].
+  ///
+  /// Mirrors `WidgetManifest`'s inliner exactly: the same import/include
+  /// regexes, the same lexical `./`/`../` resolution against the importing
+  /// file's directory, the same depth cap ([_maxClosureDepth]) — and its
+  /// once-per-assembly `visited` semantics as a fetch-once worklist. Unlike
+  /// the assembler (which comments a missing file out), a missing file here
+  /// fails the install: booting without it is precisely the gh-1831
+  /// failure.
+  Future<void> _downloadSourceClosure(
+    CatalogEntry entry,
+    Map<String, Uint8List> files,
+  ) async {
+    final entryUrl = entry.previewJsUrl;
+    final baseUri = entryUrl == null ? null : Uri.tryParse(entryUrl);
+    if (baseUri == null) return; // preview URL already validated above
+    final entryDir = baseUri.resolve('.');
+    final pending = <(String, String)>[('widget.js', '')];
+    final fetched = <String>{'widget.js'};
+    var depth = 0;
+    while (pending.isNotEmpty) {
+      if (depth++ > _maxClosureDepth) {
+        throw CatalogError(
+          '${entry.id}: source closure deeper than $_maxClosureDepth '
+          'levels — refusing to install a possibly-cyclic widget',
+        );
+      }
+      final nextLevel = List.of(pending);
+      pending.clear();
+      for (final (sourceRel, sourceDir) in nextLevel) {
+        final text = utf8.decode(files[sourceRel]!);
+        for (final match in _importRegex.allMatches(text)) {
+          await _fetchClosureFile(
+            entry,
+            files,
+            fetched,
+            pending,
+            match.group(1)!,
+            sourceDir,
+            entryDir: entryDir,
+          );
+        }
+        for (final match in _includeRegex.allMatches(text)) {
+          await _fetchClosureFile(
+            entry,
+            files,
+            fetched,
+            pending,
+            match.group(1)!,
+            sourceDir,
+            entryDir: entryDir,
+          );
+        }
+      }
+    }
+  }
+
+  /// One closure edge: resolves [ref] against [sourceDir] (lexically, like
+  /// the runtime assembler), fetches the file from the pinned preview
+  /// directory when not already in [files], and queues it for its own
+  /// imports. A path escaping the widget root (or a failed fetch) throws.
+  Future<void> _fetchClosureFile(
+    CatalogEntry entry,
+    Map<String, Uint8List> files,
+    Set<String> fetched,
+    List<(String, String)> pending,
+    String ref,
+    String sourceDir, {
+    required Uri entryDir,
+  }) async {
+    final id = entry.id;
+    final rel = _resolveClosurePath(sourceDir, ref);
+    if (rel == null || rel.isEmpty) {
+      throw CatalogError('$id: import "$ref" escapes the widget directory');
+    }
+    if (files.containsKey(rel)) return;
+    if (!fetched.add(rel)) return; // queued already — fetch-once
+    final http.Response response;
+    try {
+      response = await _client.get(entryDir.resolve(rel));
+    } on Object catch (error) {
+      throw CatalogError('$id: $rel fetch failed: $error');
+    }
+    if (response.statusCode != 200) {
+      throw CatalogError(
+        '$id: missing source $rel (HTTP '
+        '${response.statusCode}) — the entry imports it at boot',
+      );
+    }
+    files[rel] = response.bodyBytes;
+    pending.add((rel, _parentOf(rel)));
+  }
+
+  /// Lexical `./`/`../` resolution of an import reference against the
+  /// importing file's directory — the runtime assembler's
+  /// `WidgetManifest._resolvePath`, minus the out-of-root escape: returns
+  /// null when the resolved path would leave the widget root.
+  static String? _resolveClosurePath(String sourceDir, String ref) {
+    final segments = '$sourceDir/$ref'.split('/');
+    final out = <String>[];
+    for (final segment in segments) {
+      if (segment == '.' || segment.isEmpty) continue;
+      if (segment == '..') {
+        if (out.isEmpty) return null; // escapes above the widget root
+        out.removeLast();
+        continue;
+      }
+      out.add(segment);
+    }
+    if (out.isEmpty) return null;
+    return out.join('/');
+  }
+
+  static String _parentOf(String path) {
+    final idx = path.lastIndexOf('/');
+    return idx <= 0 ? '' : path.substring(0, idx);
+  }
+
+  /// [downloadWidget] with one self-heal: the rolling `catalog` release is
+  /// rebuilt by publish runs, so a TTL-cached catalog can reference asset
+  /// bytes that were replaced since (the historical sha256-mismatch
+  /// install failure). On a mismatch the catalog is refetched with the
+  /// cache bypassed and the download retried ONCE against the fresh entry
+  /// for the same id — but only when the entry actually changed.
+  Future<Map<String, Uint8List>> downloadWidgetHealing(
+    CatalogEntry entry,
+  ) async {
+    try {
+      return await downloadWidget(entry);
+    } on CatalogError catch (error) {
+      if (!error.toString().contains('sha256 mismatch')) rethrow;
+      final fresh = await fetchCatalog(force: true);
+      CatalogEntry? updated;
+      for (final candidate in fresh.entries) {
+        if (candidate.id == entry.id) updated = candidate;
+      }
+      if (updated == null ||
+          (updated.zipSha256 == entry.zipSha256 &&
+              updated.zipFile == entry.zipFile)) {
+        rethrow;
+      }
+      return downloadWidget(updated);
+    }
+  }
+
+  Future<List<CatalogEntry>> _parseEntries(Map<String, dynamic> catalog) async {
+    final rawWidgets = catalog['widgets'];
+    if (rawWidgets is! List) throw CatalogError('catalog has no widgets[]');
+    final entries = <CatalogEntry>[];
+    for (final raw in rawWidgets) {
+      if (raw is! Map<String, dynamic>) continue;
+      final entry = CatalogEntry.fromJson(raw);
+      if (entry.id.isEmpty || entry.version.isEmpty || entry.zipFile.isEmpty) {
+        continue; // malformed entry — skip, never fail the whole gallery
+      }
+      entries.add(entry);
+    }
+    entries.sort((a, b) => a.id.compareTo(b.id));
+    return entries;
+  }
+
+  Future<(DateTime, List<CatalogEntry>)?> _readCache() async {
+    final text = (await _env.readTextFile(cacheFile)).valueOrNull;
+    if (text == null) return null;
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is! Map<String, dynamic>) return null;
+      final stamp = DateTime.tryParse(decoded['fetchedAt'] as String? ?? '');
+      final payload = decoded['catalog'];
+      if (stamp == null || payload is! Map<String, dynamic>) return null;
+      return (stamp, await _parseEntries(payload));
+    } on Object {
+      return null; // torn/corrupt cache behaves like "no cache"
+    }
+  }
+
+  Future<void> _writeCache(Map<String, dynamic> catalogJson) async {
+    final payload = jsonEncode({
+      'fetchedAt': _clock().toIso8601String(),
+      'catalog': catalogJson,
+    });
+    try {
+      await _env.writeFile(cacheFile, payload);
+    } on Object {
+      // A failing cache write must not kill the gallery — refetch next time.
+    }
+  }
+}

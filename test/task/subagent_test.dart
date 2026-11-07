@@ -1,0 +1,637 @@
+@TestOn('vm')
+library;
+
+import 'package:flutter_agent_harness/src/cli/tui_theme.dart';
+import 'package:flutter_agent_harness/src/env/memory_execution_env.dart';
+import 'package:flutter_agent_harness/src/messaging/agent_message.dart';
+import 'package:flutter_agent_harness/src/messaging/fallback_messaging_repository.dart';
+import 'package:flutter_agent_harness/src/messaging/file_messaging_repository.dart';
+import 'package:flutter_agent_harness/src/messaging/messaging_repository.dart';
+import 'package:flutter_agent_harness/src/task/subagent.dart';
+import 'package:flutter_agent_harness/src/task/subagent_manager.dart';
+import 'package:test/test.dart';
+
+void main() {
+  group('SubagentHandle', () {
+    test('JSON round-trip preserves all fields', () {
+      final handle =
+          SubagentHandle(
+              id: 'agent-1',
+              name: 'my-task',
+              agentType: 'explore',
+              sessionId: 'parent/agent-1',
+              createdAt: '2026-08-13T00:00:00Z',
+              task: 'find all tests',
+            )
+            ..status = SubagentStatus.completed
+            ..tokens = 1500
+            ..requests = 3
+            ..modelId = 'gpt-4o-mini';
+
+      final json = handle.toJson();
+      final restored = SubagentHandle.fromJson(json);
+
+      expect(restored.id, 'agent-1');
+      expect(restored.name, 'my-task');
+      expect(restored.agentType, 'explore');
+      expect(restored.sessionId, 'parent/agent-1');
+      expect(restored.status, SubagentStatus.completed);
+      expect(restored.tokens, 1500);
+      expect(restored.requests, 3);
+      expect(restored.modelId, 'gpt-4o-mini');
+    });
+
+    test('fromJson defaults for missing optional fields', () {
+      final handle = SubagentHandle.fromJson({
+        'id': 'a2',
+        'sessionId': 's2',
+        'createdAt': '',
+      });
+      expect(handle.name, 'a2');
+      expect(handle.agentType, 'task');
+      expect(handle.status, SubagentStatus.completed);
+      expect(handle.tokens, 0);
+    });
+
+    test('statusLine shows emoji and key info', () {
+      final handle =
+          SubagentHandle(
+              id: 'a1',
+              name: 'a1',
+              agentType: 'explore',
+              sessionId: 's1',
+              createdAt: '',
+            )
+            ..status = SubagentStatus.running
+            ..tokens = 500
+            ..modelId = 'mini';
+      expect(handle.statusLine, contains('🔄 running'));
+      expect(handle.statusLine, contains('500t'));
+      expect(handle.statusLine, contains('mini'));
+    });
+
+    test('statusLine queued glyph routes through status.pending (gh-1446 '
+        'AC8: no hardcoded ⏳ outside tui_symbols.dart)', () {
+      final handle = SubagentHandle(
+        id: 'a1',
+        name: 'a1',
+        agentType: 'explore',
+        sessionId: 's1',
+        createdAt: '',
+      )..status = SubagentStatus.queued;
+      // The unicode default's `status.pending` glyph.
+      expect(handle.statusLine, contains('○ queued'));
+
+      // The glyph DERIVES from the active preset — an ascii switch changes
+      // it, proving the line reads the symbol table instead of a literal.
+      final controller = FaThemeController.instance..reset();
+      // The symbol preset is NOT part of reset(): restore it explicitly so
+      // a test appended later in this file does not silently inherit ascii
+      // glyphs (same teardown shape as shell_job_board_test.dart's preset
+      // test — FaThemeController.reset() leaves the preset in place).
+      addTearDown(() => controller.switchSymbols('unicode'));
+      expect(controller.switchSymbols('ascii'), isTrue);
+      expect(handle.statusLine, contains('[*] queued'));
+    });
+
+    test('queued-glyph test teardown restores the unicode preset', () {
+      // The preset-switch test above must not leak the ascii preset into
+      // any test appended after it (FaThemeController.reset() does NOT
+      // restore the symbol preset — its teardown switches back explicitly;
+      // this is the canary that would catch a regression of that shape).
+      expect(FaThemeController.instance.symbols.name, 'unicode');
+    });
+
+    test('isTerminal is true for completed/failed/aborted', () {
+      for (final status in [
+        SubagentStatus.completed,
+        SubagentStatus.failed,
+        SubagentStatus.aborted,
+      ]) {
+        final h = SubagentHandle(
+          id: 'a',
+          name: 'a',
+          agentType: 'task',
+          sessionId: 's',
+          createdAt: '',
+        )..status = status;
+        expect(h.isTerminal, isTrue);
+      }
+      for (final status in [
+        SubagentStatus.queued,
+        SubagentStatus.running,
+        SubagentStatus.idle,
+      ]) {
+        final h = SubagentHandle(
+          id: 'a',
+          name: 'a',
+          agentType: 'task',
+          sessionId: 's',
+          createdAt: '',
+        )..status = status;
+        expect(h.isTerminal, isFalse);
+      }
+    });
+  });
+
+  group('SubagentManager', () {
+    test('register creates handle and persists', () async {
+      final persisted = <List<Map<String, dynamic>>>[];
+      final mgr = SubagentManager(
+        parentSessionId: 'parent-1',
+        sink: (registry) async {
+          persisted.add(registry);
+        },
+      );
+
+      final handle = await mgr.register(
+        id: 'agent-1',
+        name: 'task-1',
+        agentType: 'explore',
+        task: 'find tests',
+      );
+
+      expect(handle.id, 'agent-1');
+      expect(handle.status, SubagentStatus.queued);
+      expect(mgr.handles, hasLength(1));
+      // Persistence is serialized fire-and-forget — let the chain land.
+      await Future<void>.delayed(Duration.zero);
+      expect(persisted, hasLength(1));
+      expect(persisted.first.first['id'], 'agent-1');
+    });
+
+    test('update changes status and accumulates tokens', () async {
+      final mgr = SubagentManager(parentSessionId: 'p');
+      await mgr.register(id: 'a1', name: 'a1', agentType: 'task', task: '');
+      await mgr.update(
+        'a1',
+        status: SubagentStatus.running,
+        tokens: 100,
+        requests: 1,
+      );
+      await mgr.update(
+        'a1',
+        status: SubagentStatus.completed,
+        tokens: 200,
+        requests: 2,
+      );
+
+      final handle = mgr['a1']!;
+      expect(handle.status, SubagentStatus.completed);
+      expect(handle.tokens, 300); // accumulated
+      expect(handle.requests, 3);
+    });
+
+    test('dispose removes handle', () async {
+      final mgr = SubagentManager(parentSessionId: 'p');
+      await mgr.register(id: 'a1', name: 'a1', agentType: 'task', task: '');
+      expect(mgr.handles, hasLength(1));
+      await mgr.dispose('a1');
+      expect(mgr.handles, isEmpty);
+      expect(mgr['a1'], isNull);
+    });
+
+    test('rehydrate restores from persisted JSON', () async {
+      final mgr = SubagentManager(
+        parentSessionId: 'p',
+        source: () async => [
+          {
+            'id': 'old-1',
+            'sessionId': 'p/old-1',
+            'createdAt': '2026-01-01',
+            'status': 'completed',
+            'agentType': 'explore',
+            'name': 'old-1',
+            'tokens': 500,
+          },
+        ],
+      );
+      await mgr.rehydrate();
+      expect(mgr.handles, hasLength(1));
+      expect(mgr['old-1']!.status, SubagentStatus.completed);
+      expect(mgr['old-1']!.tokens, 500);
+    });
+
+    test('rehydrate settles interrupted-before-start rows to a terminal state '
+        '(issue #332)', () async {
+      // A snapshot written by a host that died before a spawned child made
+      // its first request: the row says running/queued forever — no live
+      // runner exists to settle it in THIS process.
+      final persisted = <List<Map<String, dynamic>>>[];
+      final mgr = SubagentManager(
+        parentSessionId: 'p',
+        source: () async => [
+          {
+            'id': 'Task-18',
+            'name': 'Task-18',
+            'agentType': 'task',
+            'sessionId': 'p/Task-18',
+            'createdAt': '2026-09-12T16:25:00Z',
+            'lastActivity': '2026-09-12T16:25:00Z',
+            'status': 'running',
+            'tokens': 0,
+            'requests': 0,
+          },
+          {
+            'id': 'Task-19',
+            'name': 'Task-19',
+            'agentType': 'explore',
+            'sessionId': 'p/Task-19',
+            'createdAt': '2026-09-12T16:25:00Z',
+            'lastActivity': '2026-09-12T16:25:00Z',
+            'status': 'queued',
+            'tokens': 0,
+            'requests': 0,
+          },
+        ],
+        sink: (registry) async => persisted.add(registry),
+      );
+
+      await mgr.rehydrate();
+
+      // Never-started children settle to a terminal state…
+      for (final id in ['Task-18', 'Task-19']) {
+        final handle = mgr[id]!;
+        expect(handle.isTerminal, isTrue, reason: '$id must be terminal');
+        expect(handle.status, SubagentStatus.failed);
+        expect(handle.error, contains('interrupted'));
+      }
+      // …and stay resumable (task_resume works on failed, not aborted).
+      expect(mgr['Task-18']!.requests, 0);
+
+      // The tombstoned snapshot is persisted, so a LATER restart reads
+      // terminal rows instead of resurrecting the zombie.
+      await Future<void>.delayed(Duration.zero);
+      final snapshot = persisted.last;
+      final settled = snapshot.firstWhere((h) => h['id'] == 'Task-18');
+      expect(settled['status'], 'failed');
+    });
+
+    test('rehydrate settles a mid-run interrupted row (usage billed at turn '
+        'boundaries) and passes terminal and idle rows through untouched '
+        '(issue #332)', () async {
+      // A REAL persisted mid-run row: the executor bills usage onto the
+      // registry row at every turn boundary, so a child interrupted
+      // mid-run leaves 'running' + the usage earned so far (an
+      // interrupted RESUME carries its prior generation's usage the
+      // same way). Before turn-boundary billing this state could never
+      // persist — usage was only recorded at completion.
+      final mgr = SubagentManager(
+        parentSessionId: 'p',
+        source: () async => [
+          {
+            'id': 'mid-run',
+            'name': 'mid-run',
+            'agentType': 'task',
+            'sessionId': 'p/mid-run',
+            'createdAt': '2026-09-13T16:31:00Z',
+            'lastActivity': '2026-09-13T16:31:00Z',
+            'status': 'running',
+            'tokens': 900,
+            'requests': 3,
+          },
+          {
+            'id': 'done-1',
+            'name': 'done-1',
+            'agentType': 'task',
+            'sessionId': 'p/done-1',
+            'createdAt': '2026-09-13T16:00:00Z',
+            'lastActivity': '2026-09-13T16:05:00Z',
+            'status': 'completed',
+            'tokens': 500,
+            'requests': 2,
+          },
+          {
+            'id': 'idle-1',
+            'name': 'idle-1',
+            'agentType': 'task',
+            'sessionId': 'p/idle-1',
+            'createdAt': '2026-09-13T16:00:00Z',
+            'lastActivity': '2026-09-13T16:05:00Z',
+            'status': 'idle',
+            'tokens': 100,
+            'requests': 1,
+          },
+        ],
+      );
+
+      await mgr.rehydrate();
+
+      final midRun = mgr['mid-run']!;
+      expect(midRun.isTerminal, isTrue);
+      expect(midRun.status, SubagentStatus.failed);
+      expect(midRun.error, contains('interrupted'));
+      expect(midRun.tokens, 900); // usage recorded so far is preserved
+      expect(mgr['done-1']!.status, SubagentStatus.completed);
+      expect(mgr['done-1']!.error, isNull);
+      // idle = waiting for input: an actionable, resumable state — NOT a
+      // liveness lie, so it passes through.
+      expect(mgr['idle-1']!.status, SubagentStatus.idle);
+    });
+
+    test('rehydrate never clobbers a row registered by THIS process — the '
+        'boot race stays closed (issue #332)', () async {
+      // The boot-race shape: a spawn that beat the (awaited-at-boot)
+      // registry load registered a LIVE row; a late-finishing load must
+      // not overwrite or settle it with the stale snapshot copy.
+      final mgr = SubagentManager(
+        parentSessionId: 'p',
+        source: () async => [
+          {
+            'id': 'Scout-1',
+            'name': 'Scout',
+            'agentType': 'task',
+            'sessionId': 'p/Scout-1',
+            'createdAt': '2026-09-13T16:40:00Z',
+            'lastActivity': '2026-09-13T16:40:00Z',
+            'status': 'running',
+            'tokens': 0,
+            'requests': 0,
+          },
+          {
+            'id': 'Old-2',
+            'name': 'Old',
+            'agentType': 'task',
+            'sessionId': 'p/Old-2',
+            'createdAt': '2026-09-13T16:00:00Z',
+            'lastActivity': '2026-09-13T16:05:00Z',
+            'status': 'running',
+            'tokens': 0,
+            'requests': 0,
+          },
+        ],
+      );
+      await mgr.register(
+        id: 'Scout-1',
+        name: 'Scout',
+        agentType: 'task',
+        task: 'live in this process',
+      );
+      await mgr.update('Scout-1', status: SubagentStatus.running);
+
+      await mgr.rehydrate();
+
+      // The LIVE same-id row survives untouched — still running, never
+      // settled 'failed' by the snapshot's zombie copy.
+      expect(mgr['Scout-1']!.status, SubagentStatus.running);
+      expect(mgr['Scout-1']!.isTerminal, isFalse);
+      // Rows this process does NOT own still settle as zombie rows.
+      expect(mgr['Old-2']!.status, SubagentStatus.failed);
+      expect(mgr['Old-2']!.error, contains('interrupted'));
+    });
+
+    test('events stream emits on register and update', () async {
+      final mgr = SubagentManager(parentSessionId: 'p');
+      final events = <SubagentEvent>[];
+      final sub = mgr.events.listen(events.add);
+
+      await mgr.register(id: 'a1', name: 'a1', agentType: 'task', task: '');
+      await mgr.update('a1', status: SubagentStatus.completed);
+      await Future<void>.delayed(Duration.zero);
+      await sub.cancel();
+
+      // The handle is mutable — events reference the same object, so the
+      // final status is visible on every event's handle. Verify count + id.
+      expect(events, hasLength(2));
+      expect(events.every((e) => e.handle.id == 'a1'), isTrue);
+      expect(events.last.handle.status, SubagentStatus.completed);
+    });
+
+    test('register no longer calls createChildSession — the real session is '
+        'attached lazily by the executor', () async {
+      String? capturedParent;
+      String? capturedChild;
+      final mgr = SubagentManager(
+        parentSessionId: 'parent',
+        createChildSession: (parent, child) async {
+          capturedParent = parent;
+          capturedChild = child;
+          return 'parent/subagents/$child';
+        },
+      );
+      final handle = await mgr.register(
+        id: 'c1',
+        name: 'c1',
+        agentType: 'task',
+        task: '',
+      );
+      expect(capturedParent, isNull);
+      expect(capturedChild, isNull);
+      // Placeholder until the executor attaches the real session.
+      expect(handle.sessionId, 'parent/c1');
+
+      // Simulate executor wiring at completion.
+      await mgr.attachSession('c1', 'parent/subagents/c1');
+      expect(handle.sessionId, 'parent/subagents/c1');
+      expect(handle.sessionId, isNot('parent/c1'));
+    });
+
+    group('messaging fabric', () {
+      late MemoryExecutionEnv env;
+      late FileMessagingRepository repo;
+      late SubagentManager mgr;
+
+      SubagentMessage note(String text, {String from = 'main'}) =>
+          SubagentMessage(
+            fromId: from,
+            text: text,
+            sentAt: '2026-01-01T00:00:00Z',
+          );
+
+      setUp(() async {
+        env = MemoryExecutionEnv(cwd: '/work');
+        repo = FileMessagingRepository(env: env, root: '/mail');
+        mgr = SubagentManager(parentSessionId: 'p', messaging: repo)
+          ..mailboxPrefix = 'sess1';
+        await mgr.register(id: 'a1', name: 'a1', agentType: 'task', task: '');
+      });
+
+      test('enqueue delivers to the namespaced file inbox', () async {
+        await mgr.enqueueMessage('a1', note('note for a1'));
+        final pending = await repo.peek('sess1/a1');
+        expect(pending.single.text, 'note for a1');
+        // The sender address is namespaced too, so the recipient can reply
+        // across instances.
+        expect(pending.single.fromId, 'sess1/main');
+        expect(await mgr.pendingInboxCount('a1'), 1);
+      });
+
+      test('drain consumes the file inbox', () async {
+        await mgr.enqueueMessage('a1', note('one'));
+        await mgr.enqueueMessage('a1', note('two'));
+        final drained = await mgr.drainMessages('a1');
+        expect(drained.map((m) => m.text), ['one', 'two']);
+        expect(await mgr.drainMessages('a1'), isEmpty);
+      });
+
+      test('absolute mailboxes pass through unprefixed', () async {
+        await mgr.enqueueMessage('sess2/main', note('cross-instance'));
+        expect(await repo.peek('sess2/main'), hasLength(1));
+        expect(await repo.peek('sess1/sess2/main'), isEmpty);
+      });
+
+      test('messaging main (selfId) needs no handle', () async {
+        await mgr.enqueueMessage('main', note('for the parent', from: 'a1'));
+        final drained = await mgr.drainMessages('main');
+        expect(drained.single.text, 'for the parent');
+        expect(drained.single.fromId, 'sess1/a1');
+      });
+
+      test('the queue cap reads the fabric inbox size', () async {
+        final small = SubagentManager(
+          parentSessionId: 'p',
+          messaging: repo,
+          maxPendingMessages: 2,
+        )..mailboxPrefix = 'sess1';
+        await small.register(id: 'c9', name: 'c9', agentType: 'task', task: '');
+        await small.enqueueMessage('c9', note('1'));
+        await small.enqueueMessage('c9', note('2'));
+        expect(() => small.enqueueMessage('c9', note('3')), throwsStateError);
+      });
+
+      test(
+        'hub-shaped recipients pass the guard through a routing fabric',
+        () async {
+          final hub = _FakeHub()..resolvable.add('a1b2c3d4e5f60718');
+          final fabric = FallbackMessagingRepository(
+            primary: hub,
+            fallback: repo,
+          );
+          final routed = SubagentManager(
+            parentSessionId: 'p',
+            messaging: fabric,
+          )..mailboxPrefix = 'sess1';
+          await routed.register(
+            id: 'a1',
+            name: 'a1',
+            agentType: 'task',
+            task: '',
+          );
+          // A bare 16-hex hub id has no local handle and no '/' — the guard
+          // consults the fabric's routing capability instead of throwing,
+          // and the mail goes hub-ward UNPREFIXED.
+          await routed.enqueueMessage('a1b2c3d4e5f60718', note('over the hub'));
+          expect(hub.sent.single.toId, 'a1b2c3d4e5f60718');
+        },
+      );
+
+      test(
+        'unresolvable recipients still fail honestly on a live hub',
+        () async {
+          final fabric = FallbackMessagingRepository(
+            primary: _FakeHub(),
+            fallback: repo,
+          );
+          final routed = SubagentManager(
+            parentSessionId: 'p',
+            messaging: fabric,
+          )..mailboxPrefix = 'sess1';
+          expect(
+            () => routed.enqueueMessage('nobody-here', note('typo')),
+            throwsStateError,
+          );
+        },
+      );
+
+      test('aborted children refuse messages in the guard', () async {
+        final handle = await mgr.register(
+          id: 'gone',
+          name: 'gone',
+          agentType: 'task',
+          task: '',
+        );
+        handle.status = SubagentStatus.aborted;
+        expect(
+          () => mgr.enqueueMessage('gone', note('too late')),
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              contains('is aborted and takes no messages'),
+            ),
+          ),
+        );
+      });
+
+      test('remote a2a children refuse messages in the guard', () async {
+        await mgr.register(
+          id: 'remote',
+          name: 'remote',
+          agentType: 'a2a:peer',
+          task: '',
+        );
+        expect(
+          () => mgr.enqueueMessage('remote', note('no local inbox')),
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              allOf([
+                contains('runs on a remote a2a server'),
+                contains('no local inbox to deliver into'),
+              ]),
+            ),
+          ),
+        );
+      });
+
+      test('local handles and selfId win over the hub roster', () async {
+        final hub = _FakeHub()..resolvable.addAll(['a1', 'main']);
+        final fabric = FallbackMessagingRepository(
+          primary: hub,
+          fallback: repo,
+        );
+        final routed = SubagentManager(parentSessionId: 'p', messaging: fabric)
+          ..mailboxPrefix = 'sess1';
+        await routed.register(
+          id: 'a1',
+          name: 'a1',
+          agentType: 'task',
+          task: '',
+        );
+        await routed.enqueueMessage('a1', note('for the child'));
+        await routed.enqueueMessage('main', note('for the parent', from: 'a1'));
+        expect(hub.sent, isEmpty);
+        expect((await repo.peek('sess1/a1')).single.text, 'for the child');
+        expect((await repo.peek('sess1/main')).single.text, 'for the parent');
+      });
+    });
+  });
+}
+
+/// Minimal routing hub double for guard/routing tests.
+final class _FakeHub
+    implements MessagingRepository, RoutingMessagingRepository {
+  final sent = <AgentMessage>[];
+  final resolvable = <String>{};
+  bool connected = true;
+
+  @override
+  bool get isConnected => connected;
+
+  @override
+  Future<String?> resolveTarget(String toId) async =>
+      resolvable.contains(toId) ? toId : null;
+
+  @override
+  Future<void> send(AgentMessage message) async => sent.add(message);
+
+  @override
+  Future<void> register(
+    String agentId, {
+    String? sessionName,
+    List<AgentCapability> capabilities = const [],
+  }) async {}
+
+  @override
+  Future<void> touch(String agentId, {bool busy = false}) async {}
+
+  @override
+  Future<List<AgentMessage>> peek(String agentId) async => const [];
+
+  @override
+  Future<List<AgentMessage>> drain(String agentId) async => const [];
+
+  @override
+  Future<List<MailboxEntry>> directory() async => const [];
+}

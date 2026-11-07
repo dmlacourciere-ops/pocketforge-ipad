@@ -1,0 +1,202 @@
+# Dart / Flutter
+.dart_tool/
+build/
+coverage/
+# Local coverage scratch runs (e.g. cov-raw2/) — same artifact class as
+# coverage/; a WIP auto-save swept one onto the branch once (gh-1033
+# review thread 11).
+cov-*/
+# VM coverage scratch (lcov.info + per-test .vm.json) from the quality-gate
+# coverage runs — same artifact class as coverage/; WIP auto-saves swept it
+# onto the branch repeatedly (gh-1033 review thread 11, gh-1449 review
+# thread 14: coverage_cov/; gh-1439 rework: coverage-verify/;
+# gh-2044 rework: coverage_tmp/ — 89 MB of .vm.json swept onto the branch
+# and blew the staged-package gate past pub.dev's 100 MB cap).
+coverage_cov/
+coverage-verify/
+coverage_tmp/
+# Redirect artifacts with a Win32-invalid character in the name (e.g.
+# ":debug," from a mangled word-split loop): a WIP auto-save swept two of
+# them onto the gh-1800 rework branch and EVERY windows-latest job failed
+# at checkout before its first step ("error: invalid path") while the
+# Linux legs stayed green. Nothing legitimate ever carries a colon in a
+# file name (Windows cannot check it out), so ignore the class.
+*:*
+coverage-llm/  # gh-1697: LLM-tagged VM coverage scratch swept onto branches by WIP auto-saves
+# The Pages workflow assembles the Flutter web demo here; never commit it.
+site/app/
+# gh-1476 (PR #1479 owner directive): the generated GEO layer — static
+# blog/docs pages, the rendered blog index, sitemap.xml, llms-full.txt —
+# is a deploy-time product (pages.yml builds it into build/pages via
+# `dart scripts/build_site.dart --out`), never committed; site/ holds the
+# sources + templates only (blog/index.template.html is the committed
+# blog-index template).
+site/blog/*/index.html
+site/blog/index.html
+site/docs/*/index.html
+site/sitemap.xml
+site/llms-full.txt
+# library package: lockfile is not committed
+pubspec.lock
+# ...except the app: flutter_app is publish_to: none, so its lockfile IS
+# committed and enforced in CI (flutter pub get --enforce-lockfile) —
+# gh-1265. Must stay after the `pubspec.lock` rule above (last match wins
+# in a single .gitignore).
+!flutter_app/pubspec.lock
+*.iml
+.idea/
+.vscode/
+.DS_Store
+.repro/
+
+# Vendor dependencies (local wasm_run fork) - keep source, ignore build artifacts
+vendor/**/target/
+vendor/**/build/
+vendor/**/.dart_tool/
+# The prebuilt iOS framework is downloaded from pub cache by scripts/setup_vendor_ios.sh
+vendor/wasm_run_flutter/ios/Frameworks/WasmRun.xcframework/
+# The prebuilt macOS framework is downloaded on first build by wasm_run_flutter.
+# (Ignore the downloaded artifacts only, not the whole dir: pub.dev rejects
+# files that are both checked in and ignored, and its parser skips `!` rules.)
+vendor/wasm_run_flutter/macos/Frameworks/WasmRun.xcframework/
+vendor/wasm_run_flutter/macos/Frameworks/wasm_run-*.zip
+# Same for the Linux prebuilt runtime: downloaded by the plugin's CMake on
+# first linux build (pulled into the tree by gh-1265 local verification).
+vendor/wasm_run_flutter/linux/wasm_run-*/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Firebase configuration files (contain API keys and project IDs).
+# Populate from your own Firebase project download; never commit.
+google-services.json
+GoogleService-Info.plist
+# firebase_options.dart is checked in for CI builds (public API keys only).
+
+
+# Local development helpers / scratch files.
+/generated/
+install_local.sh
+test_tool_call.sh
+/tool/
+
+# Visual-test screen-text twins (contain timestamps, regenerated each run).
+test/integration/screenshots/*.txt
+# crap4dart profiling
+profile-reports/
+.crap_profile_temp/
+fa-local/
+# Runtime agent working directory (bash job logs, transient state).
+# .fah holds local-only junk (logs, sessions, bash_jobs, scratch) — but a
+# curated subset is committed on purpose: the project config, stream
+# rules, lsp/mcp settings, agents and skills. `.fah/dap.json` joins the
+# whitelist per gh-1825 v3: the DAP channel store MAY be committed because
+# it holds ENCRYPTED (`dapkey1.`) keys only — never plaintext (AC14).
+.fah/*
+!.fah/config.yaml
+!.fah/rules.yaml
+!.fah/lsp.json
+!.fah/mcp.json
+!.fah/agents/
+!.fah/skills/
+!.fah/packages.yaml
+!.fah/bootstrap.yaml
+!.fah/dap.json
+
+# Embedded browser-extension agent: dart2js output (built by
+# scripts/build_browser_ext.sh), plus the local package's tooling dirs.
+browser_ext/sw/agent.js
+browser_ext/sw/agent.js.map
+browser_ext/sw/agent.js.deps
+office_addin/web/office_agent.js
+office_addin/web/office_agent.js.map
+office_addin/web/office_agent.js.deps
+office_addin/dart/build/
+browser_ext/app/
+browser_ext/dart/build/
+
+# Playwright e2e (browser_ext/e2e): deps and run artifacts, never committed.
+browser_ext/e2e/node_modules/
+browser_ext/e2e/test-results/
+browser_ext/e2e/playwright-report/
+office_addin/e2e/node_modules/
+office_addin/e2e/test-results/
+office_addin/e2e/playwright-report/
+browser_ext/panel/app/
+
+# Local git worktrees from past sessions
+.worktrees/
+
+
+# web boot smoke local prereqs (never commit)
+/node_modules/
+/package.json
+/package-lock.json
+
+# DAP hub local key material (never commit)
+.dap/
+
+# Vendored interpreter runtimes (scripts/vendor_interpreters.sh — downloaded at build time)
+browser_ext/vendor/
+
+# Python bytecode (issue #194: four committed .pyc files)
+__pycache__/
+# dart test --file-reporter outputs (local shard runs)
+test-results/
+packages/fa_ui/test/trajectory/golden/failures/
+
+# Placeholder google-services.json is COMMITTED (the google-services
+# Gradle plugin hard-fails without it); CI overwrites it from the
+# GOOGLE_SERVICES_JSON_BASE64 secret when present (issue #289).
+!flutter_app/android/app/google-services.json
+
+# wasm_run_flutter android build artifacts. The prebuilt runtime binaries
+# under src/main/jniLibs/ are COMMITTED (gh-746: rebuilt from the vendored
+# Rust source with NDK r28's 16 KB max page size — never re-ignore them, the
+# upstream download path that populated this dir is gone).
+vendor/wasm_run_flutter/android/.cxx/
+vendor/wasm_run_flutter/android/*.tar.gz
+
+# AI-machine loop workspace artifacts — regenerated per run; the committed
+# .dmtools/config.js and .dmtools/runners/*.json MUST stay visible, so the
+# ignores are precise, never a blanket .dmtools/.
+.codegraph/
+.dmtools/fa-trace.log
+.dmtools/run-output.txt
+.dmtools/fa-sessions/
+.dmtools/copilot-sessions/
+.dmtools/credential-helper.log
+# gh-1986 review: dmtools target-workingdir marker — local tool state,
+# never commit (was swept into the PR by a WIP auto-save once already).
+.dmtools-target-workingdir
+
+# factory runtime clone (checked out by the machine loop, never committed)
+factory-agents/
+
+# Agent runtime — rebuilt from the tracker every run, never commit
+# (a tracked input/ticket.md collides with the branch-setup stash and
+# bakes conflict markers into agent PRs; see dmtools-agents
+# setup-dark-factory skill). memory/ stays tracked: notes are the
+# source of truth there, only derivatives are ignored (memory/.gitignore).
+/input/
+/outputs/
+
+# omp REFERENCE screen twins (issue #810): committed capture artifacts the
+# REG parity suite diffs — exempted from the *.txt screenshot ignores above
+# (last rule wins). The capture test overwrites them in place.
+!test/integration/screenshots/omp_ref/**
+.fm-drill-cache/
+node_modules
+
+# sdk/web type-stripped build output (node build.mjs regenerates it).
+sdk/web/dist/
+agents/
+
+# gh-2042 review: CWD artifacts of the release scripts (release_attach_or_create.sh
+# writes release-notes.md, release_drift_check.sh defaults FA_DRIFT_DETAILS to
+# drift-details.txt) — test-run residue, never committed.
+/release-notes.md
+/drift-details.txt

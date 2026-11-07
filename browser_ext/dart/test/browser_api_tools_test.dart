@@ -1,0 +1,1581 @@
+// BrowserApiToolSurface (browser_api_tools.dart): spec table (UT-T4),
+// per-tool schema validation + happy path + coded error mapping over
+// FakeChrome (UT-T1), the inject_js edge matrix — world whitelist,
+// timeout/allFrames bounds, result budget, E2 structured errors and E3
+// retryable mapping (UT-T5), restricted-page refusals with tab management
+// still allowed (E1/E17), and the targeted refusals ('active_tab',
+// 'no_longer_available', 'no_app_page'). Issue #30.
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter_agent_harness/src/agent/tool_registry.dart';
+import 'package:flutter_agent_harness/src/agent/agent_loop.dart';
+import 'package:flutter_agent_harness/src/approval/approval.dart';
+import 'package:flutter_agent_harness/src/types.dart';
+import 'package:test/test.dart';
+
+import '../src/browser_api_tools.dart';
+import '../src/chrome_api.dart';
+import '../src/fake_chrome.dart';
+
+/// Chrome that fails every call with the same coded error: lets the sweep
+/// prove EVERY tool maps a raw ChromeApiException to a thrown
+/// BrowserApiToolException (code rides the error, never a leak).
+final class _ThrowingChrome implements ChromeApi {
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw ChromeApiException('no_tab', 'no tab with id 0');
+}
+
+const _expectedNames = [
+  'tabs_open',
+  'tabs_close',
+  'tabs_update',
+  'tabs_query',
+  'tabs_move',
+  'tabs_group',
+  'tabs_ungroup',
+  'tabs_reload',
+  'tabs_discard',
+  'windows_open',
+  'windows_update',
+  'windows_close',
+  'windows_list',
+  'groups_update',
+  'groups_close',
+  'sessions_recent',
+  'sessions_restore',
+  'history_search',
+  'bookmarks_list',
+  'bookmarks_add',
+  'bookmarks_update',
+  'bookmarks_remove',
+  'download',
+  'cookies_get',
+  'cookies_set',
+  'cookies_remove',
+  'inject_js',
+  'inject_css',
+  'cdp_eval',
+  'page_screenshot',
+  'app_screenshot',
+  'nav_wait',
+  // second tier (Settings-gated, issue #34 AC4d)
+  'browser_search',
+  'top_sites',
+  'reading_list',
+  'page_capture',
+];
+
+/// Minimal VALID args per tool: enough to pass validation so the call
+/// reaches the (throwing) facade in the error-mapping sweep.
+const _minArgs = <String, Map<String, Object?>>{
+  'tabs_open': {'url': 'https://x.example/'},
+  'tabs_close': {
+    'tabIds': [1],
+  },
+  'tabs_update': {'tabId': 1},
+  'tabs_query': {},
+  'tabs_move': {'tabId': 1, 'index': 0},
+  'tabs_group': {
+    'tabIds': [1],
+  },
+  'tabs_ungroup': {
+    'tabIds': [1],
+  },
+  'tabs_reload': {'tabId': 1},
+  'tabs_discard': {'tabId': 1},
+  'windows_open': {},
+  'windows_update': {'windowId': 1},
+  'windows_close': {'windowId': 1},
+  'windows_list': {},
+  'groups_update': {'groupId': 1},
+  'groups_close': {'groupId': 1},
+  'sessions_recent': {},
+  'sessions_restore': {'sessionId': 's1'},
+  'history_search': {'text': 'x'},
+  'bookmarks_list': {},
+  'bookmarks_add': {'title': 't', 'url': 'https://x.example/'},
+  'bookmarks_update': {'id': '1'},
+  'bookmarks_remove': {'id': '1'},
+  'download': {'url': 'https://x.example/report.pdf'},
+  'cookies_get': {'url': 'https://x.example/', 'name': 'c'},
+  'cookies_set': {'url': 'https://x.example/', 'name': 'c', 'value': 'v'},
+  'cookies_remove': {'url': 'https://x.example/', 'name': 'c'},
+  'inject_js': {'tabId': 1, 'code': '1+1', 'world': 'ISOLATED'},
+  'inject_css': {'tabId': 1, 'css': 'body{}'},
+  'cdp_eval': {'tabId': 1, 'expression': '1'},
+  'page_screenshot': {},
+  'app_screenshot': {},
+  'nav_wait': {'tabId': 1, 'timeoutMs': 1000},
+  'browser_search': {'text': 'q'},
+  'top_sites': {},
+  'reading_list': {'mode': 'list'},
+  'page_capture': {'tabId': 1},
+};
+
+/// Core-only registry by default; [enabledSecondTier] turns the gate on
+/// for the named tools (they still need chrome's permission grant).
+Future<ToolRegistry> _reg(
+  ChromeApi chrome, {
+  Set<String> enabledSecondTier = const {},
+}) async {
+  final reg = ToolRegistry();
+  await registerBrowserApiTools(
+    reg,
+    chrome,
+    enabledSecondTier: enabledSecondTier,
+  );
+  return reg;
+}
+
+/// Registry with EVERY tool registered: core through the gate, gated ones
+/// directly (behavior sweeps exercise tools, not gate placement).
+Future<ToolRegistry> _fullReg(ChromeApi chrome) async {
+  final reg = ToolRegistry();
+  final surface = await registerBrowserApiTools(reg, chrome);
+  reg.registerAll([
+    for (final t in surface.tools())
+      if (BrowserApiToolSurface.specOf(t.name).visibility ==
+          BrowserToolVisibility.secondTier)
+        t,
+  ]);
+  return reg;
+}
+
+/// A registry wired to a FakeChrome with canned script/CDP answers.
+(ToolRegistry, FakeChrome) _cannedReg({
+  Object? Function(String funcSource, List<Object?> args)? resultsFor,
+  Object? Function(String method, Map<String, Object?> params)? cdpResponder,
+  int? resultBudget,
+}) {
+  final chrome = FakeChrome(resultsFor: resultsFor, cdpResponder: cdpResponder);
+  final tools = BrowserApiToolSurface(
+    chrome,
+    resultBudget: resultBudget ?? defaultResultBudgetBytes,
+  ).tools();
+  return (ToolRegistry()..registerAll(tools), chrome);
+}
+
+Future<String> _run(
+  ToolRegistry reg,
+  String name, [
+  Map<String, Object?> args = const {},
+]) async {
+  final result = await reg[name].execute(
+    Map<String, dynamic>.of(args),
+    null,
+    null,
+  );
+  return result.content.whereType<TextContent>().map((c) => c.text).join('\n');
+}
+
+Map<String, Object?> _jsonOf(String text) =>
+    jsonDecode(text) as Map<String, Object?>;
+
+/// Runs a tool and returns the full result (image blocks included) —
+/// `_run` only collects the text channel.
+Future<ToolExecutionResult> _runRes(
+  ToolRegistry reg,
+  String name, [
+  Map<String, Object?> args = const {},
+]) => reg[name].execute(Map<String, dynamic>.of(args), null, null);
+
+TypeMatcher<BrowserApiToolException> _err(String code) =>
+    isA<BrowserApiToolException>().having((e) => e.code, 'code', code);
+
+TypeMatcher<BrowserApiToolException> _errMsg(String code, Object message) =>
+    _err(code).having((e) => e.message, 'message', message);
+
+Object? _validArg(String prop, String type) {
+  if (prop == 'world') return 'ISOLATED';
+  return switch (type) {
+    'string' => 'x',
+    'integer' => 1,
+    'boolean' => true,
+    'array' => [1],
+    _ => null,
+  };
+}
+
+void main() {
+  late FakeChrome chrome;
+  late ToolRegistry reg;
+
+  setUp(() async {
+    chrome = FakeChrome(clock: () => 1730000000000);
+    reg = await _reg(chrome);
+  });
+
+  // -------------------------------------------------------------------------
+  group('specs table (UT-T4)', () {
+    test('36 tools (32 core + 4 Settings-gated) with exact names', () {
+      final specs = browserApiToolSpecs();
+      expect(specs.map((s) => s.name), unorderedEquals(_expectedNames));
+      expect(specs.map((s) => s.name).toSet().length, 36);
+    });
+
+    test('exactly four second-tier specs, all others core', () {
+      final gated = browserApiToolSpecs()
+          .where((s) => s.visibility == BrowserToolVisibility.secondTier)
+          .map((s) => s.name)
+          .toSet();
+      expect(gated, secondTierToolNames());
+      expect(gated.length, 4);
+      expect(
+        browserApiToolSpecs()
+            .where((s) => s.visibility == BrowserToolVisibility.core)
+            .length,
+        32,
+      );
+    });
+
+    test('every spec: tier, visibility, alwaysPrompts, permissions', () {
+      const reads = {
+        'tabs_query',
+        'windows_list',
+        'sessions_recent',
+        'history_search',
+        'bookmarks_list',
+        'cookies_get',
+        'nav_wait',
+        'app_screenshot',
+        'top_sites', // second tier
+      };
+      const execs = {
+        'inject_js',
+        'cdp_eval',
+        'page_screenshot',
+        'page_capture',
+      };
+      for (final s in browserApiToolSpecs()) {
+        expect(
+          s.tier,
+          reads.contains(s.name)
+              ? ApprovalTier.read
+              : execs.contains(s.name)
+              ? ApprovalTier.exec
+              : ApprovalTier.write,
+          reason: '${s.name}: wrong tier',
+        );
+        expect(
+          s.visibility,
+          secondTierToolNames().contains(s.name)
+              ? BrowserToolVisibility.secondTier
+              : BrowserToolVisibility.core,
+          reason: s.name,
+        );
+        expect(s.alwaysPrompts, s.name == 'inject_js', reason: s.name);
+        expect(s.permissions, isNotEmpty, reason: s.name);
+      }
+      // The one always-prompting tool runs MAIN-world page code.
+      expect(
+        browserApiToolSpecs().firstWhere((s) => s.name == 'inject_js').tier,
+        ApprovalTier.exec,
+      );
+    });
+
+    test(
+      'FULL registry contents match the spec table exactly (name + tier)',
+      () async {
+        final full = await _fullReg(chrome);
+        expect(
+          full.names.toSet(),
+          browserApiToolSpecs().map((s) => s.name).toSet(),
+        );
+        expect(full.length, 36);
+        final specs = {for (final s in browserApiToolSpecs()) s.name: s};
+        for (final tool in full.agentTools) {
+          expect(tool.tier, specs[tool.name]!.tier, reason: tool.name);
+          expect(tool.name, isIn(_expectedNames));
+        }
+      },
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  group('second-tier Settings gate (issue #34 AC4d, #19 semantics)', () {
+    // Each test starts from a FRESH chrome (outer setUp) with the grants
+    // it needs — the floor is per-test behavior, not shared state.
+    test('enabled + granted → registered', () async {
+      await chrome.grantPermissions([
+        'search',
+        'topSites',
+        'readingList',
+        'pageCapture',
+      ]);
+      final gated = await _reg(
+        chrome,
+        enabledSecondTier: secondTierToolNames(),
+      );
+      expect(
+        gated.names.toSet(),
+        browserApiToolSpecs().map((s) => s.name).toSet(),
+      );
+      expect(gated.length, 36);
+    });
+
+    test('enabled + NOT granted → hidden (capability floor)', () async {
+      // Fresh chrome: zero grants.
+      final gated = await _reg(
+        FakeChrome(clock: () => 1730000000000),
+        enabledSecondTier: secondTierToolNames(),
+      );
+      expect(gated.names, everyElement(isNot(isIn(secondTierToolNames()))));
+      expect(gated.length, 32);
+    });
+
+    test(
+      'disabled + granted → hidden (config cannot beat the floor)',
+      () async {
+        final gated = await _reg(chrome); // nothing enabled
+        expect(gated.names, everyElement(isNot(isIn(secondTierToolNames()))));
+        expect(gated.length, 32);
+      },
+    );
+
+    test('grant/revoke after registration surfaces/hides live', () async {
+      final reg = ToolRegistry();
+      final surface = await registerBrowserApiTools(
+        reg,
+        chrome,
+        enabledSecondTier: secondTierToolNames(),
+      );
+      // Not granted yet → hidden even though enabled.
+      expect(reg.names, everyElement(isNot(isIn(secondTierToolNames()))));
+
+      await chrome.grantPermissions(['search']);
+      await syncSecondTierTools(reg, surface, secondTierToolNames());
+      expect(reg.names, contains('browser_search'));
+      expect(reg.names, isNot(contains('top_sites')));
+
+      await chrome.revokePermissions(['search']);
+      await syncSecondTierTools(reg, surface, secondTierToolNames());
+      expect(reg.names, everyElement(isNot(isIn(secondTierToolNames()))));
+      expect(reg.length, 32); // core unaffected (incl. gated `download`)
+    });
+
+    test('sync is idempotent: double-apply does not duplicate', () async {
+      await chrome.grantPermissions(['topSites']);
+      final reg = ToolRegistry();
+      final surface = await registerBrowserApiTools(
+        reg,
+        chrome,
+        enabledSecondTier: {'top_sites'},
+      );
+      await syncSecondTierTools(reg, surface, {'top_sites'});
+      expect(reg.length, 33);
+      await syncSecondTierTools(reg, surface, {'top_sites'});
+      expect(reg.length, 33);
+    });
+
+    test('dynamically granting an optional permission surfaces its tool '
+        'through the host gate (#19 semantics)', () async {
+      final reg = ToolRegistry();
+      final surface = await registerBrowserApiTools(
+        reg,
+        chrome,
+        enabledSecondTier: {'top_sites'},
+      );
+      expect(reg.names, isNot(contains('top_sites')));
+      await chrome.grantPermissions(['topSites']);
+      await syncSecondTierTools(reg, surface, {'top_sites'});
+      expect(reg.names, contains('top_sites'));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  group('schema validation sweep (UT-T1)', () {
+    test('every tool: missing args → structured bad_args (or a mapped '
+        'facade error when nothing is required), never a crash', () async {
+      final throwReg = await _fullReg(_ThrowingChrome());
+      for (final spec in browserApiToolSpecs()) {
+        final schema = throwReg[spec.name].parameters;
+        final required = (schema['required']! as List).cast<String>();
+        if (required.isEmpty) {
+          await expectLater(
+            _run(throwReg, spec.name),
+            throwsA(_err('no_tab')),
+            reason: '${spec.name}: {} should reach the facade',
+          );
+        } else {
+          await expectLater(
+            _run(throwReg, spec.name),
+            throwsA(_err('bad_args')),
+            reason: '${spec.name}: {} should fail validation',
+          );
+        }
+      }
+    });
+
+    test('every tool: wrong-typed required args → error naming the '
+        'argument', () async {
+      final throwReg = await _fullReg(_ThrowingChrome());
+      for (final spec in browserApiToolSpecs()) {
+        final schema = throwReg[spec.name].parameters;
+        final required = (schema['required']! as List).cast<String>();
+        final props = schema['properties']! as Map<String, Object?>;
+        for (final prop in required) {
+          final type = (props[prop]! as Map)['type']! as String;
+          final wrong = switch (type) {
+            'string' => 42,
+            'integer' => 'nope',
+            'boolean' => 'nope',
+            'array' => 'nope',
+            _ => Object(),
+          };
+          final args = <String, Object?>{
+            for (final p in required)
+              p: p == prop
+                  ? wrong
+                  : _validArg(p, (props[p]! as Map)['type']! as String),
+          };
+          await expectLater(
+            _run(throwReg, spec.name, args),
+            throwsA(
+              isA<BrowserApiToolException>()
+                  .having((e) => e.code, 'code', anyOf('bad_args', 'bad_world'))
+                  .having((e) => e.message, 'message', contains(prop)),
+            ),
+            reason: '${spec.name}.$prop = $wrong',
+          );
+        }
+      }
+    });
+
+    test('every tool maps a raw ChromeApiException to a thrown coded tool '
+        'error — no leak', () async {
+      final throwReg = await _fullReg(_ThrowingChrome());
+      for (final spec in browserApiToolSpecs()) {
+        await expectLater(
+          _run(throwReg, spec.name, _minArgs[spec.name]!),
+          throwsA(
+            isA<BrowserApiToolException>()
+                .having((e) => e.code, 'code', 'no_tab')
+                .having((e) => e.isRetryable, 'isRetryable', false),
+          ),
+          reason: spec.name,
+        );
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  group('happy path per tool (UT-T1)', () {
+    test('tabs_open', () async {
+      final out = await _run(reg, 'tabs_open', {'url': 'https://a.example/'});
+      expect(out, contains('opened tab'));
+      expect(await chrome.tabs.query(url: 'https://a.example/'), hasLength(1));
+    });
+
+    test('tabs_close', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      final b = await chrome.tabs.create(url: 'https://b.example/');
+      await _run(reg, 'tabs_close', {
+        'tabIds': [a.id, b.id],
+      });
+      expect(await chrome.tabs.query(), isEmpty);
+    });
+
+    test('tabs_update', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      await _run(reg, 'tabs_update', {
+        'tabId': t.id,
+        'pinned': true,
+        'muted': true,
+      });
+      final after = await chrome.tabs.get(t.id);
+      expect(after.pinned, isTrue);
+      expect(after.muted, isTrue);
+    });
+
+    test('tabs_query', () async {
+      await chrome.tabs.create(url: 'https://a.example/page');
+      await chrome.tabs.create(url: 'https://b.example/page');
+      final out = await _run(reg, 'tabs_query', {'url': '*a.example*'});
+      final list = jsonDecode(out) as List<Object?>;
+      expect(list, hasLength(1));
+      expect((list.single! as Map)['url'], 'https://a.example/page');
+    });
+
+    test(
+      'tabs_query: a bare domain is a substring filter, not a pattern',
+      () async {
+        // Models pass 'apple.com' — chrome rejects it as an Invalid url
+        // pattern and the whole call errored. Coerce: no scheme, no '*'
+        // → substring match over the tab list.
+        await chrome.tabs.create(url: 'https://www.apple.com/mac');
+        await chrome.tabs.create(url: 'https://b.example/');
+        final out = await _run(reg, 'tabs_query', {'url': 'apple.com'});
+        final list = jsonDecode(out) as List<Object?>;
+        expect(list, hasLength(1));
+        expect((list.single! as Map)['url'], 'https://www.apple.com/mac');
+      },
+    );
+
+    test(
+      'tabs_query: bare substring title filter works the same way',
+      () async {
+        await chrome.tabs.create(url: 'https://a.example/', title: 'Apple');
+        await chrome.tabs.create(url: 'https://b.example/', title: 'Beta');
+        final out = await _run(reg, 'tabs_query', {'title': 'apple'});
+        final list = jsonDecode(out) as List<Object?>;
+        expect(list, hasLength(1), reason: 'substring, case-insensitive');
+      },
+    );
+
+    test('tabs_move', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      final b = await chrome.tabs.create(url: 'https://b.example/');
+      await _run(reg, 'tabs_move', {'tabId': b.id, 'index': 0});
+      final win = await chrome.windows.get(b.windowId);
+      expect(win.tabIds.first, b.id);
+      expect(win.tabIds, contains(a.id));
+      expect(win.tabIds.last, a.id);
+    });
+
+    test('tabs_group', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      final b = await chrome.tabs.create(url: 'https://b.example/');
+      final out = await _run(reg, 'tabs_group', {
+        'tabIds': [a.id, b.id],
+        'title': 'research',
+        'color': 'blue',
+      });
+      expect(out, contains('group'));
+      final groups = await chrome.groups.query(title: 'research');
+      expect(groups, hasLength(1));
+      expect(groups.single.color, 'blue');
+      expect((await chrome.tabs.get(a.id)).groupId, groups.single.id);
+    });
+
+    test('tabs_ungroup', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      await chrome.tabs.group(tabIds: [a.id], title: 'g');
+      await _run(reg, 'tabs_ungroup', {
+        'tabIds': [a.id],
+      });
+      expect(await chrome.tabs.get(a.id).then((t) => t.groupId), isNull);
+    });
+
+    test('tabs_reload', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      final out = await _run(reg, 'tabs_reload', {
+        'tabId': a.id,
+        'bypassCache': true,
+      });
+      expect(out, contains('reloaded'));
+    });
+
+    test('tabs_discard (background tab)', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      await chrome.tabs.create(url: 'https://b.example/'); // becomes active
+      await _run(reg, 'tabs_discard', {'tabId': a.id});
+      expect((await chrome.tabs.get(a.id)).discarded, isTrue);
+    });
+
+    test('windows_open', () async {
+      final before = await chrome.windows.getAll();
+      await _run(reg, 'windows_open', {'url': 'https://a.example/'});
+      final after = await chrome.windows.getAll();
+      expect(after.length, before.length + 1);
+    });
+
+    test('windows_update', () async {
+      await chrome.tabs.create(url: 'https://a.example/'); // ensures a window
+      final w = (await chrome.windows.getAll()).first;
+      await _run(reg, 'windows_update', {
+        'windowId': w.id,
+        'state': 'maximized',
+      });
+    });
+
+    test('windows_close', () async {
+      final w = await chrome.windows.create(url: 'https://a.example/');
+      await _run(reg, 'windows_close', {'windowId': w.id});
+      expect(
+        (await chrome.windows.getAll()).map((x) => x.id),
+        isNot(contains(w.id)),
+      );
+    });
+
+    test('windows_list', () async {
+      await chrome.tabs.create(url: 'https://a.example/'); // ensures a window
+      final out = await _run(reg, 'windows_list');
+      final list = jsonDecode(out) as List<Object?>;
+      expect(list, isNotEmpty);
+      expect((list.first! as Map)['tabIds'], isA<List>());
+    });
+
+    test('groups_update', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      final gid = await chrome.tabs.group(tabIds: [a.id]);
+      await _run(reg, 'groups_update', {'groupId': gid, 'title': 'renamed'});
+      final groups = await chrome.groups.query(title: 'renamed');
+      expect(groups, hasLength(1));
+      expect(groups.single.id, gid);
+    });
+
+    test('groups_close', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      final gid = await chrome.tabs.group(tabIds: [a.id]);
+      await _run(reg, 'groups_close', {'groupId': gid});
+      expect(await chrome.groups.query(), isEmpty);
+      expect(await chrome.tabs.query(), isEmpty);
+    });
+
+    test('sessions_recent', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      await chrome.tabs.close(a.id);
+      final out = await _run(reg, 'sessions_recent');
+      final list = jsonDecode(out) as List<Object?>;
+      expect(list, hasLength(1));
+      expect(
+        ((list.single! as Map)['tab']! as Map)['url'],
+        'https://a.example/',
+      );
+    });
+
+    test('sessions_restore', () async {
+      final a = await chrome.tabs.create(url: 'https://a.example/');
+      await chrome.tabs.close(a.id);
+      final sessions = await chrome.sessions.getRecentlyClosed();
+      final out = await _run(reg, 'sessions_restore', {
+        'sessionId': sessions.single.sessionId,
+      });
+      final parsed = _jsonOf(out);
+      expect(parsed['ok'], true);
+      expect(
+        ((parsed['restored']! as Map)['tab']! as Map)['url'],
+        'https://a.example/',
+      );
+    });
+
+    test('history_search', () async {
+      chrome.seedHistory(
+        url: 'https://docs.example/flutter',
+        title: 'Flutter docs',
+      );
+      final out = await _run(reg, 'history_search', {'text': 'flutter'});
+      expect(out, contains('https://docs.example/flutter'));
+    });
+
+    test('bookmarks_list', () async {
+      await chrome.bookmarks.create(title: 'GH', url: 'https://github.com');
+      final out = await _run(reg, 'bookmarks_list');
+      expect(out, contains('https://github.com'));
+    });
+
+    test('bookmarks_add', () async {
+      final out = await _run(reg, 'bookmarks_add', {
+        'title': 'GH',
+        'url': 'https://github.com',
+        'parentId': '2',
+      });
+      expect(out, contains('added bookmark'));
+      expect(
+        await chrome.bookmarks.tree().then((t) => t[1].children.single.url),
+        'https://github.com',
+      );
+    });
+
+    test('bookmarks_update', () async {
+      final n = await chrome.bookmarks.create(
+        title: 'GH',
+        url: 'https://github.com',
+      );
+      await _run(reg, 'bookmarks_update', {'id': n.id, 'title': 'GitHub'});
+      final tree = await chrome.bookmarks.tree();
+      expect(tree[0].children.single.title, 'GitHub');
+    });
+
+    test('bookmarks_remove', () async {
+      final n = await chrome.bookmarks.create(
+        title: 'GH',
+        url: 'https://github.com',
+      );
+      await _run(reg, 'bookmarks_remove', {'id': n.id});
+      final tree = await chrome.bookmarks.tree();
+      expect(tree[0].children, isEmpty);
+    });
+
+    // downloads_* tools: removed with the `downloads` permission (gh-1630).
+    // The FakeChrome.downloads facade stays — it is the seam the real
+    // feature (gh-1630 F2 second tier) re-registers through.
+
+    test('cookies_get', () async {
+      await chrome.cookies.set(
+        url: 'https://x.example/',
+        name: 'c',
+        value: 'v',
+      );
+      final out = await _run(reg, 'cookies_get', {
+        'url': 'https://x.example/',
+        'name': 'c',
+      });
+      expect((_jsonOf(out)['cookie']! as Map)['value'], 'v');
+      final missing = await _run(reg, 'cookies_get', {
+        'url': 'https://x.example/',
+        'name': 'nope',
+      });
+      expect(_jsonOf(missing)['cookie'], isNull);
+    });
+
+    test('cookies_set', () async {
+      await _run(reg, 'cookies_set', {
+        'url': 'https://x.example/',
+        'name': 'c',
+        'value': 'v',
+      });
+      final c = await chrome.cookies.get(url: 'https://x.example/', name: 'c');
+      expect(c!.value, 'v');
+    });
+
+    test('cookies_remove', () async {
+      await chrome.cookies.set(
+        url: 'https://x.example/',
+        name: 'c',
+        value: 'v',
+      );
+      await _run(reg, 'cookies_remove', {
+        'url': 'https://x.example/',
+        'name': 'c',
+      });
+      expect(
+        await chrome.cookies.get(url: 'https://x.example/', name: 'c'),
+        isNull,
+      );
+    });
+
+    test('inject_css', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      await _run(reg, 'inject_css', {
+        'tabId': t.id,
+        'css': 'body { color: red }',
+      });
+      expect(chrome.cssCalls.single.css, 'body { color: red }');
+    });
+
+    test('nav_wait resolves on a matching main-frame navigation', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      final fut = _run(reg, 'nav_wait', {
+        'tabId': t.id,
+        'urlContains': 'done',
+        'timeoutMs': 2000,
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await chrome.navCompleted(tabId: t.id, url: 'https://a.example/other');
+      await chrome.navCompleted(tabId: t.id, url: 'https://a.example/done');
+      expect(await fut, contains('done'));
+    });
+
+    test(
+      'nav_wait: an already-loaded matching tab answers immediately',
+      () async {
+        // tabs_open resolves before the page finishes; by the time nav_wait
+        // subscribes the navigation has often ALREADY fired onCompleted —
+        // waiting for the next one then times out against a loaded page
+        // (seen live: 'timed out waiting for "apple.com"' on apple.com).
+        final t = await chrome.tabs.create(url: 'https://www.apple.com/');
+        final out = await _run(reg, 'nav_wait', {
+          'tabId': t.id,
+          'urlContains': 'apple.com',
+          'timeoutMs': 300,
+        });
+        expect(out, contains('already complete'));
+      },
+    );
+
+    test(
+      'nav_wait: a complete tab with a non-matching URL keeps waiting',
+      () async {
+        final t = await chrome.tabs.create(url: 'https://a.example/');
+        final fut = _run(reg, 'nav_wait', {
+          'tabId': t.id,
+          'urlContains': 'done',
+          'timeoutMs': 200,
+        });
+        expectLater(
+          fut,
+          throwsA(
+            isA<BrowserApiToolException>().having(
+              (e) => e.message,
+              'message',
+              contains('timed out'),
+            ),
+          ),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        // no event: the snapshot check must NOT swallow the timeout
+      },
+    );
+
+    test('nav_wait resolves on a history-state (SPA) update', () async {
+      // Google's results "page" is a same-document push — onCompleted
+      // never fires; webNavigation.onHistoryStateUpdated does.
+      final t = await chrome.tabs.create(url: 'https://www.google.com/');
+      chrome.setTabStatus(t.id, 'loading');
+      final fut = _run(reg, 'nav_wait', {
+        'tabId': t.id,
+        'urlContains': 'q=fa+ai',
+        'timeoutMs': 1000,
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await chrome.navHistoryUpdated(
+        tabId: t.id,
+        url: 'https://www.google.com/search?q=fa+ai',
+      );
+      expect(await fut, contains('q=fa+ai'));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  group('inject_js (UT-T1 happy + UT-T5 edges)', () {
+    test('happy path: canned result with frameId, ISOLATED recorded', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      final out = await _run(reg, 'inject_js', {
+        'tabId': t.id,
+        'code': '() => document.title',
+        'world': 'ISOLATED',
+      });
+      final parsed = _jsonOf(out);
+      expect(parsed['ok'], true);
+      final entry =
+          (parsed['results']! as List).single! as Map<String, Object?>;
+      expect(entry['frameId'], 0);
+      expect(entry['result'], {'recorded': true});
+      expect(entry.containsKey('truncated'), isFalse);
+      expect(chrome.scriptCalls.single.world, 'ISOLATED');
+    });
+
+    test('MAIN world passes through to scripting', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      await _run(reg, 'inject_js', {
+        'tabId': t.id,
+        'code': '1',
+        'world': 'MAIN',
+      });
+      expect(chrome.scriptCalls.single.world, 'MAIN');
+    });
+
+    test('world whitelist: ISOLATED/MAIN pass, main/worker/missing/typed '
+        'wrong → bad_world naming the argument', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      await _run(reg, 'inject_js', {
+        'tabId': t.id,
+        'code': '1',
+        'world': 'ISOLATED',
+      });
+      await _run(reg, 'inject_js', {
+        'tabId': t.id,
+        'code': '1',
+        'world': 'MAIN',
+      });
+      for (final world in ['main', 'worker', null, 42]) {
+        final args = <String, Object?>{
+          'tabId': t.id,
+          'code': '1',
+          'world': ?world,
+        };
+        await expectLater(
+          _run(reg, 'inject_js', args),
+          throwsA(_errMsg('bad_world', contains('world'))),
+          reason: 'world=$world',
+        );
+      }
+    });
+
+    test('allFrames bounds: bool only', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      for (final bad in ['yes', 1]) {
+        await expectLater(
+          _run(reg, 'inject_js', {
+            'tabId': t.id,
+            'code': '1',
+            'world': 'ISOLATED',
+            'allFrames': bad,
+          }),
+          throwsA(_errMsg('bad_args', contains('allFrames'))),
+        );
+      }
+    });
+
+    test('timeoutMs bounds: 1..120000, default 30000', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      for (final bad in [0, -5, 120001, 'fast']) {
+        await expectLater(
+          _run(reg, 'inject_js', {
+            'tabId': t.id,
+            'code': '1',
+            'world': 'ISOLATED',
+            'timeoutMs': bad,
+          }),
+          throwsA(_errMsg('bad_args', contains('timeoutMs'))),
+          reason: 'timeoutMs=$bad',
+        );
+      }
+      await _run(reg, 'inject_js', {
+        'tabId': t.id,
+        'code': '1',
+        'world': 'ISOLATED',
+        'timeoutMs': 120000,
+      });
+    });
+
+    test('frameIds fan out one result entry per frame', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/');
+      final out = await _run(reg, 'inject_js', {
+        'tabId': t.id,
+        'code': '1',
+        'world': 'ISOLATED',
+        'frameIds': [0, 2],
+      });
+      final results = (_jsonOf(out)['results']! as List)
+          .cast<Map<String, Object?>>();
+      expect(results.map((e) => e['frameId']), [0, 2]);
+    });
+
+    test(
+      'result budget: oversized frame result truncates with flag (E4)',
+      () async {
+        final (bReg, bChrome) = _cannedReg(
+          resultsFor: (source, args) => {'k': 'v' * 500},
+          resultBudget: 32,
+        );
+        final t = await bChrome.tabs.create(url: 'https://a.example/');
+        final out = await _run(bReg, 'inject_js', {
+          'tabId': t.id,
+          'code': '1',
+          'world': 'ISOLATED',
+        });
+        final entry =
+            (_jsonOf(out)['results']! as List).single! as Map<String, Object?>;
+        expect(entry['truncated'], true);
+        expect(
+          utf8.encode(entry['result']! as String).length,
+          lessThanOrEqualTo(32),
+        );
+      },
+    );
+
+    test('E2 trio: page throw / rejected promise → structured {ok:false}, '
+        'never a raw exception', () async {
+      final (throwReg, throwChrome) = _cannedReg(
+        resultsFor: (source, args) => throw Exception('page blew up'),
+      );
+      final (apiErrReg, apiChrome) = _cannedReg(
+        resultsFor: (source, args) =>
+            throw ChromeApiException('page_error', 'bang'),
+      );
+      final t = await throwChrome.tabs.create(url: 'https://a.example/');
+      final args = {'tabId': t.id, 'code': '1', 'world': 'ISOLATED'};
+
+      final raw = _jsonOf(await _run(throwReg, 'inject_js', args));
+      expect(raw['ok'], false);
+      expect((raw['error']! as Map)['code'], 'page_error');
+      expect((raw['error']! as Map)['message'], contains('page blew up'));
+
+      final t2 = await apiChrome.tabs.create(url: 'https://a.example/');
+      final coded = _jsonOf(
+        await _run(apiErrReg, 'inject_js', {
+          'tabId': t2.id,
+          'code': '1',
+          'world': 'ISOLATED',
+        }),
+      );
+      expect(coded['ok'], false);
+      expect((coded['error']! as Map)['code'], 'page_error');
+      expect((coded['error']! as Map)['message'], 'bang');
+    });
+
+    test('E2: non-serializable result keeps the facade code', () async {
+      final (nReg, nChrome) = _cannedReg(
+        resultsFor: (source, args) => Object(),
+      );
+      final t = await nChrome.tabs.create(url: 'https://a.example/');
+      final out = await _run(nReg, 'inject_js', {
+        'tabId': t.id,
+        'code': '1',
+        'world': 'ISOLATED',
+      });
+      final parsed = _jsonOf(out);
+      expect(parsed['ok'], false);
+      expect((parsed['error']! as Map)['code'], 'result_not_serializable');
+    });
+
+    test('E3: execution_context_destroyed throws retryable=true', () async {
+      final (eReg, eChrome) = _cannedReg(
+        resultsFor: (source, args) =>
+            throw ChromeApiException('execution_context_destroyed', 'gone'),
+      );
+      final t = await eChrome.tabs.create(url: 'https://a.example/');
+      await expectLater(
+        _run(eReg, 'inject_js', {
+          'tabId': t.id,
+          'code': '1',
+          'world': 'ISOLATED',
+        }),
+        throwsA(
+          _err(
+            'execution_context_destroyed',
+          ).having((e) => e.isRetryable, 'isRetryable', true),
+        ),
+      );
+    });
+    test(
+      'timeoutMs is enforced: a hung page fails with retryable timeout',
+      () async {
+        // The fake's executeScript cannot hang (resultsFor is consumed
+        // synchronously), so inject a scripting seam that never completes.
+        final hangingReg = ToolRegistry()
+          ..registerAll(
+            BrowserApiToolSurface(_HangingScriptChrome(chrome)).tools(),
+          );
+        final t = await chrome.tabs.create(url: 'https://a.example/');
+        await expectLater(
+          _run(hangingReg, 'inject_js', {
+            'tabId': t.id,
+            'code': '1',
+            'world': 'ISOLATED',
+            'timeoutMs': 40,
+          }),
+          throwsA(
+            _err('timeout').having((e) => e.isRetryable, 'isRetryable', true),
+          ),
+        );
+      },
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  group('cdp_eval + screenshots', () {
+    test('cdp_eval returns the evaluated value', () async {
+      final (cReg, c) = _cannedReg(
+        cdpResponder: (method, params) => {
+          'result': {'value': 42},
+        },
+      );
+      final t = await c.tabs.create(url: 'https://a.example/');
+      final out = await _run(cReg, 'cdp_eval', {
+        'tabId': t.id,
+        'expression': '6*7',
+      });
+      final parsed = _jsonOf(out);
+      expect(parsed['ok'], true);
+      expect(parsed['value'], 42);
+      expect(c.cdpCalls.single.method, 'Runtime.evaluate');
+    });
+
+    test('cdp_eval detaches what it attached', () async {
+      final (cReg, c) = _cannedReg(
+        cdpResponder: (method, params) => {
+          'result': {'value': 1},
+        },
+      );
+      final t = await c.tabs.create(url: 'https://a.example/');
+      await _run(cReg, 'cdp_eval', {'tabId': t.id, 'expression': '1'});
+      // A fresh attach succeeding proves the tool released the target.
+      await c.debugger.attach(t.id);
+      await c.debugger.detach(t.id);
+    });
+
+    test(
+      'cdp_eval reuses a foreign session instead of double-attaching',
+      () async {
+        final (cReg, c) = _cannedReg(
+          cdpResponder: (method, params) => {
+            'result': {'value': 1},
+          },
+        );
+        final t = await c.tabs.create(url: 'https://a.example/');
+        await c.debugger.attach(t.id); // foreign session up front
+        await _run(cReg, 'cdp_eval', {'tabId': t.id, 'expression': '1'});
+        // The foreign session survived the tool call — detaching is ours.
+        await c.debugger.detach(t.id);
+      },
+    );
+
+    test('cdp_eval surfaces page throws as page_error', () async {
+      final (cReg, c) = _cannedReg(
+        cdpResponder: (method, params) => {
+          'exceptionDetails': {'text': 'ReferenceError'},
+        },
+      );
+      final t = await c.tabs.create(url: 'https://a.example/');
+      await expectLater(
+        _run(cReg, 'cdp_eval', {'tabId': t.id, 'expression': 'nope'}),
+        throwsA(_err('page_error')),
+      );
+    });
+
+    test(
+      'page_screenshot returns a vision image block, not base64 text',
+      () async {
+        final png = base64Encode([1, 2, 3, 4]);
+        final (cReg, c) = _cannedReg(
+          cdpResponder: (method, params) =>
+              method == 'Page.captureScreenshot' ? {'data': png} : null,
+        );
+        final t = await c.tabs.create(url: 'https://a.example/');
+        final res = await _runRes(cReg, 'page_screenshot', {
+          'tabId': t.id,
+          'fullPage': true,
+        });
+        // The model SEES the shot: one image block with the PNG.
+        final images = res.content.whereType<ImageContent>().toList();
+        expect(images, hasLength(1));
+        expect(images.single.data, png);
+        expect(images.single.mimeType, 'image/png');
+        // The text channel stays compact metadata — no base64 flood.
+        final text = res.content
+            .whereType<TextContent>()
+            .map((c) => c.text)
+            .join('\n');
+        expect(text, contains('"tabId":${t.id}'));
+        expect(text, contains('"fullPage":true'));
+        expect(text, isNot(contains(png)));
+        expect(c.cdpCalls.single.method, 'Page.captureScreenshot');
+        expect(c.cdpCalls.single.params['captureBeyondViewport'], true);
+      },
+    );
+
+    test('page_screenshot defaults to the active tab', () async {
+      final png = base64Encode([9, 9]);
+      final (cReg, c) = _cannedReg(
+        cdpResponder: (method, params) => {'data': png},
+      );
+      await c.tabs.create(url: 'https://a.example/'); // active in window 1
+      final out = await _run(cReg, 'page_screenshot');
+      expect(_jsonOf(out)['tabId'], 1);
+    });
+
+    test('app_screenshot prefers /app/, falls back to /panel/ (E14 '
+        'otherwise)', () async {
+      final png = base64Encode([7]);
+      Future<String> shot(FakeChrome c) async {
+        final shotReg = ToolRegistry()
+          ..registerAll(BrowserApiToolSurface(c).tools());
+        return _jsonOf(await _run(shotReg, 'app_screenshot'))['url']! as String;
+      }
+
+      final appChrome = FakeChrome(
+        clock: () => 1730000000000,
+        cdpResponder: (method, params) => {'data': png},
+      );
+      await appChrome.tabs.create(
+        url: 'chrome-extension://fa/panel/index.html',
+      );
+      await appChrome.tabs.create(url: 'chrome-extension://fa/app/index.html');
+      expect(await shot(appChrome), contains('/app/'));
+
+      final panelChrome = FakeChrome(
+        clock: () => 1730000000000,
+        cdpResponder: (method, params) => {'data': png},
+      );
+      await panelChrome.tabs.create(url: 'https://a.example/');
+      await panelChrome.tabs.create(
+        url: 'chrome-extension://fa/panel/index.html',
+      );
+      expect(await shot(panelChrome), contains('/panel/'));
+
+      await expectLater(
+        _run(reg, 'app_screenshot'),
+        throwsA(_err('no_app_page')),
+      );
+    });
+
+    test('app_screenshot carries the vision image block', () async {
+      final png = base64Encode([5, 6, 7]);
+      final appChrome = FakeChrome(
+        clock: () => 1730000000000,
+        cdpResponder: (method, params) => {'data': png},
+      );
+      await appChrome.tabs.create(url: 'chrome-extension://fa/app/index.html');
+      final shotReg = ToolRegistry()
+        ..registerAll(BrowserApiToolSurface(appChrome).tools());
+      final res = await _runRes(shotReg, 'app_screenshot');
+      final images = res.content.whereType<ImageContent>().toList();
+      expect(images, hasLength(1));
+      expect(images.single.data, png);
+      final text = res.content
+          .whereType<TextContent>()
+          .map((c) => c.text)
+          .join('\n');
+      expect(text, contains('/app/'));
+      expect(text, isNot(contains(png)));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  group('restricted pages (E1/E17)', () {
+    const restrictedUrls = [
+      'chrome://settings',
+      'https://chromewebstore.google.com/detail/x',
+      'chrome-extension://fa/app/index.html',
+    ];
+
+    test('inject_js / inject_css / cdp_eval / page_screenshot refuse with '
+        'restricted_page', () async {
+      for (final url in restrictedUrls) {
+        final t = await chrome.tabs.create(url: url);
+        await expectLater(
+          _run(reg, 'inject_js', {
+            'tabId': t.id,
+            'code': '1',
+            'world': 'ISOLATED',
+          }),
+          throwsA(_err('restricted_page')),
+          reason: url,
+        );
+        await expectLater(
+          _run(reg, 'inject_css', {'tabId': t.id, 'css': 'a{}'}),
+          throwsA(_err('restricted_page')),
+          reason: url,
+        );
+        await expectLater(
+          _run(reg, 'cdp_eval', {'tabId': t.id, 'expression': '1'}),
+          throwsA(_err('restricted_page')),
+          reason: url,
+        );
+        await expectLater(
+          _run(reg, 'page_screenshot', {'tabId': t.id}),
+          throwsA(_err('restricted_page')),
+          reason: url,
+        );
+      }
+    });
+
+    test(
+      'refusals carry the reason; tab management stays allowed (E17)',
+      () async {
+        final t = await chrome.tabs.create(url: 'chrome://settings');
+        try {
+          await _run(reg, 'inject_js', {
+            'tabId': t.id,
+            'code': '1',
+            'world': 'MAIN',
+          });
+          fail('inject_js should have been refused');
+        } on BrowserApiToolException catch (e) {
+          expect(e.message, contains('chrome: pages are restricted'));
+        }
+        expect(
+          await _run(reg, 'tabs_open', {'url': 'https://ok.example/'}),
+          contains('opened'),
+        );
+        await _run(reg, 'tabs_move', {'tabId': t.id, 'index': 0});
+        await _run(reg, 'tabs_close', {
+          'tabIds': [t.id],
+        });
+      },
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  group('targeted refusals', () {
+    test('tabs_discard refuses the active tab with active_tab', () async {
+      final t = await chrome.tabs.create(url: 'https://a.example/'); // active
+      await expectLater(
+        _run(reg, 'tabs_discard', {'tabId': t.id}),
+        throwsA(_errMsg('active_tab', contains('active tab'))),
+      );
+      // Inactive sibling still discards.
+      final u = await chrome.tabs.create(url: 'https://b.example/');
+      await chrome.tabs.update(t.id, active: true);
+      await _run(reg, 'tabs_discard', {'tabId': u.id});
+      expect((await chrome.tabs.get(u.id)).discarded, isTrue);
+    });
+
+    test(
+      'sessions_restore: absent session → no_longer_available (E19)',
+      () async {
+        await expectLater(
+          _run(reg, 'sessions_restore', {'sessionId': 's-gone'}),
+          throwsA(
+            _errMsg('no_longer_available', contains('no longer available')),
+          ),
+        );
+      },
+    );
+
+    test(
+      'app_screenshot: no app page → no_app_page, never blank success',
+      () async {
+        await chrome.tabs.create(url: 'https://a.example/');
+        await expectLater(
+          _run(reg, 'app_screenshot'),
+          throwsA(_err('no_app_page')),
+        );
+      },
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  group('policy functions', () {
+    test('restrictedReason covers the contracted set', () {
+      expect(
+        restrictedReason('chrome://settings'),
+        'chrome: pages are restricted',
+      );
+      expect(restrictedReason('edge://version'), 'edge: pages are restricted');
+      expect(restrictedReason('about:blank'), 'about: pages are restricted');
+      expect(
+        restrictedReason('chrome-extension://fa/app/index.html'),
+        contains('chrome-extension'),
+      );
+      expect(
+        restrictedReason('https://chromewebstore.google.com/detail/x'),
+        contains('Web Store'),
+      );
+      expect(
+        restrictedReason('https://chrome.google.com/webstore/category/x'),
+        contains('Web Store'),
+      );
+      expect(restrictedReason('file:///docs/report.pdf'), contains('PDF'));
+      expect(restrictedReason('file:///docs/report.PDF'), contains('PDF'));
+      expect(restrictedReason('https://example.com/page'), isNull);
+      expect(restrictedReason('file:///docs/notes.txt'), isNull);
+    });
+
+    test('truncateResult passes small results, clamps oversized ones (E4)', () {
+      var r = truncateResult({'a': 1}, 1000);
+      expect(r.truncated, isFalse);
+      expect(r.result, {'a': 1});
+
+      r = truncateResult('x' * 100, 16);
+      expect(r.truncated, isTrue);
+      expect(utf8.encode(r.result! as String).length, lessThanOrEqualTo(16));
+
+      // Multi-byte runes never push past the byte budget.
+      r = truncateResult('🦄' * 50, 10);
+      expect(r.truncated, isTrue);
+      expect(utf8.encode(r.result! as String).length, lessThanOrEqualTo(10));
+    });
+  });
+
+  group('applyModePromptOverrides', () {
+    test('yolo drops the always-prompt guards; other modes keep them', () {
+      // inject_js's per-tool prompt override outranks the session mode —
+      // so a yolo session still prompted on every inject_js call (user
+      // report: "включил yolo, а он всё равно спрашивает").
+      final approvals = ApprovalManager(
+        mode: ApprovalMode.alwaysAsk,
+        overrides: alwaysPromptOverrides(),
+      );
+      expect(approvals.overrideFor('inject_js'), ApprovalPolicy.prompt);
+
+      applyModePromptOverrides(approvals, ApprovalMode.yolo);
+      expect(approvals.overrideFor('inject_js'), isNull);
+
+      // Back to a guarded mode: the guard is restored, now naming where
+      // it comes from (issue #380 AC3).
+      applyModePromptOverrides(approvals, ApprovalMode.alwaysAsk);
+      expect(approvals.overrideFor('inject_js'), ApprovalPolicy.prompt);
+      expect(
+        approvals.overrideOriginFor('inject_js'),
+        'browser always-prompt guard',
+      );
+
+      // unattended keeps the guard: no user is present to answer, and a
+      // prompt resolving as deny beats silently running page JS.
+      applyModePromptOverrides(approvals, ApprovalMode.unattended);
+      expect(approvals.overrideFor('inject_js'), ApprovalPolicy.prompt);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // download tool (gh-1630 F2′): the `downloads` permission's real call
+  // site — http/https only, size-capped via the injected probe, sanitized
+  // filename, the OutboundKind.download exfil gate, path+size result.
+  // -------------------------------------------------------------------------
+  group('download tool (gh-1630 F2′)', () {
+    (ToolRegistry, FakeChrome) dlReg(DownloadProbe? probe) {
+      final c = FakeChrome();
+      final surface = BrowserApiToolSurface(c, downloadProbe: probe);
+      return (ToolRegistry()..registerAll(surface.tools()), c);
+    }
+
+    test('happy path: gated, downloaded, waits for completion, path+size',
+        () async {
+      final probed = <String>[];
+      final (reg2, c2) = dlReg((url) async {
+        probed.add(url);
+        return 1024;
+      });
+      // Complete the download as soon as it starts (the tool polls).
+      c2.onDownloadStarted = (id) => c2.completeDownload(id, fileSize: 1024);
+      final out = _jsonOf(
+        await _run(reg2, 'download', {'url': 'https://cdn.example/report.pdf'}),
+      );
+      expect(probed, ['https://cdn.example/report.pdf']);
+      expect(out['ok'], true);
+      expect(out['state'], 'complete');
+      expect(out['size'], 1024);
+      expect(out['path'] as String, contains('report.pdf'));
+      // THE static call site the permission justification cites.
+      final items = await c2.downloads.search(query: 'report.pdf');
+      expect(items, hasLength(1));
+      expect(items.single.url, 'https://cdn.example/report.pdf');
+    });
+
+    test('scheme gate: non-http(s) refused with bad_url, nothing downloaded',
+        () async {
+      final (reg2, c2) = dlReg(null);
+      for (final url in const ['ftp://x.example/f', 'file:///etc/passwd']) {
+        await expectLater(
+          _run(reg2, 'download', {'url': url}),
+          throwsA(_errMsg('bad_url', contains('http'))),
+        );
+      }
+      expect(await c2.downloads.search(), isEmpty);
+    });
+
+    test('size cap: probe above the cap refuses download_too_large',
+        () async {
+      final (reg2, c2) =
+          dlReg((url) async => defaultMaxDownloadBytes + 1);
+      await expectLater(
+        _run(reg2, 'download', {'url': 'https://x.example/big.bin'}),
+        throwsA(_errMsg('download_too_large', contains('cap'))),
+      );
+      expect(await c2.downloads.search(), isEmpty);
+    });
+
+    test('probe unknown (null) proceeds with an honest pre-check note',
+        () async {
+      final (reg2, c2) = dlReg((url) async => null);
+      c2.onDownloadStarted = (id) => c2.completeDownload(id, fileSize: 5);
+      final out = _jsonOf(
+        await _run(reg2, 'download', {'url': 'https://x.example/f.bin'}),
+      );
+      expect(out['ok'], true);
+      expect(out['size_precheck'], 'unknown');
+    });
+
+    test('filename sanitization: traversal, separators, control chars',
+        () async {
+      final (reg2, c2) = dlReg(null);
+      c2.onDownloadStarted = (id) => c2.completeDownload(id, fileSize: 1);
+      for (final pair in const {
+        '../../../etc/passwd': 'passwd',
+        '..\\..\\evil.exe': 'evil.exe',
+        're\x00port.pdf': 'report.pdf',
+        '/abs/path/x.txt': 'x.txt',
+      }.entries) {
+        final out = _jsonOf(
+          await _run(reg2, 'download', {
+            'url': 'https://x.example/${pair.key}',
+            'filename': pair.key,
+          }),
+        );
+        expect(out['ok'], true, reason: pair.key);
+        expect(out['path'] as String, endsWith(pair.value),
+            reason: '${pair.key} -> ${out['path']}');
+      }
+      expect(await c2.downloads.search(), hasLength(4));
+    });
+
+    test('filename that sanitizes to empty refused with bad_filename',
+        () async {
+      final (reg2, _) = dlReg(null);
+      await expectLater(
+        _run(reg2, 'download', {
+          'url': 'https://x.example/f',
+          'filename': '..',
+        }),
+        throwsA(_err('bad_filename')),
+      );
+    });
+
+    test('saveAs passes through to the facade', () async {
+      final (reg2, c2) = dlReg(null);
+      c2.onDownloadStarted = (id) => c2.completeDownload(id, fileSize: 1);
+      final out = _jsonOf(
+        await _run(reg2, 'download', {
+          'url': 'https://x.example/f.bin',
+          'saveAs': true,
+        }),
+      );
+      expect(out['ok'], true);
+      final items = await c2.downloads.search(query: 'f.bin');
+      expect(items, hasLength(1));
+    });
+
+    test('still in flight at the wait deadline reports honestly', () async {
+      final (reg2, _) = dlReg(null);
+      final out = _jsonOf(
+        await _run(reg2, 'download', {'url': 'https://x.example/slow.bin'}),
+      );
+      expect(out['ok'], true);
+      expect(out['state'], 'in_progress');
+      expect(out['id'], isNotNull);
+    });
+
+    test('in-flight cap enforcement: unknown Content-Length, over-cap '
+        'expected size observed mid-flight → cancelled, download_too_large',
+        () async {
+      // The pre-check cannot see chunked/opaque responses (probe → null);
+      // the enforcement point is the expected total chrome.downloads
+      // reports once headers arrive. The poll must cancel + fail instead
+      // of letting an arbitrarily large download run on.
+      final (reg2, c2) = dlReg((url) async => null);
+      c2.onDownloadStarted =
+          (id) => c2.growDownload(id, fileSize: defaultMaxDownloadBytes + 1);
+      await expectLater(
+        _run(reg2, 'download', {'url': 'https://x.example/huge.bin'}),
+        throwsA(_errMsg('download_too_large', contains('cap'))),
+      );
+      final items = await c2.downloads.search();
+      expect(items.single.state, 'interrupted',
+          reason: 'the over-cap download must be cancelled, not left '
+              'running uncapped');
+    });
+
+    test('settled over-cap download surfaces download_too_large without '
+        'a cancel attempt', () async {
+      // A completed item cannot be cancelled; the honest surface is the
+      // same coded failure (the cap was exceeded either way).
+      final (reg2, c2) = dlReg((url) async => null);
+      c2.onDownloadStarted = (id) =>
+          c2.completeDownload(id, fileSize: defaultMaxDownloadBytes + 1);
+      await expectLater(
+        _run(reg2, 'download', {'url': 'https://x.example/big.bin'}),
+        throwsA(_errMsg('download_too_large', contains('cap'))),
+      );
+    });
+  });
+}
+
+/// ChromeApi whose executeScript never completes: exercises the real
+/// Future.timeout path in inject_js (E3 companion). Only tabs + scripting
+/// are wired; every other member is a loud failure.
+final class _HangingScriptChrome implements ChromeApi {
+  _HangingScriptChrome(this._inner);
+  final ChromeApi _inner;
+
+  @override
+  TabsApi get tabs => _inner.tabs;
+
+  @override
+  ScriptingApi get scripting => _HangingScripting();
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError(
+    '_HangingScriptChrome only serves tabs/scripting: $invocation',
+  );
+}
+
+final class _HangingScripting implements ScriptingApi {
+  @override
+  Future<List<ScriptResult>> executeScript({
+    required int tabId,
+    String? world,
+    bool? allFrames,
+    List<int>? frameIds,
+    required String funcSource,
+    List<Object?>? args,
+  }) => Completer<List<ScriptResult>>().future; // never completes
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnimplementedError();
+}

@@ -1,0 +1,3136 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:fa/apps/app_preflight.dart' show smokeProbeEngineFactory;
+import 'package:fa/apps/apps_store.dart';
+import 'package:fa/apps/js_app_engine.dart';
+import 'package:fa/apps/js_app_error_channel.dart';
+import 'package:fa/services/asr_service.dart';
+import 'package:fa/services/calendar_service.dart';
+import 'package:fa/services/contact_service.dart';
+import 'package:fa/services/health_service.dart';
+import 'package:fa/services/home_service.dart';
+import 'package:fa/services/notify_service.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+import '../native_test_guard.dart';
+
+/// Skip value stamped on this file's engine-dependent tests: every one
+/// boots a real JS engine (issue #184). Resolved once per isolate.
+final _engineSkip = quickJsBridgeAvailable ? false : kQuickJsBridgeUnavailable;
+
+/// Polls [done] once per 150 ms tick until it returns true or [maxTicks]
+/// elapse. Shared by the engine tests below: bridge calls cross real
+/// platform channels, so a single fixed settle can race under load.
+Future<void> waitFor(bool Function() done, {int maxTicks = 40}) async {
+  for (var i = 0; i < maxTicks && !done(); i++) {
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+  }
+}
+
+/// Fake [CalendarApi] for the `fa.calendar` bridge tests — the host-side
+/// tests never touch the real method channel.
+final class _FakeCalendarApi implements CalendarApi {
+  final created = <({String title, DateTime start, DateTime end})>[];
+  final deletedIds = <String>[];
+  String? createdCalendar;
+  String? createdUrl;
+  List<int>? createdAlarms;
+  CalendarRecurrence? createdRecurrence;
+  final deletedSpans = <CalendarSpan>[];
+
+  @override
+  Future<bool> get isAvailable async => true;
+
+  @override
+  Future<bool> requestAccess() async => true;
+
+  @override
+  Future<List<CalendarEvent>> events({
+    required DateTime start,
+    required DateTime end,
+  }) async => [
+    (
+      id: 'ev-standup',
+      title: 'Standup',
+      start: DateTime(2026, 7, 25, 10),
+      end: DateTime(2026, 7, 25, 11),
+      allDay: false,
+      calendar: 'Work',
+      location: null,
+      notes: null,
+      url: null,
+      alarms: const [10],
+      recurrence: (
+        frequency: 'weekly',
+        interval: 1,
+        daysOfWeek: const ['MO', 'WE', 'FR'],
+        daysOfMonth: null,
+        until: null,
+        count: 10,
+      ),
+    ),
+  ];
+
+  @override
+  Future<List<CalendarInfo>> calendars() async => const [
+    (title: 'Work', source: 'Outlook', writable: true),
+  ];
+
+  @override
+  Future<String> createEvent({
+    required String title,
+    required DateTime start,
+    required DateTime end,
+    bool allDay = false,
+    String? calendar,
+    String? location,
+    String? notes,
+    String? url,
+    List<int>? alarms,
+    CalendarRecurrence? recurrence,
+  }) async {
+    created.add((title: title, start: start, end: end));
+    createdCalendar = calendar;
+    createdUrl = url;
+    createdAlarms = alarms;
+    createdRecurrence = recurrence;
+    return 'fake-id-${created.length}';
+  }
+
+  @override
+  Future<void> updateEvent({
+    required String id,
+    String? title,
+    DateTime? start,
+    DateTime? end,
+    bool? allDay,
+    String? calendar,
+    String? location,
+    String? notes,
+    String? url,
+    List<int>? alarms,
+    CalendarRecurrence? recurrence,
+    bool removeRecurrence = false,
+    CalendarSpan span = CalendarSpan.thisEvent,
+  }) async {}
+
+  @override
+  Future<void> deleteEvent({
+    required String id,
+    CalendarSpan span = CalendarSpan.thisEvent,
+  }) async {
+    deletedIds.add(id);
+    deletedSpans.add(span);
+  }
+}
+
+/// The stock address-book entry the contacts bridge tests resolve ids
+/// against (the `fa.contacts` suite expects this exact phone number).
+const _annaContact = (
+  id: 'c-anna',
+  name: 'Anna Ivanova',
+  phones: ['+1 555 0100'],
+  emails: ['anna@example.com'],
+);
+
+/// Fake [ContactApi] for the `fa.contacts` bridge tests — the host-side
+/// tests never touch the real method channel.
+final class _FakeContactApi implements ContactApi {
+  _FakeContactApi({this.book = const [_annaContact]});
+
+  /// The address book `searchContacts` lists (issue #565: configurable so
+  /// the direct `contactsPhone` tests can cover the phone-less branch).
+  final List<Contact> book;
+  final created = <({String name, List<String>? phones})>[];
+  final deletedIds = <String>[];
+  final openedUrls = <String>[];
+
+  @override
+  Future<bool> get isAvailable async => true;
+
+  @override
+  Future<bool> requestAccess() async => true;
+
+  @override
+  Future<List<Contact>> searchContacts({
+    required String query,
+    int limit = 200,
+    int offset = 0,
+  }) async => book;
+
+  @override
+  Future<String> createContact({
+    required String name,
+    List<String>? phones,
+    List<String>? emails,
+    String? note,
+  }) async {
+    created.add((name: name, phones: phones));
+    return 'fake-id-${created.length}';
+  }
+
+  @override
+  Future<void> updateContact({
+    required String id,
+    String? name,
+    List<String>? phones,
+    List<String>? emails,
+    String? note,
+  }) async {}
+
+  @override
+  Future<void> deleteContact({required String id}) async {
+    deletedIds.add(id);
+  }
+
+  @override
+  Future<bool> openUrl(String url) async {
+    openedUrls.add(url);
+    return true;
+  }
+}
+
+/// Fake [HealthApi] for the `fa.health.summary` bridge tests — the host-side
+/// tests never touch the real method channel.
+final class _FakeHealthApi implements HealthApi {
+  int? lastDays;
+
+  @override
+  Future<bool> get isAvailable async => true;
+
+  @override
+  Future<bool> requestAccess() async => true;
+
+  @override
+  Future<HealthSummary> summary({required int days}) async {
+    lastDays = days;
+    return (
+      steps: const [(date: '2026-07-25', value: 12345.0)],
+      restingHeartRate: const [(date: '2026-07-25', value: 58.0)],
+      sleepHours: const [(date: '2026-07-25', value: 7.5)],
+    );
+  }
+}
+
+/// Fake [HomeApi] for the `fa.home` bridge tests — the host-side tests
+/// never touch the real method channel.
+final class _FakeHomeApi implements HomeApi {
+  final powerCalls = <({String id, bool on, String? name, String? room})>[];
+  final brightnessCalls =
+      <({String id, int value, String? name, String? room})>[];
+  final temperatureCalls =
+      <({String id, double celsius, String? name, String? room})>[];
+  final writeCalls =
+      <({String id, String type, Object value, String? name, String? room})>[];
+  final executedScenes = <String>[];
+
+  @override
+  Future<bool> get isAvailable async => true;
+
+  @override
+  Future<bool> requestAccess() async => true;
+
+  @override
+  Future<List<HomeInfo>> listHomes() async => const [
+    (
+      id: 'h-1',
+      name: 'My Home',
+      primary: true,
+      roomCount: 2,
+      accessoryCount: 2,
+    ),
+  ];
+
+  @override
+  Future<List<HomeRoom>> listRooms({String? homeId}) async => const [
+    (id: 'r-1', name: 'Living Room', homeName: 'My Home', accessoryCount: 1),
+    (id: 'r-2', name: 'Hallway', homeName: 'My Home', accessoryCount: 1),
+  ];
+
+  @override
+  Future<List<HomeAccessory>> listAccessories({
+    String? homeId,
+    String? roomId,
+  }) async => const [
+    (
+      id: 'a-light',
+      name: 'Ceiling Light',
+      room: 'Living Room',
+      homeName: 'My Home',
+      category: 'lightbulb',
+      reachable: true,
+      isOn: true,
+      brightness: 80,
+      targetTemperature: null,
+      services: [
+        (
+          type: 'lightbulb',
+          name: 'Lightbulb',
+          characteristics: [
+            (type: 'powerState', value: true, readable: true, writable: true),
+            (type: 'brightness', value: 80, readable: true, writable: true),
+          ],
+        ),
+      ],
+    ),
+    (
+      id: 'a-thermo',
+      name: 'Thermostat',
+      room: 'Hallway',
+      homeName: 'My Home',
+      category: 'thermostat',
+      reachable: true,
+      isOn: null,
+      brightness: null,
+      targetTemperature: 21.5,
+      services: [],
+    ),
+  ];
+
+  @override
+  Future<HomeAccessory> readAccessory({required String id}) async =>
+      (await listAccessories()).firstWhere(
+        (accessory) => accessory.id == id,
+        orElse: () => throw StateError('no accessory with this id'),
+      );
+
+  @override
+  Future<void> writeCharacteristic({
+    required String id,
+    required String type,
+    required Object value,
+    String? name,
+    String? room,
+  }) async {
+    writeCalls.add((id: id, type: type, value: value, name: name, room: room));
+  }
+
+  @override
+  Future<List<HomeScene>> listScenes({String? homeId}) async => const [
+    (
+      id: 's-1',
+      name: 'Good Night',
+      homeName: 'My Home',
+      actionCount: 3,
+      executing: false,
+    ),
+  ];
+
+  @override
+  Future<void> executeScene({required String id}) async {
+    executedScenes.add(id);
+  }
+
+  @override
+  Future<void> setPower({
+    required String id,
+    required bool on,
+    String? name,
+    String? room,
+  }) async {
+    powerCalls.add((id: id, on: on, name: name, room: room));
+  }
+
+  @override
+  Future<void> setBrightness({
+    required String id,
+    required int value,
+    String? name,
+    String? room,
+  }) async {
+    brightnessCalls.add((id: id, value: value, name: name, room: room));
+  }
+
+  @override
+  Future<void> setTargetTemperature({
+    required String id,
+    required double celsius,
+    String? name,
+    String? room,
+  }) async {
+    temperatureCalls.add((id: id, celsius: celsius, name: name, room: room));
+  }
+}
+
+/// Smoke test for the real JS backend (flutter_js / JavaScriptCore on the
+/// macOS test host): boots the engine, expects a render tree, and checks the
+/// fa-bridge permission gates.
+///
+/// Everything runs inside `tester.runAsync` with small real delays: the
+/// JS→Dart bridge messages are processed on the real event loop, and the
+/// fake-time `pump()` would both starve them and trip the pending-timer
+/// invariant.
+void main() {
+  group('JS engine (native quickjs/JavaScriptCore bridge)', () {
+    TestWidgetsFlutterBinding.ensureInitialized();
+
+    const settle = Duration(milliseconds: 300);
+
+    const widgetJs = '''
+  (function() {
+    jsr.onEvent(function(actionId, payload) {
+      if (actionId === 'tap') {
+        jsr.render({type: 'text', data: 'tapped'});
+        jsr.exportState({tapped: true});
+      }
+    });
+    jsr.render({type: 'text', data: 'hello'});
+    jsr.exportState({ready: true});
+  })();
+  ''';
+
+    JsAppInfo app() => JsAppInfo.fromManifest(
+      const {'id': 'demo', 'name': 'Demo'},
+      bundled: false,
+      fallbackId: 'demo',
+    );
+
+    /// Waits until the app exported state (the bridge calls cross real
+    /// platform channels, so a single fixed settle can race under load).
+    Future<void> waitForState(JsAppEngine engine) async {
+      await waitFor(() => engine.exportedState != null);
+    }
+
+    testWidgets('engine renders the initial tree and exports state', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', widgetJs);
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+        );
+        try {
+          await engine.start();
+          await Future<void>.delayed(settle);
+
+          expect(engine.tree.value, isNotNull);
+          expect(jsonEncode(engine.tree.value), contains('hello'));
+          expect(engine.exportedState, isNotNull);
+          expect(engine.exportedState!['ready'], isTrue);
+
+          await engine.callEvent('tap');
+          await Future<void>.delayed(settle);
+          expect(jsonEncode(engine.tree.value), contains('tapped'));
+          expect(engine.exportedState!['tapped'], isTrue);
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('back bridge: registration push, consume, and close', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    var backs = 0;
+    jsr.onEvent(function(actionId, payload) {
+      // 'back' is reserved: it must NOT reach the app handler.
+      if (actionId === 'back') jsr.exportState({leaked: true});
+    });
+    jsr.onBack = function() {
+      backs++;
+      jsr.exportState({backs: backs});
+      return backs < 2; // consume the first back, decline the second
+    };
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+        );
+        try {
+          var closeRequests = 0;
+          engine.onCloseRequested = () => closeRequests++;
+          await engine.start();
+
+          // The bootstrap pushes the jsr.onBack registration to the host.
+          for (var i = 0; i < 20 && !engine.backHandlerRegistered.value; i++) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+          expect(engine.backHandlerRegistered.value, isTrue);
+
+          // First back: the app consumes it — no close request.
+          await engine.callEvent('back');
+          await Future<void>.delayed(settle);
+          expect(engine.exportedState?['backs'], 1);
+          expect(engine.exportedState?['leaked'], isNull);
+          expect(closeRequests, 0);
+
+          // Second back: the app declines — the host is asked to close.
+          await engine.callEvent('back');
+          await Future<void>.delayed(settle);
+          expect(engine.exportedState?['backs'], 2);
+          expect(closeRequests, 1);
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('back without a jsr.onBack handler asks the host to close', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.onEvent(function(actionId, payload) {});
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+        );
+        try {
+          var closeRequests = 0;
+          engine.onCloseRequested = () => closeRequests++;
+          await engine.start();
+          await Future<void>.delayed(settle);
+          expect(engine.backHandlerRegistered.value, isFalse);
+
+          await engine.callEvent('back');
+          await Future<void>.delayed(settle);
+          expect(closeRequests, 1);
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.llm is gated by the llm permission', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.llm('ping').then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        Future<Object?> fakeLlm(
+          List<FaLlmMessage> messages, {
+          void Function(String delta)? onDelta,
+        }) async => 'pong:${messages.single.content}';
+
+        // Without the permission the bridge answers with a permission error.
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          llmHandler: fakeLlm,
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('llm permission'),
+          );
+        } finally {
+          await denied.dispose();
+        }
+
+        // With it, the handler runs.
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(llm: true),
+          llmHandler: fakeLlm,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          expect(granted.exportedState?['result'], 'pong:ping');
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets(
+      'fa.llm.chat is gated and passes multi-turn messages in order',
+      (tester) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.llm.chat([
+      {role: 'system', content: 'be terse'},
+      {role: 'user', content: 'hi'},
+      {role: 'assistant', content: 'hello'},
+      {role: 'user', content: 'how are you?'}
+    ]).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+          final received = <FaLlmMessage>[];
+          Future<Object?> fakeLlm(
+            List<FaLlmMessage> messages, {
+            void Function(String delta)? onDelta,
+          }) async {
+            received.addAll(messages);
+            return 'fine';
+          }
+
+          // Without the permission the bridge answers with a permission error.
+          final denied = JsAppEngine(
+            app: app(),
+            env: env,
+            permissions: const AppPermissions(),
+            llmHandler: fakeLlm,
+          );
+          try {
+            await denied.start();
+            await Future<void>.delayed(settle);
+            expect(
+              jsonEncode(denied.exportedState?['result']),
+              contains('llm permission'),
+            );
+            expect(received, isEmpty);
+          } finally {
+            await denied.dispose();
+          }
+
+          // With it, the full conversation reaches the handler in order.
+          final granted = JsAppEngine(
+            app: app(),
+            env: env,
+            permissions: const AppPermissions(llm: true),
+            llmHandler: fakeLlm,
+          );
+          try {
+            await granted.start();
+            await Future<void>.delayed(settle);
+            expect(granted.exportedState?['result'], 'fine');
+            expect(received.map((m) => m.role), [
+              'system',
+              'user',
+              'assistant',
+              'user',
+            ]);
+            expect(received.map((m) => m.content), [
+              'be terse',
+              'hi',
+              'hello',
+              'how are you?',
+            ]);
+          } finally {
+            await granted.dispose();
+          }
+
+          // Permission granted but no model connected: actionable error.
+          final noModel = JsAppEngine(
+            app: app(),
+            env: env,
+            permissions: const AppPermissions(llm: true),
+          );
+          try {
+            await noModel.start();
+            await Future<void>.delayed(settle);
+            expect(
+              jsonEncode(noModel.exportedState?['result']),
+              contains('connect a model'),
+            );
+          } finally {
+            await noModel.dispose();
+          }
+        });
+      },
+    );
+
+    testWidgets('fa.llm.stream delivers ordered deltas and resolves full text', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        // Note: no jsr.onEvent registration — the bootstrap's fallback handler
+        // must still deliver llm.delta events.
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    var partials = [];
+    jsr.fa.llm.stream([{role: 'user', content: 'count'}], function(partial) {
+      partials.push(partial);
+    }).then(function(text) {
+      jsr.exportState({partials: partials, done: text});
+    }, function(error) {
+      jsr.exportState({done: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final received = <FaLlmMessage>[];
+        Future<Object?> fakeLlm(
+          List<FaLlmMessage> messages, {
+          void Function(String delta)? onDelta,
+        }) async {
+          received.addAll(messages);
+          onDelta?.call('one ');
+          onDelta?.call('two');
+          return 'one two';
+        }
+
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(llm: true),
+          llmHandler: fakeLlm,
+        );
+        try {
+          await engine.start();
+          for (
+            var i = 0;
+            i < 30 && engine.exportedState?['done'] == null;
+            i++
+          ) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+          // onDelta receives the ACCUMULATED partial text, in order.
+          expect(engine.exportedState?['partials'], ['one ', 'one two']);
+          expect(engine.exportedState?['done'], 'one two');
+          expect(received.single.role, 'user');
+          expect(received.single.content, 'count');
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.calendar is gated by the calendar permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.calendar({date: '2026-07-25'}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the bridge answers with a permission error.
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          calendar: _FakeCalendarApi(),
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('calendar permission'),
+          );
+        } finally {
+          await denied.dispose();
+        }
+
+        // With it, the events come from the CalendarApi.
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(calendar: true),
+          calendar: _FakeCalendarApi(),
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          final result = jsonEncode(granted.exportedState?['result']);
+          expect(result, contains('Standup'));
+          expect(result, contains('Work'));
+          // Recurrence + alarms ride the events rows too.
+          expect(result, contains('"frequency":"weekly"'));
+          expect(result, contains('"daysOfWeek":["MO","WE","FR"]'));
+          expect(result, contains('"count":10'));
+          expect(result, contains('"alarms":[10]'));
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.calendar create forwards recurrence/alarms/calendar/url', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.calendar.create({
+      title: 'Gym', date: '2026-07-27', startHour: 18,
+      calendar: 'Work', url: 'https://gym.example.com', alarms: [10, 60],
+      recurrence: {frequency: 'weekly', daysOfWeek: ['MO', 'WE'], until: '2026-12-31'},
+    }).then(function(result) {
+      jsr.exportState({created: result});
+      jsr.fa.calendar.delete({id: 'ev-standup', span: 'future'}).then(function(deleteResult) {
+        jsr.exportState({created: result, deleted: deleteResult});
+      });
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final calendar = _FakeCalendarApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(calendar: true),
+          calendar: calendar,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          expect(calendar.created, hasLength(1));
+          expect(calendar.createdCalendar, 'Work');
+          expect(calendar.createdUrl, 'https://gym.example.com');
+          expect(calendar.createdAlarms, [10, 60]);
+          final rule = calendar.createdRecurrence!;
+          expect(rule.frequency, 'weekly');
+          expect(rule.daysOfWeek, ['MO', 'WE']);
+          expect(rule.until, DateTime(2026, 12, 31));
+          expect(calendar.deletedIds, ['ev-standup']);
+          expect(calendar.deletedSpans, [CalendarSpan.future]);
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.health.summary is gated by the health permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.health.summary({days: 14}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the bridge answers with a permission error.
+        final deniedHealth = _FakeHealthApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          health: deniedHealth,
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('health permission'),
+          );
+          expect(deniedHealth.lastDays, isNull);
+        } finally {
+          await denied.dispose();
+        }
+
+        // With it, the summary comes from the HealthApi.
+        final grantedHealth = _FakeHealthApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(health: true),
+          health: grantedHealth,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          expect(grantedHealth.lastDays, 14);
+          final result = jsonEncode(granted.exportedState?['result']);
+          expect(result, contains('2026-07-25'));
+          expect(result, contains('12345'));
+          expect(result, contains('restingHeartRate'));
+          expect(result, contains('sleepHours'));
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.home is gated by the homekit permission', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.home.list().then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the bridge answers with a permission error.
+        final deniedHome = _FakeHomeApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          home: deniedHome,
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('homekit permission'),
+          );
+          expect(deniedHome.powerCalls, isEmpty);
+        } finally {
+          await denied.dispose();
+        }
+
+        // With it, the accessories come from the HomeApi.
+        final grantedHome = _FakeHomeApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(homekit: true),
+          home: grantedHome,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          final result = jsonEncode(granted.exportedState?['result']);
+          expect(result, contains('Ceiling Light'));
+          expect(result, contains('Living Room'));
+          expect(result, contains('"brightness":80'));
+          expect(result, contains('"targetTemperature":21.5'));
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('granted fa.home writes reach the HomeApi (legacy homekit '
+        'form included)', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.home.setPower({id: 'a-light', on: false}).then(function(power) {
+      jsr.fa.home.setBrightness({id: 'a-light', value: 60}).then(function(bright) {
+        jsr.fa.homekit('setTemperature', {id: 'a-thermo', celsius: 22.5}).then(function(temp) {
+          jsr.exportState({power: power, bright: bright, temp: temp});
+        });
+      });
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final home = _FakeHomeApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(homekit: true),
+          home: home,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          expect(home.powerCalls, [
+            (id: 'a-light', on: false, name: null, room: null),
+          ]);
+          expect(home.brightnessCalls, [
+            (id: 'a-light', value: 60, name: null, room: null),
+          ]);
+          expect(home.temperatureCalls, [
+            (id: 'a-thermo', celsius: 22.5, name: null, room: null),
+          ]);
+          final state = granted.exportedState!;
+          expect(jsonEncode(state['power']), contains('"on":false'));
+          expect(jsonEncode(state['bright']), contains('"brightness":60'));
+          expect(jsonEncode(state['temp']), contains('"temperature":22.5'));
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.home forwards name/room on writes (duplicate bridge ids)', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.home.setPower({id: 'bridge-id', on: false, name: 'Свет', room: 'Кухня'}).then(function(power) {
+      jsr.fa.home.write({id: 'bridge-id', type: 'brightness', value: 40, name: 'Свет', room: 'Кухня'}).then(function(wrote) {
+        jsr.exportState({power: power, wrote: wrote});
+      });
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final home = _FakeHomeApi();
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(homekit: true),
+          home: home,
+        );
+        try {
+          await engine.start();
+          await Future<void>.delayed(settle);
+          expect(home.powerCalls, [
+            (id: 'bridge-id', on: false, name: 'Свет', room: 'Кухня'),
+          ]);
+          expect(home.writeCalls, [
+            (
+              id: 'bridge-id',
+              type: 'brightness',
+              value: 40,
+              name: 'Свет',
+              room: 'Кухня',
+            ),
+          ]);
+          expect(
+            jsonEncode(engine.exportedState!['power']),
+            contains('"on":false'),
+          );
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.home exposes homes, rooms, scenes, read and the generic '
+        'write', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.home.homes().then(function(homes) {
+      jsr.fa.home.rooms({}).then(function(rooms) {
+        jsr.fa.home.list({homeId: 'h-1'}).then(function(list) {
+          jsr.fa.home.read({id: 'a-light'}).then(function(read) {
+            jsr.fa.home.write({id: 'a-light', type: 'hue', value: 120}).then(function(wrote) {
+              jsr.fa.home.scenes({}).then(function(scenes) {
+                jsr.fa.home.executeScene({id: 's-1'}).then(function(executed) {
+                  jsr.exportState({
+                    homes: homes, rooms: rooms, list: list, read: read,
+                    wrote: wrote, scenes: scenes, executed: executed,
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final home = _FakeHomeApi();
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(homekit: true),
+          home: home,
+        );
+        try {
+          await engine.start();
+          await Future<void>.delayed(settle);
+          final state = engine.exportedState!;
+          expect(jsonEncode(state['homes']), contains('"name":"My Home"'));
+          expect(jsonEncode(state['homes']), contains('"primary":true'));
+          expect(jsonEncode(state['rooms']), contains('"Living Room"'));
+          // The list carries the services/characteristics breakdown.
+          final list = jsonEncode(state['list']);
+          expect(list, contains('"services"'));
+          expect(list, contains('"type":"powerState"'));
+          expect(list, contains('"writable":true'));
+          // read returns a single accessory with fresh values.
+          expect(jsonEncode(state['read']), contains('"id":"a-light"'));
+          // write reaches the generic characteristic write.
+          expect(home.writeCalls, [
+            (id: 'a-light', type: 'hue', value: 120, name: null, room: null),
+          ]);
+          expect(jsonEncode(state['wrote']), contains('"written":true'));
+          expect(jsonEncode(state['scenes']), contains('"Good Night"'));
+          expect(home.executedScenes, ['s-1']);
+          expect(jsonEncode(state['executed']), contains('"executed":true'));
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.home surfaces HomeApi failures as bridge errors', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.home.read({id: 'missing'}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(homekit: true),
+          home: _FakeHomeApi(),
+        );
+        try {
+          await engine.start();
+          await Future<void>.delayed(settle);
+          final result = jsonEncode(engine.exportedState?['result']);
+          expect(result, contains('__error'));
+          expect(result, contains('no accessory'));
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.calendar write methods are gated by the permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.calendar.create({title: 'Dentist', date: '2026-07-25', startHour: 14, endHour: 15}).then(function(result) {
+      jsr.exportState({created: result});
+    }, function(error) {
+      jsr.exportState({created: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the write calls answer with an error.
+        final deniedCalendar = _FakeCalendarApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          calendar: deniedCalendar,
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['created']),
+            contains('calendar permission'),
+          );
+          expect(deniedCalendar.created, isEmpty);
+          expect(deniedCalendar.deletedIds, isEmpty);
+        } finally {
+          await denied.dispose();
+        }
+      });
+    });
+
+    testWidgets('granted fa.calendar create/delete reach the CalendarApi', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.calendar.create({title: 'Dentist', date: '2026-07-25', startHour: 14, endHour: 15}).then(function(result) {
+      jsr.exportState({created: result});
+      jsr.fa.calendar.delete({id: 'ev-standup'}).then(function(deleteResult) {
+        jsr.exportState({created: result, deleted: deleteResult});
+      });
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final calendar = _FakeCalendarApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(calendar: true),
+          calendar: calendar,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          expect(calendar.created, hasLength(1));
+          expect(calendar.created.single.title, 'Dentist');
+          expect(calendar.created.single.start, DateTime(2026, 7, 25, 14));
+          expect(calendar.created.single.end, DateTime(2026, 7, 25, 15));
+          expect(calendar.deletedIds, ['ev-standup']);
+          final created = jsonEncode(granted.exportedState?['created']);
+          expect(created, contains('fake-id-1'));
+          expect(
+            jsonEncode(granted.exportedState?['deleted']),
+            contains('true'),
+          );
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.notify is gated by the notifications permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.notify.schedule({title: 'Build done', body: 'ok', delaySeconds: 60}).then(function(result) {
+      if (result && result.id) {
+        jsr.fa.notify.cancel({id: result.id}).then(function(cancelResult) {
+          jsr.exportState({result: result, cancelResult: cancelResult});
+        }, function(error) {
+          jsr.exportState({result: {__error: '' + error}});
+        });
+      } else {
+        jsr.exportState({result: result});
+      }
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the bridge answers with a permission error
+        // and the backend never sees a schedule.
+        final deniedNotify = _FakeNotifyApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          notify: deniedNotify,
+        );
+        try {
+          await denied.start();
+          // The bridge call crosses real platform channels — poll instead of
+          // a fixed settle (races under load).
+          for (
+            var i = 0;
+            i < 40 && denied.exportedState?['result'] == null;
+            i++
+          ) {
+            await Future<void>.delayed(const Duration(milliseconds: 150));
+          }
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('notifications permission'),
+          );
+          expect(deniedNotify.scheduled, isEmpty);
+        } finally {
+          await denied.dispose();
+        }
+
+        // With it, schedule reaches the NotifyApi and cancel removes the id.
+        final grantedNotify = _FakeNotifyApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(notifications: true),
+          notify: grantedNotify,
+        );
+        try {
+          await granted.start();
+          for (
+            var i = 0;
+            i < 40 && granted.exportedState?['cancelResult'] == null;
+            i++
+          ) {
+            await Future<void>.delayed(const Duration(milliseconds: 150));
+          }
+          expect(grantedNotify.scheduled, hasLength(1));
+          expect(grantedNotify.scheduled.single.title, 'Build done');
+          expect(grantedNotify.scheduled.single.body, 'ok');
+          expect(grantedNotify.scheduled.single.delaySeconds, 60.0);
+          expect(grantedNotify.cancelledIds, ['fake-id-1']);
+          expect(
+            jsonEncode(granted.exportedState?['result']),
+            contains('fake-id-1'),
+          );
+          expect(
+            jsonEncode(granted.exportedState?['cancelResult']),
+            contains('true'),
+          );
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.notify schedule validates its arguments', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.notify.schedule({title: '', delaySeconds: -1}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final notify = _FakeNotifyApi();
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(notifications: true),
+          notify: notify,
+        );
+        try {
+          await engine.start();
+          for (
+            var i = 0;
+            i < 40 && engine.exportedState?['result'] == null;
+            i++
+          ) {
+            await Future<void>.delayed(const Duration(milliseconds: 150));
+          }
+          expect(
+            jsonEncode(engine.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(notify.scheduled, isEmpty);
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.contacts is gated by the contacts permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.contacts.search({query: 'anna'}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final contacts = _FakeContactApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          contacts: contacts,
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('contacts permission'),
+          );
+
+          final granted = JsAppEngine(
+            app: app(),
+            env: env,
+            permissions: const AppPermissions(contacts: true),
+            contacts: contacts,
+          );
+          try {
+            await granted.start();
+            await Future<void>.delayed(settle);
+            final result = jsonEncode(granted.exportedState?['result']);
+            expect(result, contains('Anna Ivanova'));
+            expect(result, contains('+1 555 0100'));
+          } finally {
+            await granted.dispose();
+          }
+        } finally {
+          await denied.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.contacts write/call/sms are gated by the permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.contacts.create({name: 'Bob', phones: ['+7 900 0000']}).then(function(result) {
+      jsr.exportState({created: result});
+    }, function(error) {
+      jsr.exportState({created: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final deniedContacts = _FakeContactApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          contacts: deniedContacts,
+        );
+        try {
+          await denied.start();
+          await Future<void>.delayed(settle);
+          expect(
+            jsonEncode(denied.exportedState?['created']),
+            contains('contacts permission'),
+          );
+          expect(deniedContacts.created, isEmpty);
+          expect(deniedContacts.deletedIds, isEmpty);
+          expect(deniedContacts.openedUrls, isEmpty);
+        } finally {
+          await denied.dispose();
+        }
+      });
+    });
+
+    testWidgets('granted fa.contacts create/call/sms reach the ContactApi', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.contacts.create({name: 'Bob', phones: ['+7 900 0000']}).then(function(result) {
+      jsr.fa.contacts.call({id: 'c-anna'}).then(function(callResult) {
+        jsr.fa.contacts.sms({phone: '+1 555 0100', text: 'hi there'}).then(function(smsResult) {
+          jsr.exportState({created: result, called: callResult, texted: smsResult});
+        });
+      });
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final contacts = _FakeContactApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(contacts: true),
+          contacts: contacts,
+        );
+        try {
+          await granted.start();
+          await Future<void>.delayed(settle);
+          expect(contacts.created, hasLength(1));
+          expect(contacts.created.single.name, 'Bob');
+          expect(contacts.created.single.phones, ['+7 900 0000']);
+          // {id} resolved via the search results to the first phone number.
+          expect(contacts.openedUrls, [
+            'tel:+1 555 0100',
+            'sms:+1 555 0100?&body=hi%20there',
+          ]);
+          final state = granted.exportedState!;
+          expect(jsonEncode(state['created']), contains('fake-id-1'));
+          expect(jsonEncode(state['called']), contains('+1 555 0100'));
+          expect(jsonEncode(state['texted']), contains('+1 555 0100'));
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.asr.record is gated by the microphone permission', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.asr.record({seconds: 1}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the bridge answers with a permission error.
+        final deniedAsr = _FakeAsrApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          asr: deniedAsr,
+        );
+        try {
+          await denied.start();
+          await waitForState(denied);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('__error'),
+          );
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('microphone permission'),
+          );
+          expect(deniedAsr.startCalls, 0);
+        } finally {
+          await denied.dispose();
+        }
+
+        // With it, the recording comes from the AsrApi (the engine waits the
+        // requested wall-clock second).
+        final grantedAsr = _FakeAsrApi();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(microphone: true),
+          asr: grantedAsr,
+        );
+        try {
+          await granted.start();
+          await waitForState(granted);
+          expect(grantedAsr.startCalls, 1);
+          expect(grantedAsr.stopCalls, 1);
+          final result = jsonEncode(granted.exportedState?['result']);
+          expect(result, contains('/tmp/fah-mic-test.m4a'));
+          expect(result, contains('"durationMs":5000'));
+          expect(result, contains('"sampleRate":44100'));
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.asr.stop ends an in-flight recording early', (
+      tester,
+    ) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.onEvent(function(action) {
+      if (action === 'stop') jsr.fa.asr.stop();
+    });
+    jsr.fa.asr.record({seconds: 120}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final asr = _FakeAsrApi();
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(microphone: true),
+          asr: asr,
+        );
+        try {
+          await engine.start();
+          // Let the record bridge call start, then ask it to stop — the
+          // record promise must resolve NOW, not after the 120 s guard.
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+          expect(asr.startCalls, 1);
+          final sw = Stopwatch()..start();
+          engine.callEvent('stop');
+          await waitForState(engine);
+          sw.stop();
+          expect(asr.stopCalls, 1);
+          final result = jsonEncode(engine.exportedState?['result']);
+          expect(result, contains('/tmp/fah-mic-test.m4a'));
+          expect(result, isNot(contains('__error')));
+          // Well under the 120 s max: the stop signal cut the wait short.
+          expect(sw.elapsed.inSeconds, lessThan(30));
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.asr.record answers with the denial guidance when OS '
+        'access is denied', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.asr.record({seconds: 1}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        final deniedOs = _FakeAsrApi()..granted = false;
+        final engine = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(microphone: true),
+          asr: deniedOs,
+        );
+        try {
+          await engine.start();
+          await waitForState(engine);
+          expect(
+            jsonEncode(engine.exportedState?['result']),
+            contains('microphone access was denied'),
+          );
+          expect(deniedOs.startCalls, 0);
+        } finally {
+          await engine.dispose();
+        }
+      });
+    });
+
+    testWidgets('fa.asr.transcribe is gated, rides the transcriber, and '
+        'guides when no endpoint is configured', (tester) async {
+      await tester.runAsync(() async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', '''
+  (function() {
+    jsr.fa.asr.transcribe({path: '/tmp/fah-mic-test.m4a'}).then(function(result) {
+      jsr.exportState({result: result});
+    }, function(error) {
+      jsr.exportState({result: {__error: '' + error}});
+    });
+    jsr.render({type: 'text', data: 'x'});
+  })();
+  ''');
+
+        // Without the permission the bridge answers with a permission error.
+        final deniedAsr = _FakeAsrApi();
+        final denied = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(),
+          asr: deniedAsr,
+          asrTranscriber: _FakeAsrTranscriber(),
+        );
+        try {
+          await denied.start();
+          await waitForState(denied);
+          expect(
+            jsonEncode(denied.exportedState?['result']),
+            contains('microphone permission'),
+          );
+          expect(deniedAsr.readPaths, isEmpty);
+        } finally {
+          await denied.dispose();
+        }
+
+        // With the permission but no configured endpoint, the error tells
+        // the user what to configure.
+        final noEndpoint = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(microphone: true),
+          asr: _FakeAsrApi(),
+        );
+        try {
+          await noEndpoint.start();
+          await waitForState(noEndpoint);
+          expect(
+            jsonEncode(noEndpoint.exportedState?['result']),
+            contains('No ASR-capable endpoint'),
+          );
+        } finally {
+          await noEndpoint.dispose();
+        }
+
+        // With both, the transcript comes from the transcriber.
+        final grantedAsr = _FakeAsrApi();
+        final transcriber = _FakeAsrTranscriber();
+        final granted = JsAppEngine(
+          app: app(),
+          env: env,
+          permissions: const AppPermissions(microphone: true),
+          asr: grantedAsr,
+          asrTranscriber: transcriber,
+        );
+        try {
+          await granted.start();
+          await waitForState(granted);
+          expect(grantedAsr.readPaths, ['/tmp/fah-mic-test.m4a']);
+          expect(transcriber.calls, hasLength(1));
+          expect(transcriber.calls.single.filename, 'fah-mic-test.m4a');
+          expect(
+            jsonEncode(granted.exportedState?['result']),
+            contains('fake transcript'),
+          );
+        } finally {
+          await granted.dispose();
+        }
+      });
+    });
+
+    group('state.sync (live storage broadcast between engines of one app)', () {
+      // Records reserved 'state.sync' payloads into the exported state and
+      // performs storage writes on demand — the seam the two-engine sync
+      // tests drive.
+      const syncWidgetJs = '''
+  (function() {
+    var snap = {};
+    function exportSnap() { jsr.exportState(snap); }
+    jsr.onEvent(function(actionId, payload) {
+      if (actionId === 'state.sync') {
+        snap.received = snap.received || [];
+        snap.received.push(payload);
+      } else if (actionId === 'write') {
+        jsr.storage.set(payload.key, payload.value);
+        snap.wrote = payload.key;
+      }
+      exportSnap();
+    });
+    jsr.storage.get('seed').then(function(v) {
+      snap.seed = (v === undefined || v === null) ? null : v;
+      exportSnap();
+    });
+    jsr.render({type: 'text', data: 'sync'});
+  })();
+  ''';
+
+      JsAppInfo appOf(String id) => JsAppInfo.fromManifest(
+        {'id': id, 'name': id},
+        bundled: false,
+        fallbackId: id,
+      );
+
+      Future<void> waitForExport(JsAppEngine engine, String key) async {
+        await waitFor(() => engine.exportedState?[key] != null);
+      }
+
+      testWidgets('a storage write reaches sibling engines, not the writer', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', syncWidgetJs);
+          final tile = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          final full = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await tile.start();
+            await full.start();
+            await Future<void>.delayed(settle);
+
+            await tile.callEvent('write', {
+              'key': '__state',
+              'value': {'rev': 1, 'running': true},
+            });
+            await waitForExport(full, 'received');
+            final received = full.exportedState?['received'] as List;
+            final payload = received.last as Map;
+            expect(payload['appId'], 'demo');
+            expect(payload['key'], '__state');
+            expect((payload['value'] as Map)['running'], true);
+            expect(payload['writer'], startsWith('e'));
+
+            // The writer never sees its own write echoed back.
+            expect(tile.exportedState?['received'], isNull);
+
+            // Rewriting the SAME value produces no new broadcast.
+            await tile.callEvent('write', {
+              'key': '__state',
+              'value': {'rev': 1, 'running': true},
+            });
+            await Future<void>.delayed(settle);
+            expect(
+              (full.exportedState?['received'] as List).length,
+              received.length,
+            );
+          } finally {
+            await tile.dispose();
+            await full.dispose();
+          }
+        });
+      });
+
+      testWidgets('engines of other apps never receive the broadcast', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', syncWidgetJs);
+          await env.writeFile('apps/other/widget.js', syncWidgetJs);
+          final demo = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          final other = JsAppEngine(
+            app: appOf('other'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await demo.start();
+            await other.start();
+            await Future<void>.delayed(settle);
+
+            await demo.callEvent('write', {'key': '__state', 'value': 1});
+            await Future<void>.delayed(settle);
+            expect(demo.exportedState?['received'], isNull);
+            expect(other.exportedState?['received'], isNull);
+          } finally {
+            await demo.dispose();
+            await other.dispose();
+          }
+        });
+      });
+
+      testWidgets('sibling engines of one app render independently', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', widgetJs);
+          final tile = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          final full = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await tile.start();
+            await full.start();
+            await Future<void>.delayed(settle);
+
+            // An event routed to the FULLSCREEN engine must not leak into the
+            // tile's tree (the native router used to key both on widgetId).
+            await full.callEvent('tap');
+            await Future<void>.delayed(settle);
+            expect(jsonEncode(full.tree.value), contains('tapped'));
+            expect(jsonEncode(tile.tree.value), contains('hello'));
+            expect(jsonEncode(tile.tree.value), isNot(contains('tapped')));
+          } finally {
+            await tile.dispose();
+            await full.dispose();
+          }
+        });
+      });
+
+      testWidgets('a disposed sibling does not take the live engine down', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', widgetJs);
+          await env.writeFile('apps/other/widget.js', widgetJs);
+          final tile = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          final full = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          // A third engine with a DIFFERENT app id, started last: its router
+          // closures then dominate the shared native channel maps, so the
+          // tile's messages resolve via the iid route lookup — exactly the
+          // path that drops when the shared widgetId entry is gone.
+          final distractor = JsAppEngine(
+            app: appOf('other'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await tile.start();
+            await full.start();
+            await distractor.start();
+            await Future<void>.delayed(settle);
+            // Closing the fullscreen engine used to drop the route entry
+            // keyed by the SHARED widgetId — the still-alive board tile then
+            // rendered into the void and its buttons looked dead.
+            await full.dispose();
+            await Future<void>.delayed(settle);
+            await tile.callEvent('tap');
+            await Future<void>.delayed(settle);
+            expect(jsonEncode(tile.tree.value), contains('tapped'));
+          } finally {
+            await tile.dispose();
+            await distractor.dispose();
+          }
+        });
+      });
+
+      testWidgets('a write landing during a sibling boot is not lost', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', syncWidgetJs);
+          final first = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          final second = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await first.start();
+            await Future<void>.delayed(settle);
+            // Boot the second engine WITHOUT awaiting, write mid-boot. The
+            // write lands either before the boot storage read (hydration
+            // path) or after it (the post-start drift replay) — the widget
+            // must observe the value either way.
+            final booting = second.start();
+            await first.callEvent('write', {
+              'key': 'seed',
+              'value': 'mid-boot',
+            });
+            await booting;
+            await waitForExport(second, 'received');
+            await Future<void>.delayed(settle);
+            final viaHydration = second.exportedState?['seed'] == 'mid-boot';
+            final viaReplay = (second.exportedState?['received'] as List?)?.any(
+              (event) =>
+                  (event as Map)['key'] == 'seed' &&
+                  event['value'] == 'mid-boot',
+            );
+            expect(viaHydration || (viaReplay ?? false), isTrue);
+          } finally {
+            await first.dispose();
+            await second.dispose();
+          }
+        });
+      });
+
+      testWidgets('a booting engine hydrates from storage.json', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', syncWidgetJs);
+          final first = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          await first.start();
+          await Future<void>.delayed(settle);
+          await first.callEvent('write', {'key': 'seed', 'value': 'from-tile'});
+          // The persist is fire-and-forget — let it land before disposing.
+          await Future<void>.delayed(settle);
+          await first.dispose();
+
+          final second = JsAppEngine(
+            app: appOf('demo'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await second.start();
+            await waitForExport(second, 'seed');
+            expect(second.exportedState?['seed'], 'from-tile');
+          } finally {
+            await second.dispose();
+          }
+        });
+      });
+    });
+
+    group('regex escape round-trip (gh-1272)', () {
+      // The exact corruption from the TestFlight report: a regex literal
+      // with \t/\n in its char class must survive source → engine → eval
+      // byte-identically, and the engine's own injected bootstrap must
+      // not inject real control characters into the parse stream.
+      const regexHeavyWidgetJs = r'''
+(function() {
+  var ws = /[ \t\n]+/g;
+  var norm = String('a  b\tc\nd').replace(ws, '_');
+  jsr.exportState({norm: norm});
+  jsr.render({type: 'text', data: norm});
+})();
+''';
+
+      testWidgets('a widget whose source uses \t/\n regex char classes '
+          'evals and renders (uiTree set)', (tester) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', regexHeavyWidgetJs);
+          final engine = JsAppEngine(
+            app: JsAppInfo.fromManifest(
+              const {'id': 'demo', 'name': 'Demo'},
+              bundled: false,
+              fallbackId: 'demo',
+            ),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await engine.start();
+            await waitFor(() => engine.tree.value != null);
+            // uiTree set: the eval succeeded (gh-1272 AC1)…
+            expect(engine.tree.value, isNotNull);
+            expect(jsonEncode(engine.tree.value), contains('a_b_c_d'));
+            // …and the regex matched byte-identically (NG2).
+            expect(engine.exportedState?['norm'], 'a_b_c_d');
+          } finally {
+            await engine.dispose();
+          }
+        });
+      });
+    });
+
+    group('uiTree watchdog (gh-1336)', () {
+      // A SYNTAX error: the whole wrapper IIFE fails to parse, so neither
+      // the runtime's inner try/catch nor `jsr.showError` ever runs — the
+      // exact silent-failure shape from the field report.
+      const brokenWidgetJs = 'this is not valid javascript ;;; {';
+      const healthyWidgetJs = '''
+(function() {
+  jsr.render({type: 'text', data: 'neighbour-ok'});
+})();
+''';
+
+      JsAppInfo appOf(String id) => JsAppInfo.fromManifest(
+        {'id': id, 'name': id},
+        bundled: false,
+        fallbackId: id,
+      );
+
+      testWidgets('a widget whose source fails to eval surfaces bootError '
+          'instead of spinning forever, and its neighbour keeps rendering', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final previousWarn = JsAppEngine.uiTreeWarnAfter;
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/broken/widget.js', brokenWidgetJs);
+          await env.writeFile('apps/healthy/widget.js', healthyWidgetJs);
+          final broken = JsAppEngine(
+            app: appOf('broken'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          final healthy = JsAppEngine(
+            app: appOf('healthy'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            JsAppEngine.uiTreeWarnAfter = const Duration(milliseconds: 400);
+            // The runtime swallows the eval failure: start() resolves and
+            // the tree never arrives (the old infinite-spinner shape).
+            await broken.start();
+            expect(broken.tree.value, isNull);
+            // The neighbour boots and renders normally — one broken
+            // widget never touches other engines (gh-1336 AC1).
+            await healthy.start();
+            await waitFor(() => healthy.tree.value != null);
+            expect(jsonEncode(healthy.tree.value), contains('neighbour-ok'));
+            // …and the broken engine's spinner turns into a surfaceable
+            // error with the widget id + failure mode (gh-1336 AC1/AC3).
+            await waitFor(() => broken.bootError.value != null);
+            final error = '${broken.bootError.value}';
+            expect(error, contains("'broken'"));
+            expect(error, contains('UI tree'));
+          } finally {
+            JsAppEngine.uiTreeWarnAfter = previousWarn;
+            await broken.dispose();
+            await healthy.dispose();
+          }
+        });
+      });
+
+      testWidgets('a widget that renders after the warn window recovers: '
+          'the stale bootError clears and the tree surfaces (gh-1336 '
+          'review — late-arriving success)', (tester) async {
+        await tester.runAsync(() async {
+          final previousWarn = JsAppEngine.uiTreeWarnAfter;
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/late/widget.js', '''
+(function() {
+  setTimeout(function() {
+    jsr.render({type: 'text', data: 'late-recovery'});
+  }, 1500);
+})();
+''');
+          final late = JsAppEngine(
+            app: appOf('late'),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            JsAppEngine.uiTreeWarnAfter = const Duration(milliseconds: 400);
+            await late.start();
+            // The warn window elapses first: the error surface fires…
+            await waitFor(() => late.bootError.value != null);
+            expect(late.tree.value, isNull);
+            // …then the late render lands. The engine must clear the
+            // stale verdict — a slow-but-healthy widget recovers in
+            // place instead of hiding behind a permanent error card.
+            await waitFor(() => late.tree.value != null, maxTicks: 30);
+            expect(jsonEncode(late.tree.value), contains('late-recovery'));
+            expect(late.bootError.value, isNull);
+          } finally {
+            JsAppEngine.uiTreeWarnAfter = previousWarn;
+            await late.dispose();
+          }
+        });
+      });
+    });
+  }, skip: _engineSkip);
+
+  group(
+    'multi-file app boot (entry assembled via WidgetManifest, gh-1207)',
+    () {
+      TestWidgetsFlutterBinding.ensureInitialized();
+
+      const settle = Duration(milliseconds: 300);
+
+      JsAppInfo appOf([
+        Map<String, Object?> manifest = const {'id': 'demo', 'name': 'Demo'},
+      ]) =>
+          JsAppInfo.fromManifest(manifest, bundled: false, fallbackId: 'demo');
+
+      testWidgets('a bare-import entry boots and renders (fa-craft shape)', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          // The fa-craft shape: a one-line multi-file entry. A bare `import`
+          // is a syntax error in the script-eval path — without the
+          // assembler the engine never renders and the view spins forever.
+          await env.writeFile(
+            'apps/demo/widget.js',
+            "import './game/main.js';\n",
+          );
+          await env.writeFile('apps/demo/game/main.js', '''
+import { tag } from './parts.js';
+jsr.render({type: 'text', data: 'assembled:' + tag});
+jsr.exportState({booted: true});
+''');
+          await env.writeFile(
+            'apps/demo/game/parts.js',
+            "export const tag = 'mf';\n",
+          );
+
+          final engine = JsAppEngine(
+            app: appOf(),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await engine.start();
+            await Future<void>.delayed(settle);
+            expect(jsonEncode(engine.tree.value), contains('assembled:mf'));
+            expect(engine.exportedState?['booted'], isTrue);
+          } finally {
+            await engine.dispose();
+          }
+        });
+      });
+
+      testWidgets('a manifest files list concatenates the declared order', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile(
+            'apps/demo/manifest.json',
+            jsonEncode({
+              'id': 'demo',
+              'name': 'Demo',
+              'files': ['game/first.js', 'game/second.js'],
+            }),
+          );
+          await env.writeFile('apps/demo/widget.js', '/* unused: files win */');
+          await env.writeFile(
+            'apps/demo/game/first.js',
+            "var bootOrder = '1';",
+          );
+          await env.writeFile(
+            'apps/demo/game/second.js',
+            "jsr.render({type: 'text', data: 'order-' + bootOrder});",
+          );
+
+          final engine = JsAppEngine(
+            app: appOf(),
+            env: env,
+            permissions: const AppPermissions(),
+          );
+          try {
+            await engine.start();
+            await Future<void>.delayed(settle);
+            expect(jsonEncode(engine.tree.value), contains('order-1'));
+          } finally {
+            await engine.dispose();
+          }
+        });
+      });
+
+      testWidgets('a live-tile entry assembles its own imports', (
+        tester,
+      ) async {
+        await tester.runAsync(() async {
+          final env = MemoryExecutionEnv();
+          await env.writeFile('apps/demo/widget.js', '''
+jsr.render({type: 'text', data: 'full-app'});
+''');
+          await env.writeFile(
+            'apps/demo/widget_tile.js',
+            "import './game/tile.js';\n",
+          );
+          await env.writeFile(
+            'apps/demo/game/tile.js',
+            "jsr.render({type: 'text', data: 'tile-boot'});",
+          );
+
+          final engine = JsAppEngine(
+            app: appOf(const {
+              'id': 'demo',
+              'name': 'Demo',
+              'widget': {'entry': 'widget_tile.js'},
+            }),
+            env: env,
+            permissions: const AppPermissions(),
+            entryFile: 'widget_tile.js',
+          );
+          try {
+            await engine.start();
+            await Future<void>.delayed(settle);
+            // The tile entry runs — not the app's own widget.js.
+            expect(jsonEncode(engine.tree.value), contains('tile-boot'));
+            expect(jsonEncode(engine.tree.value), isNot(contains('full-app')));
+          } finally {
+            await engine.dispose();
+          }
+        });
+      });
+    },
+    skip: _engineSkip,
+  );
+
+  group('entry assembly (host-side, no live engine, gh-1207)', () {
+    test(
+      'a manifest files list + a live-tile entry assembles the tile entry, not the files bundle',
+      () async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile(
+          'apps/demo/manifest.json',
+          jsonEncode({
+            'id': 'demo',
+            'name': 'Demo',
+            'files': ['game/first.js', 'game/second.js'],
+          }),
+        );
+        await env.writeFile('apps/demo/widget.js', '/* full-app entry */');
+        await env.writeFile(
+          'apps/demo/game/first.js',
+          "var fullAppOnly = '1';",
+        );
+        await env.writeFile(
+          'apps/demo/game/second.js',
+          'var fullAppSecond = true;',
+        );
+        await env.writeFile(
+          'apps/demo/widget_tile.js',
+          "import './game/tile.js';\n",
+        );
+        await env.writeFile(
+          'apps/demo/game/tile.js',
+          "jsr.render({type: 'text', data: 'tile-boot'});",
+        );
+
+        final js = await JsAppEngine.assembleEntryJsForTest(
+          env: env,
+          dir: 'apps/demo',
+          entryFile: 'widget_tile.js',
+        );
+
+        // The tile entry (with its own import inlined) assembles — never
+        // the full-app `files` bundle, which would render the whole app
+        // inside the tile (gh-1207 review thread 1).
+        expect(js, contains('tile-boot'));
+        expect(js, isNot(contains('fullAppOnly')));
+        expect(js, isNot(contains('fullAppSecond')));
+        expect(js, isNot(contains('full-app entry')));
+      },
+    );
+
+    test('the default entry still honors a manifest files list', () async {
+      final env = MemoryExecutionEnv();
+      await env.writeFile(
+        'apps/demo/manifest.json',
+        jsonEncode({
+          'id': 'demo',
+          'name': 'Demo',
+          'files': ['game/first.js', 'game/second.js'],
+        }),
+      );
+      await env.writeFile('apps/demo/widget.js', '/* unused: files win */');
+      await env.writeFile('apps/demo/game/first.js', "var bootOrder = '1';");
+      await env.writeFile(
+        'apps/demo/game/second.js',
+        "jsr.render({type: 'text', data: 'order-' + bootOrder});",
+      );
+
+      final js = await JsAppEngine.assembleEntryJsForTest(
+        env: env,
+        dir: 'apps/demo',
+        entryFile: 'widget.js',
+      );
+
+      expect(js, contains('bootOrder'));
+      expect(js, contains('order-'));
+      expect(js, isNot(contains('unused: files win')));
+    });
+
+    test(
+      'a missing entry file fails assembly with a clear StateError',
+      () async {
+        final env = MemoryExecutionEnv();
+        await expectLater(
+          JsAppEngine.assembleEntryJsForTest(
+            env: env,
+            dir: 'apps/demo',
+            entryFile: 'widget.js',
+          ),
+          throwsA(
+            isA<StateError>().having(
+              (e) => e.message,
+              'message',
+              contains('app entry not found'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test('engine start fails with the same StateError before any JS engine '
+        'work — no native bridge needed', () async {
+      final env = MemoryExecutionEnv();
+      final engine = JsAppEngine(
+        app: JsAppInfo.fromManifest(
+          const {'id': 'demo', 'name': 'Demo'},
+          bundled: false,
+          fallbackId: 'demo',
+        ),
+        env: env,
+        permissions: const AppPermissions(),
+      );
+      try {
+        await expectLater(engine.start(), throwsA(isA<StateError>()));
+      } finally {
+        await engine.dispose();
+      }
+    });
+
+    test('the reader redirects the manifest entry path and passes everything '
+        'else 1:1', () async {
+      final env = MemoryExecutionEnv();
+      await env.writeFile('apps/demo/widget_tile.js', 'tile entry');
+      await env.writeFile('apps/demo/game/parts.js', 'parts');
+
+      final reader = JsAppEngine.appWidgetFileReaderForTest(
+        env: env,
+        dir: 'apps/demo',
+        entryFile: 'widget_tile.js',
+      );
+
+      expect(await reader.readString('apps/demo/widget.js'), 'tile entry');
+      expect(await reader.readString('apps/demo/game/parts.js'), 'parts');
+      expect(await reader.readString('apps/demo/missing.js'), isNull);
+    });
+
+    test(
+      'the reader exists() answers presence without reading content',
+      () async {
+        final env = MemoryExecutionEnv();
+        await env.writeFile('apps/demo/widget.js', 'entry');
+
+        final reader = JsAppEngine.appWidgetFileReaderForTest(
+          env: env,
+          dir: 'apps/demo',
+          entryFile: 'widget.js',
+        );
+
+        expect(await reader.exists('apps/demo/widget.js'), isTrue);
+        expect(await reader.exists('apps/demo/missing.js'), isFalse);
+      },
+    );
+  });
+
+  group('host-side home dispatcher (no live engine)', () {
+    JsAppInfo app() => JsAppInfo.fromManifest(
+      const {'id': 'demo', 'name': 'Demo'},
+      bundled: false,
+      fallbackId: 'demo',
+    );
+
+    JsAppEngine engine(_FakeHomeApi home, {bool homekit = true}) => JsAppEngine(
+      app: app(),
+      env: MemoryExecutionEnv(),
+      permissions: AppPermissions(homekit: homekit),
+      home: home,
+    );
+
+    Matcher matches(String fragment) => throwsA(
+      isA<StateError>().having(
+        (error) => error.message,
+        'message',
+        contains(fragment),
+      ),
+    );
+
+    test(
+      'homeCallForTest routes every action through the gated HomeApi',
+      () async {
+        final api = _FakeHomeApi();
+        final js = engine(api);
+        addTearDown(js.dispose);
+
+        expect((await js.homeCallForTest('homes', {}))['homes'], hasLength(1));
+        expect((await js.homeCallForTest('rooms', {}))['rooms'], hasLength(2));
+        final accessories =
+            (await js.homeCallForTest('list', {}))['accessories'] as List;
+        expect(accessories, hasLength(2));
+        final light = accessories.first as Map<String, Object?>;
+        expect(light['id'], 'a-light');
+        final services = light['services'] as List<Map<String, Object?>>;
+        expect(services.single['characteristics'], hasLength(2));
+
+        final read = await js.homeCallForTest('read', {'id': 'a-light'});
+        expect((read['accessory'] as Map)['id'], 'a-light');
+
+        expect(
+          await js.homeCallForTest('write', {
+            'id': 'a-light',
+            'type': 'powerState',
+            'value': true,
+          }),
+          {'written': true},
+        );
+        expect(api.writeCalls.single.id, 'a-light');
+
+        expect(
+          (await js.homeCallForTest('scenes', {}))['scenes'],
+          hasLength(1),
+        );
+        expect(await js.homeCallForTest('executeScene', {'id': 's-1'}), {
+          'executed': true,
+        });
+        expect(api.executedScenes, ['s-1']);
+
+        expect(
+          await js.homeCallForTest('setPower', {'id': 'a-light', 'on': true}),
+          {'on': true},
+        );
+        expect(
+          await js.homeCallForTest('setBrightness', {
+            'id': 'a-light',
+            'value': 40,
+          }),
+          {'brightness': 40},
+        );
+        expect(
+          await js.homeCallForTest('setTemperature', {
+            'id': 'a-thermo',
+            'celsius': 21.5,
+          }),
+          {'temperature': 21.5},
+        );
+        // The write aliases carry the optional name/room narrowing for
+        // duplicate bridge ids.
+        await js.homeCallForTest('setPower', {
+          'id': 'a-light',
+          'on': false,
+          'name': 'Ceiling Light',
+          'room': 'Living Room',
+        });
+        expect(api.powerCalls.last.name, 'Ceiling Light');
+        expect(api.powerCalls.last.room, 'Living Room');
+      },
+    );
+
+    test('homeCallForTest gates on the homekit permission', () async {
+      final js = engine(_FakeHomeApi(), homekit: false);
+      addTearDown(js.dispose);
+      await expectLater(js.homeCallForTest('homes', {}), matches('homekit'));
+    });
+
+    test('homeCallForTest rejects unknown actions', () async {
+      final js = engine(_FakeHomeApi());
+      addTearDown(js.dispose);
+      await expectLater(
+        js.homeCallForTest('bogus', {}),
+        matches('unknown home action'),
+      );
+    });
+
+    test('homeCallForTest validates the generic write args', () async {
+      final js = engine(_FakeHomeApi());
+      addTearDown(js.dispose);
+      await expectLater(
+        js.homeCallForTest('write', {'id': 'a-light'}),
+        matches('type is required'),
+      );
+      await expectLater(
+        js.homeCallForTest('write', {'id': 'a-light', 'type': 'powerState'}),
+        matches('value is required'),
+      );
+    });
+  });
+
+  group('host-side storage sync core (no live engine)', () {
+    test('storageDiff reports changed, added and removed keys', () {
+      final diff = JsAppEngine.storageDiff(
+        {'a': 1, 'b': 'keep', 'gone': 'x'},
+        {'a': 2, 'b': 'keep', 'new': true},
+      );
+      expect(diff, {'a': 2, 'new': true, 'gone': null});
+    });
+
+    test('storageDiff compares nested values by JSON, not identity', () {
+      // Same JSON shape through a fresh instance → not a change.
+      expect(
+        JsAppEngine.storageDiff(
+          {
+            'm': {'n': 1},
+          },
+          {
+            'm': {'n': 1},
+          },
+        ),
+        isEmpty,
+      );
+      // A mutated nested map → changed, mapped to the new value.
+      expect(
+        JsAppEngine.storageDiff(
+          {
+            'm': {'n': 1},
+          },
+          {
+            'm': {'n': 2},
+          },
+        ),
+        {
+          'm': {'n': 2},
+        },
+      );
+    });
+
+    test('storageDiff maps a changed key to the new value object', () {
+      final fresh = <String, dynamic>{};
+      expect(
+        JsAppEngine.storageDiff({'k': 'old'}, {'k': fresh}).values.single,
+        same(fresh),
+      );
+    });
+  });
+
+  group('host-side llm/storage arg helpers (no live engine)', () {
+    test('parseLlmMessages accepts the three roles and coerces content', () {
+      final messages = JsAppEngine.parseLlmMessages([
+        {'role': 'system', 'content': 'be terse'},
+        {'role': 'user', 'content': 'hi'},
+        {'role': 'assistant'},
+      ]);
+      expect(messages, hasLength(3));
+      expect(messages.first.role, 'system');
+      expect(messages[1].content, 'hi');
+      expect(messages.last, (role: 'assistant', content: ''));
+    });
+
+    test('parseLlmMessages rejects non-lists, bad entries and empty input', () {
+      void throws(String fragment, Object? raw) {
+        expect(
+          () => JsAppEngine.parseLlmMessages(raw),
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              contains(fragment),
+            ),
+          ),
+        );
+      }
+
+      throws('must be a list', 'not a list');
+      throws('must be a {role, content} object', [
+        {'role': 'user', 'content': 'ok'},
+        'stray',
+      ]);
+      throws('unsupported message role "tool"', [
+        {'role': 'tool', 'content': 'x'},
+      ]);
+      throws('must not be empty', const []);
+    });
+
+    test('stringListArg reads JSON lists and comma-separated strings', () {
+      List<String>? read(Object? value) =>
+          JsAppEngine.stringListArg({'v': value}, 'v');
+
+      expect(read(['  +1 555 ', '', 'x']), ['+1 555', 'x']);
+      expect(read('a, b,,c'), ['a', 'b', 'c']);
+      expect(read(''), isNull);
+      expect(read(null), isNull);
+      expect(read(['  ', '']), isNull);
+    });
+  });
+
+  group('host-side bridge helpers (no live engine, issue #565)', () {
+    Matcher stateError(String fragment) => isA<StateError>().having(
+      (error) => error.message,
+      'message',
+      contains(fragment),
+    );
+
+    test('parseFaEnvelope reads the jsr.fa exec envelope', () {
+      final envelope = JsAppEngine.parseFaEnvelope(
+        '{"fa":"llm.chat","args":{"messages":[]}}',
+      );
+      expect(envelope, isNotNull);
+      expect(envelope!.fa, 'llm.chat');
+      expect(envelope.args, {'messages': const <Object?>[]});
+    });
+
+    test('parseFaEnvelope defaults args to empty and passes commands '
+        'through', () {
+      expect(JsAppEngine.parseFaEnvelope('{"fa":"emit"}')!.args, isEmpty);
+      expect(JsAppEngine.parseFaEnvelope('ls -la'), isNull);
+      expect(JsAppEngine.parseFaEnvelope('{not json'), isNull);
+      expect(JsAppEngine.parseFaEnvelope('{"fa":42}'), isNull);
+      expect(JsAppEngine.parseFaEnvelope('{"args":{}}'), isNull);
+    });
+
+    test('contactsPhone prefers the explicit phone argument', () async {
+      final phone = await JsAppEngine.contactsPhone(_FakeContactApi(), {
+        'phone': ' +1 555 0100 ',
+      });
+      expect(phone, '+1 555 0100');
+    });
+
+    test('contactsPhone resolves the id to the first contact number', () async {
+      final phone = await JsAppEngine.contactsPhone(_FakeContactApi(), {
+        'id': 'c-anna',
+      });
+      expect(phone, '+1 555 0100');
+    });
+
+    test('contactsPhone rejects missing args, unknown and phone-less '
+        'contacts', () async {
+      Future<String> read(Map<String, Object?> args) =>
+          JsAppEngine.contactsPhone(_FakeContactApi(), args);
+      Future<String> phoneless() => JsAppEngine.contactsPhone(
+        _FakeContactApi(
+          book: [(id: 'c-mute', name: 'Mute', phones: [], emails: [])],
+        ),
+        {'id': 'c-mute'},
+      );
+
+      await expectLater(
+        read(const {}),
+        throwsA(stateError('phone (or id) is required')),
+      );
+      await expectLater(
+        read({'id': 'c-nope'}),
+        throwsA(stateError('no contact with id "c-nope"')),
+      );
+      await expectLater(
+        phoneless(),
+        throwsA(stateError('this contact has no phone number')),
+      );
+    });
+
+    test('keysRequestArgs validates the name and defaults the reason', () {
+      final defaulted = JsAppEngine.keysRequestArgs({
+        'name': ' API_KEY ',
+      }, appName: 'Demo');
+      expect(defaulted.name, 'API_KEY');
+      expect(defaulted.reason, 'The app "Demo" asks for the API_KEY key.');
+
+      final custom = JsAppEngine.keysRequestArgs({
+        'name': 'K',
+        'reason': '  for CI  ',
+      }, appName: 'Demo');
+      expect(custom.reason, 'for CI');
+
+      expect(
+        () => JsAppEngine.keysRequestArgs({'reason': 'x'}, appName: 'Demo'),
+        throwsA(stateError('name is required')),
+      );
+    });
+
+    test('calendarUpdateSlot reads the slot keys or returns null', () {
+      expect(JsAppEngine.calendarUpdateSlot(const {}), isNull);
+      expect(JsAppEngine.calendarUpdateSlot({'date': '2026-07-25'}), isNull);
+      expect(JsAppEngine.calendarUpdateSlot({'title': 'x'}), isNull);
+
+      final slot = JsAppEngine.calendarUpdateSlot({
+        'date': '2026-07-25',
+        'startHour': 9,
+        'endHour': 10,
+      });
+      expect(slot!.start, DateTime(2026, 7, 25, 9));
+      expect(slot.end, DateTime(2026, 7, 25, 10));
+      expect(slot.allDay, isFalse);
+
+      final allDay = JsAppEngine.calendarUpdateSlot({
+        'date': '2026-07-25',
+        'allDay': true,
+      });
+      expect(allDay!.allDay, isTrue);
+      expect(allDay.start, DateTime(2026, 7, 25));
+      expect(allDay.end, DateTime(2026, 7, 26));
+    });
+
+    test('mediaReadVideoPath trims and requires a non-empty path', () {
+      expect(
+        JsAppEngine.mediaReadVideoPath({'path': ' vid/a.mp4 '}),
+        'vid/a.mp4',
+      );
+      for (final args in const <Map<String, Object?>>[
+        {},
+        {'path': '   '},
+      ]) {
+        expect(
+          () => JsAppEngine.mediaReadVideoPath(args),
+          throwsA(stateError('path is required')),
+        );
+      }
+    });
+
+    test('emitPayload copies maps and coerces everything else to empty', () {
+      final source = {'a': 1};
+      final payload = JsAppEngine.emitPayload(source);
+      expect(payload, {'a': 1});
+      expect(payload, isNot(same(source)));
+      expect(JsAppEngine.emitPayload('text'), isEmpty);
+      expect(JsAppEngine.emitPayload(null), isEmpty);
+      expect(JsAppEngine.emitPayload(['list']), isEmpty);
+    });
+  });
+
+  group('gh-1164 review hardening (host-side, no live engine)', () {
+    test('computeSourceRevision hashes the WHOLE source tree — a '
+        'helper-file edit re-arms the error gate (review thread 6)', () async {
+      final env = MemoryExecutionEnv();
+      await env.writeFile(
+        'apps/demo/manifest.json',
+        '{"id":"demo","name":"Demo"}',
+      );
+      await env.writeFile('apps/demo/widget.js', "import './components/a.js';");
+      await env.writeFile('apps/demo/components/a.js', 'jsr.render({});');
+
+      final rev1 = await JsAppEngine.computeSourceRevision(
+        env,
+        'apps/demo',
+        'widget.js',
+      );
+      expect(rev1, isNotEmpty);
+      expect(rev1, hasLength(64), reason: 'sha256 hex');
+
+      // The entry is untouched — only a HELPER file changed.
+      await env.writeFile(
+        'apps/demo/components/a.js',
+        'jsr.render({type:"text",data:"v2"});',
+      );
+      final rev2 = await JsAppEngine.computeSourceRevision(
+        env,
+        'apps/demo',
+        'widget.js',
+      );
+      expect(rev2, isNot(rev1));
+
+      await env.writeFile(
+        'apps/demo/widget.js',
+        "import './components/a.js'; // v3",
+      );
+      final rev3 = await JsAppEngine.computeSourceRevision(
+        env,
+        'apps/demo',
+        'widget.js',
+      );
+      expect({rev1, rev2, rev3}, hasLength(3));
+    });
+
+    test('computeSourceRevision excludes runtime state (storage/session '
+        'json are not source)', () async {
+      final env = MemoryExecutionEnv();
+      await env.writeFile('apps/demo/manifest.json', '{"id":"demo"}');
+      await env.writeFile('apps/demo/widget.js', 'jsr.render({});');
+      final rev1 = await JsAppEngine.computeSourceRevision(
+        env,
+        'apps/demo',
+        'widget.js',
+      );
+      await env.writeFile('apps/demo/storage.json', '{"score":1}');
+      await env.writeFile('apps/demo/session.json', '{"sessionId":"s1"}');
+      final rev2 = await JsAppEngine.computeSourceRevision(
+        env,
+        'apps/demo',
+        'widget.js',
+      );
+      expect(rev2, rev1, reason: 'runtime state must not re-arm the gate');
+    });
+
+    test('the injected bootstrap emits a stable fingerprint per error '
+        '(review thread 7: dedup does not collapse to message equality)', () {
+      final js = JsAppEngine.faBootstrapJsFor('en');
+      expect(
+        js,
+        contains('fingerprint: __faFingerprint(message, stack)'),
+        reason: 'every faAppError record must carry the fingerprint',
+      );
+      // The normalization strips per-occurrence noise (indices,
+      // timestamps, per-frame layout values) so noisy RAF-loop errors
+      // collapse to ONE dedup key and the circuit breaker can trip.
+      expect(js, contains("replace(/[0-9]+/g, '#')"));
+      expect(js, contains("replace(/0x[0-9a-fA-F]+/g, '#')"));
+    });
+
+    test('the injected bootstrap keeps JS escape sequences byte-identical '
+        '(gh-1272: a non-raw Dart string unescaped \\t/\\n into real '
+        'control chars, killing every widget eval)', () {
+      final js = JsAppEngine.faBootstrapJsFor('en');
+      // The gh-1164 fingerprint normalizer collapses whitespace runs via
+      // a regex char class and splits stack strings on a newline. Those
+      // backslash escapes must reach the JS engine as TWO characters
+      // each: a real TAB/CR/LF inside the char class is a JS SyntaxError
+      // ("Unterminated regular expression literal '/[ <TAB>'") that
+      // kills EVERY widget boot, since the bootstrap precedes all widget
+      // code (TestFlight 1.0.512: all catalog widgets dead, gh-1272).
+      expect(
+        js,
+        contains(r".replace(/[ \t\r\n]+/g, ' ')"),
+        reason: 'the whitespace-collapse regex must survive byte-identically',
+      );
+      expect(
+        js,
+        contains(r"String(stack || '').split('\n')"),
+        reason: 'stack-line splitting must survive byte-identically',
+      );
+      expect(
+        js,
+        contains(r"return norm + '\n' + frame;"),
+        reason: 'the fingerprint join must survive byte-identically',
+      );
+      // No real control character may leak out of Dart escape
+      // processing. Scoped to the fingerprint-normalizer region rather
+      // than the whole bootstrap (review): a CRLF checkout would put \r
+      // on the raw string's own line ends and false-positive here, while
+      // a real TAB/CR can only ever appear inside this JS block as an
+      // escaped pair — so the region bound is the exact guard needed.
+      final fpStart = js.indexOf('var __faFingerprint');
+      final fpEnd = js.indexOf('var __faReport', fpStart);
+      expect(
+        fpStart,
+        greaterThanOrEqualTo(0),
+        reason: 'fingerprint block present',
+      );
+      expect(fpEnd, greaterThan(fpStart), reason: 'fingerprint block closed');
+      final fpBlock = js.substring(fpStart, fpEnd);
+      expect(fpBlock, isNot(contains('\t')));
+      expect(fpBlock, isNot(contains('\r')));
+    });
+
+    test('live engines join the sibling group; smoke-gate probes never '
+        'do (review thread 4)', () {
+      JsAppInfo app() => JsAppInfo.fromManifest(
+        const {'id': 'demo', 'name': 'Demo'},
+        bundled: false,
+        fallbackId: 'demo',
+      );
+
+      final live = JsAppEngine(
+        app: app(),
+        env: MemoryExecutionEnv(),
+        permissions: const AppPermissions(),
+      );
+      expect(live.joinSiblingGroup, isTrue);
+
+      final probe = smokeProbeEngineFactory(
+        app: app(),
+        env: MemoryExecutionEnv(),
+        permissions: const AppPermissions(),
+      );
+      expect(
+        probe.joinSiblingGroup,
+        isFalse,
+        reason:
+            'a scratch-env probe must stay out of the process-wide '
+            'live-engine group: its storage writes would otherwise '
+            'reach the real viewports (and vice versa)',
+      );
+    });
+
+    test('reportHostError forwards render-host errors: a local sink owns '
+        'them; otherwise the channel gates + publishes (host-side, feeds '
+        'the CRAP-covered _forwardError path)', () async {
+      JsAppErrorChannel.instance.disposeAndReset();
+      addTearDown(JsAppErrorChannel.instance.disposeAndReset);
+      final notices = <JsAppErrorNotice>[];
+      final sub = JsAppErrorChannel.instance.onDeliver.listen(notices.add);
+      addTearDown(sub.cancel);
+
+      JsAppInfo app() => JsAppInfo.fromManifest(
+        const {'id': 'demo', 'name': 'Demo'},
+        bundled: false,
+        fallbackId: 'demo',
+      );
+      final env = MemoryExecutionEnv();
+
+      // 1. Local sink (the pre-flight probe shape): the event goes to
+      // the sink ONLY — never the app-wide channel.
+      final sunk = <JsAppErrorEvent>[];
+      final probe = JsAppEngine(
+        app: app(),
+        env: env,
+        permissions: const AppPermissions(),
+        errorSink: sunk.add,
+      );
+      addTearDown(() => probe.dispose());
+      probe.reportHostError('tile blew up');
+      expect(sunk, hasLength(1));
+      expect(sunk.single.kind, JsAppErrorKind.render);
+      expect(sunk.single.message, 'tile blew up');
+      expect(notices, isEmpty, reason: 'a local sink owns the error');
+
+      // 2. No sink (the live viewport shape): the channel gates — the
+      // first occurrence publishes; an identical repeat is deduped; past
+      // the breaker threshold the gate silences the key entirely.
+      final live = JsAppEngine(
+        app: app(),
+        env: env,
+        permissions: const AppPermissions(),
+        entryFile: 'tile.js', // non-default entry → the launcher tile
+      );
+      addTearDown(() => live.dispose());
+      live.reportHostError('render blew up');
+      // The channel's broadcast delivery lands on the next event-loop
+      // turns — flush before asserting.
+      for (var i = 0; i < 3; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(notices, hasLength(1));
+      expect(notices.single.appId, 'demo');
+      expect(
+        notices.single.surface,
+        'tile',
+        reason: 'a non-default entry powers the launcher tile surface',
+      );
+      live.reportHostError('render blew up');
+      for (var i = 0; i < 3; i++) {
+        await Future<void>.delayed(Duration.zero);
+      }
+      expect(
+        notices,
+        hasLength(1),
+        reason: 'one report per (app, fingerprint) per source revision',
+      );
+      for (var i = 0; i < JsAppErrorChannel.breakerThreshold + 2; i++) {
+        live.reportHostError('render blew up');
+      }
+      expect(
+        notices,
+        hasLength(1),
+        reason: 'the per-app circuit breaker silences the loop',
+      );
+    });
+  });
+
+  group('gh-1266 bootstrap raw-string invariant (host-side, no live '
+      'engine)', () {
+    test('the injected bootstrap keeps JS escape sequences intact '
+        '(gh-1266: a non-raw Dart literal swallows them and the JS parser '
+        'dies with "unexpected line terminator in regexp")', () {
+      final js = JsAppEngine.faBootstrapJsFor('en');
+      // The gh-1164 fingerprint normalizer splits stack strings on a JS
+      // '\n' escape and normalizes whitespace with a /[ \t\r\n]+/ regex.
+      // Those backslash escapes must reach the engine verbatim — if the
+      // Dart literal is not raw, Dart converts them into real control
+      // characters, the regex literal contains a line terminator, and the
+      // ENTIRE widget eval (bootstrap + app code in one script) fails on
+      // every engine-capable host (macOS JSC, Linux/Windows QuickJS).
+      expect(
+        js,
+        contains(r"split('\n')"),
+        reason: 'stack splitting must use a JS newline escape',
+      );
+      expect(
+        js,
+        contains(r"norm + '\n' + frame"),
+        reason: 'fingerprint join must use a JS newline escape',
+      );
+      expect(
+        js,
+        contains(r'/[ \t\r\n]+/g'),
+        reason: 'whitespace normalization regex must keep its escapes',
+      );
+      expect(
+        js,
+        contains(r".replace(/[ \t\r\n]+/g, ' ')"),
+        reason:
+            'whitespace runs must collapse to a single quoted space — '
+            'an unterminated replacement string kills the whole eval',
+      );
+      expect(js.contains('\r'), isFalse, reason: 'no raw CR in the JS');
+      expect(js.contains('\t'), isFalse, reason: 'no raw TAB in the JS');
+    });
+  });
+}
+
+/// Fake [AsrApi] for the `fa.asr` bridge tests — the host-side tests never
+/// touch the real method channel.
+final class _FakeAsrApi implements AsrApi {
+  bool granted = true;
+  int startCalls = 0;
+  int stopCalls = 0;
+  final readPaths = <String>[];
+
+  @override
+  Future<bool> get isAvailable async => true;
+
+  @override
+  Future<bool> requestAccess() async => granted;
+
+  @override
+  Future<void> startRecording() async {
+    startCalls++;
+  }
+
+  @override
+  Future<AsrRecording> stopRecording() async {
+    stopCalls++;
+    return (path: '/tmp/fah-mic-test.m4a', durationMs: 5000, sampleRate: 44100);
+  }
+
+  @override
+  Future<Uint8List> readRecording(String path) async {
+    readPaths.add(path);
+    return Uint8List.fromList(const [1, 2, 3]);
+  }
+}
+
+/// Fake [AsrTranscriber] returning a fixed transcript.
+final class _FakeAsrTranscriber implements AsrTranscriber {
+  final calls = <({Uint8List bytes, String filename})>[];
+
+  @override
+  Future<String> transcribe({
+    required Uint8List bytes,
+    required String filename,
+    String? language,
+  }) async {
+    calls.add((bytes: bytes, filename: filename));
+    return 'fake transcript';
+  }
+}
+
+/// Fake [NotifyApi] for the `fa.notify` bridge tests — the host-side tests
+/// never touch the real method channel.
+final class _FakeNotifyApi implements NotifyApi {
+  bool granted = true;
+  final scheduled = <({String title, String? body, double? delaySeconds})>[];
+  final cancelledIds = <String>[];
+
+  @override
+  Future<bool> get isAvailable async => true;
+
+  @override
+  Future<bool> requestAccess() async => granted;
+
+  @override
+  Future<String> schedule({
+    required String title,
+    String? body,
+    String? id,
+    double? delaySeconds,
+  }) async {
+    scheduled.add((title: title, body: body, delaySeconds: delaySeconds));
+    return id ?? 'fake-id-${scheduled.length}';
+  }
+
+  @override
+  Future<void> cancel({required String id}) async {
+    cancelledIds.add(id);
+  }
+
+  @override
+  Future<void> cancelAll() async {}
+}

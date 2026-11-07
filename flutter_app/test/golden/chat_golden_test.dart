@@ -1,0 +1,566 @@
+/// Golden (screenshot) tests for the chat surface:
+/// `lib/ui/screens/chat_screen.dart` (the full `ChatScreen`) — which
+/// embeds `lib/ui/widgets/chat_composer.dart` for the input row — and
+/// `lib/ui/widgets/fa_mark.dart`.
+///
+/// Messages are injected straight into `AgentService.messages` (the pattern
+/// from `app_theme_test.dart`) so no agent run, network, or clock leaks into
+/// the snapshots; the fakes below are copied verbatim from
+/// `chat_screen_test.dart`.
+///
+/// The hero conversation shot is the full chat surface: transcript, tool
+/// call, code block and a collapsed thinking section. There is no left
+/// sessions panel anymore (legacy) — sessions live in the launcher sheet.
+library;
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:fa/l10n/app_localizations.dart';
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/services/flutter_session_manager.dart';
+import 'package:fa/ui/app_theme.dart';
+import 'package:fa/ui/screens/chat_screen.dart';
+import 'package:fa/ui/widgets/fa_mark.dart';
+import 'package:fa/ui/widgets/media_player.dart';
+import 'package:fa_ui/fa_ui.dart' show FaChatAttachment;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show FontLoader, rootBundle;
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import '../fake_media_controllers.dart';
+import 'golden_test_helper.dart';
+
+StreamFunction _singleTextResponse(String text) {
+  return (model, context, {cancelToken}) {
+    final stream = AssistantMessageEventStream();
+    final message = AssistantMessage(
+      content: [TextContent(text: text)],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: Usage.zero,
+      stopReason: StopReason.stop,
+      timestamp: DateTime.now(),
+    );
+    stream.push(DoneEvent(reason: StopReason.stop, message: message));
+    stream.end();
+    return stream;
+  };
+}
+
+AgentService _fakeService(ExecutionEnv env) {
+  return AgentService(
+    agent: Agent(
+      model: Model(
+        id: 'test-model',
+        api: 'test-api',
+        provider: 'test',
+        baseUrl: 'https://example.com',
+        contextWindow: 100000,
+        maxTokens: 4096,
+      ),
+      systemPrompt: 'You are Fa.',
+      streamFunction: _singleTextResponse('ok'),
+      toolRegistry: ToolRegistry(const []),
+    ),
+    watchExternalSessions: false,
+    env: env,
+    sessionsRoot: '/sessions',
+    config: AgentConfig(
+      providerKind: 'test',
+      modelId: 'test-model',
+      baseUrl: 'https://example.com',
+      apiKey: '',
+    ),
+  );
+}
+
+/// A 64×64 teal→indigo gradient swatch PNG (618 bytes), generated once
+/// offline and embedded so the image-attachment snapshot never touches
+/// network or assets.
+final Uint8List _tinyPngBytes = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAACMUlEQVR42u3a2TaVcRzG'
+  'cbfQWg67ipAhpUmIFCqpZJ7bUZLpJkpzUQgJIZmnsAfbtodsmaU0kCShC/A/6+j5HX'
+  'XwPmu9az0X8P2cPx57PPdSz0MH6ID/CNjnGvFyGtW8HUYfh8nHbtpvN/uOm31tFj+b'
+  'xX9sVC3Aaj2gNmoNtIwdVDPbDpltQaZxtcNG+5ERNcfRYccxtSHn8SFn8DtX8KDrxO'
+  'D7kAG1idD+ibB+d1if+2SvO7x3MrxnMqLnw6lutanIrqnTndNqZzqmozpmotpnottn'
+  'Y97OxrTNnW2bO/dmXu1860Js6wIEUNTHtogA7ddfaF6EAIr6OAFAUR/3+iMGMNRfFA'
+  'AU9ZealiCAol4EMNRfbvwEART18Q0YQFEf3/BZAmi//sorDKCoTxAAFPUJ9csYwFCf'
+  'KAAo6pNefoEAivqkOgHAUJ9c9xUCKOpTajGAoj6l9psE0H59ag0GUNSn1XyHAIr6tB'
+  'cSgKA+vRoDKOozqlcggKI+o0oAMNRnVq1CAEV9ViUGUNRnVf7AAIb67OcYQFGf82wN'
+  'AijqZQBB/dUKDKCoN1T8hACKekO5AGCov1a+DgEU9blPMYCiPvfJLwxgqM8TABT11x'
+  '9vQABFvQwgqL/x6DcEUNTnCwCK+vyHIkD79TcfbEIARX2BAKCoL7j/BwMY6m8JAIr6'
+  'wntbEEBRLwIY6ovubkMARX1xGQZQ1BeX7UgA7deX3MEAivpSAUBRX3r7r/7c1QE64N'
+  '92ATXq/Gi3ONqSAAAAAElFTkSuQmCC',
+);
+
+
+/// Pumps the full [ChatScreen] as the app home (it is a Scaffold itself) at
+/// [size] — no left sessions panel exists anymore (legacy); the snapshot is
+/// the chat surface itself.
+Future<void> _pumpChatScreen(
+  WidgetTester tester,
+  AgentService service, {
+  Size size = goldenSizeWide,
+}) async {
+  final manager = FlutterSessionManager(
+    env: MemoryExecutionEnv(),
+    sessionsRoot: '/sessions',
+  )..addSession('fake-session', service);
+  await pumpGolden(
+    tester,
+    ChatScreen(manager: manager),
+    size: size,
+    wrap: (child) => child,
+  );
+}
+
+void main() {
+  setUpAll(() async {
+    await ensureGoldenFonts();
+    // Icon fonts are not registered from the test asset bundle — without
+    // this every Icon renders as a placeholder square.
+    final icons = FontLoader('MaterialIcons')
+      ..addFont(rootBundle.load('fonts/MaterialIcons-Regular.otf'));
+    await icons.load();
+  });
+
+  group('ChatScreen goldens', () {
+    testWidgets('empty chat screen', (tester) async {
+      await _pumpChatScreen(tester, _fakeService(MemoryExecutionEnv()));
+      await expectGolden(tester, 'chat_empty');
+    });
+
+    testWidgets('conversation — light theme', (tester) async {
+      final service = _fakeService(MemoryExecutionEnv());
+      service.messages
+        ..add(
+          FahChatMessage(
+            role: 'user',
+            content:
+                'the auth integration test fails after my refactor — can you '
+                'take a look?',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'assistant',
+            content:
+                'Found it — the test still calls the old two-argument '
+                '`signIn`:\n'
+                '\n'
+                '```dart\n'
+                'test(\'signs in anonymously\', () async {\n'
+                '  final session = await auth.signIn();\n'
+                '  expect(session.token, isNotNull);\n'
+                '});\n'
+                '```\n'
+                '\n'
+                'Patched `integration_test/auth_test.dart` — the suite is '
+                'green again.',
+          ),
+        );
+      final manager = FlutterSessionManager(
+        env: MemoryExecutionEnv(),
+        sessionsRoot: '/sessions',
+      )..addSession('fake-session', service);
+      await pumpGolden(
+        tester,
+        ChatScreen(manager: manager),
+        size: goldenSizeDesktop,
+        theme: buildFahThemeLight(),
+        wrap: (child) => child,
+      );
+      await expectGolden(tester, 'chat_conversation_light');
+      // The chat list's initial scroll-to-end timer fires post-snapshot;
+      // pump it out so no FakeTimer stays pending at teardown.
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('hero: conversation with sidebar, tool call, code block, '
+        'collapsed thinking', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env);
+      service.messages
+        ..add(
+          FahChatMessage(
+            role: 'user',
+            content:
+                'the auth integration test fails after my refactor — can you '
+                'take a look?',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'thinking',
+            content: [
+              'Let me trace through the auth flow.',
+              'The refactor made the token parameter optional…',
+              '…but the test may still pass it positionally.',
+              'Checking the call sites first:',
+              '  - lib/auth.dart: signIn({token})',
+              '  - integration_test/auth_test.dart: old two-arg call',
+              'So the expectation is stale, not the implementation.',
+              'I will read the test to confirm the exact mismatch,',
+              'then update the expectation to the new signature',
+              'and re-run the suite to make sure it is green.',
+              'Nothing else touches signIn directly —',
+              'the provider wrapper goes through the facade.',
+              'Risk is low: test-only change, no behavior diff.',
+              'Plan: read → patch expectation → verify.',
+            ].join('\n'),
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'system',
+            content: '[read] {"path": "integration_test/auth_test.dart"}',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'tool',
+            toolName: 'read',
+            content:
+                '12  test(\'signs in anonymously\', () async {\n'
+                '13    final session = await auth.signIn(\'token\');\n'
+                '14    expect(session.token, isNotNull);\n'
+                '15  });',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'assistant',
+            content:
+                'Found it — the test still calls the old two-argument '
+                '`signIn`:\n'
+                '\n'
+                '```dart\n'
+                'test(\'signs in anonymously\', () async {\n'
+                '  final session = await auth.signIn();\n'
+                '  expect(session.token, isNotNull);\n'
+                '});\n'
+                '```\n'
+                '\n'
+                'Patched `integration_test/auth_test.dart` — the suite is '
+                'green again.',
+          ),
+        );
+
+      final manager = FlutterSessionManager(env: env, sessionsRoot: '/sessions')
+        ..addSession('7b21e04d-notes-app', _fakeService(env))
+        ..addSession('f3a9c1d4-auth-test-fix', service);
+
+      await pumpGolden(
+        tester,
+        ChatScreen(manager: manager),
+        size: goldenSizeDesktop,
+        wrap: (child) => child,
+      );
+
+      await expectGolden(tester, 'chat_conversation');
+    });
+
+    testWidgets('image attachment thumbnail renders inside the user '
+        'bubble (issue #461)', (tester) async {
+      final service = _fakeService(MemoryExecutionEnv());
+      service.messages
+        ..add(
+          FahChatMessage(
+            role: 'user',
+            content: 'what color is this swatch?',
+            attachments: [(bytes: _tinyPngBytes, path: 'uploads/swatch.png')],
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'assistant',
+            content: 'A teal-to-indigo gradient.',
+          ),
+        );
+      final manager = FlutterSessionManager(
+        env: MemoryExecutionEnv(),
+        sessionsRoot: '/sessions',
+      )..addSession('fake-session', service);
+
+      tester.view.physicalSize = goldenSizeWide;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      // The attachment thumbnail decodes on the real event loop — runAsync
+      // lets it finish between pumps (no temp file anymore: the bubble
+      // renders straight from the record's bytes).
+      await tester.runAsync(() async {
+        await tester.pumpWidget(
+          MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: buildFahTheme(),
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: ChatScreen(manager: manager),
+          ),
+        );
+        // Thumbnails decode on the real event loop; give the hop time.
+        for (var i = 0; i < 8; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await tester.pump();
+        }
+        await tester.pumpAndSettle();
+      });
+      await expectGolden(tester, 'chat_image');
+    });
+
+    testWidgets('generated image — inline under the tool tile and in the '
+        'markdown reply', (tester) async {
+      final env = MemoryExecutionEnv();
+      await env.writeBinaryFile('generated/image-1.png', _tinyPngBytes);
+      final service = _fakeService(env);
+      service.messages
+        ..add(
+          FahChatMessage(
+            role: 'user',
+            content: 'draw me a teal-to-indigo gradient swatch',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'tool',
+            toolName: 'generate_image',
+            content:
+                'Generated image saved to generated/image-1.png '
+                '(618 bytes, 1024x1024). Reference it as '
+                '![image](generated/image-1.png) to display it inline in '
+                'the chat.',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'assistant',
+            content:
+                'Here is the swatch:\n\n'
+                '![teal-to-indigo gradient swatch](generated/image-1.png)',
+          ),
+        );
+      final manager = FlutterSessionManager(env: env, sessionsRoot: '/sessions')
+        ..addSession('fake-session', service);
+
+      tester.view.physicalSize = goldenSizeWide;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      // The env read + image codec resolve on the real event loop; each
+      // resolved image needs another layout pass before it can paint.
+      await tester.runAsync(() async {
+        await tester.pumpWidget(
+          MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: buildFahTheme(),
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: ChatScreen(manager: manager),
+          ),
+        );
+        for (var i = 0; i < 8; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+          await tester.pump();
+        }
+        await tester.pumpAndSettle();
+        // Determinism: the composer's cursor blink is an infinite
+        // animation whose phase at capture is wall-clock dependent —
+        // unfocus so the snapshot never catches a random blink phase, then
+        // wait out the cursor's fade-out animation.
+        FocusManager.instance.primaryFocus?.unfocus();
+        await tester.pump(const Duration(milliseconds: 600));
+        await tester.pump();
+      });
+      await expectGolden(tester, 'chat_generated_image');
+    });
+
+    testWidgets('generated media — audio player under the speak tile and a '
+        'video player under a bash tile', (tester) async {
+      final env = MemoryExecutionEnv();
+      final fakeBytes = Uint8List.fromList(List<int>.filled(64, 7));
+      await env.writeBinaryFile('generated/speech-1.mp3', fakeBytes);
+      await env.writeBinaryFile('generated/clip-1.mp4', fakeBytes);
+      final service = _fakeService(env);
+      service.messages
+        ..add(
+          FahChatMessage(
+            role: 'user',
+            content: 'say hi out loud, then render a 2s teal clip',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'tool',
+            toolName: 'speak',
+            content:
+                'Speech saved to generated/speech-1.mp3 '
+                '(64 bytes, voice "alloy", ~0s).',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'tool',
+            toolName: 'bash',
+            content: 'rendered generated/clip-1.mp4 (64 bytes)',
+          ),
+        )
+        ..add(
+          FahChatMessage(
+            role: 'assistant',
+            content: 'Done — the voice line and the clip are above.',
+          ),
+        );
+      final manager = FlutterSessionManager(env: env, sessionsRoot: '/sessions')
+        ..addSession('fake-session', service);
+
+      tester.view.physicalSize = goldenSizeWide;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      // The env reads + controller creation resolve on the real event loop
+      // (same dance as the generated-image shot); the players themselves are
+      // deterministic fakes (paused at 0:00, fixed 0:07 duration). Wait for
+      // the players to actually mount instead of a fixed delay budget —
+      // under a loaded suite runner the fixed budget flakes.
+      await tester.runAsync(() async {
+        await tester.pumpWidget(
+          MaterialApp(
+            debugShowCheckedModeBanner: false,
+            theme: buildFahTheme(),
+            localizationsDelegates: AppLocalizations.localizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: ChatScreen(
+              manager: manager,
+              audioControllerFactory: (bytes) => FakeAudioController(),
+              videoControllerFactory: (path, bytes) => FakeVideoController(),
+            ),
+          ),
+        );
+        for (var i = 0; i < 50; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await tester.pump();
+          final audioMounted = find
+              .byType(SandboxAudioPlayer)
+              .evaluate()
+              .isNotEmpty;
+          final videoMounted = find
+              .byType(SandboxVideoPlayer)
+              .evaluate()
+              .isNotEmpty;
+          if (audioMounted && videoMounted && i > 5) break;
+        }
+        await tester.pumpAndSettle();
+      });
+      expect(find.byType(SandboxAudioPlayer), findsOneWidget);
+      expect(find.byType(SandboxVideoPlayer), findsOneWidget);
+      expect(find.text('0:00 / 0:07'), findsOneWidget);
+      await expectGolden(tester, 'chat_generated_media');
+    });
+  });
+
+  // Issue #461 AC5: the user attachment bubble — 1 image, a wrapped
+  // 3-image grid, the unavailable-image placeholder and the file chip —
+  // in light + dark, at phone width.
+  Future<void> _pumpAttachmentBubble(
+    WidgetTester tester, {
+    required List<FaChatAttachment> attachments,
+    required bool light,
+  }) async {
+    final service = _fakeService(MemoryExecutionEnv());
+    service.messages.add(
+      FahChatMessage(
+        role: 'user',
+        content: 'what do you think?',
+        attachments: attachments,
+      ),
+    );
+    final manager = FlutterSessionManager(
+      env: MemoryExecutionEnv(),
+      sessionsRoot: '/sessions',
+    )..addSession('fake-session', service);
+    tester.view.physicalSize = goldenSizePhone;
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await tester.runAsync(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: light ? buildFahThemeLight() : buildFahTheme(),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: ChatScreen(manager: manager),
+        ),
+      );
+      // Thumbnails decode on the real event loop; give the hop time.
+      for (var i = 0; i < 6; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        await tester.pump();
+      }
+      await tester.pumpAndSettle();
+    });
+  }
+
+  group('user bubble attachments (issue #461)', () {
+    final singleImage = <FaChatAttachment>[
+      (bytes: _tinyPngBytes, path: 'uploads/swatch.png'),
+    ];
+    final threeImages = <FaChatAttachment>[
+      (bytes: _tinyPngBytes, path: 'uploads/teal.png'),
+      (bytes: _tinyPngBytes, path: 'uploads/indigo.png'),
+      (bytes: _tinyPngBytes, path: 'uploads/gradient.png'),
+    ];
+    final droppedImage = <FaChatAttachment>[
+      (bytes: null, path: 'uploads/photo.png'),
+    ];
+    final fileChip = <FaChatAttachment>[
+      (bytes: null, path: 'uploads/quarterly-report.pdf'),
+    ];
+    for (final (light, suffix) in [(true, 'light'), (false, 'dark')]) {
+      testWidgets('1 image — $suffix', (tester) async {
+        await _pumpAttachmentBubble(
+          tester,
+          attachments: singleImage,
+          light: light,
+        );
+        await expectGolden(tester, 'chat_bubble_1_image_$suffix');
+      });
+      testWidgets('3 images wrap in a grid — $suffix', (tester) async {
+        await _pumpAttachmentBubble(
+          tester,
+          attachments: threeImages,
+          light: light,
+        );
+        await expectGolden(tester, 'chat_bubble_3_images_$suffix');
+      });
+      testWidgets('dropped image renders the placeholder — $suffix', (
+        tester,
+      ) async {
+        await _pumpAttachmentBubble(
+          tester,
+          attachments: droppedImage,
+          light: light,
+        );
+        await expectGolden(tester, 'chat_bubble_placeholder_$suffix');
+      });
+      testWidgets('non-image renders a file chip — $suffix', (tester) async {
+        await _pumpAttachmentBubble(
+          tester,
+          attachments: fileChip,
+          light: light,
+        );
+        await expectGolden(tester, 'chat_bubble_file_chip_$suffix');
+      });
+    }
+  });
+
+  group('FaMark goldens', () {
+    testWidgets('standalone brand mark', (tester) async {
+      await pumpGolden(tester, const FaMark(size: 64));
+      await expectGolden(tester, 'chat_fa_mark');
+    });
+  });
+}

@@ -1,0 +1,1444 @@
+/// Session management commands split from [AgentCli] to keep agent_cli.dart
+/// under the repo's 2800-line size gate. Same library (a `part of`), so the
+/// extension sees the class's private members.
+part of 'agent_cli.dart';
+
+/// The CLI wiring fields a restore mutates, captured before the first
+/// mutation: a FAILED roles re-pin rolls them all back so the status bar,
+/// the key state and the stream keep describing the model that actually
+/// serves (gh-1000 T3).
+typedef _RestoreWiring = ({
+  String? customName,
+  String providerKind,
+  String apiKey,
+  bool explicitToken,
+  StreamFunction streamFunction,
+});
+
+/// Implementation members of [AgentCli] for named sessions: switching, initializing,
+/// creating, loading, renaming, listing, and the empty-session cleanup.
+extension on AgentCli {
+  Future<void> _switchSession(String name) async {
+    final trimmed = name.trim();
+    await deleteSessionIfEmpty();
+    _subagentManager.reset();
+    // The status meter belongs to the session (see _switchToMetadata).
+    _usage.reset();
+    _meter.reset();
+    final matches = await _sessionNameMatches(trimmed);
+    SessionMetadata? metadata;
+    if (matches.length > 1 &&
+        [
+              for (final m in matches)
+                if (m.cwd == _env.cwd) m,
+            ].length !=
+            1) {
+      // Ambiguous: several in this folder or none in it — ask which one
+      // (the TUI wizard picker, or a numbered list in line mode). The
+      // caller's flow gate buffers an answer typed AHEAD of the prompt
+      // instead of dispatching it as a command.
+      final options = <FlowOption>[
+        for (var i = 0; i < matches.length; i++)
+          (
+            '$i',
+            '${matches[i].cwd} — ${matches[i].id}',
+            _sessionMatchDescription(matches[i]),
+          ),
+      ];
+      final picked = await _pickOption(
+        "Several sessions named '$trimmed'",
+        options,
+      );
+      if (picked == null) {
+        io.writeln('session switch cancelled');
+        return;
+      }
+      metadata = matches[int.parse(picked)];
+    } else {
+      metadata = _resolveSessionNameMatch(matches);
+      if (matches.length > 1 && metadata != null) {
+        io.writeln(
+          _style.dim(
+            "note: ${matches.length} sessions named '$trimmed' — opened "
+            'this folder\'s (${metadata.id})',
+          ),
+        );
+      }
+    }
+    if (metadata != null) {
+      await _switchToMetadata(metadata, trimmed);
+      return;
+    }
+    // gh-1241: close the outgoing session's usage segment before the
+    // switch. NO deleteSessionIfEmpty() here: the switch's own cleanup ran
+    // at the top of _switchSession (BEFORE _subagentManager.reset()) —
+    // this create path runs AFTER the reset, when the registry handles are
+    // already gone, so a session holding only a persisted subagent_registry
+    // record would wrongly count as "empty" and be trashed (#332 data
+    // loss). The fresh session's marker lands lazily at its first drive.
+    await _flushUsageLedger();
+    _agent.reset();
+    _checkpoints.clear();
+    _ttsr?.reset();
+    _session = await _createSession(name: trimmed);
+    _notifyPluginSessionReady();
+    _syncMailboxPrefix();
+    // herdr pane state (issue #1481): in-process session switch — re-report
+    // the new session, never a release.
+    _herdrSessionSwitched();
+    // Re-claim ownership for the new session (#428): free → drive,
+    // live lease → viewer (no takeover ever).
+    await _releaseSessionLease();
+    await _claimSessionLease();
+    await _printViewerBannerIfAny();
+    _persistedCount = 0;
+    io.writeln("created session '$trimmed'");
+  }
+
+  /// The `/session <name>` disambiguation row's second line: when the
+  /// session was last active.
+  String _sessionMatchDescription(SessionMetadata metadata) {
+    final stamp = metadata.lastUpdatedAt ?? metadata.createdAt;
+    return 'last active ${stamp.toIso8601String()}';
+  }
+
+  /// Switches to an existing session by metadata (picker, /resume). Adopts
+  /// the session's original working directory so the agent keeps operating
+  /// in the project the session belongs to.
+  ///
+  /// gh-1734: every stage is attributable in fa.log — `boot_stage`
+  /// switch-begin/open/walk/context/rehydrate/replay/switch-done lines
+  /// name the target session, so a switch regression is attributable from
+  /// the log alone (open/walk/context come from the shared session-load
+  /// path). The shell stack is NOT re-booted: config, providers, MCP,
+  /// plugins and the prompt stay live — only the session, its context and
+  /// the transcript replay rebuild, and the skills/project-context reload
+  /// runs only when the session's cwd actually differs (the live prompt
+  /// already matches the session's project otherwise).
+  Future<void> _switchToMetadata(SessionMetadata metadata, String label) async {
+    final switchSw = Stopwatch()..start();
+    void switchStage(String name) => _logDiagnostic(
+      'boot_stage $name ms=${switchSw.elapsedMilliseconds} '
+      'sid=${metadata.id}',
+    );
+    _logDiagnostic('boot_stage switch-begin ms=0 sid=${metadata.id}');
+    await deleteSessionIfEmpty();
+    // gh-1241: close the outgoing session's usage segment before the
+    // switch (after the empty-cleanup: a deleted session folds nothing).
+    await _flushUsageLedger();
+    _subagentManager.reset();
+    // The status meter belongs to the session: tok/cost/turn must not carry
+    // the previous session's totals into the new one.
+    _usage.reset();
+    _meter.reset();
+    _agent.reset();
+    _checkpoints.clear();
+    _ttsr?.reset();
+    // gh-1425 review (stale-abort boot-cap skip): _runAbortRequested is
+    // CLI-lifetime state — without this clear, an abort of the PREVIOUS
+    // session's run survives the switch and `_capResumedContext` (which
+    // treats the flag as "a run is being aborted right now") skips the
+    // boot cap, so a resumed over-window session idles above 100% until
+    // the first prompt resets the flag. An abort of the previous run has
+    // no meaning for the session being booted — clear it with the other
+    // per-session resets (the next prompt's own reset at
+    // `_beginUserPrompt` is untouched).
+    _runAbortRequested = false;
+    final cwdChanged = _env.cwd != metadata.cwd;
+    _env.cwd = metadata.cwd;
+    _modes = builtInAgentModes(_env.cwd, overrides: config.promptOverrides);
+    _currentMode = _modes[_currentMode.name] ?? _modes['code']!;
+    // Reload skills/project context for the new cwd so the system prompt
+    // matches the session's project. gh-1734: a same-cwd switch keeps the
+    // already-live prompt — config/providers/MCP/plugins/prompt are all
+    // still in place, and re-scanning skills plus re-reading the project
+    // tree for the SAME project re-pays the boot for nothing.
+    if (cwdChanged) await _loadAgentContext();
+    _session = await _loadSession(metadata);
+    _notifyPluginSessionReady();
+    _syncMailboxPrefix();
+    // herdr pane state (issue #1481): in-process session switch — re-report
+    // the new session, never a release.
+    _herdrSessionSwitched();
+    // Re-claim ownership for the new session (#428): free → drive,
+    // live lease → viewer (no takeover ever).
+    await _releaseSessionLease();
+    await _claimSessionLease();
+    await _printViewerBannerIfAny();
+    // gh-1241: NO eager marker — a switch that never drives must leave the
+    // resumed chain byte-untouched; the segment opens lazily at the first
+    // drive ([_runPrompt]).
+    // Now that `_session` is assigned, the registry source can read the
+    // resumed session's `subagent_registry` records. Awaited (issue #332):
+    // zombie rows settle before the next prompt can spawn children, and no
+    // same-id spawn can race the load.
+    await _subagentManager.rehydrate();
+    switchStage('rehydrate');
+    io.writeln("switched to session '$label' [${_pathBasename(metadata.cwd)}]");
+    _replayRestoredHistory(_agent.state.messages, label);
+    switchStage('replay');
+    _logDiagnostic(
+      'boot_stage switch-done ms=${switchSw.elapsedMilliseconds} '
+      'sid=${metadata.id}',
+    );
+  }
+
+  /// Replays a restored session's transcript into the output so a resume
+  /// doesn't look empty: compact per-message rows filling a row budget from
+  /// the END (see [buildReplayEntries] — a typical session replays in full,
+  /// only marathon ones truncate, and the header says so).
+  void _replayRestoredHistory(List<Message> messages, String label) {
+    // Restore the composer's ↑ history from the session's user messages so
+    // recall — not viewport scrolling — answers ↑ right after a resume.
+    _tuiController?.setInputHistory(restoredInputHistory(messages));
+    if (messages.isEmpty) return;
+    // Below the TUI history cap (2000 lines) so the replay never trims its
+    // own head in TUI mode.
+    final width = io.columns > 0 ? io.columns : 80;
+    final (entries, firstIndex) = buildReplayEntries(
+      messages,
+      tui: _useTui,
+      width: width,
+      dim: _style.dim,
+      cwd: _env.cwd,
+      home: config.homeDir,
+    );
+    final count = firstIndex > 0
+        ? 'last ${messages.length - firstIndex} of ${messages.length}'
+        : '${messages.length}';
+    io.writeln(_style.dim('─── restored session: $label ($count messages)'));
+    for (final entry in entries) {
+      for (final line in entry) {
+        io.writeln(line);
+      }
+    }
+    // The trailing rule is line-mode chrome only: in the TUI it costs a
+    // glass row on resume, and the resumed window anchors at the
+    // transcript region — the spare row is tail parity (issue #446
+    // wave-14).
+    if (!_useTui) io.writeln(_style.dim('─' * 20));
+  }
+
+  /// `/resume`: switches to the most recently created session across every
+  /// workspace (the repo lists sessions newest-first).
+  Future<void> _resumeLastSession() async {
+    final sessions = await _repo.list();
+    if (sessions.isEmpty) {
+      io.writeln('no sessions');
+      return;
+    }
+    final latest = sessions.first;
+    final current = await _session?.getMetadata();
+    // gh-1555 W1 (d3): only the name is read before the switch — open
+    // windowed so an over-the-backstop ledger still /resumes (the full
+    // open refuses); resolveSessionName pages back for a far name record.
+    final session = await _repo.open(latest, windowed: true);
+    final label = await session.resolveSessionName() ?? latest.id;
+    if (current?.path == latest.path) {
+      io.writeln("already on the latest session '$label'");
+      return;
+    }
+    await _switchToMetadata(latest, label);
+  }
+
+  Future<void> _renameSession(String name) async {
+    final trimmed = name.trim();
+    final session = _session;
+    if (session == null) {
+      io.writeln('no active session');
+      return;
+    }
+    await session.appendSessionName(trimmed);
+    io.writeln("renamed current session to '$trimmed'");
+  }
+
+  Future<void> _listSessions() async {
+    // List every session in the shared root, across workspaces, so sessions
+    // created in the Fa app or in another `fa` run are visible here. The
+    // current folder's sessions lead the list (issue #83). Children render
+    // nested under their parent (issue #198).
+    final sessions = sortSessionsCurrentFolderFirst(
+      await _repo.list(),
+      _env.cwd,
+    );
+    if (sessions.isEmpty) {
+      io.writeln('no sessions');
+      return;
+    }
+    io.writeln('sessions:');
+    for (final line in formatSessionListLines(
+      buildSessionListRows(
+        sessions: sessions,
+        flat: false,
+        names: await sessionDisplayNames(_repo, sessions),
+        currentSessionPath: (await _session?.getMetadata())?.path,
+      ),
+      dim: _style.dim,
+    )) {
+      io.writeln(line);
+    }
+    io.writeln(
+      _style.dim('switch: /session <name> · rename: /rename-session <name>'),
+    );
+    // gh-1746 Visibility: the usage footer, only when the user configured
+    // a retention cap (REG-1: the cap-free listing stays byte-identical).
+    final sessionsRetention = config.sessionsRetention?.retention;
+    if (sessionsRetention != null && sessionsRetention.hasCap) {
+      try {
+        final usage = await SessionRetentionSweeper(
+          fs: _env,
+          sessionsRoot: config.sessionRoot,
+        ).usage();
+        final footer = sessionUsageFooterLine(usage, sessionsRetention);
+        if (footer != null) io.writeln(_style.dim(footer));
+      } on Object {
+        // Best-effort chrome: a failed walk never fails the listing.
+      }
+    }
+  }
+
+  Future<void> _createNamedSession(String name) async {
+    final trimmed = name.trim();
+    final existing = await _findSessionByName(trimmed);
+    if (existing != null) {
+      io.writeln("session '$trimmed' already exists");
+      return;
+    }
+    await deleteSessionIfEmpty();
+    // gh-1241: close the outgoing session's usage segment (after the
+    // empty-cleanup: a deleted session folds nothing).
+    await _flushUsageLedger();
+    _subagentManager.reset();
+    _agent.reset();
+    _checkpoints.clear();
+    _ttsr?.reset();
+    _session = await _createSession(name: trimmed);
+    _notifyPluginSessionReady();
+    _syncMailboxPrefix();
+    // herdr pane state (issue #1481): in-process session switch — re-report
+    // the new session, never a release.
+    _herdrSessionSwitched();
+    // Re-claim ownership for the new session (#428): free → drive,
+    // live lease → viewer (no takeover ever).
+    await _releaseSessionLease();
+    await _claimSessionLease();
+    await _printViewerBannerIfAny();
+    // gh-1241: NO eager marker — the fresh session's segment opens lazily
+    // at its first drive ([_runPrompt]), keeping an idle boot byte-silent.
+    _persistedCount = 0;
+    io.writeln("created session '$trimmed'");
+  }
+
+  /// `/sessions`: a bare command opens the TUI picker; anything else prints
+  /// the session list.
+  Future<void> _sessionsSlash(String rest) async {
+    if (rest.isEmpty && _useTui && _tuiController != null) {
+      await _openSessionsPicker();
+    } else {
+      await _listSessions();
+    }
+  }
+
+  /// A `/session-new`-style command requiring a name argument.
+  Future<void> _namedSessionSlash(
+    String rest,
+    String command,
+    Future<void> Function(String) action,
+  ) async {
+    if (rest.trim().isEmpty) {
+      io.writeln('usage: /$command <name>');
+    } else {
+      await action(rest.trim());
+    }
+  }
+
+  Future<void> _handleSessionCommand(String rest) async {
+    final trimmed = rest.trim();
+    if (trimmed.isEmpty) {
+      final session = _session;
+      if (session == null) {
+        io.writeln('no active session');
+        return;
+      }
+      final metadata = await session.getMetadata();
+      final name = await session.getSessionName();
+      io.writeln('session: ${name ?? '(unnamed)'}  ${metadata.path}');
+      io.writeln(_style.dim('rename: /rename-session <name>'));
+      return;
+    }
+    // Detached (see _switchSessionGated): the ambiguity picker's answer
+    // must reach the pending prompt through the NEXT line dispatch.
+    unawaited(_switchSessionGated(trimmed));
+  }
+
+  /// The detached switch: runs OUTSIDE the sequential line dispatch so the
+  /// ambiguity picker's answer line can be routed to the pending prompt —
+  /// awaiting the switch inline would deadlock the line REPL (the dispatch
+  /// waits for the switch, the switch waits for the answer only the next
+  /// dispatch could deliver — the reason the guided provider flows run
+  /// detached too). The gate buffers input for the switch's lifetime; a
+  /// second `/session` while one runs is ignored.
+  Future<void> _switchSessionGated(String trimmed) {
+    if (_providerFlowActive) return Future<void>.value();
+    _providerFlowActive = true;
+    return _switchSession(trimmed).whenComplete(() {
+      _providerFlowActive = false;
+      // Lines typed DURING the switch are real input, not flow junk —
+      // redispatch them after the switch (in order), never drop them:
+      // `/session new` + a prompt typed right after used to lose the
+      // prompt to the flow-junk clear.
+      final buffered = List<String>.of(_promptLineBuffer);
+      _promptLineBuffer.clear();
+      // The switch runs outside the dispatch's prompt lifecycle: redraw
+      // the idle prompt so the status meter (zeroed by the switch) shows
+      // in the transcript like it did when the switch was awaited inline.
+      if (!_exited && !isBusy) _writeIdlePrompt();
+      for (final line in buffered) {
+        if (line.isNotEmpty) unawaited(_dispatchInput(line, line, const []));
+      }
+    });
+  }
+
+  /// Whether nothing was ever said in the session and nothing owns it.
+  bool _sessionIsEmpty() =>
+      _sessionHasNoContent &&
+      _subagentManager.handles.isEmpty &&
+      _session != null;
+
+  /// No live messages and no records persisted to disk.
+  bool get _sessionHasNoContent =>
+      _agent.state.messages.isEmpty && _persistedCount == 0;
+
+  Future<void> _deleteEmptySessionFile() async {
+    final session = _session;
+    if (session == null) return;
+    try {
+      await _repo.delete(
+        await session.getMetadata(),
+        actor: 'cli:empty-cleanup',
+      );
+      _session = null;
+      // The session scope is gone — drop it from the resolution.
+      unawaited(AgentCliTools(this).rebuildToolAvailability());
+    } on Object {
+      // Best-effort cleanup.
+    }
+  }
+
+  Future<Session> _initializeSession() async {
+    // gh-1746 boot hygiene: resolve the resume target FIRST, then run the
+    // opt-in sessions retention sweep (AC7). The sweeper must exempt the
+    // session this process is about to open: its presence row registers
+    // only after the load (agent_cli `_registerLivePresence`), so at sweep
+    // time the resolved id is the only protection — sweeping before the
+    // name scan deleted the very transcript `fa --session <id>` was about
+    // to open (and any resume under `keepNamed: false`), silently
+    // replacing it with a fresh empty session. Awaited (unlike the
+    // header-only sweep below): it DELETES files, so it must finish before
+    // this process opens a session the sweep could otherwise race. Only
+    // runs when the user touched `sessions:` in the config — a
+    // section-free boot stays byte-identical legacy (AC1).
+    final name = config.sessionName?.trim();
+    var matches = const <SessionMetadata>[];
+    SessionMetadata? metadata;
+    if (name != null && name.isNotEmpty) {
+      matches = await _sessionNameMatches(name);
+      metadata = _resolveSessionNameMatch(
+        matches,
+        onAmbiguous: (all) {
+          // Interactive prompting is impossible this early (the input pump
+          // starts after init): auto-resolve and let the TUI offer the
+          // scoped picker after boot; line mode gets the printed hint.
+          _startupAmbiguousSessions = all;
+          _startupAmbiguousName = name;
+        },
+      );
+    }
+    await _retentionBootCheck(currentSessionId: metadata?.id);
+    // gh-1660 boot hygiene: crashed/killed runs leave header-only session
+    // files behind (the clean-exit `deleteSessionIfEmpty` never ran for
+    // them). Fire-and-forget, best-effort — never delays the first turn.
+    unawaited(_sweepHeaderOnlySessions());
+    if (name != null && name.isNotEmpty) {
+      if (metadata != null) {
+        if (matches.length > 1) {
+          io.writeln(
+            _style.dim(
+              "note: ${matches.length} sessions named '$name' — opened "
+              '${metadata.id} (${metadata.cwd}); pick another with '
+              '/sessions or restart with fa --session <id>',
+            ),
+          );
+        }
+        return _loadSession(metadata);
+      }
+      return _createSession(name: name);
+    }
+    return _createSession();
+  }
+
+  /// The boot-time header-only sweep (gh-1660): trashes one-line session
+  /// files older than the grace — garbage left by crashed/killed runs the
+  /// clean-exit [deleteSessionIfEmpty] never saw. Best-effort and
+  /// fire-and-forget: a failed sweep leaves the files for the next boot,
+  /// and the age guard (plus the live-presence-row guard inside the repo)
+  /// keeps concurrently booting processes' brand-new files safe.
+  static const _headerOnlySweepGrace = Duration(minutes: 10);
+
+  Future<void> _sweepHeaderOnlySessions() async {
+    final repo = _repo;
+    if (repo is! JsonlSessionRepo) return;
+    try {
+      await repo.cleanupEmptySessions(olderThan: _headerOnlySweepGrace);
+    } on Object {
+      // Best-effort: never let hygiene delay or fail the boot.
+    }
+  }
+
+  /// The boot retention check (gh-1746): with the `sessions:` config
+  /// section present, run [SessionRetentionSweeper.enforceAtBoot] — cap
+  /// + `sweep: boot` deletes whole units; every outcome renders through
+  /// [sessionSweepReportLines] into the boot log (fa.log, AC7) and the
+  /// dim notice channel (line mode + the TUI re-print after the banner,
+  /// the same surface as the roles-drop warning). Absent section (null)
+  /// returns immediately: no sweep, no note, no walk (AC1). Best-effort:
+  /// a failed check never fails the boot. [currentSessionId] exempts the
+  /// resume target this boot resolved BEFORE sweeping — the one session
+  /// the sweep must never eat (its presence row registers only after the
+  /// load).
+  Future<void> _retentionBootCheck({String? currentSessionId}) async {
+    final sessions = config.sessionsRetention;
+    if (sessions == null) return;
+    try {
+      final report = await SessionRetentionSweeper(
+        fs: _env,
+        sessionsRoot: config.sessionRoot,
+        retention: sessions.retention,
+        presenceStore: config.presenceStore,
+        currentSessionId: currentSessionId,
+        // AC7: one log line per auto-deletion (+ the plan on a boot
+        // apply) lands in fa.log with the other lifecycle lines.
+        log: (line) => _logDiagnostic('[retention] $line'),
+      ).enforceAtBoot();
+      final lines = sessionSweepReportLines(report);
+      for (final line in lines) {
+        _logDiagnostic('[retention] $line');
+      }
+      _retentionBootLines = List.unmodifiable(lines);
+    } on Object catch (error) {
+      _logDiagnostic('[retention] boot check failed: $error');
+    }
+  }
+
+  Future<Session> _createSession({String? name}) async {
+    // The wake gate (see [_sessionLoadsInFlight]) — same contract as
+    // [_loadSession]: creation resets agent state too.
+    _sessionLoadsInFlight++;
+    try {
+      return await _createSessionInner(name: name);
+    } finally {
+      _sessionLoadsInFlight--;
+    }
+  }
+
+  Future<Session> _createSessionInner({String? name}) async {
+    try {
+      final session = await _repo.create(
+        JsonlSessionCreateOptions(
+          cwd: _env.cwd,
+          // `agent: cli` marks the owning process — the Fa app's live badge
+          // and attach view key off presence, but the metadata tells
+          // sessions apart in listings (the app writes 'fa').
+          metadata: {'agent': 'cli', 'model': _agent.state.model.id},
+        ),
+      );
+      if (name != null && name.isNotEmpty) {
+        await session.appendSessionName(name);
+      }
+      return session;
+    } on SessionException catch (error) {
+      final fallbackRoot = '${config.homeDir ?? _env.cwd}/.fah/sessions';
+      if (config.sessionRoot != fallbackRoot) {
+        try {
+          final fallbackRepo = JsonlSessionRepo(
+            fs: _env,
+            sessionsRoot: fallbackRoot,
+            // Issue #522: the gate needs live heartbeats on any root the
+            // process writes sessions into — the fallback root included.
+            presenceStore: FileSessionPresenceStore(
+              env: _env,
+              root: fallbackRoot,
+            ),
+            processId: config.processId,
+          );
+          final session = await fallbackRepo.create(
+            JsonlSessionCreateOptions(
+              cwd: _env.cwd,
+              metadata: {'agent': 'cli', 'model': _agent.state.model.id},
+            ),
+          );
+          _repo = fallbackRepo;
+          // Storage moved — the mailboxes move with it. Without this the
+          // fabric keeps pointing at the failed root: presence/register
+          // throws, and an attached app's messages land where this process
+          // never looks (the silent-dead-attach bug).
+          _fileFabric.swap(
+            FileMessagingRepository(
+              env: _env,
+              root: '$fallbackRoot/${encodeSessionCwd(_env.cwd)}/messages',
+              decodeSessionCwd: decodeSessionCwd,
+              homeDir: config.homeDir,
+            ),
+          );
+          if (name != null && name.isNotEmpty) {
+            await session.appendSessionName(name);
+          }
+          io.writeln(
+            tuiWarning(
+              'warning: Failed to create session under ${config.sessionRoot} (${error.message}).\n'
+              'Falling back to session storage at $fallbackRoot.\n'
+              'To fix permissions for shared macOS sessions, run:\n'
+              '  sudo chown -R \$(whoami) ~/Library/"Group Containers"/group.dev.fa1.shared\n'
+              '  chmod -R u+rwx ~/Library/"Group Containers"/group.dev.fa1.shared',
+            ),
+          );
+          return session;
+        } catch (_) {
+          // Fall through to rethrow original error.
+        }
+      }
+      rethrow;
+    }
+  }
+
+  /// Every session whose id IS [name] (exact id short-circuits — ids are
+  /// unique) or whose session_info name equals it, across every workspace
+  /// (the exit hint prints `fa --session '<id>'` for unnamed sessions, so
+  /// ids must resolve too). Several sessions can share a NAME — different
+  /// project folders, or renamed twice — so callers get the full list and
+  /// disambiguate (see [_resolveSessionNameMatch]). The id check is pure
+  /// metadata — zero file IO; the name scan fans out through the bounded
+  /// [JsonlSessionRepo.sessionNamesQuick] pool, so a 300-session store
+  /// probes its files in parallel instead of per-file serial (issue
+  /// #369).
+  Future<List<SessionMetadata>> _sessionNameMatches(String name) async {
+    final wanted = name.trim();
+    final sessions = await _repo.list();
+    for (final metadata in sessions) {
+      if (metadata.id == wanted) return [metadata];
+    }
+    final repo = _repo;
+    if (repo is! JsonlSessionRepo) {
+      // Foreign repo implementation: no batch API — bounded windowed
+      // scan per session (gh-1555 d4: never a full open per session, so
+      // MANY over-the-backstop sessions scan in bounded memory).
+      final matches = <SessionMetadata>[];
+      for (final metadata in sessions) {
+        final session = await _repo.open(metadata, windowed: true);
+        final sessionName = await session.resolveSessionName();
+        if (sessionName != null && sessionName.trim() == wanted) {
+          matches.add(metadata);
+        }
+      }
+      return matches;
+    }
+    final names = await repo.sessionNamesQuick(sessions);
+    return [
+      for (final metadata in sessions)
+        if (names[metadata.id]?.trim() == wanted) metadata,
+    ];
+  }
+
+  /// Finds a session by display name OR exact id — the first match. Kept
+  /// for the rename-conflict check ("the name is taken anywhere").
+  Future<SessionMetadata?> _findSessionByName(String name) async {
+    final matches = await _sessionNameMatches(name);
+    return matches.isEmpty ? null : matches.first;
+  }
+
+  /// Disambiguates same-named sessions: the LAUNCH folder's session beats a
+  /// namesake from another project (the "fa --session X opens the wrong
+  /// folder's session" bug); a clear single local wins silently, anything
+  /// else is ambiguous and [onAmbiguous] receives the full match list so
+  /// the caller can offer a choice. The fallback pick is the most recently
+  /// updated local (or global when the folder has none).
+  SessionMetadata? _resolveSessionNameMatch(
+    List<SessionMetadata> matches, {
+    void Function(List<SessionMetadata> matches)? onAmbiguous,
+  }) {
+    if (matches.isEmpty) return null;
+    if (matches.length == 1) return matches.single;
+    final local = [
+      for (final m in matches)
+        if (m.cwd == _env.cwd) m,
+    ];
+    if (local.length == 1) return local.single;
+    onAmbiguous?.call(matches);
+    final pool = local.isNotEmpty ? local : matches;
+    pool.sort(
+      (a, b) => (b.lastUpdatedAt ?? b.createdAt).compareTo(
+        a.lastUpdatedAt ?? a.createdAt,
+      ),
+    );
+    return pool.first;
+  }
+
+  /// Offers the startup ambiguity choice: the sessions picker scoped to
+  /// the same-named matches. The current session stays the auto-resolved
+  /// one; picking another switches, Esc keeps it.
+  Future<void> _offerStartupSessionChoice() async {
+    final matches = _startupAmbiguousSessions;
+    final name = _startupAmbiguousName;
+    _startupAmbiguousSessions = null;
+    _startupAmbiguousName = null;
+    if (matches == null || name == null) return;
+    _lastSessionRows = await _sessionPickerRows(matches);
+    _tuiController?.openPicker(
+      'sessions',
+      "Several sessions named '$name' — which one?",
+      sessionPickerItems(
+        _lastSessionRows!,
+        flat: _sessionPickerFlat,
+        toggle: false,
+      ),
+    );
+  }
+
+  Future<Session> _loadSession(SessionMetadata metadata) async {
+    // The wake gate (see [_sessionLoadsInFlight]): no inbox/scheduled
+    // wake may start a run while this load walks — the half-loaded agent
+    // cannot survive an over-window guard (the goal_builder incident).
+    _sessionLoadsInFlight++;
+    try {
+      return await _loadSessionInner(metadata);
+    } finally {
+      _sessionLoadsInFlight--;
+    }
+  }
+
+  /// The session file's stat fingerprint for the warm-switch context
+  /// cache (gh-1734): one `fileInfo` probe. Null when the path cannot be
+  /// statted (foreign repo backends, probe failure) — no caching then;
+  /// the load behaves exactly as before.
+  Future<({int sizeBytes, int mtimeMs})?> _sessionFileFingerprint(
+    SessionMetadata metadata,
+  ) async {
+    try {
+      final info = await _env.fileInfo(metadata.path);
+      final file = info.valueOrNull;
+      if (file == null || file.kind != FileKind.file) return null;
+      return (sizeBytes: file.size, mtimeMs: file.mtimeMs);
+    } on Object {
+      return null;
+    }
+  }
+
+  /// The opt-in keep-latest vacuum at session open (issue #1882 AC2):
+  /// with `sessions.vacuumLedgers: true`, drop the resumed session's
+  /// superseded `shell_job_registry` / `subagent_registry` /
+  /// `obligations_ledger` snapshots. The surgery is the SAME
+  /// [repairSessionLedgers] `fa session repair` performs — MINUS the
+  /// full-drop ledger types (`model_request_summary`, the trajectory
+  /// blobs): a resume-time vacuum reclaims dead SNAPSHOTS only; dropping
+  /// request summaries is the explicit `fa session repair` deep clean,
+  /// never an automatic side effect (issue #1882 review coherence — PR1
+  /// bounded those records at ≤ 20 KB, and the Request tab plus the
+  /// usage-estimation basis live in them). Everything else matches the
+  /// verb: newest snapshot per ledger kept, everything else byte-
+  /// verbatim, pre-vacuum bytes preserved at `<path>.bak`, atomic swap.
+  /// Never a silent default: the config flag is the explicit opt-in, the
+  /// report lands as a dim line plus a `[vacuum]` fa.log entry. Guards:
+  /// a live presence row means another instance holds the session — skip
+  /// (this process registers its own row only after the load); a
+  /// filesystem without the ranged-read/atomic-rename surface, or any
+  /// failure, logs and leaves the file untouched. Runs before the
+  /// warm-switch fingerprint so the cache keys the post-vacuum bytes.
+  Future<void> _vacuumLedgersAtOpen(SessionMetadata metadata) async {
+    final sessions = config.sessionsRetention;
+    if (sessions == null || !sessions.vacuumLedgers) return;
+    final presenceRows = await config.presenceStore?.list() ?? const {};
+    if (presenceRows.containsKey(metadata.id)) {
+      _logDiagnostic(
+        '[vacuum] skipped ${metadata.id}: another instance holds the '
+        'session (live presence row)',
+      );
+      return;
+    }
+    SessionRepairReport report;
+    try {
+      report = await repairSessionLedgers(
+        _env,
+        metadata.path,
+        dropTypes: const {},
+      );
+    } on Object catch (error) {
+      _logDiagnostic('[vacuum] failed for ${metadata.id}: $error');
+      return;
+    }
+    final droppedTotal = report.droppedByType.values.fold<int>(
+      0,
+      (a, b) => a + b,
+    );
+    if (droppedTotal == 0) return;
+    final reclaimed = report.bytesBefore - report.bytesAfter;
+    final ledgerParts = [
+      for (final MapEntry(key: type, value: count)
+          in report.droppedByType.entries)
+        '$type ×$count',
+    ].join(', ');
+    final line =
+        'vacuum: dropped $droppedTotal superseded ledger snapshots '
+        '($ledgerParts), reclaimed $reclaimed bytes '
+        '(${report.bytesBefore} → ${report.bytesAfter}); '
+        'original at ${report.backupPath}';
+    io.writeln(_style.dim(line));
+    _logDiagnostic('[vacuum] $line');
+  }
+
+  /// Stores a freshly built context for the warm-switch cache only when
+  /// the file did not change during the open: the fingerprint must
+  /// describe exactly the bytes the context was built from, or a later
+  /// warm hit could serve a stale transcript (gh-1734).
+  Future<void> _rememberResumedContext(
+    SessionMetadata metadata,
+    ({int sizeBytes, int mtimeMs})? fpBefore,
+    int budget,
+    SessionContext built,
+  ) async {
+    final fpAfter = await _sessionFileFingerprint(metadata);
+    if (fpBefore != null &&
+        fpAfter != null &&
+        fpBefore.sizeBytes == fpAfter.sizeBytes &&
+        fpBefore.mtimeMs == fpAfter.mtimeMs) {
+      _resumedContextCache.remember(
+        metadata.path,
+        sizeBytes: fpAfter.sizeBytes,
+        mtimeMs: fpAfter.mtimeMs,
+        variant: budget,
+        context: built,
+      );
+    }
+  }
+
+  Future<Session> _loadSessionInner(SessionMetadata metadata) async {
+    final bootSw = Stopwatch()..start();
+    // gh-968 parity: the budget must price the prompt the FIRST REQUEST
+    // will carry. The messaging section joins at mailbox-prefix sync,
+    // which runs after this walk in boot order — project the prefix
+    // here so a resume cannot materialize one section more than the
+    // live loop carried before exit (issue #1151: builtin-skills
+    // metadata exhausted the record-bucket slack this race left).
+    if (_subagentManager.messaging != null && metadata.id.isNotEmpty) {
+      _assignMailboxPrefix(metadata.id);
+    }
+    void stage(String name) => _logDiagnostic(
+      'boot_stage $name ms=${bootSw.elapsedMilliseconds} sid=${metadata.id}',
+    );
+    // Windowed open (owner directive): the CLI resume used to parse the
+    // WHOLE file — 30s boots on marathon sessions. Open from the tail and
+    // page back only to the newest compaction boundary; sessions without
+    // compaction degenerate to the full load, so behavior is unchanged
+    // for them. Context stays byte-identical: the compaction transform
+    // drops everything before the boundary anyway.
+    // Issue #1882 AC2: the opt-in (`sessions.vacuumLedgers`) keep-latest
+    // vacuum runs BEFORE the open — and before the fingerprint, so the
+    // warm-switch cache keys the post-vacuum bytes. Best-effort: a failed
+    // vacuum logs and the resume proceeds on the untouched file.
+    await _vacuumLedgersAtOpen(metadata);
+    // Issue #1882 AC3: no silent GB-scale operations — a resume over a
+    // heavy session file says so (exact size + the hygiene escapes).
+    final heavyScan = await sessionSizeIfHeavy(_env, metadata.path);
+    if (heavyScan != null) {
+      for (final line in heavyScanGuardLines(heavyScan, metadata.path)) {
+        io.writeln(_style.dim(line));
+      }
+      _logDiagnostic('[heavy-scan] resume over $heavyScan bytes');
+    }
+    final fpBefore = await _sessionFileFingerprint(metadata);
+    // The resume budget bounds how much history the walk keeps resident —
+    // two different budgets legitimately build different context slices,
+    // so it rides the cache key as the build variant (gh-1734).
+    final budget = resumeParityBudget(
+      effectiveContextWindow: _effectiveContextWindow,
+      reserveTokens: _effectiveCompactionSettings.reserveTokens,
+      systemPrompt: _agent.state.systemPrompt,
+      tools: _agent.state.tools,
+    );
+    final cachedContext = fpBefore == null
+        ? null
+        : _resumedContextCache.match(
+            metadata.path,
+            sizeBytes: fpBefore.sizeBytes,
+            mtimeMs: fpBefore.mtimeMs,
+            variant: budget,
+          );
+    final session = await _repo.open(metadata, windowed: true);
+    stage('open');
+    // A marathon WITHOUT compaction pages past the windowed residency
+    // cache — the leaf slides out and the branch would read empty (a
+    // resume that looks like a fresh session, pty_resume_equivalence
+    // AC6). Fall back to the full open: the documented degenerate path.
+    //
+    // Token budget (owner directive, issue #503 round 3): a resume needs
+    // only the tail that fits the model's context window — walking a
+    // marathon file back to the newest compaction parsed ~470MB / 11.5k
+    // records (~10s) on a session whose window holds a fraction of that.
+    //
+    // gh-968 (AC-R3): the budget is the PARITY formula — effective
+    // window minus the SAME unanchored system-prompt/tool-schema
+    // overhead the ctx meter adds, minus the ACTIVE compaction reserve.
+    // Pricing the transcript alone against the window (the old budget)
+    // let a resume materialize MORE request than the live loop carried
+    // before exit (the reported `127%/200k` footer): the meter read
+    // transcript + overhead over the window and tripped the guard /
+    // auto-compaction on a fresh resume. With the parity budget the
+    // resumed meter sits at/below window − reserve — below the
+    // compaction trigger — on every fresh resume.
+    final boundaryResident = await session.ensureCompactionBoundaryResident(
+      tokenBudget: budget,
+    );
+    if (!boundaryResident) {
+      // gh-1555 W1 (d2): the walk exhausted maxPages without reaching a
+      // boundary or the file head — a degenerate giant. The OLD fallback
+      // re-opened FULL, which refuses outright past the gh-1073 backstop
+      // (the incident's broken rescue): the marathon then could not
+      // resume at all. Proceed with the tail-anchored windowed session
+      // instead: the resident tail is a valid budget-truncated resume,
+      // and the boot cap below owns the over-window residue.
+      _logDiagnostic(
+        'boot_stage boundary-walk exhausted maxPages; proceeding with '
+        'the tail window sid=${metadata.id}',
+      );
+    }
+    stage('walk');
+    // gh-1734: a warm switch to an unchanged session reuses the built
+    // context — the projection (compaction transform + per-record
+    // projection + the obligations-ledger tail scan inside
+    // `buildContext`) is a pure function of the file bytes, so an
+    // unchanged (size, mtime) fingerprint means an identical result.
+    // Cached entry, the `context` stage reports `source=cache`.
+    final SessionContext context;
+    if (cachedContext != null) {
+      context = cachedContext;
+      stage('context source=cache');
+    } else {
+      final built = await session.buildContext();
+      context = built;
+      stage('context');
+      await _rememberResumedContext(metadata, fpBefore, budget, built);
+    }
+    final messages = context.messages;
+    // Loaded usage anchors are generation-time: post-compaction they
+    // phantom-report the pre-compaction size (183k on a 27k branch) and
+    // fire a no-op compaction on every resume. Re-anchor at chars/4.
+    _agent.state.messages = resetLoadedUsageAnchors(messages);
+    _persistedCount = messages.length;
+    // gh-1449 AC6: seed the one-shot orphan-report latch from the persisted
+    // `orphan_report` records (raw scan — the windowed open drops side-leaf
+    // custom records out of getEntries, the same reason the subagent
+    // registry scans raw). A resumed session never re-reports an orphan
+    // it already reported. Best-effort: a scan failure must not break boot.
+    //
+    // lastSegmentOnly (gh-1449 rework): the scan rides the RESUME BOOT
+    // PATH, so it reads the primary segment only — orphan_report records
+    // are tail-appended during runs, and the primary is rotation-bounded
+    // (kSessionSegmentRotateBytes). A record already rotated into a
+    // `.part-NN` segment may cost one re-report after a resume — the
+    // accepted trade against the #503 whole-chain boot cost below.
+    // clear() first: the Agent instance is reused across session opens,
+    // so the latch must be strictly per-session.
+    try {
+      final repo = _repo;
+      if (repo is JsonlSessionRepo) {
+        final reports = await repo.readCustomRecordsOfType(metadata, {
+          orphanReportRecordType,
+        }, lastSegmentOnly: true);
+        _agent.reportedOrphanKeys
+          ..clear()
+          ..addAll(orphanReportKeysFromRecords(reports));
+      }
+    } on Object catch (error) {
+      _logDiagnostic('orphan_report seed failed sid=${metadata.id}: $error');
+    }
+    // Issue #437: persisted-but-unconsumed steering from a crashed
+    // session re-enters the queue and wakes the idle agent (E1: one
+    // record, consumed once — restart-safe).
+    // Issue #503: NOT awaited — the scan reads the whole session file
+    // (~1.5s on a 434MB marathon) and its result only arms the idle
+    // wake, so it must not sit on the boot path. Fire-and-forget: the
+    // wake's 2s inbox tick picks up the populated queue when the scan
+    // lands. The method catches its own errors (a broken session must
+    // still boot), so an unawaited future cannot go unhandled.
+    unawaited(_queueRecoveredSteering(session));
+    // Adopt the session's original project folder. This matters both when
+    // switching mid-run and when the CLI starts with --session: tools like
+    // bash/read/edit must operate in the session's directory, not the launch
+    // directory.
+    if (_env.cwd != metadata.cwd) {
+      _env.cwd = metadata.cwd;
+      _modes = builtInAgentModes(_env.cwd, overrides: config.promptOverrides);
+      _currentMode = _modes[_currentMode.name] ?? _modes['code']!;
+      await _loadAgentContext();
+    }
+    // The session may live in a DIFFERENT folder than the launch cwd: the
+    // boot applied the launch folder's model memory, so a session opened
+    // across folders landed on the wrong provider (user report: a z.ai
+    // session reopened as copilot). Re-apply the session folder's saved
+    // triple.
+    await _applySessionFolderModelState(session, leafModel: context.model);
+    // gh-1425 AC3 (the resume boot cap): a resume that lands over the
+    // compaction trigger is capped HERE — one forced pass at idle boot,
+    // before any user message — so the meter renders a post-cap number
+    // instead of idling above 100% until the first pre-flight. The
+    // boundary walk above bounds residency, but a reachable boundary
+    // whose kept-path projection is over the window (or a giant tail
+    // record the budget trim floors at) still boots over-window.
+    //
+    // Ordered AFTER the gh-1000 binding restore (gh-1425 review): the
+    // cap's summarizer requests must ride the session's OWN
+    // provider/model binding, not the launch default — otherwise every
+    // boot of a non-default-provider session bills (or 401s against) the
+    // wrong endpoint before the restore lands.
+    await _capResumedContext(session);
+    return session;
+  }
+
+  /// Re-applies the model/provider binding the restored session ran on —
+  /// the runtime twin of the boot restore in bin/fah.dart.
+  ///
+  /// Binding precedence (gh-1000):
+  /// 1. the session's OWN leaf `model_change` when it pins an endpoint or
+  ///    a saved custom-provider entry (name-pinned, never modelId-matched
+  ///    — two entries can share one endpoint+modelId, AC1);
+  /// 2. the per-folder model state ([loadFolderModelState]), whose
+  ///    `customProvider` name pins the entry the same way;
+  /// 3. nothing (a pre-gh-1000 session) — today's behavior, no binding.
+  ///
+  /// A pinned name that no longer resolves degrades to endpoint-keyed
+  /// resolution with a one-line note (E1 — the model is kept); a pinned
+  /// key that no longer resolves degrades to a named re-auth note instead
+  /// of a raw 401 mid-chat (AC3/E3).
+  Future<void> _applySessionFolderModelState(
+    Session session, {
+    ({
+      String provider,
+      String modelId,
+      String? baseUrl,
+      String? customProvider,
+    })?
+    leafModel,
+  }) async {
+    if (!config.folderModelStateApplies) return;
+    // 1. The session's own name-bound leaf binding wins.
+    if (leafModel != null &&
+        (leafModel.baseUrl != null || leafModel.customProvider != null)) {
+      final spec = resolveCliProviderSpec(leafModel.provider);
+      if (spec != null) {
+        await _applyRestoredModelBinding(
+          session,
+          providerKind: spec.kind,
+          modelId: leafModel.modelId,
+          baseUrl: leafModel.baseUrl,
+          customProviderName: leafModel.customProvider,
+        );
+        return;
+      }
+      // An unresolvable leaf provider falls through to the folder state.
+    }
+    // 2. The folder state.
+    final state = await loadFolderModelState(
+      _env,
+      sessionsRoot: config.sessionRoot,
+      cwd: _env.cwd,
+    );
+    if (state == null) return;
+    final pin = folderStateProviderEntry(state, config.customProviders);
+    if (pin.note != null) io.writeln(_style.dim('note: ${pin.note}'));
+    await _applyRestoredModelBinding(
+      session,
+      providerKind: state.providerKind,
+      modelId: state.modelId,
+      baseUrl: state.baseUrl,
+      customProviderName: pin.entry?.name,
+    );
+  }
+
+  /// Applies one resolved restore binding: builds the model, re-pins the
+  /// active custom entry (its key slot then serves the model), re-points
+  /// the stream wiring (roles mode re-pins the default chain — the same
+  /// wiring a live provider switch builds; the legacy path rebuilds the
+  /// direct stream function), and records the binding back into the
+  /// session. Best-effort: an unresolvable provider keeps the current
+  /// model with a note.
+  ///
+  /// G3 judges only RE-APPLY restores: [_restoreBindingSatisfied]
+  /// early-returns when the boot already applied this exact binding, so a
+  /// boot that applied a mixed triple never reaches this gate — the G2
+  /// request-build gate catches that at request time.
+  Future<void> _applyRestoredModelBinding(
+    Session session, {
+    required String providerKind,
+    required String modelId,
+    required String? baseUrl,
+    required String? customProviderName,
+  }) async {
+    if (_restoreBindingSatisfied(modelId, baseUrl, customProviderName)) {
+      return; // already on this binding (the boot applied it)
+    }
+    // The restore mutates CLI fields before the roles re-pin runs — a
+    // FAILED re-pin rolls them all back (T3), so capture the originals
+    // FIRST.
+    final previous = _captureRestoreWiring();
+    final entry = _pinnedRestoreEntry(customProviderName);
+    final built = _buildRestoredModel(
+      providerKind: providerKind,
+      modelId: modelId,
+      baseUrl: baseUrl,
+      entry: entry,
+    );
+    if (built == null) return;
+    // G3 restore gate (gh-178): a persisted triple that no longer forms a
+    // valid binding is never applied mixed. Auto-repair keeps the
+    // boot-coherent model with a loud diagnostic naming the conflicted
+    // fields and the repair (OQ3: repair, not halt — the session still
+    // boots, on a coherent quadruple). The resolvability is the REAL
+    // verdict — normally redundant with [_buildRestoredModel]'s guard
+    // (an unresolvable kind returns null above), but it keeps the
+    // decision core's three-way contract honest at the wired site.
+    final gate = restoreGateDecision(
+      providerResolvable: resolveCliProviderSpec(providerKind) != null,
+      bindingResolves: _restoreBindingResolves(providerKind, modelId, baseUrl),
+      persistedModelId: modelId,
+      providerName: providerKind,
+      repairModelId: _agent.state.model.id,
+    );
+    if (gate.verdict != RestoreGateVerdict.restore) {
+      // `repairModelId` IS the id the session repairs/keeps to (OQ3): the
+      // boot-coherent model. The refuse verdict (unresolvable provider)
+      // carries none — the boot model is kept there too.
+      final keptId = gate.repairModelId ?? _agent.state.model.id;
+      io.writeln(_style.dim('note: ${gate.refusal!.message}'));
+      io.writeln(
+        _style.dim(
+          '      keeping $keptId '
+          '(${_agent.state.model.provider} @ ${_agent.state.model.baseUrl})',
+        ),
+      );
+      return;
+    }
+    final spec = resolveCliProviderSpec(built.provider)!;
+    // The resolved KIND feeds the session state and the stream factory —
+    // a raw name-shaped id here would throw at providerStreamFunction
+    // (the crash this PR removes at boot) and persist itself back into
+    // the state file via onProviderChanged (issue #772 review).
+    _activeCustomName = entry?.name;
+    _providerKind = spec.kind;
+    final key = _providerKeyFor(spec, built.baseUrl) ?? '';
+    _apiKey = key;
+    _explicitToken = false;
+    if (_restoreUsesRolesChain(entry, key)) {
+      final applied = _repinRolesChain(
+        resolver: config.modelRolesResolver!,
+        spec: spec,
+        built: built,
+        entry: entry,
+        key: key,
+        previous: previous,
+      );
+      if (!applied) return;
+    } else {
+      _streamFunction = _catalogStreamFunction(
+        spec.kind,
+        key,
+        // _activeCustomName was JUST assigned from entry?.name above —
+        // state it explicitly (entry bind keys the entry name).
+        providerName: entry?.name ?? spec.name,
+      );
+      _agent.streamFunction = _streamFunction;
+    }
+    if (key.isEmpty) {
+      io.writeln(_style.dim(_restoreKeyHint(entry, built.baseUrl)));
+    } else {
+      _noteKeyShadowing(entry, built.baseUrl);
+    }
+    await _finishRestoreBinding(session, built: built, entry: entry);
+  }
+
+  /// Whether the CLI is already on the binding the restore would apply —
+  /// the boot applied this folder's state, and a re-apply must not
+  /// restart the model cache or append a duplicate `model_change`.
+  bool _restoreBindingSatisfied(
+    String modelId,
+    String? baseUrl,
+    String? customProviderName,
+  ) {
+    final current = _agent.state.model;
+    return current.id == modelId &&
+        current.baseUrl == baseUrl &&
+        (customProviderName == null || _activeCustomName == customProviderName);
+  }
+
+  /// Whether the restore re-points the stream through the roles resolver:
+  /// roles-driven boots with a resolver. A genuinely keyless endpoint (no
+  /// entry key slot and nothing resolved) is excluded — roles chains
+  /// cannot form there by design, so the restore keeps the legacy direct
+  /// wiring, exactly as before gh-1000.
+  bool _restoreUsesRolesChain(CustomProviderEntry? entry, String key) {
+    if (!_rolesDriven) return false;
+    if (config.modelRolesResolver == null) return false;
+    return !(key.isEmpty && entry?.keyName == null);
+  }
+
+  /// The saved entry a pinned NAME resolves to. A name that no longer
+  /// resolves must not unpin silently (E1, leaf-pin variant) — say so,
+  /// exactly like the folder-state branch, before the endpoint-keyed
+  /// fallback can bind a twin account's key.
+  CustomProviderEntry? _pinnedRestoreEntry(String? customProviderName) {
+    if (customProviderName == null) return null;
+    final entry = config.customProviders?.find(customProviderName);
+    if (entry != null) return entry;
+    io.writeln(
+      _style.dim(
+        'note: saved provider "$customProviderName" is no longer '
+        'configured — resolved by endpoint (model kept)',
+      ),
+    );
+    return null;
+  }
+
+  /// G3 (gh-178): whether the persisted `(kind, modelId, baseUrl)` triple
+  /// still resolves through the ONE validating constructor. A null
+  /// persisted endpoint resolves the record default first — the same
+  /// resolution `buildCliDefaultModel` applies — so legacy states without
+  /// a recorded baseUrl are judged on the triple they would actually bind.
+  /// Unknown/private endpoints pass leniently (nothing to judge them by);
+  /// canonical-endpoint dialect/family conflicts refuse.
+  bool _restoreBindingResolves(
+    String providerKind,
+    String modelId,
+    String? baseUrl,
+  ) {
+    final effective =
+        baseUrl?.trim() ??
+        resolveCliProviderSpec(providerKind)?.defaultBaseUrl ??
+        '';
+    if (effective.isEmpty) return true;
+    try {
+      ProviderModelBinding.resolve(
+        providerKind: providerKind,
+        modelId: modelId,
+        baseUrl: effective,
+        provenance: BindingProvenance.restore,
+      );
+      return true;
+    } on ConfigException {
+      return false;
+    }
+  }
+
+  /// Builds the restored model with the issue-#964 authHeader precedence:
+  /// the PINNED entry's own header wins — two entries can share one
+  /// endpoint (the gh-1000 twin fixture), and the endpoint-first scan
+  /// would otherwise bind the twin's (missing) header. Returns null (the
+  /// stale note is printed) when the saved kind no longer resolves.
+  Model? _buildRestoredModel({
+    required String providerKind,
+    required String modelId,
+    required String? baseUrl,
+    required CustomProviderEntry? entry,
+  }) {
+    try {
+      return buildCliDefaultModel(
+        providerKind,
+        modelId: modelId,
+        baseUrl: baseUrl,
+        authHeader:
+            entry?.authHeader ??
+            authHeaderForBaseUrl(
+              config.customProviders?.entries ?? const [],
+              baseUrl,
+            ),
+        // The same precedence for the CodeMie project (issue #1941): a
+        // restored CodeMie endpoint without its header bills the user's
+        // DEFAULT project, not the selected one.
+        projectHeader:
+            entry?.project ??
+            projectHeaderForBaseUrl(
+              config.customProviders?.entries ?? const [],
+              baseUrl,
+            ),
+      );
+    } on ConfigException {
+      io.writeln(
+        _style.dim(
+          'note: saved model state is stale ($providerKind) — '
+          'keeping ${_agent.state.model.id}',
+        ),
+      );
+      return null;
+    }
+  }
+
+  /// Captures the CLI wiring fields the restore is about to mutate, so a
+  /// FAILED roles re-pin can roll every one of them back (T3).
+  _RestoreWiring _captureRestoreWiring() => (
+    customName: _activeCustomName,
+    providerKind: _providerKind,
+    apiKey: _apiKey,
+    explicitToken: _explicitToken,
+    streamFunction: _streamFunction,
+  );
+
+  /// Rolls every captured wiring field back onto the CLI (and the agent's
+  /// live stream) — the model that serves keeps describing itself
+  /// consistently in the status bar and the transcript.
+  void _rollbackRestoreWiring(_RestoreWiring previous) {
+    _activeCustomName = previous.customName;
+    _providerKind = previous.providerKind;
+    _apiKey = previous.apiKey;
+    _explicitToken = previous.explicitToken;
+    _streamFunction = previous.streamFunction;
+    _agent.streamFunction = previous.streamFunction;
+  }
+
+  /// Roles mode: re-pin the default chain onto the restored provider —
+  /// the same wiring a live `/provider` switch builds. The resolved key
+  /// material is seeded under the pinned key name FIRST: a store-backed
+  /// key never reaches the resolver's startup snapshot. Returns true on
+  /// success; on a FAILED re-pin (`setRoleChain` mutates before
+  /// `applyToAgent` throws) rolls the chain AND the captured CLI fields
+  /// back and prints the named notes — never a raw 401 on the next turn
+  /// (AC3/E3).
+  bool _repinRolesChain({
+    required ModelRolesResolver resolver,
+    required ProviderSpec spec,
+    required Model built,
+    required CustomProviderEntry? entry,
+    required String key,
+    required _RestoreWiring previous,
+  }) {
+    final pinnedKeyName =
+        entry?.keyName ??
+        _rolesKeyNameFor(spec.name, built.baseUrl) ??
+        _scopedKeyNameForNonDefault(spec.name, built.baseUrl);
+    if (pinnedKeyName != null && key.isNotEmpty) {
+      resolver.addSecret(pinnedKeyName, key);
+    }
+    // The resolver's default chain is captured too: a FAILED re-pin must
+    // restore it (setRoleChain mutates before applyToAgent throws).
+    final previousChain =
+        resolver.config.roles[defaultModelRole] ?? const <ModelRef>[];
+    try {
+      resolver.setDefaultChain([
+        ModelRef(
+          provider: spec.name,
+          modelId: built.id,
+          baseUrl: built.baseUrl,
+          contextWindow: built.contextWindow,
+          maxTokens: built.maxTokens,
+          apiKeyName: pinnedKeyName,
+          // A saved entry carrying this endpoint's authHeader (issue
+          // #964) must survive the restore — the roles stream serves
+          // from the CHAIN entry, so a header-less ModelRef 401s even
+          // though the agent state's model carries the header.
+          authHeader: built.authHeader,
+          // Same for the CodeMie project (issue #1941): a header-less
+          // ModelRef silently re-attributes every chain request to the
+          // user's DEFAULT project.
+          project: built.codeMieProject,
+        ),
+      ]);
+      resolver.applyToAgent(_agent);
+      _streamFunction = _agent.streamFunction;
+      return true;
+    } on ConfigException catch (error) {
+      if (previousChain.isNotEmpty) {
+        resolver.setRoleChain(defaultModelRole, previousChain);
+      }
+      _rollbackRestoreWiring(previous);
+      io.writeln(_style.dim('note: ${error.message}'));
+      io.writeln(
+        _style.dim(
+          'keeping ${_agent.state.model.id} (${_agent.state.model.provider})'
+          ' — set the key, then restart this session to retry the restore',
+        ),
+      );
+      return false;
+    }
+  }
+
+  /// Completes an applied restore: invalidates the previous provider's
+  /// cached model list, moves the agent onto the built model, records the
+  /// binding into the session (the next restore's leaf pin) and says so.
+  Future<void> _finishRestoreBinding(
+    Session session, {
+    required Model built,
+    required CustomProviderEntry? entry,
+  }) async {
+    // The cached model list belongs to the previous provider/endpoint.
+    _modelCache = const [];
+    _modelContextWindows = const {};
+    _modelMaxTokens = const {};
+    _lastModelList = null;
+    unawaited(_refreshModelCache());
+    _agent.state.model = built;
+    await session.appendModelChange(
+      provider: built.provider,
+      modelId: built.id,
+      baseUrl: built.baseUrl,
+      customProvider: entry?.name,
+    );
+    io.writeln(
+      _style.dim('restored ${built.id} (${built.provider}) from this folder'),
+    );
+  }
+
+  /// The re-auth note for a restore whose key did not resolve: names the
+  /// provider entry (or endpoint), the expected key slot, and the fix —
+  /// keys and values are never printed (AC2/E3).
+  String _restoreKeyHint(CustomProviderEntry? entry, String? baseUrl) {
+    final keyName =
+        entry?.keyName ??
+        (baseUrl == null ? null : CustomProviderRegistry.keyNameFor(baseUrl));
+    if (keyName == null) {
+      return 'no key resolved — run /provider to re-authenticate';
+    }
+    final target = entry != null ? 'provider "${entry.name}"' : baseUrl;
+    return 'no key for $target — set it with /key set $keyName <value>'
+        '${entry != null ? ' (or /provider ${entry.name})' : ''}';
+  }
+
+  /// E2: when the restored key slot exists in BOTH the environment and the
+  /// store with DIFFERENT values, note the provenance order (the env value
+  /// is the one sent). The detection and wording are the shared
+  /// [envShadowingNote] rule — the boot (bin/fah.dart) and the banner hint
+  /// (key_status) use the same one.
+  void _noteKeyShadowing(CustomProviderEntry? entry, String? baseUrl) {
+    final keyName = entry?.keyName;
+    if (keyName == null) return;
+    final note = envShadowingNote(
+      keyName,
+      config.envVarValue?.call(keyName),
+      config.secureKeys?.read(keyName),
+    );
+    if (note == null) return;
+    io.writeln(_style.dim('note: $note'));
+  }
+
+  /// The label for a startup-resumed session's replay header, or null when
+  /// this run started a fresh session (no messages to replay).
+  Future<String?> _resumedSessionLabel() async {
+    if (_agent.state.messages.isEmpty) return null;
+    final session = _session;
+    if (session == null) return null;
+    return await session.getSessionName() ?? (await session.getMetadata()).id;
+  }
+
+  /// After an interactive run ends, prints the command that picks this
+  /// session back up (kimi prints the resume hint on exit too). Skipped for
+  /// sessions with nothing persisted yet — resuming those is pointless.
+  Future<void> printSessionResumeHint() async {
+    final hint = await sessionResumeHint();
+    if (hint != null) io.writeln(_style.dim(hint));
+  }
+}

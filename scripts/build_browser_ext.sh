@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Package browser_ext/ into build/fa-extension.zip (runtime files only:
+# manifest, sw/, content/, panel/ — README, dart/ sources, test/, and
+# compiled artifacts' side files stay out).
+# `--with-app` first builds the Flutter web app (flutter_app/ → build/web) and
+# bundles it as browser_ext/app/ so the side panel hosts the full fa app.
+# browser_ext/app/ is a build artifact (gitignored, never committed).
+# Compiles the embedded Dart agent first when a Dart SDK is available
+# (scripts must FAIL LOUDLY on compile errors — CI always builds it).
+# Without dart: a previously built sw/agent.js ships if present, else the
+# zip is scaffold-only with a warning (never a failure).
+# Runs green on ubuntu-latest and macOS: needs zip + python3|node|grep.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+with_app=0
+case "${1:-}" in
+  --with-app) with_app=1 ;;
+  "") ;;
+  *) echo "unknown option: $1 (usage: $0 [--with-app])" >&2; exit 1 ;;
+esac
+
+manifest=browser_ext/manifest.json
+
+# The manifest carries // comments (Chrome's parser is lenient, strict
+# JSON validators are not) — strip them before validating, the same
+# regex test/browser_ext/chrome_driver.dart uses.
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c '
+import json, re, sys
+raw = open(sys.argv[1]).read()
+json.loads(re.sub(r"^\s*//.*$", "", raw, flags=re.M))
+' "$manifest"
+elif command -v node >/dev/null 2>&1; then
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8").replace(/^\s*\/\/.*$/gm, ""))' "$manifest"
+else
+  grep -q '"manifest_version"[[:space:]]*:[[:space:]]*3' "$manifest"
+fi
+
+# --- Vendored engine assets (gh-1630 I2): fetched ONLY from
+# browser_ext/vendor.lock.json, SHA-256-verified, fail-loud on mismatch.
+# Covers the offscreen run_script runtimes AND the panel app's on-device
+# engines (pyodide/quickjs/sql.js/webllm/transformers/litert). ---
+"$(dirname "$0")/fetch_vendor_assets.sh"
+
+# --- Embedded agent (dart2js). Output is a build artifact: never committed. ---
+agent_js=browser_ext/sw/agent.js
+if command -v dart >/dev/null 2>&1; then
+  echo "building embedded agent (dart2js)…"
+  ( cd browser_ext/dart \
+    && dart pub get >/dev/null \
+    && dart compile js -O2 -o ../sw/agent.js agent_main.dart )
+  rm -f "${agent_js}.deps" "${agent_js}.map"
+elif [ -f "$agent_js" ]; then
+  echo "dart SDK not found — shipping prebuilt $agent_js"
+else
+  echo "WARNING: no dart SDK and no prebuilt sw/agent.js — scaffold-only zip (embedded agent disabled)"
+fi
+
+# --- Optional fa web app (flutter_app → browser_ext/app). Build artifact. ---
+if [ "$with_app" -eq 1 ]; then
+  if ! command -v flutter >/dev/null 2>&1; then
+    echo "ERROR: --with-app passed but flutter is not installed — cannot build browser_ext/app/" >&2
+    exit 1
+  fi
+  echo "building fa web app (flutter build web --release)…"
+  # gh-1265 AC2: resolve against the committed lockfile — in the
+  # build-macos release job this script's pub get is the ONLY
+  # flutter_app resolution, so a plain resolve would float a
+  # pubspec/lockfile skew into a green release build.
+  # --base-href MUST match the panel-relative location: panel.js resolves
+  # 'app/index.html' against panel/panel.html, so the bundle lives at
+  # browser_ext/panel/app/ (a root-level copy is invisible to the panel).
+  ( cd flutter_app && flutter pub get --enforce-lockfile >/dev/null
+    # .env is gitignored but declared as a Flutter asset (pubspec.yaml),
+    # so the web build dies bundling it when the file is absent (#140).
+    # Create it AFTER pub get — pub get removes a placeholder touched
+    # earlier (runs 34593431895, 34596707238) — and keep it non-empty:
+    # the populated placeholder is the shape build-macos.yml's app job
+    # has shipped green. A real local .env (developer keys) is never
+    # overwritten.
+    if [ ! -f .env ]; then
+      printf 'OPENROUTER_API_KEY=\nMODEL_ID=\nBASE_URL=\n' > .env
+    fi
+    FLUTTER_WEB_CANVASKIT_URL=./canvaskit/ \
+    flutter build web --release --pwa-strategy=none --base-href=/panel/app/ \
+      --dart-define=FA_HOST=extension )
+  rm -rf browser_ext/panel/app
+  mkdir -p browser_ext/panel/app
+  cp -R flutter_app/build/web/. browser_ext/panel/app/
+  # Shared prune (scripts/prune_flutter_assets.sh — same rulebook as every
+  # packaging surface): assets/wasm is mobile-only (WasiSandboxShell via
+  # env_factory_io.dart; the panel compiles env_factory_stub and runs
+  # python/js/sqlite from cdn.jsdelivr.net, live interpreter = vendored
+  # pyodide in offscreen/), plus the pub package's test fixtures
+  # (coach_anny.glb, 5.6 MB) — dead weight here.
+  bash scripts/prune_flutter_assets.sh browser_ext/panel/app/assets \
+    assets/wasm packages/js_widget_runtime/test
+  # CWS single-manifest rule (#291): the Flutter web build ships a PWA
+  # manifest (panel/app/manifest.json, <link rel=manifest> in its
+  # index.html) — the Chrome Web Store hard-rejects any package with more
+  # than one manifest.json, and inside an extension page the PWA manifest
+  # is functionally dead (extension pages are not installable PWAs). The
+  # STAGED copy is DELETED-and-delinked, not renamed: nothing in the
+  # extension consumes it, so an app.webmanifest rename would only ship
+  # dead weight and keep a dead link. Sources stay untouched — this dir
+  # is a gitignored build artifact re-copied from flutter_app/build/web
+  # on every --with-app run; the unpacked dev flow (AC5) loads the same
+  # stripped tree and boots identically (the panel never reads the PWA
+  # manifest). Idempotent: a Flutter template without the link tag is a
+  # no-op (#291 E3).
+  python3 scripts/ext_package_guard.py strip browser_ext/panel/app
+  # The extension CSP forbids remote hosts: point the bootstrap at the
+  # bundled canvaskit copy (FLUTTER_WEB_CANVASKIT_URL does not reach the
+  # generated bootstrap in this flutter).
+  python3 - <<'PYS'
+import glob
+for f in glob.glob('flutter_app/build/web/flutter_bootstrap.js') + glob.glob('browser_ext/panel/app/flutter_bootstrap.js'):
+    t = open(f).read()
+    t = t.replace('https://www.gstatic.com/flutter-canvaskit/', './canvaskit/')
+    t = t.replace('https:\\/\\/www.gstatic.com\\/flutter-canvaskit\\/', '.\\/canvaskit\\/')
+    t = t.replace('"https://www.gstatic.com/flutter-canvaskit"', '"./canvaskit"')
+    open(f, 'w').write(t)
+PYS
+  # The engine requests canvaskit under <engineRevision>/chromium/; the
+  # build lays the copies flat — mirror the layout the bootstrap asks for.
+  # Extract the FULL engine revision from the bootstrap config — a bounded
+  # grep like [a-f0-9]{32} silently truncates the 40-char SHA1 and the
+  # engine then 404s on canvaskit/<rev>/chromium/ (regression).
+  REV=$(grep -o '"engineRevision":"[a-f0-9]*"' flutter_app/build/web/flutter_bootstrap.js | head -1 | sed 's/.*":"//;s/"//')
+  if [ -n "$REV" ]; then
+    if [ ${#REV} -ne 40 ]; then
+      echo "FATAL: engineRevision '$REV' is not 40 hex chars" >&2
+      exit 1
+    fi
+    # Copy from the BUILD OUTPUT, never from the bundle copy itself —
+    # the rev dir lives inside the bundle copy, so self-copying there
+    # recurses into itself (File name too long on the next run).
+    mkdir -p "browser_ext/panel/app/canvaskit/$REV"
+    cp -R "flutter_app/build/web/canvaskit/." "browser_ext/panel/app/canvaskit/$REV/"
+    for f in canvaskit.js canvaskit.wasm; do
+      [ -f "browser_ext/panel/app/canvaskit/$REV/chromium/$f" ] || {
+        echo "FATAL: canvaskit/$REV/chromium/$f missing after mirror" >&2
+        exit 1
+      }
+    done
+    echo "canvaskit mirrored to canvaskit/$REV/chromium/ (verified)"
+    # canvaskit dedup (#1096 AC2): the engine only ever requests
+    # canvaskit/<rev>/chromium/... (FLUTTER_WEB_CANVASKIT_URL=./canvaskit/
+    # + the engineRevision the bootstrap pins), so the flat top-level
+    # copy from build/web — canvaskit.js/wasm, chromium/, webparagraph/ —
+    # is unreachable dead weight (~13MB duplicate subtree). Keep the rev
+    # mirror (the verified-complete copy), drop its flat siblings.
+    find browser_ext/panel/app/canvaskit -mindepth 1 -maxdepth 1 ! -name "$REV" -exec rm -rf {} +
+    echo "canvaskit deduplicated to canvaskit/$REV/ (#1096)"
+  else
+    echo "FATAL: engineRevision not found in flutter_bootstrap.js" >&2
+    exit 1
+  fi
+  # The extension package must carry NO remote code (gh-1630 Blue Argon)
+  # and its CSP forbids remote scripts: stage the on-device engine loaders
+  # (WebLLM / transformers.js / LiteRT-LM) onto the package-local vendor
+  # dir instead of the CDN imports the web build uses. Standalone,
+  # idempotent script (test/browser_ext/cws_compliance_test.dart exercises
+  # it) — replaces the pre-gh-1630 ondevice_stub.js failure shim: the
+  # engines are vendored now, so they LOAD instead of degrading.
+  python3 scripts/stage_extension_panel.py --app-dir browser_ext/panel/app
+  echo "bundled fa web app (browser_ext/panel/app/)"
+fi
+
+# A staged app from an earlier --with-app run can outlive the flag (the
+# dir is gitignored and never cleaned): without this, a plain local build
+# zips panel/app/manifest.json verbatim and the guard fails the package
+# (CWS single-manifest rule, #291). Strip unconditionally — idempotent.
+if [ -d browser_ext/panel/app ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    python3 scripts/ext_package_guard.py strip browser_ext/panel/app
+  else
+    echo "WARNING: no python3 — cannot strip browser_ext/panel/app;" \
+         "the packaging guard below hard-requires python3 anyway" >&2
+  fi
+fi
+
+mkdir -p build
+rm -f build/fa-extension.zip
+
+# CWS-strict manifest (owner report 2026-10-11): the store uploader
+# rejects // comments ("manifest.json:17:2: missing value") AND the dev
+# "key" field ("key field is not allowed in manifest" — CWS owns the
+# key, the source pins it only for a stable local dev id). The zip must
+# carry a comment-stripped, key-less manifest while the source keeps
+# both. Staged under build/pack/ so the zip entry name stays exactly
+# "manifest.json". The ext_package_guard check below re-parses the
+# packaged manifest STRICTLY and rejects "key", so a regression here
+# fails the build, never the store upload.
+mkdir -p build/pack
+if command -v python3 >/dev/null 2>&1; then
+  python3 -c '
+import json, re, sys
+raw = open(sys.argv[1]).read()
+m = json.loads(re.sub(r"^\s*//.*$", "", raw, flags=re.M))
+m.pop("key", None)
+open(sys.argv[2], "w").write(json.dumps(m, indent=2) + "\n")
+' "$manifest" build/pack/manifest.json
+elif command -v node >/dev/null 2>&1; then
+  node -e 'const fs=require("fs"); const m=JSON.parse(fs.readFileSync(process.argv[1], "utf8").replace(/^\s*\/\/.*$/gm, "")); delete m.key; fs.writeFileSync(process.argv[2], JSON.stringify(m, null, 2) + "\n")' "$manifest" build/pack/manifest.json
+else
+  echo "WARNING: no python3/node — packaging the RAW source manifest;" \
+       "the strict guard below is expected to fail (CWS needs stripped JSON)" >&2
+  cp "$manifest" build/pack/manifest.json
+fi
+
+if command -v zip >/dev/null 2>&1; then
+  runtime="sw content panel icons offscreen.html offscreen vendor"
+  # panel/app rides inside the panel/ dir — no separate root entry.
+  # The stripped CWS manifest rides from build/pack/ (the verbatim source
+  # manifest.json stays out of the zip on purpose).
+  ( cd browser_ext && zip -qr ../build/fa-extension.zip $runtime \
+      -x 'sw/agent.js.map' 'sw/agent.js.deps' )
+  ( cd build/pack && zip -q ../fa-extension.zip manifest.json )
+else
+python3 - <<'PY'
+import os, zipfile
+RUNTIME_DIRS = ("sw", "content", "panel", "icons", "offscreen", "vendor")
+SKIP_NAMES = {"README.md", "agent.js.map", "agent.js.deps"}
+with zipfile.ZipFile("build/fa-extension.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    # build/pack/manifest.json is the comment-stripped CWS copy made above.
+    z.write("build/pack/manifest.json", "manifest.json")
+    z.write("browser_ext/offscreen.html", "offscreen.html")
+    for d in RUNTIME_DIRS:
+        for root, _, files in os.walk(os.path.join("browser_ext", d)):
+            for f in files:
+                if f in SKIP_NAMES:
+                    continue
+                p = os.path.join(root, f)
+                z.write(p, os.path.relpath(p, "browser_ext"))
+PY
+fi
+
+echo "build/fa-extension.zip: $(wc -c < build/fa-extension.zip) bytes"
+
+# CWS shape guard (#291): the store's structural rules asserted on the
+# REAL artifact every build — exactly one manifest.json at the root, no
+# duplicate/junk/empty entries, MV3 root manifest, referenced icons
+# present. Hard failure (::error + exit 1) so a nested manifest (a
+# Flutter upgrade, a new subdir) breaks HERE — in CI and locally — never
+# again at store upload. Runs for every zip this script makes, with or
+# without the bundled app.
+python3 scripts/ext_package_guard.py check build/fa-extension.zip
+
+# Keep an unpacked copy beside the zip: load THIS directory once via
+# chrome://extensions -> "Load unpacked"; after every rebuild a single
+# extension Reload picks the new build up.
+rm -rf build/fa-extension
+python3 - <<'PY'
+import zipfile
+with zipfile.ZipFile("build/fa-extension.zip") as z:
+    z.extractall("build/fa-extension")
+PY
+echo "build/fa-extension/ (unpacked — load this in chrome://extensions)"

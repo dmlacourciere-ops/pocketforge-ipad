@@ -1,0 +1,481 @@
+// Issue #467 grid integration suite (owner-directed): the REAL CLI runs in
+// a PTY against a scripted mock LLM (multi-second tool call keeps the busy
+// ticker ticking), the screen is rendered by a real terminal emulator (the
+// in-repo xterm — the dart twin of the pyte probe), and assertions run on
+// the RENDERED GRID at 100x40 AND narrow 80x24:
+//
+//   1. a long composed input soft-wraps across rows;
+//   2. the footer/status row appears EXACTLY once, on its own bottom row,
+//      never merged with the composer or the ticker row;
+//   3. the ticker row updates IN PLACE — the grid diff between two ticks
+//      touches only the busy row, and inside it only the spinner glyph and
+//      the seconds cell;
+//   4. zero foreign/bleed-through rows mid-run (the composer region carries
+//      only composer content).
+@Tags(['io', 'integration'])
+@Timeout(Duration(minutes: 5))
+library;
+
+import 'dart:io';
+
+import 'package:fa_llm_mock/fa_llm_mock.dart';
+import 'package:test/test.dart';
+
+import 'pty_harness.dart';
+
+const _composed =
+    'please check whether the composer wraps this very long line correctly '
+    'across several terminal rows without ever sliding the beginning of the '
+    'sentence out of view at any point during a long busy run ok';
+
+void main() {
+  for (final (columns, rowsCount) in [(100, 40), (80, 24)]) {
+    test('grid integrity mid-run at ${columns}x$rowsCount', () async {
+      final tempHome = Directory.systemTemp.createTempSync('fa_tui_467_grid_');
+      // Unique SHORT cwd (the #936/#938 race class — the fixed /tmp/fa467ws
+      // raced the loop's own second width test under --concurrency=4).
+      // /tmp with a 1-char prefix keeps the resolved mac path
+      // (/private/tmp/<name>, 20 chars) byte-length-equal to the old fixed
+      // dir: the status row is tail-truncated and line 122 asserts the
+      // model slug at 80 columns — 'fa467wsXXXXXX' (26) erodes the slug's
+      // margin as the ctx segment grows mid-run.
+      final workspace = Directory('/tmp').createTempSync('f');
+      addTearDown(() => workspace.deleteSync(recursive: true));
+      final server = await MockLlmServer.start()
+        ..enqueueToolCall('bash', '{"command": "sleep 60"}')
+        ..enqueueText('sleep finished');
+      addTearDown(server.stop);
+      File('${tempHome.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('''
+provider: openai-completions
+model: mock-model
+baseUrl: ${server.baseUrl}
+mode: code
+approvalMode: yolo
+allowedTools: []
+tui:
+  classic: true  # the grid/chrome suites pin the classic TUI design (see #467); the band redesign (#805-#807) has its own surface
+''');
+
+      final harness = await FaCliHarness.spawn(
+        workingDirectory: workspace.path,
+        extraEnv: {'HOME': tempHome.path},
+        columns: columns,
+        rows: rowsCount,
+      );
+      addTearDown(() async {
+        await harness.close();
+        tempHome.deleteSync(recursive: true);
+      });
+
+      await harness.waitForBoot();
+      harness.sendText('run the long sleep now');
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      harness.sendEnter();
+      await harness.waitForText('· submit', timeout: const Duration(seconds: 20));
+
+      // Compose the long line mid-run, then let the 1 Hz ticks repaint.
+      for (var i = 0; i < _composed.length; i += 10) {
+        harness.sendText(
+          _composed.substring(i, i + 10 > _composed.length
+              ? _composed.length
+              : i + 10),
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      // gh-1026: readiness handshake before the grid math — the composed
+      // line must actually be PAINTED in the composer region (the old
+      // fixed 1200ms sleep raced the render loop on loaded hosts and
+      // sampled half-echoed frames). The sleep above gives the bounded
+      // sampling below 20s+25s of budget inside the busy window; the
+      // teardown kills the CLI, so the extra sleep never costs wall time.
+      await _waitForComposedInRegion(harness, columns);
+      final (gridA, gridB) = await _oneRowTickDiffPair(harness);
+
+      // ── (1) the composed line soft-wraps across rows ───────────────────
+      final rule = '─' * columns;
+      final rules = <int>[
+        for (var i = 0; i < gridA.length; i++)
+          if (gridA[i].trim() == rule) i,
+      ];
+      expect(rules.length, greaterThanOrEqualTo(2), reason: 'input frame');
+      final region = gridA
+          .sublist(rules[rules.length - 2] + 1, rules.last)
+          .map((l) => l.trimRight())
+          .toList();
+      expect(region.length, greaterThanOrEqualTo(3),
+          reason: 'wrapped, not one row: ${region.join(" | ")}');
+      final visible = region.map((l) => l.replaceAll(' ', '')).join();
+      expect(visible, _composed.replaceAll(' ', ''));
+      expect(region.first.trimLeft().startsWith('please '), isTrue);
+
+      // ── (2) the status row: EXACTLY once, own bottom row, never merged ──
+      final statusRows = [
+        for (final row in gridA)
+          if (row.contains(' · turn ')) row,
+      ];
+      expect(statusRows.length, 1,
+          reason: 'status rendered exactly once; screen:\n'
+              '${gridA.where((l) => l.trim().isNotEmpty).join("\n")}');
+      final statusRow = statusRows.single.trimRight();
+      // Merging with the composer would put composed text left of the cwd.
+      expect(statusRow.trimLeft().startsWith('/'), isTrue,
+          reason: 'status opens with the cwd, not composer text');
+      expect(statusRow, contains('ctx '));
+      expect(statusRow, contains('mock-model'));
+      // Own bottom row: the status is the LAST non-blank grid row and the
+      // row right above it is the input zone's bottom rule.
+      var last = gridA.length - 1;
+      while (last > 0 && gridA[last].trim().isEmpty) {
+        last--;
+      }
+      expect(gridA[last].contains(' · turn '), isTrue,
+          reason: 'status is the bottom row');
+      expect(gridA[last - 1].trim(), rule,
+          reason: 'a full-width rule separates the composer from the status');
+
+      // ── (3) the ticker updates IN PLACE ─────────────────────────────────
+      // _oneRowTickDiffPair already guarantees exactly ONE differing row
+      // (anything else resamples); what remains here is the CONTRACT:
+      // that row must be the busy ticker, and inside it only the spinner
+      // glyph and the seconds cell may move.
+      var busyIdx = -1;
+      for (var i = 0; i < gridA.length; i++) {
+        if (gridA[i] != gridB[i]) {
+          busyIdx = i;
+        }
+      }
+      expect(busyIdx, greaterThanOrEqualTo(0),
+          reason: 'the sampled pair must differ in the busy row');
+      // gh-1446 retired the face zone (issue #1374): the row is plain
+      // text at column 0, only the seconds digits move; every other
+      // column stays pinned byte-for-byte.
+      String masked(String row) => row.replaceAll(RegExp(r'\d'), '#');
+      final busyA = gridA[busyIdx];
+      final busyB = gridB[busyIdx];
+      expect(busyA.isNotEmpty, isTrue);
+      expect(masked(busyA), masked(busyB),
+          reason: 'inside the busy row only spinner + seconds may move:\n'
+              '$busyA\n$busyB');
+      // And it really is the ticker row.
+      expect(busyA, contains('· submit'));
+
+      // ── (4) zero foreign rows in the composer region ────────────────────
+      for (final row in region) {
+        expect(row, isNot(contains('· submit')));
+        expect(row, isNot(contains('sh-1')));
+        expect(row, isNot(contains('sleep finished')));
+        expect(row.runes.length, lessThanOrEqualTo(columns));
+      }
+    });
+  }
+
+  /// NEW AC (owner evidence #3, RED first): mid-run with a 500+ char tool
+  /// row AND a 300-char composed line, the frame must stay EXACTLY
+  /// [rowsCount] tall across consecutive ticks — zero hardware-wrapped
+  /// rows anywhere, no board-snapshot residue, status pinned to the bottom.
+  for (final (columns, rowsCount) in [(100, 40), (80, 24)]) {
+    test('zero wrapped rows with overlong tool output at '
+        '$columns x$rowsCount', () async {
+      final tempHome = Directory.systemTemp.createTempSync('fa_tui_467_wrap_');
+      final ascii520 = 'gh issue create --title "${'x' * 500}"';
+      final cjkCommand = 'echo 終${'終' * 60}終'; // wide glyphs: unit-clip trap
+      String jq(String s) =>
+          '"${s.replaceAll(r'\', r'\\').replaceAll('"', r'\"')}"';
+      final server = await MockLlmServer.start()
+        ..enqueueToolCall('bash', '{"command": "sleep 20"}')
+        ..enqueueToolCall('bash', '{"command": ${jq(ascii520)}}')
+        ..enqueueToolCall('bash', '{"command": ${jq(cjkCommand)}}')
+        ..enqueueText('all done');
+      addTearDown(server.stop);
+      File('${tempHome.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('''
+provider: openai-completions
+model: mock-model
+baseUrl: ${server.baseUrl}
+mode: code
+approvalMode: yolo
+allowedTools: []
+tui:
+  classic: true  # the grid/chrome suites pin the classic TUI design (see #467); the band redesign (#805-#807) has its own surface
+''');
+      final workspace = Directory('/tmp').createTempSync('f');
+      addTearDown(() => workspace.deleteSync(recursive: true));
+
+      final harness = await FaCliHarness.spawn(
+        workingDirectory: workspace.path,
+        extraEnv: {'HOME': tempHome.path},
+        columns: columns,
+        rows: rowsCount,
+      );
+      addTearDown(() async {
+        await harness.close();
+        tempHome.deleteSync(recursive: true);
+      });
+
+      await harness.waitForBoot();
+      final composed300 = 'wrap me ' * 43; // 301 chars — several wrapped rows
+      harness.sendText(composed300.substring(0, 300));
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      harness.sendEnter();
+      await harness.waitForText(
+        '· submit',
+        timeout: const Duration(seconds: 20),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 2500));
+
+      final grids = <List<String>>[
+        _grid(harness),
+        await Future<void>.delayed(
+          const Duration(milliseconds: 1200),
+        ).then((_) => _grid(harness)),
+        await Future<void>.delayed(
+          const Duration(milliseconds: 1200),
+        ).then((_) => _grid(harness)),
+      ];
+
+      for (var tick = 0; tick < grids.length; tick++) {
+        final grid = grids[tick];
+        expect(grid.length, rowsCount,
+            reason: 'tick $tick: frame height drifted — a row wrapped');
+        // The status stays the BOTTOM row: any wrap above pushes it off.
+        expect(grid[rowsCount - 1].contains(' · turn '), isTrue,
+            reason: 'tick $tick: status not at the bottom — drift');
+        for (final row in grid) {
+          expect(row.runes.length, lessThanOrEqualTo(columns));
+        }
+        // Board residue: a live job id is painted at most once, and no two
+        // board rows are identical (a longer previous snapshot must not
+        // survive a repaint).
+        final boardIds = [
+          for (final row in grid)
+            if (row.contains('↳ ')) row.substring(0, row.indexOf(' ·')),
+        ];
+        expect(boardIds.toSet().length, boardIds.length,
+            reason: 'tick $tick: duplicated board rows (ghost snapshot)');
+      }
+      // The composed line survived intact through the run.
+      final rules = [
+        for (var i = 0; i < grids.last.length; i++)
+          if (grids.last[i].trim() == '─' * columns) i,
+      ];
+      // The composer itself is CLEAN: the line was submitted, so the input
+      // zone holds the cursor only — submitted text must never linger (or
+      // duplicate) in the input row (issue #496).
+      final composer = grids.last
+          .sublist(rules[rules.length - 2] + 1, rules.last)
+          .map((l) => l.replaceAll(' ', ''))
+          .join();
+      expect(composer, isEmpty,
+          reason: 'the submitted line must not linger in the composer:\n'
+              '${grids.last.join('\n')}');
+      // …and the line survived the run INTACT: the history echo still
+      // carries all 300 chars, wrapped inside the width (rows already
+      // width-checked above). Probed against 2dfea311: the old check
+      // (text between the last two rules) could never pass on ANY build —
+      // it looked in the cleared composer, not the echo.
+      final onScreen = grids.last
+          .map((l) => l.replaceAll(' ', ''))
+          .join();
+      expect(onScreen, contains(composed300.substring(0, 300)
+          .replaceAll(' ', '')),
+          reason: 'the composed line must survive the run intact (echoed '
+              'into the history, width-wrapped):\n${grids.last.join('\n')}');
+    });
+  }
+  /// NEW AC (owner evidence #2, issue #503): a steering insert landing
+  /// mid-run while the composer holds a TALL multi-row text must keep the
+  /// bottom chrome distinct — the painted frame never overruns the glass
+  /// (the old build floored the _FramePlan budget at 0 while the input
+  /// zone painted all rows unconditionally: the input row overwrote the
+  /// status row, the frame rules vanished).
+  for (final (columns, rowsCount) in [(100, 40), (80, 24)]) {
+    test('steering insert keeps bottom chrome distinct at '
+        '$columns x$rowsCount', () async {
+      final tempHome = Directory.systemTemp.createTempSync('fa_tui_503_steel_');
+      final server = await MockLlmServer.start()
+        ..enqueueToolCall('bash', '{"command": "sleep 15"}')
+        ..enqueueText('steer ack done');
+      addTearDown(server.stop);
+      File('${tempHome.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('''
+provider: openai-completions
+model: mock-model
+baseUrl: ${server.baseUrl}
+mode: code
+approvalMode: yolo
+allowedTools: []
+tui:
+  classic: true  # the grid/chrome suites pin the classic TUI design (see #467); the band redesign (#805-#807) has its own surface
+''');
+      final workspace = Directory('/tmp').createTempSync('f');
+      addTearDown(() => workspace.deleteSync(recursive: true));
+
+      final harness = await FaCliHarness.spawn(
+        workingDirectory: workspace.path,
+        extraEnv: {'HOME': tempHome.path},
+        columns: columns,
+        rows: rowsCount,
+      );
+      addTearDown(() async {
+        await harness.close();
+        tempHome.deleteSync(recursive: true);
+      });
+
+      await harness.waitForBoot();
+      harness.sendText('run the held tool');
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      harness.sendEnter();
+      await harness.waitForText('· submit', timeout: const Duration(seconds: 20));
+
+      // The steering insert lands mid-run (the owner's trigger).
+      harness.sendText('steer me once');
+      harness.sendCtrlS();
+      await harness.waitForText(
+        'steered into the running turn',
+        timeout: const Duration(seconds: 20),
+      );
+
+      // …while the composer holds a TALL multi-row text (a paste-length
+      // steering draft): 40 rows of input on a 24- or 40-row glass.
+      // ctrl+o inserts composer newlines (LF would submit per line).
+      harness.sendText('\x0f' * 39);
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      harness.sendText('steer draft line 40 of forty');
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+
+      final grid = [
+        for (final line in harness.viewportLines) line.trimRight(),
+      ];
+      final rule = '─' * columns;
+      String screenShot() => grid.join('\n');
+
+      // The frame fits the glass: no overrun, no hardware scroll.
+      expect(grid.length, rowsCount,
+          reason: 'frame height drifted — the input zone overran the '
+              'glass:\n${screenShot()}');
+
+      // Status: bottom row, left edge intact (cwd, never composer text).
+      var last = grid.length - 1;
+      while (last > 0 && grid[last].trim().isEmpty) {
+        last--;
+      }
+      expect(grid[last].contains(' · turn '), isTrue,
+          reason: 'status is the bottom row:\n${screenShot()}');
+      expect(
+        grid[last].trimLeft().startsWith('/') ||
+            grid[last].trimLeft().startsWith('…'),
+        isTrue,
+        reason: 'status left edge (cwd) not overwritten: '
+            '"${grid[last]}"',
+      );
+      expect(grid[last - 1].trim(), rule,
+          reason: 'a full-width rule separates the composer from the '
+              'status:\n${screenShot()}');
+
+      // Input-frame rules both present, input zone between them.
+      final rules = [
+        for (var i = 0; i < grid.length; i++)
+          if (grid[i].trim() == rule) i,
+      ];
+      expect(rules.length, greaterThanOrEqualTo(2),
+          reason: 'input frame rules present:\n${screenShot()}');
+      expect(rules.last, last - 1,
+          reason: 'the bottom rule sits directly above the status');
+      expect(last - 1 - rules[rules.length - 2], greaterThanOrEqualTo(1),
+          reason: 'the input zone holds at least one row between the '
+              'rules:\n${screenShot()}');
+
+      // The cursor window shows the composer tail (the last typed line).
+      final composer = grid
+          .sublist(rules[rules.length - 2] + 1, rules.last)
+          .map((l) => l.replaceAll(' ', ''))
+          .join();
+      expect(composer, contains('steerdraftline40offorty'),
+          reason: 'the cursor window follows the composer tail:\n'
+              '${screenShot()}');
+    });
+  }
+}
+
+/// The rendered screen: right-trimmed rows, blank rows dropped at the tail
+/// only by the assertions that need them (grid math keeps positions).
+List<String> _grid(FaCliHarness harness) => [
+  for (final line in harness.viewportLines) line.trimRight(),
+];
+
+/// The composer region: the rows between the last two full-width rules.
+List<String> _composerRegion(List<String> grid, int columns) {
+  final rule = '─' * columns;
+  final rules = <int>[
+    for (var i = 0; i < grid.length; i++)
+      if (grid[i].trim() == rule) i,
+  ];
+  if (rules.length < 2) return const [];
+  return grid.sublist(rules[rules.length - 2] + 1, rules.last);
+}
+
+/// gh-1026 readiness handshake: poll until the composer region actually
+/// paints the FULL composed text (content compare, spaces stripped) — the
+/// deterministic replacement for the old fixed 1200ms sleep before the
+/// grid math, which sampled half-echoed frames on loaded hosts (#550
+/// family: the raw echo settles long before the render loop repaints).
+Future<void> _waitForComposedInRegion(
+  FaCliHarness harness,
+  int columns,
+) async {
+  final want = _composed.replaceAll(' ', '');
+  final deadline = DateTime.now().add(const Duration(seconds: 20));
+  while (DateTime.now().isBefore(deadline)) {
+    final visible = _composerRegion(_grid(harness), columns)
+        .map((l) => l.replaceAll(' ', ''))
+        .join();
+    if (visible.contains(want)) return;
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+  }
+  fail(
+    'the composed line never fully painted in the composer region:\n'
+    '${harness.screenText}',
+  );
+}
+
+/// gh-1026 tick-diff sampler: returns a pair of consecutive painted frames
+/// that differ in EXACTLY one row (same row count). The old shape — wait a
+/// fixed 1200ms, sample twice, assert one changed row — lotteried on the
+/// render loop: under load a non-tick repaint can land inside the window
+/// (multi-row diff) or the loop can stall past it (no diff). Resampling
+/// keeps the assertion (there EXISTS a consecutive-frame pair where only
+/// one row moved) and drops the timing bet. Bounded; fails with both
+/// frames dumped when the budget runs out.
+Future<(List<String>, List<String>)> _oneRowTickDiffPair(
+  FaCliHarness harness,
+) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 25));
+  var gridA = _grid(harness);
+  var gridB = gridA;
+  while (DateTime.now().isBefore(deadline)) {
+    final pairDeadline = DateTime.now().add(const Duration(seconds: 5));
+    gridB = gridA;
+    while (DateTime.now().isBefore(pairDeadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      gridB = _grid(harness);
+      if (gridB.join('\n') != gridA.join('\n')) break;
+    }
+    final changedRows = [
+      for (var i = 0; i < gridA.length && i < gridB.length; i++)
+        if (gridA[i] != gridB[i]) i,
+    ];
+    if (gridA.length == gridB.length && changedRows.length == 1) {
+      return (gridA, gridB);
+    }
+    gridA = gridB;
+  }
+  fail(
+    'no clean one-row tick diff within budget — last pair:\n'
+    '--- A ---\n${gridA.join('\n')}\n'
+    '--- B ---\n${gridB.join('\n')}',
+  );
+}

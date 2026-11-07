@@ -1,0 +1,955 @@
+/// Core message, usage, and streaming-event types.
+///
+/// Ported from pi-mono `packages/ai/src/types.ts`. Kept mechanically close to
+/// the TypeScript originals so future pi fixes port trivially. Differences
+/// from the original:
+///
+/// - Union types (`AssistantMessageEvent`, content blocks) are `sealed` class
+///   hierarchies instead of discriminated-object unions.
+/// - `timestamp` is a [DateTime] instead of Unix milliseconds.
+/// - [ToolCall.partialArguments] carries the not-yet-parseable JSON argument
+///   fragment while a tool call streams; pi tracks this in adapter-local state.
+library;
+
+import 'rate_limit_info.dart';
+
+/// Why the assistant message stream terminated.
+///
+/// Ported from pi's `StopReason` union.
+enum StopReason {
+  /// The model finished naturally.
+  stop,
+
+  /// The model hit the token limit.
+  length,
+
+  /// The model stopped to invoke one or more tools.
+  toolUse,
+
+  /// The stream failed (network error, malformed SSE, provider error, ...).
+  error,
+
+  /// The stream was cancelled via a `CancelToken`.
+  aborted,
+}
+
+/// finish_reason retryability classification (issue #312).
+///
+/// Vendor finish_reasons are tri-state at the wire: TRANSIENT failures
+/// heal on replay, TERMINAL ones (policy/refusal family) never retry —
+/// retrying a filter is a safety bug — and UNKNOWN vendor words default
+/// to transient so a new term degrades to a retry instead of killing the
+/// turn (that terminal-by-default was the #312 bug). Unknown words are
+/// loud-logged via [onUnknownFinishReason] so the table grows from
+/// production logs.
+enum FinishReasonClass { transient, terminal, unknown }
+
+/// TRANSIENT finish_reasons, vendor-tagged:
+/// - `network_error` — generic wire-level word (several vendors);
+/// - `unexpected_state` — Kimi/Moonshot k3 gateway: internal transient
+///   failure, same family as its one-off "500: Internal network failure".
+const _transientFinishReasons = {'network_error', 'unexpected_state'};
+
+/// TERMINAL finish_reasons: the standard `content_filter` plus the
+/// policy/refusal-shaped family — a refusal will not heal on replay.
+const _terminalFinishReasons = {
+  'content_filter',
+  'content_policy_violation',
+  'policy_violation',
+  'moderation_blocked',
+  'prohibited_content',
+  'refusal',
+};
+
+/// Classifies a raw wire finish_reason ([AssistantMessage.rawStopReason]).
+/// Anything outside both sets is [FinishReasonClass.unknown].
+FinishReasonClass classifyFinishReason(String reason) {
+  final key = reason.trim().toLowerCase();
+  if (_transientFinishReasons.contains(key)) {
+    return FinishReasonClass.transient;
+  }
+  if (_terminalFinishReasons.contains(key)) {
+    return FinishReasonClass.terminal;
+  }
+  return FinishReasonClass.unknown;
+}
+
+/// The loud log for UNKNOWN finish_reasons (the #312 cataloguing hook):
+/// fires once per occurrence at mapping time with the raw reason so new
+/// vendor words can join the classification table. Null keeps it silent.
+void Function(String reason)? onUnknownFinishReason;
+
+/// Budget/spending exhaustion wordings (issue #926): the personal-budget
+/// limit responses CodeMie returns when the monthly spending budget is used
+/// up (`insufficient_quota` is OpenAI's billing-exhausted wording). A
+/// budget refills on its reset date, never on a retry — every retry layer
+/// treats this class as terminal for the dead entry.
+final _budgetExhaustionPatterns = [
+  RegExp(r'spending.?limit', caseSensitive: false),
+  RegExp(r'budget.?limit', caseSensitive: false),
+  RegExp(r'budget.?reset', caseSensitive: false),
+  RegExp(r'insufficient.?quota', caseSensitive: false),
+];
+
+/// Whether [message]'s error text reports budget/spending exhaustion
+/// (issue #926): the entry is dead until the budget reset — a retry loop
+/// against it only burns requests and floods logs.
+bool isBudgetExhaustion(AssistantMessage message) {
+  if (message.stopReason != StopReason.error) return false;
+  final text = message.errorMessage;
+  if (text == null || text.isEmpty) return false;
+  return _budgetExhaustionPatterns.any((pattern) => pattern.hasMatch(text));
+}
+
+/// The structured retry verdict the wire finish_reason carries, or null
+/// when the failure has no finish_reason (HTTP-level errors, socket cuts,
+/// truncation) and the message-text nets decide instead. TERMINAL vetoes
+/// every retry. Budget/spending exhaustion (issue #926) is TERMINAL
+/// regardless of the wire form.
+FinishReasonClass? finishReasonRetryClass(AssistantMessage message) {
+  if (message.stopReason != StopReason.error) return null;
+  if (isBudgetExhaustion(message)) return FinishReasonClass.terminal;
+  // Scoped to the openai-completions finish_reason family: its error
+  // wording is the marker that the wire word came through the vocabulary
+  // this table catalogues. Other adapters set rawStopReason too (Google
+  // SAFETY/RECITATION, Anthropic sensitive) - refused content keeps the
+  // terminal behavior it had before this table existed; replaying it is
+  // a safety bug.
+  final text = message.errorMessage;
+  if (text == null || !text.startsWith('Provider finish_reason: ')) {
+    return null;
+  }
+  final raw = message.rawStopReason;
+  if (raw == null || raw.isEmpty) return null;
+  return classifyFinishReason(raw);
+}
+
+/// Monetary cost of a request, in USD.
+///
+/// Ported from pi's `Usage.cost`.
+final class UsageCost {
+  const UsageCost({
+    this.input = 0,
+    this.output = 0,
+    this.cacheRead = 0,
+    this.cacheWrite = 0,
+    this.total = 0,
+  });
+
+  /// Cost of input tokens.
+  final double input;
+
+  /// Cost of output tokens.
+  final double output;
+
+  /// Cost of tokens read from the prompt cache.
+  final double cacheRead;
+
+  /// Cost of tokens written to the prompt cache.
+  final double cacheWrite;
+
+  /// Total cost.
+  final double total;
+
+  UsageCost copyWith({
+    double? input,
+    double? output,
+    double? cacheRead,
+    double? cacheWrite,
+    double? total,
+  }) {
+    return UsageCost(
+      input: input ?? this.input,
+      output: output ?? this.output,
+      cacheRead: cacheRead ?? this.cacheRead,
+      cacheWrite: cacheWrite ?? this.cacheWrite,
+      total: total ?? this.total,
+    );
+  }
+
+  /// Serializes to a JSON map.
+  Map<String, dynamic> toJson() => {
+    'input': input,
+    'output': output,
+    'cacheRead': cacheRead,
+    'cacheWrite': cacheWrite,
+    'total': total,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory UsageCost.fromJson(Map<String, dynamic> json) => UsageCost(
+    input: (json['input'] as num? ?? 0).toDouble(),
+    output: (json['output'] as num? ?? 0).toDouble(),
+    cacheRead: (json['cacheRead'] as num? ?? 0).toDouble(),
+    cacheWrite: (json['cacheWrite'] as num? ?? 0).toDouble(),
+    total: (json['total'] as num? ?? 0).toDouble(),
+  );
+}
+
+/// Token accounting for one assistant response, reported inline by providers.
+///
+/// Ported from pi's `Usage`.
+final class Usage {
+  const Usage({
+    required this.input,
+    required this.output,
+    required this.cacheRead,
+    required this.cacheWrite,
+    this.cacheWrite1h,
+    this.reasoning,
+    required this.totalTokens,
+    required this.cost,
+  });
+
+  /// Zero-valued usage, used to seed partial messages before the provider
+  /// reports real numbers.
+  static const zero = Usage(
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: UsageCost(),
+  );
+
+  /// Input (prompt) tokens.
+  final int input;
+
+  /// Output (completion) tokens.
+  final int output;
+
+  /// Tokens read from the prompt cache.
+  final int cacheRead;
+
+  /// Tokens written to the prompt cache.
+  final int cacheWrite;
+
+  /// Subset of [cacheWrite] written with 1h retention. Only Anthropic reports
+  /// this split.
+  final int? cacheWrite1h;
+
+  /// Reasoning/thinking tokens, when the provider reports them. This is a
+  /// subset of [output]: [output] already includes these tokens. Set by
+  /// providers that expose a reasoning breakdown; `null` otherwise.
+  final int? reasoning;
+
+  /// Total tokens as reported by the provider.
+  final int totalTokens;
+
+  /// Cost breakdown in USD.
+  final UsageCost cost;
+
+  Usage copyWith({
+    int? input,
+    int? output,
+    int? cacheRead,
+    int? cacheWrite,
+    int? cacheWrite1h,
+    int? reasoning,
+    int? totalTokens,
+    UsageCost? cost,
+  }) {
+    // crap:ignore: hand-rolled copyWith boilerplate (the idiomatic Dart shape every immutable type here shares); codegen is the real fix — gh-1106.
+    return Usage(
+      input: input ?? this.input,
+      output: output ?? this.output,
+      cacheRead: cacheRead ?? this.cacheRead,
+      cacheWrite: cacheWrite ?? this.cacheWrite,
+      cacheWrite1h: cacheWrite1h ?? this.cacheWrite1h,
+      reasoning: reasoning ?? this.reasoning,
+      totalTokens: totalTokens ?? this.totalTokens,
+      cost: cost ?? this.cost,
+    );
+  }
+
+  /// Serializes to a JSON map.
+  Map<String, dynamic> toJson() => {
+    'input': input,
+    'output': output,
+    'cacheRead': cacheRead,
+    'cacheWrite': cacheWrite,
+    if (cacheWrite1h != null) 'cacheWrite1h': cacheWrite1h,
+    if (reasoning != null) 'reasoning': reasoning,
+    'totalTokens': totalTokens,
+    'cost': cost.toJson(),
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory Usage.fromJson(Map<String, dynamic> json) => Usage(
+    input: json['input'] as int? ?? 0,
+    output: json['output'] as int? ?? 0,
+    cacheRead: json['cacheRead'] as int? ?? 0,
+    cacheWrite: json['cacheWrite'] as int? ?? 0,
+    cacheWrite1h: json['cacheWrite1h'] as int?,
+    reasoning: json['reasoning'] as int?,
+    totalTokens: json['totalTokens'] as int? ?? 0,
+    cost: json['cost'] is Map<String, dynamic>
+        ? UsageCost.fromJson(json['cost'] as Map<String, dynamic>)
+        : const UsageCost(),
+  );
+}
+
+/// A content block of a [Message].
+///
+/// Sealed counterpart of pi's `TextContent | ThinkingContent | ToolCall |
+/// ImageContent` unions.
+sealed class ContentBlock {
+  const ContentBlock();
+
+  /// Serializes to a JSON map with a `type` discriminator (pi shape).
+  Map<String, dynamic> toJson();
+
+  /// Deserializes a JSON map produced by [toJson], dispatching on `type`.
+  factory ContentBlock.fromJson(Map<String, dynamic> json) {
+    return switch (json['type']) {
+      'text' => TextContent.fromJson(json),
+      'thinking' => ThinkingContent.fromJson(json),
+      'toolCall' => ToolCall.fromJson(json),
+      'image' => ImageContent.fromJson(json),
+      'audio' => AudioContent.fromJson(json),
+      'video' => VideoContent.fromJson(json),
+      _ => throw FormatException('Unknown content block type: ${json['type']}'),
+    };
+  }
+}
+
+/// Plain text produced by the model.
+///
+/// Ported from pi's `TextContent`.
+final class TextContent extends ContentBlock {
+  const TextContent({required this.text, this.textSignature});
+
+  /// The text itself.
+  final String text;
+
+  /// Provider-specific opaque signature (e.g. an OpenAI responses message id)
+  /// needed to replay this block in multi-turn conversations.
+  final String? textSignature;
+
+  TextContent copyWith({String? text, String? textSignature}) {
+    return TextContent(
+      text: text ?? this.text,
+      textSignature: textSignature ?? this.textSignature,
+    );
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'text',
+    'text': text,
+    if (textSignature != null) 'textSignature': textSignature,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory TextContent.fromJson(Map<String, dynamic> json) => TextContent(
+    text: json['text'] as String? ?? '',
+    textSignature: json['textSignature'] as String?,
+  );
+}
+
+/// Model reasoning ("thinking") produced before or alongside the answer.
+///
+/// Ported from pi's `ThinkingContent`.
+final class ThinkingContent extends ContentBlock {
+  const ThinkingContent({
+    required this.thinking,
+    this.thinkingSignature,
+    this.redacted = false,
+  });
+
+  /// The reasoning text.
+  final String thinking;
+
+  /// Provider-specific opaque signature (e.g. an OpenAI responses reasoning
+  /// item id, or the encrypted payload when [redacted] is true) needed to
+  /// replay this block for multi-turn continuity.
+  final String? thinkingSignature;
+
+  /// Whether the thinking content was redacted by safety filters. The opaque
+  /// encrypted payload is stored in [thinkingSignature].
+  final bool redacted;
+
+  ThinkingContent copyWith({
+    String? thinking,
+    String? thinkingSignature,
+    bool? redacted,
+  }) {
+    return ThinkingContent(
+      thinking: thinking ?? this.thinking,
+      thinkingSignature: thinkingSignature ?? this.thinkingSignature,
+      redacted: redacted ?? this.redacted,
+    );
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'thinking',
+    'thinking': thinking,
+    if (thinkingSignature != null) 'thinkingSignature': thinkingSignature,
+    'redacted': redacted,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory ThinkingContent.fromJson(Map<String, dynamic> json) =>
+      ThinkingContent(
+        thinking: json['thinking'] as String? ?? '',
+        thinkingSignature: json['thinkingSignature'] as String?,
+        redacted: json['redacted'] as bool? ?? false,
+      );
+}
+
+/// A request by the model to invoke a tool.
+///
+/// Ported from pi's `ToolCall`, plus [partialArguments] for streaming.
+final class ToolCall extends ContentBlock {
+  const ToolCall({
+    required this.id,
+    required this.name,
+    required this.arguments,
+    this.parentCallId,
+    this.thoughtSignature,
+    this.partialArguments,
+  });
+
+  /// Provider-assigned tool call id (matched by the tool result message).
+  final String id;
+
+  /// Name of the tool to invoke.
+  final String name;
+
+  /// Parsed tool arguments. Empty while the call is still streaming; see
+  /// [partialArguments].
+  final Map<String, dynamic> arguments;
+
+  /// Google-specific opaque signature for reusing thought context.
+  final String? thoughtSignature;
+
+  /// Id of the enclosing tool call for nested (subtool) executions, or
+  /// null for a top-level call.
+  final String? parentCallId;
+
+  /// Raw, not-yet-complete JSON argument text accumulated from
+  /// [ToolCallDeltaEvent]s. Providers keep the live partial message's tool
+  /// call block up to date with this; on [ToolCallEndEvent] the completed
+  /// JSON is parsed into [arguments]. `null` once parsing succeeded.
+  final String? partialArguments;
+
+  ToolCall copyWith({
+    String? id,
+    String? name,
+    Map<String, dynamic>? arguments,
+    String? parentCallId,
+    String? thoughtSignature,
+    String? partialArguments,
+  }) {
+    return ToolCall(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      arguments: arguments ?? this.arguments,
+      parentCallId: parentCallId ?? this.parentCallId,
+      thoughtSignature: thoughtSignature ?? this.thoughtSignature,
+      partialArguments: partialArguments ?? this.partialArguments,
+    );
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'toolCall',
+    'id': id,
+    'name': name,
+    'arguments': _sanitizeJsonValue(arguments),
+    if (parentCallId != null) 'parentCallId': parentCallId,
+    if (thoughtSignature != null) 'thoughtSignature': thoughtSignature,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  ///
+  /// Note that [partialArguments] is streaming scratch state and is never
+  /// serialized, mirroring pi which strips the buffer before persisting.
+  factory ToolCall.fromJson(Map<String, dynamic> json) => ToolCall(
+    id: json['id'] as String? ?? '',
+    name: json['name'] as String? ?? '',
+    arguments:
+        (json['arguments'] as Map<String, dynamic>?) ??
+        const <String, dynamic>{},
+    parentCallId: json['parentCallId'] as String?,
+    thoughtSignature: json['thoughtSignature'] as String?,
+  );
+}
+
+/// An image supplied by the user or a tool result.
+///
+/// Ported from pi's `ImageContent`.
+final class ImageContent extends ContentBlock {
+  const ImageContent({required this.data, required this.mimeType});
+
+  /// Base64-encoded image data.
+  final String data;
+
+  /// MIME type of the image, e.g. `image/jpeg` or `image/png`.
+  final String mimeType;
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'image',
+    'data': data,
+    'mimeType': mimeType,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory ImageContent.fromJson(Map<String, dynamic> json) => ImageContent(
+    data: json['data'] as String? ?? '',
+    mimeType: json['mimeType'] as String? ?? '',
+  );
+}
+
+/// Inline audio data for providers with audio understanding (Gemini
+/// `inlineData`). Base64-encoded like [ImageContent]; providers without
+/// audio input skip the block defensively.
+final class AudioContent extends ContentBlock {
+  const AudioContent({required this.data, required this.mimeType});
+
+  /// Base64-encoded audio bytes (mp3, m4a/mp4, wav, aac, flac, ogg…).
+  final String data;
+
+  /// MIME type, e.g. `audio/mp4` (m4a), `audio/mpeg` (mp3), `audio/wav`.
+  final String mimeType;
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'audio',
+    'data': data,
+    'mimeType': mimeType,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory AudioContent.fromJson(Map<String, dynamic> json) => AudioContent(
+    data: json['data'] as String? ?? '',
+    mimeType: json['mimeType'] as String? ?? '',
+  );
+}
+
+/// Inline video data for video-understanding models (gh-1985 C1: the
+/// `glm-5.3-flash`/`gemini` video-read family). Base64-encoded like
+/// [ImageContent]; providers shape it natively (google `inlineData`,
+/// openai-completions `video_url`) and models without the `video` input
+/// modality have the block replaced by the standard omission note before
+/// the request (same downgrade path as images).
+final class VideoContent extends ContentBlock {
+  const VideoContent({required this.data, required this.mimeType});
+
+  /// Base64-encoded video bytes (mp4, webm, mov, mpeg…).
+  final String data;
+
+  /// MIME type, e.g. `video/mp4`, `video/webm`, `video/quicktime`.
+  final String mimeType;
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'type': 'video',
+    'data': data,
+    'mimeType': mimeType,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory VideoContent.fromJson(Map<String, dynamic> json) => VideoContent(
+    data: json['data'] as String? ?? '',
+    mimeType: json['mimeType'] as String? ?? '',
+  );
+}
+
+/// A message in a conversation context.
+///
+/// Ported from pi's `Message` union (`UserMessage | AssistantMessage |
+/// ToolResultMessage`). An `abstract interface` rather than a `sealed` class
+/// because [AssistantMessage] predates this interface in this library and
+/// sealed subtypes must share a library.
+abstract interface class Message {
+  /// The role discriminator: `user`, `assistant`, or `toolResult`.
+  String get role;
+
+  /// When this message was created.
+  DateTime get timestamp;
+
+  /// Serializes to a JSON map with a `role` discriminator (pi shape).
+  Map<String, dynamic> toJson();
+}
+
+/// A message produced by the assistant (the model), final or partial.
+///
+/// Ported from pi's `AssistantMessage`. The `role` is implicit in the type.
+/// Partial instances are the live snapshots carried by every
+/// [AssistantMessageEvent] (partial-first design): consumers can render them
+/// directly without accumulating deltas themselves.
+final class AssistantMessage implements Message {
+  const AssistantMessage({
+    required this.content,
+    required this.api,
+    required this.provider,
+    required this.model,
+    this.responseModel,
+    this.responseId,
+    required this.usage,
+    required this.stopReason,
+    this.rawStopReason,
+    this.errorMessage,
+    this.rateLimit,
+    required this.timestamp,
+  });
+
+  /// Ordered content blocks (text, thinking, tool calls).
+  final List<ContentBlock> content;
+
+  /// The API dialect that produced this message (e.g. `openai-completions`,
+  /// `anthropic-messages`, `google-generative-ai`).
+  final String api;
+
+  /// The provider id (e.g. `openai`, `anthropic`, `openrouter`).
+  final String provider;
+
+  /// The requested model id.
+  final String model;
+
+  /// Concrete model id reported by the provider, when different from [model]
+  /// (e.g. OpenRouter `auto` routing to `anthropic/...`).
+  final String? responseModel;
+
+  /// Provider-specific response/message identifier, when exposed upstream.
+  final String? responseId;
+
+  /// Token and cost accounting for this response.
+  final Usage usage;
+
+  /// Why the stream terminated. On partial snapshots this is the provider's
+  /// current best guess (usually [StopReason.stop] until the terminal event).
+  final StopReason stopReason;
+
+  /// The provider's raw terminal stop/finish reason as reported on the wire
+  /// (e.g. `end_turn`, `max_tokens`, `SAFETY`), when the adapter parsed one.
+  /// Values that do not map onto [StopReason] surface as [StopReason.error]
+  /// with the original string preserved here.
+  final String? rawStopReason;
+
+  /// Human-readable error description when [stopReason] is
+  /// [StopReason.error] or [StopReason.aborted].
+  final String? errorMessage;
+
+  /// The structured decode of a 429 rate-limit failure (issue #867), when
+  /// the provider surfaced one. Carried on the error event so every surface
+  /// renders from the structure; [RateLimitInfo.rawBody] stays diagnostics-
+  /// only and never reaches a render.
+  final RateLimitInfo? rateLimit;
+
+  /// When this message was created (pi stores Unix milliseconds; Dart uses
+  /// [DateTime]).
+  @override
+  final DateTime timestamp;
+
+  AssistantMessage copyWith({
+    List<ContentBlock>? content,
+    String? api,
+    String? provider,
+    String? model,
+    String? responseModel,
+    String? responseId,
+    Usage? usage,
+    StopReason? stopReason,
+    String? rawStopReason,
+    String? errorMessage,
+    RateLimitInfo? rateLimit,
+    DateTime? timestamp,
+  }) {
+    return AssistantMessage(
+      content: content ?? this.content,
+      api: api ?? this.api,
+      provider: provider ?? this.provider,
+      model: model ?? this.model,
+      responseModel: responseModel ?? this.responseModel,
+      responseId: responseId ?? this.responseId,
+      usage: usage ?? this.usage,
+      stopReason: stopReason ?? this.stopReason,
+      rawStopReason: rawStopReason ?? this.rawStopReason,
+      errorMessage: errorMessage ?? this.errorMessage,
+      rateLimit: rateLimit ?? this.rateLimit,
+      timestamp: timestamp ?? this.timestamp,
+    );
+  }
+
+  @override
+  String get role {
+    return 'assistant';
+  }
+
+  @override
+  Map<String, dynamic> toJson() => {
+    'role': role,
+    'content': content.map((block) => block.toJson()).toList(),
+    'api': api,
+    'provider': provider,
+    'model': model,
+    if (responseModel != null) 'responseModel': responseModel,
+    if (responseId != null) 'responseId': responseId,
+    'usage': usage.toJson(),
+    'stopReason': stopReason.name,
+    if (rawStopReason != null) 'rawStopReason': rawStopReason,
+    if (errorMessage != null) 'errorMessage': errorMessage,
+    if (rateLimit != null) 'rateLimit': rateLimit!.toJson(),
+    'timestamp': timestamp.millisecondsSinceEpoch,
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory AssistantMessage.fromJson(Map<String, dynamic> json) =>
+      AssistantMessage(
+        content: [
+          for (final block in (json['content'] as List?) ?? const [])
+            ContentBlock.fromJson(block as Map<String, dynamic>),
+        ],
+        api: json['api'] as String? ?? '',
+        provider: json['provider'] as String? ?? '',
+        model: json['model'] as String? ?? '',
+        responseModel: json['responseModel'] as String?,
+        responseId: json['responseId'] as String?,
+        usage: json['usage'] is Map<String, dynamic>
+            ? Usage.fromJson(json['usage'] as Map<String, dynamic>)
+            : Usage.zero,
+        stopReason: StopReason.values.firstWhere(
+          (value) => value.name == json['stopReason'],
+          orElse: () => StopReason.stop,
+        ),
+        rawStopReason: json['rawStopReason'] as String?,
+        errorMessage: json['errorMessage'] as String?,
+        rateLimit: json['rateLimit'] is Map<String, dynamic>
+            ? RateLimitInfo.fromJson(json['rateLimit'] as Map<String, dynamic>)
+            : null,
+        timestamp: DateTime.fromMillisecondsSinceEpoch(
+          json['timestamp'] as int? ?? 0,
+        ),
+      );
+}
+
+/// Event protocol for `AssistantMessageEventStream`.
+///
+/// Ported from pi's `AssistantMessageEvent` union. Providers emit
+/// [StartEvent], then any sequence of text/thinking/tool-call start, delta,
+/// and end events, and terminate with exactly one [DoneEvent] or
+/// [ErrorEvent].
+///
+/// Partial-first invariant: every event carries [partial], the live snapshot
+/// of the [AssistantMessage] as of this event.
+sealed class AssistantMessageEvent {
+  const AssistantMessageEvent();
+
+  /// The live partial message as of this event.
+  AssistantMessage get partial;
+}
+
+/// Emitted once before any content events.
+final class StartEvent extends AssistantMessageEvent {
+  const StartEvent({required this.partial});
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// A text content block started at [contentIndex].
+final class TextStartEvent extends AssistantMessageEvent {
+  const TextStartEvent({required this.contentIndex, required this.partial});
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// Incremental text for the block at [contentIndex].
+final class TextDeltaEvent extends AssistantMessageEvent {
+  const TextDeltaEvent({
+    required this.contentIndex,
+    required this.delta,
+    required this.partial,
+  });
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  /// The newly arrived text fragment.
+  final String delta;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// The text block at [contentIndex] is complete.
+final class TextEndEvent extends AssistantMessageEvent {
+  const TextEndEvent({
+    required this.contentIndex,
+    required this.content,
+    required this.partial,
+  });
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  /// The full text of the completed block.
+  final String content;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// A thinking content block started at [contentIndex].
+final class ThinkingStartEvent extends AssistantMessageEvent {
+  const ThinkingStartEvent({required this.contentIndex, required this.partial});
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// Incremental thinking text for the block at [contentIndex].
+final class ThinkingDeltaEvent extends AssistantMessageEvent {
+  const ThinkingDeltaEvent({
+    required this.contentIndex,
+    required this.delta,
+    required this.partial,
+  });
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  /// The newly arrived reasoning fragment.
+  final String delta;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// The thinking block at [contentIndex] is complete.
+final class ThinkingEndEvent extends AssistantMessageEvent {
+  const ThinkingEndEvent({
+    required this.contentIndex,
+    required this.content,
+    required this.partial,
+  });
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  /// The full reasoning text of the completed block.
+  final String content;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// A tool call started at [contentIndex].
+final class ToolCallStartEvent extends AssistantMessageEvent {
+  const ToolCallStartEvent({required this.contentIndex, required this.partial});
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// Incremental JSON argument text for the tool call at [contentIndex].
+///
+/// [delta] is a raw JSON fragment, not parsed arguments; the accumulated
+/// fragment is available on [ToolCall.partialArguments] of [partial].
+final class ToolCallDeltaEvent extends AssistantMessageEvent {
+  const ToolCallDeltaEvent({
+    required this.contentIndex,
+    required this.delta,
+    required this.partial,
+  });
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  /// The newly arrived JSON fragment.
+  final String delta;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// The tool call at [contentIndex] is complete; [toolCall] has fully parsed
+/// [ToolCall.arguments].
+final class ToolCallEndEvent extends AssistantMessageEvent {
+  const ToolCallEndEvent({
+    required this.contentIndex,
+    required this.toolCall,
+    required this.partial,
+  });
+
+  /// Index into [AssistantMessage.content] of the block this event concerns.
+  final int contentIndex;
+
+  /// The completed tool call with parsed arguments.
+  final ToolCall toolCall;
+
+  @override
+  final AssistantMessage partial;
+}
+
+/// Terminal event: the message completed successfully.
+final class DoneEvent extends AssistantMessageEvent {
+  const DoneEvent({required this.reason, required this.message});
+
+  /// Why the model stopped. One of [StopReason.stop], [StopReason.length],
+  /// or [StopReason.toolUse].
+  final StopReason reason;
+
+  /// The final message.
+  final AssistantMessage message;
+
+  @override
+  AssistantMessage get partial => message;
+}
+
+/// Terminal event: the stream failed or was aborted.
+///
+/// Per the providers-never-throw contract, all provider failures arrive here
+/// instead of as exceptions.
+final class ErrorEvent extends AssistantMessageEvent {
+  const ErrorEvent({
+    required this.reason,
+    required this.error,
+    this.retryAfter,
+  });
+
+  /// Why the stream failed: [StopReason.error] or [StopReason.aborted].
+  final StopReason reason;
+
+  /// The final message, with [AssistantMessage.stopReason] set to [reason]
+  /// and [AssistantMessage.errorMessage] describing the failure.
+  final AssistantMessage error;
+
+  /// Provider-suggested delay before retrying, parsed from the `Retry-After`
+  /// response header on rate-limit (HTTP 429) failures. `null` when the
+  /// failure was not an HTTP error or the provider sent no parseable header;
+  /// callers should then apply their own backoff strategy.
+  final Duration? retryAfter;
+
+  @override
+  AssistantMessage get partial => error;
+}
+
+/// Recursively replaces values that [jsonEncode] cannot handle (cyclic
+/// references, Dart objects, etc.) with the string `'[unserializable]'`.
+Object? _sanitizeJsonValue(Object? value) {
+  if (value == null || value is bool || value is num || value is String) {
+    return value;
+  }
+  if (value is List<dynamic>) {
+    return value.map(_sanitizeJsonValue).toList();
+  }
+  if (value is Map<String, dynamic>) {
+    return value.map((key, child) => MapEntry(key, _sanitizeJsonValue(child)));
+  }
+  return '[unserializable]';
+}

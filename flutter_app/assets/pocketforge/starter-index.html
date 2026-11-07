@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Neon Drift</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="game">
+    <header><span class="wordmark">NEON<span>DRIFT</span></span><span class="build">POCKETFORGE / 01</span></header>
+    <section class="hud" aria-label="Race status">
+      <div><span>DISTANCE</span><strong id="distance">0<small>m</small></strong></div>
+      <div><span>SPEED</span><strong id="speed">0<small>km/h</small></strong></div>
+      <div><span>SHIELD</span><strong id="shield">3<small>/ 3</small></strong></div>
+      <div><span>SCORE</span><strong id="score">0</strong></div>
+    </section>
+    <section class="track" id="track" aria-label="Racing game">
+      <canvas id="race" aria-label="Neon road with your car and approaching obstacles"></canvas>
+      <div id="overlay" class="overlay">
+        <div class="kicker">MIDNIGHT IS YOURS</div>
+        <h1>Find your<br><em>next gear.</em></h1>
+        <p id="intro">Three lanes. One endless night.<br>Dodge the barriers. Keep the dream alive.</p>
+        <button id="start">Start driving <span>↗</span></button>
+        <span class="instructions">TOUCH THE ARROWS · OR USE ← →</span>
+      </div>
+      <span class="track-label">NIGHT CIRCUIT / ENDLESS</span>
+      <div id="flash" aria-hidden="true"></div>
+    </section>
+    <nav class="controls" aria-label="Driving controls">
+      <button id="left" aria-label="Steer left">←</button>
+      <div><span id="status" role="status">Your next great game starts here.</span><button id="pause" aria-label="Pause race" disabled>PAUSE</button></div>
+      <button id="right" aria-label="Steer right">→</button>
+    </nav>
+    <footer><span>BUILT TO PLAY. BUILT ON IPAD.</span><span>LOCAL GAME RUNTIME</span></footer>
+  </main>
+  <script src="game.js"></script>
+</body>
+</html>

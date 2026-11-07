@@ -1,0 +1,249 @@
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+/// Guard: the `--help` reference must stay complete — every flag
+/// `parseCliArgs` accepts and every user-facing feature the binary wires
+/// must be mentioned. When you add a flag or a config section, add it here
+/// AND to `cliHelpText`.
+void main() {
+  group('cliHelpText', () {
+    // Rendered once with a fixed test version for the keyword guards; the
+    // real version is threaded through from the executable's `_version`.
+    final helpText = cliHelpText('0.0.0-test');
+    // Every flag accepted by parseCliArgs (see lib/src/cli/cli_args.dart).
+    const flags = [
+      '--help',
+      '-h',
+      '--version',
+      '--pi',
+      '--debug-secrets',
+      '--model',
+      '--provider',
+      '--base-url',
+      '--system-prompt',
+      '--system-prompt-file',
+      '--vision-model',
+      '--vision-base-url',
+      '--transcribe-model',
+      '--transcribe-base-url',
+      '--plugin',
+      '--prompt-template-dir',
+      '--mode',
+      '--cwd',
+      '--session-root',
+      '--session',
+      '--cube',
+      '--cube-config',
+      '--tools',
+      '--log-file',
+      '--attach',
+      '--output',
+      '--output-format',
+      '--prompt',
+      '-p',
+      '--prompt-file',
+      '-f',
+      '--stream-thinking',
+    ];
+    for (final flag in flags) {
+      test('mentions flag $flag', () {
+        expect(helpText, contains(flag));
+      });
+    }
+
+    // Feature keywords: providers, config sections, approval modes, session
+    // commands, tools, plugins, and file locations.
+    const keywords = [
+      // Invocation.
+      'interactive REPL',
+      'headless',
+      'update',
+      'uninstall',
+      'Exit codes: 0 ok',
+      // Trajectory reader + ATIF exporter (fa trajectory + REPL /trajectory).
+      'fa trajectory',
+      'trajectory <view|tail|cost|inspect|',
+      '[--json] [--at N]',
+      '[--format atif] [--output path]',
+      '/trajectory',
+      // Session repair (gh-1073).
+      'fa session repair',
+      // Headless config verbs (fa config).
+      'fa config export-providers',
+      '--passphrase-stdin',
+      '.fahx',
+      // JS extensions (fa ext + REPL /ext + bootstrap).
+      'fa ext',
+      'fa ext <list|install|remove|update|audit|',
+      'enable|disable> [--json]',
+      '--bundled [name]',
+      '--pin <sha256>',
+      'REPL-only',
+      '.fa/bootstrap.yaml',
+      'FA_EXT_BOOTSTRAP_',
+      '/ext',
+      // jsr widget pass-through (fa jsr + REPL /jsr, gh-1033).
+      'fa jsr',
+      'widget:test',
+      'widget:screenshot',
+      '--expect-state JSON',
+      '--freeze-clock',
+      'js_widget_runtime',
+      '.dart_tool/package_config.json',
+      '/jsr',
+      // Providers and keys.
+      'openai-completions',
+      'kimi',
+      'anthropic',
+      'google',
+      'dial',
+      'OPENROUTER_API_KEY',
+      'KIMI_API_KEY',
+      'OPENAI_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'GOOGLE_API_KEY',
+      'DIAL_API_KEY',
+      'DIAL_API_VERSION',
+      'VISION_API_KEY',
+      'TRANSCRIBE_API_KEY',
+      'BRAVE_API_KEY',
+      'TAVILY_API_KEY',
+      'ZAI_API_KEY',
+      'glm-5.3',
+      'minimax',
+      'Ollama',
+      'OPENROUTER_API_KEY_2',
+      'whisper-1',
+      // Model roles.
+      'roles:',
+      'modelOverrides:',
+      'retry:',
+      'smol',
+      'retriesPerEntry',
+      // Models config (media slots + custom model definitions).
+      'models:',
+      'imageGeneration',
+      'audioTts',
+      'musicGeneration',
+      'videoGeneration',
+      'transcription',
+      '/models config',
+      '/models set <slot> <model> [baseUrl]',
+      '/models remove <slot>',
+      // Prompts.
+      'prompts:',
+      'cli/mode_code',
+      'cli/mode_architect',
+      'cli/mode_review',
+      'compaction/summary',
+      'compaction/summary_system',
+      'compaction/summary_update',
+      'compaction/turn_prefix',
+      '{{cwd}}',
+      '/code',
+      '/architect',
+      '/review',
+      // Approvals.
+      'always-ask',
+      'yolo',
+      'autopilot',
+      '/approval',
+      '/settings',
+      '/allow',
+      // Sessions and compaction.
+      '~/.fah/sessions',
+      '/reset',
+      '/compact',
+      '/stats',
+      'checkpoint',
+      'rewind',
+      '/tasks',
+      '/skills',
+      'SKILL.md',
+      'CLAUDE.md',
+      'GOAL.md',
+      'DESIGN.md',
+      'ttsr:',
+      // Cube sandbox (fa_cube).
+      'cube:',
+      '/cube',
+      'cube sandbox',
+      '.fah/cubes',
+      '.fah/rules.yaml',
+      // Tools.
+      'read',
+      'write',
+      'edit',
+      'ls',
+      'bash',
+      'web_search',
+      'web_fetch',
+      'lsp',
+      'task',
+      'ask',
+      'inspect_image',
+      'transcribe_audio',
+      'FA_TOOLS',
+      'FA_LOG_FILE',
+      'tools:',
+      '.fah/lsp.json',
+      // Plugins and templates.
+      '.fah/packages.yaml',
+      '.fah/prompts',
+      // REPL commands.
+      '/exit',
+      '/model',
+      '/model-edit',
+      '/provider',
+      '/providers',
+      'openrouter oauth',
+      'codemie sso',
+      'dial setup',
+      '/provider copilot',
+      '/provider export',
+      'token copied to clipboard',
+      'fine-grained PAT',
+      'device flow',
+      '/key',
+      '/key',
+      '/mode',
+      '/session',
+      '/session-new',
+      '/sessions',
+      '/resume',
+      '/help',
+      '/help hotkeys',
+      '/tools',
+      // Config file.
+      '~/.fah/config.yaml',
+      // Auto-update (`auto_update:` section + /update, issue #1377).
+      'auto_update:',
+      '/update',
+    ];
+    for (final keyword in keywords) {
+      test('mentions $keyword', () {
+        expect(helpText, contains(keyword));
+      });
+    }
+
+    test('renders the version in the header line', () {
+      expect(
+        helpText,
+        contains('fa — flutter_agent_harness CLI agent v0.0.0-test'),
+      );
+    });
+
+    test('documents the flag > config > built-in resolution order', () {
+      expect(
+        helpText,
+        contains('--system-prompt[-file] flag > config prompts: override'),
+      );
+    });
+
+    test('lists the overridable prompt names from the registry', () {
+      for (final name in overridablePromptNames.keys) {
+        expect(helpText, contains(name), reason: 'missing prompt $name');
+      }
+    });
+  });
+}

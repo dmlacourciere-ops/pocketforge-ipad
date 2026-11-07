@@ -1,0 +1,1330 @@
+/// Auto-compaction loop shared by the CLI [AgentCli] and the Flutter
+/// [AgentService]. Single source of truth for:
+///
+/// - **smol → main fallback**: when the `smol` summarizer fails (rate
+///   limit, 403, etc.) and points at a different model/endpoint than the
+///   main chain, retry once with the main stream. If `smol == main`,
+///   skip the fallback (it would just re-trigger the same 403).
+/// - **Transient retry**: 5xx HTTP, `connection closed/reset/aborted`,
+///   `socket exception`, `stream closed` — up to 3 attempts with
+///   1s/2s backoff. Hard refusals (`usage limit`, `429`, validation,
+///   auth) fail-fast — retrying burns the same quota twice.
+/// - **Multi-pass**: when the post-compaction transcript still exceeds
+///   the window (e.g. 1M-token session landing in a 200k model,
+///   short-window on-device contexts), retry the whole pass until it
+///   fits or the per-run pass cap is hit. Each pass re-estimates tokens
+///   against the freshly shrunken transcript.
+///
+/// Hosts inject the host-specific bits (smol resolver, summarizer,
+/// persistence, progress sink) through the configuration object — there
+/// is no implicit coupling to `AgentCli` or `AgentService`.
+library;
+
+import 'dart:async';
+import 'dart:math' as math;
+import '../cancel_token.dart';
+import '../compaction/compaction.dart';
+import '../compaction/token_estimation.dart';
+import '../compaction/structured/engine.dart';
+import '../compaction/structured/markers.dart' show localTrimMarkerPrefix;
+import '../compaction/structured/judge.dart';
+import '../context.dart';
+import '../model.dart';
+import '../session/session_tree.dart' show Session;
+import 'message_cap.dart'
+    show kMessageCapDefaultMargin, messageCapTriggerReached;
+import '../skills/operative_pins.dart'
+    show SkillOperativePins, pinnedOperativePromptBlock;
+import '../skills/skills.dart' show Skill;
+import '../types.dart';
+import 'agent.dart' show AgentState;
+import 'agent_loop.dart' show StreamFunction;
+import 'tool_pairing.dart' show repairToolPairing;
+import '../session/session_record.dart' show CompactionRecord, MessageRecord;
+
+/// Per-pass outcome surfaced through [AutoCompactorHooks.onPass].
+final class AutoCompactorPass {
+  const AutoCompactorPass({
+    required this.pass,
+    required this.tokensBefore,
+    required this.tokensAfter,
+    required this.fallback,
+    required this.ok,
+    this.error,
+    this.summary,
+    this.hiddenRecords = 0,
+    this.summarizedMessages = 0,
+    this.droppedMessages = 0,
+    this.marginTokens,
+    this.bandTokens,
+    this.hideableRemaining,
+  });
+
+  /// 1-based pass number.
+  final int pass;
+
+  /// Estimated tokens before the pass.
+  final int tokensBefore;
+
+  /// Estimated tokens after the pass.
+  final int tokensAfter;
+
+  /// Which summarizer was used: `'smol'`, `'main'`, or `null` when the
+  /// pass was skipped (no work to do).
+  final String? fallback;
+
+  /// Whether the pass succeeded.
+  final bool ok;
+
+  /// The error that failed the pass, when [ok] is `false`.
+  final Object? error;
+
+  /// The summary text the pass wrote (from the compaction record); `null`
+  /// for failed / no-work / local-trim passes.
+  final String? summary;
+
+  /// Session records hidden behind the compaction boundary.
+  final int hiddenRecords;
+
+  /// Message records folded into [summary].
+  final int summarizedMessages;
+
+  /// Live-context messages dropped by the local-trim fallback (issue #673
+  /// AC3): the trim frees tokens WITHOUT hiding session records or folding
+  /// summaries, so a report showing only hidden/summarized cannot explain
+  /// where the tokens went. 0 for every summarizer pass.
+  final int droppedMessages;
+
+  /// gh-2044 fragile-band escalation metadata (optional, never content):
+  /// the settled margin that triggered the structured engine's escalation
+  /// pass. Null on every pass except `structured·ckpt-escalation`.
+  final int? marginTokens;
+
+  /// gh-2044: the band the margin was measured against
+  /// (`settings.reserveTokens`). Null except on escalation passes.
+  final int? bandTokens;
+
+  /// gh-2044: remaining hideable-entry count at escalation time — a
+  /// diagnostic count only. Null except on escalation passes.
+  final int? hideableRemaining;
+}
+
+/// Hooks for a host UI to observe progress. Implementations should not
+/// throw — the compactor swallows and logs around them.
+abstract class AutoCompactorHooks {
+  /// Called once per pass with its outcome. Used by the CLI TUI to print
+  /// "auto-compacted N tokens summarized" and by the Flutter chat sheet
+  /// to update the chat list.
+  void onPass(AutoCompactorPass pass);
+
+  /// Called when a pass retries on a transient error.
+  void onRetry(int attempt, int maxAttempts, Duration backoff, Object error);
+
+  /// Called once after the loop terminates, on success or exhaustion.
+  void onDone(int passes, int tokens);
+
+  /// Called when both smol and main failed in the same pass. The CLI
+  /// prints a "switch models" hint here; the Flutter sheet shows a
+  /// snackbar.
+  void onBothRolesFailed(Object lastError);
+
+  /// Streaming deltas (text + thinking) of the active summarization pass,
+  /// so a host UI can show the summary being written instead of a silent
+  /// spinner. Default no-op; high-frequency — hosts should throttle.
+  void onDelta(String delta) {}
+
+  /// Called when a summarization attempt starts, with the summarizer
+  /// label (`smol=provider/model` / `main=provider/model`), the 1-based
+  /// attempt number and the per-attempt budget. Hosts surface this in the
+  /// busy row so a slow/dead summarizer endpoint reads as a bounded wait
+  /// ("attempt 1, 300 s cap") instead of a silent hang. Default no-op.
+  void onAttemptStart(String label, int attempt, Duration budget) {}
+}
+
+/// Compact helper that owns the multi-pass + retry + smol→main logic.
+/// Hosts register a single [AutoCompactor.run] call after each run; the
+/// helper handles everything else.
+final class AutoCompactor {
+  const AutoCompactor({
+    required this.session,
+    required this.state,
+    required this.window,
+    required this.settings,
+    required this.summary,
+    required this.mainSummary,
+    required this.smolModel,
+    required this.hooks,
+    this.memoryExtractionHook,
+    this.prompts = defaultCompactionPrompts,
+    this.operativeSkills = const [],
+    this.maxPasses = 8,
+    this.maxAttempts = 3,
+    this.baseBackoff = const Duration(seconds: 1),
+    this.force = false,
+    this.attemptBudget = const Duration(seconds: 300),
+    this.totalBudget = const Duration(minutes: 15),
+    this.runToken,
+    this.messageCap,
+    this.messageCapMargin = kMessageCapDefaultMargin,
+  });
+
+  /// The session to compact and to read the projected transcript from.
+  final Session session;
+
+  /// Agent state whose [AgentState.messages] is replaced with the
+  /// compacted transcript on success.
+  final AgentState state;
+
+  /// The model's context window (in tokens). Used by [shouldCompact].
+  final int window;
+
+  /// Compaction thresholds (`reserveTokens`, `keepRecentTokens`,
+  /// `triggerRatio`).
+  final CompactionSettings settings;
+
+  /// The summarizer used at the top of the pass chain (typically the
+  /// `smol` role). May equal [mainSummary] for hosts without a separate
+  /// `smol` (the helper skips the fallback in that case).
+  final SummarizeFn summary;
+
+  /// Fallback summarizer (typically the main model).
+  final SummarizeFn mainSummary;
+
+  /// The model passed to [summary] (i.e. the `smol` Model spec).
+  final Model? smolModel;
+
+  /// Progress / error sink.
+  final AutoCompactorHooks hooks;
+
+  /// Optional Phase 2 hook: forwarded to every [CompactionManager] so
+  /// durable-fact extraction (CLI long-term memory, future Flutter
+  /// equivalents) runs once per pass with the summarized span.
+  final Future<void> Function(String summarizedText)? memoryExtractionHook;
+
+  /// Summarization prompts forwarded to the [CompactionManager] so a
+  /// host's `prompts:` yaml override reaches the same `summary` callback
+  /// that `streamFunctionSummarizer` already uses.
+  final CompactionPrompts prompts;
+
+  /// gh-1409: the skills known to the session — their `operative:`
+  /// directives ride every summarization prompt as the verbatim-preserve
+  /// pinned block (AC3) and are protected from the sanitizer (AC4).
+  /// Empty (default) → prompts byte-identical to the pre-pin pipeline
+  /// (F4 compat guard).
+  final List<Skill> operativeSkills;
+
+  /// The pinned-operative payload derived from [operativeSkills] (null
+  /// when the skills declare no operative lines).
+  PinnedOperativePayload? get pinnedOperative =>
+      pinnedOperativePayloadOf(operativeSkills);
+
+  /// Upper bound on pass count per [run]. Picked so a 1M→200k session
+  /// compacts down in 2-3 passes; deep enough for the worst case but
+  /// bounded so a model that just won't summarize doesn't loop forever.
+  final int maxPasses;
+
+  /// Retry attempts per pass before falling back / failing.
+  final int maxAttempts;
+
+  /// First backoff sleep between same-pass attempts (multiplied by
+  /// attempt number): 1s, 2s.
+  final Duration baseBackoff;
+
+  /// Wall-clock budget for ONE summarization attempt. A provider endpoint
+  /// that accepts the request and never answers (no bytes, no error, no
+  /// done) would otherwise pend `stream.result` forever and wedge the turn
+  /// on the compaction spinner for as long as the user is willing to
+  /// watch it — the provider-level connect/idle watchdogs cover clean
+  /// hangs, but not dribbling keep-alives or a lost completion. When the
+  /// budget fires the attempt fails with a [TimeoutException] (not
+  /// transient — no retry spin), the pass falls to the next summarizer /
+  /// the local trim, and the turn goes on. 300 s (gh-740 M1, raised from
+  /// 90 s): a summarizer writes a bounded summary, and "Compacting
+  /// context…" must never read as a hang (the 0.1.240 default was 10
+  /// minutes per attempt — up to 20 minutes of silent spinner when both
+  /// summarizers dribbled).
+  final Duration attemptBudget;
+
+  /// Wall-clock budget for the WHOLE compactor run across all passes,
+  /// attempts and summarizers. Checked before each attempt: once the
+  /// elapsed time is over the budget, remaining attempts are skipped and
+  /// the run falls to the local trim. Bounds pathological combinations
+  /// (maxPasses × retries × smol+main) that would otherwise keep the UI
+  /// on the compaction spinner for tens of minutes. Defaults to
+  /// `attemptBudget × maxAttempts` (15 min for the 300s gh-740 M1
+  /// attempt budget) — the total must never be smaller than one attempt,
+  /// or a single full timeout would exhaust it and silently collapse the
+  /// retry ladder to a single attempt.
+  final Duration totalBudget;
+
+  /// When `true`, skip the [shouldCompact] gate and run the compactor
+  /// unconditionally. Set by manual `/compact` (the user asked, so we
+  /// honour the request even when the auto-trigger threshold isn't
+  /// crossed).
+  final bool force;
+
+  /// The owning run's cancellation token (issue #1085 M1/M3), when the
+  /// compaction runs inside a run (mid-run over-window relief). When it
+  /// cancels — a USER abort, never the suspended watchdog — every
+  /// in-flight summarization attempt is cancelled with it, so an abort
+  /// kills the compaction promptly instead of waiting out the 15-30 min
+  /// relief. `null` = not linked (standalone compaction).
+  final CancelToken? runToken;
+
+  /// gh-1680: the learned per-model per-request message cap. When the
+  /// live message count reaches `cap − margin` the compactor fires even
+  /// if the TOKEN trigger is untouched — the message-count dimension is
+  /// additive, never a replacement for the token trigger (AC4/AC8). Null
+  /// = no learned cap: token-only behavior, byte-identical to today.
+  final int? messageCap;
+
+  /// The margin below [messageCap] at which the pre-emptive trigger
+  /// fires (see [messageCapTriggerReached]).
+  final int messageCapMargin;
+
+  /// Transient error markers worth retrying: 5xx HTTP, aborted /
+  /// reset / closed sockets, and the browser fetch death (`TypeError:
+  /// Failed to fetch` — an MV3 service-worker provider stream dies with
+  /// exactly that string; gh-2059 arch 7). Hard refusals (rate limit,
+  /// 429, content filter, auth) fail fast.
+  static final _transient = RegExp(
+    r'(?:5\d\d|connection\s+(?:closed|reset|aborted|refused)|'
+    r'socket\s+exception|stream\s+closed|failed\s+to\s+fetch)',
+    caseSensitive: false,
+  );
+
+  /// Overflow-classified failures (issue #729): the request itself cannot
+  /// fit the endpoint's window — a deterministic 400 (occasionally wrapped
+  /// in a 5xx). Never retried; routes straight to the next summarizer /
+  /// the local trim.
+  static final _overflow = RegExp(
+    '(?:context length|context window|maximum context|prompt is too long|'
+    'too many tokens|input length|exceed[s]? the (?:model )?(?:maximum|context)|'
+    'reduce the (?:length|size))',
+    caseSensitive: false,
+  );
+
+  /// The live request-size estimate in the ONE basis the ctx meter and
+  /// the loop's over-window guard also enforce: transcript estimate plus
+  /// the system-prompt / tool-schema overhead whenever no provider-usage
+  /// anchor prices them in (post-compaction transcripts are unanchored by
+  /// design — their next request still carries that overhead).
+  int _requestTokens() => estimateRequestTokens(
+    state.messages,
+    systemPrompt: state.systemPrompt,
+    tools: state.tools,
+  );
+
+  /// gh-1680: whether the live message count reached the learned cap's
+  /// pre-emptive trigger (`count ≥ cap − margin`). The additive
+  /// message-count dimension: fires BEFORE the provider refuses, so the
+  /// request rides a compacted array instead of a doomed round-trip.
+  bool _overMessageCap() => messageCapTriggerReached(
+    state.messages.length,
+    messageCap,
+    margin: messageCapMargin,
+  );
+
+  /// Drives the multi-pass loop. Returns `true` on success (the
+  /// transcript fits in [window]), `false` when the loop gave up or
+  /// every summarizer failed.
+  Future<bool> run() async {
+    try {
+      if (window <= 0) return true;
+      final initial = _requestTokens();
+      if (!force &&
+          !shouldCompact(initial, window, settings) &&
+          !_overMessageCap()) {
+        return true;
+      }
+
+      final runFallback = _shouldRunFallback();
+      final clock = Stopwatch()..start();
+
+      for (var pass = 1; pass <= maxPasses; pass++) {
+        final result = await _runPass(
+          pass,
+          runFallback: runFallback,
+          clock: clock,
+        );
+        if (result.done) return result.success;
+      }
+      final tokens = _requestTokens();
+      hooks.onDone(maxPasses, tokens);
+      return false;
+    } finally {
+      // A cancelled compaction is NEVER a mere failed pass (issue #1085
+      // round-4): both engines fold a cancelled summarizer into
+      // `ok: false`, which callers read as "nothing changed" — the
+      // over-window funnel then RELAUNCHES the compaction the user just
+      // stopped. Surface the cancel as an exception so every host's
+      // abort handling sees it; a success that races a late cancel is
+      // equally dead (the next request rides a cancelled run token).
+      runToken?.throwIfCancelled();
+    }
+  }
+
+  /// gh-1743: host-callable emergency valve for a timed-out compaction —
+  /// applies the same mechanical local trim [_localTrimFallback] the
+  /// classic pass ladder ends on (keep the most recent
+  /// [CompactionSettings.keepRecentTokens], repair tool pairing, prefix
+  /// the `[context trimmed locally]` marker), fires the `local-trim` pass
+  /// receipt and closes the [AutoCompactorHooks.onDone] bracket exactly
+  /// like the `_runPass` trim branch, and reports whether the live
+  /// context was actually bounded. `false` means nothing was droppable —
+  /// the caller keeps its failure verdict.
+  ///
+  /// Deliberately NOT gated on `_runPass`'s under-trigger check
+  /// (`!shouldCompact && !_overMessageCap`): the gh-1425 clamp lands the
+  /// trim under the TOKEN trigger by construction, so the only dimension
+  /// that can stay over is the gh-1680 message cap (many tiny kept
+  /// messages). This boolean answers "does the session live" for the
+  /// over-window funnel — a `false` here aborts the live task, gh-1743's
+  /// whole bug — and a still-over-cap context self-heals at the next
+  /// turn's pre-flight compaction, which fires on the message-cap
+  /// dimension and runs the healthy LM path. A cancelled [runToken]
+  /// throws before anything is trimmed or reported (issue #1085 cancel
+  /// parity with [run]).
+  bool applyLocalTrimFallback({int pass = 1}) {
+    // Cancel parity (issue #1085): a cancelled compaction is NEVER a
+    // mere failed pass. If the owning run's token cancelled around the
+    // moment the budget fired, surface the abort instead of trimming —
+    // and reporting success on — a run the user stopped.
+    runToken?.throwIfCancelled();
+    final tokensBefore = _requestTokens();
+    final trimmed = _localTrimFallback();
+    if (trimmed == null) return false;
+    state.messages = trimmed.messages;
+    final tokensAfter = _requestTokens();
+    hooks.onPass(
+      AutoCompactorPass(
+        pass: pass,
+        tokensBefore: tokensBefore,
+        tokensAfter: tokensAfter,
+        fallback: 'local-trim',
+        ok: true,
+        droppedMessages: trimmed.dropped,
+      ),
+    );
+    hooks.onDone(pass, tokensAfter);
+    return true;
+  }
+
+  /// Whether the smol summarizer is distinct from the main one and should be
+  /// tried before falling back to main.
+  bool _shouldRunFallback() {
+    final smol = smolModel;
+    if (smol == null) return false;
+    final mainModel = state.model;
+    return smol.provider != mainModel.provider || smol.id != mainModel.id;
+  }
+
+  /// Runs one compaction pass. Returns `done: true` when the loop should
+  /// terminate (success or hard failure), `done: false` when another pass is
+  /// needed.
+  Future<({bool done, bool success})> _runPass(
+    int pass, {
+    required bool runFallback,
+    required Stopwatch clock,
+  }) async {
+    final tokensBefore = _requestTokens();
+    final mainModel = state.model;
+    final smolModel = this.smolModel;
+
+    final attempt = await _pickAttempt(
+      pass,
+      runFallback: runFallback,
+      mainLabel: _modelLabel(mainModel),
+      smolLabel: smolModel == null ? 'default' : _modelLabel(smolModel),
+      clock: clock,
+    );
+
+    if (!attempt.ok) {
+      // Both summarizers down: as a last resort, mechanically bound the
+      // live context (see [_localTrimFallback]) so the agent can keep
+      // working instead of being stuck over-window until the endpoint
+      // recovers.
+      final trimmed = _localTrimFallback();
+      if (trimmed != null) {
+        state.messages = trimmed.messages;
+        final tokensAfter = _requestTokens();
+        hooks.onPass(
+          AutoCompactorPass(
+            pass: pass,
+            tokensBefore: tokensBefore,
+            tokensAfter: tokensAfter,
+            fallback: 'local-trim',
+            ok: true,
+            droppedMessages: trimmed.dropped,
+          ),
+        );
+        hooks.onDone(pass, tokensAfter);
+        return (
+          done: true,
+          success:
+              !shouldCompact(tokensAfter, window, settings) &&
+              !_overMessageCap(),
+        );
+      }
+      hooks.onBothRolesFailed(attempt.error!);
+      hooks.onPass(
+        AutoCompactorPass(
+          pass: pass,
+          tokensBefore: tokensBefore,
+          tokensAfter: tokensBefore,
+          fallback: null,
+          ok: false,
+          error: attempt.error,
+        ),
+      );
+      hooks.onDone(pass, _requestTokens());
+      return (done: true, success: false);
+    }
+
+    // A no-op pass (the branch is already compacted at the leaf): stop
+    // instead of spinning identical passes to maxPasses.
+    if (attempt.noWork) {
+      hooks.onPass(
+        AutoCompactorPass(
+          pass: pass,
+          tokensBefore: tokensBefore,
+          tokensAfter: tokensBefore,
+          fallback: attempt.fallback,
+          ok: true,
+        ),
+      );
+      hooks.onDone(pass, tokensBefore);
+      return (done: true, success: true);
+    }
+
+    // Pass succeeded — re-stamp the in-memory transcript with the
+    // session's projected context, then re-estimate. The kept assistant
+    // messages carry generation-time usage from BEFORE the compaction —
+    // anchoring the estimator at it would keep reporting the
+    // pre-compaction size and retrigger the loop forever. Clear it; the
+    // next turn's usage report re-anchors the estimate.
+    state.messages = [
+      for (final message in await session.buildContextMessages())
+        if (message is AssistantMessage)
+          message.copyWith(usage: Usage.zero)
+        else
+          message,
+    ];
+    final tokensAfter = _requestTokens();
+    hooks.onPass(
+      AutoCompactorPass(
+        pass: pass,
+        tokensBefore: tokensBefore,
+        tokensAfter: tokensAfter,
+        fallback: attempt.fallback,
+        ok: true,
+        summary: attempt.summary,
+        hiddenRecords: attempt.hiddenRecords,
+        summarizedMessages: attempt.summarizedMessages,
+      ),
+    );
+    if (!shouldCompact(tokensAfter, window, settings) && !_overMessageCap()) {
+      hooks.onDone(pass, tokensAfter);
+      return (done: true, success: true);
+    }
+    return (done: false, success: false);
+  }
+
+  /// Emergency valve when both summarizers are down and the transcript is
+  /// over the window: mechanically keep the most recent
+  /// [CompactionSettings.keepRecentTokens] (estimated) messages, prefixing
+  /// a user-role marker so the model (and providers, which reject
+  /// toolResult-first transcripts) see what happened. In-memory only — the
+  /// session file keeps every record; the next restart replays the full
+  /// transcript and the pre-flight compaction retries the LLM path with a
+  /// healthy endpoint. Returns null when there is nothing droppable (the
+  ({List<Message> messages, int dropped})? _localTrimFallback() =>
+      localTrimValve(
+        messages: state.messages,
+        reason: 'the summarizer endpoint was unavailable',
+        window: window,
+        settings: settings,
+        overheadTokens: estimateRequestTokens(
+          const [],
+          systemPrompt: state.systemPrompt,
+          tools: state.tools,
+        ),
+      );
+
+  /// Picks the summarizer for this pass: smol first, main as fallback when
+  /// [runFallback] is true. Returns the outcome, the fallback label used and
+  /// the winning attempt's record data (summary + hidden/summarized counts)
+  /// for the pass report.
+  Future<_PickOutcome> _pickAttempt(
+    int pass, {
+    required bool runFallback,
+    required String mainLabel,
+    required String smolLabel,
+    required Stopwatch clock,
+  }) async {
+    if (runFallback) {
+      final smolOk = await _attempt(
+        'smol=$smolLabel',
+        summarize: summary,
+        pass: pass,
+        clock: clock,
+        // E1 (#729): chunk sizing uses the SUMMARIZER's window, never the
+        // main model's — a smaller smol role gets smaller chunks.
+        summarizerWindow: smolModel?.contextWindow,
+      );
+      if (smolOk.ok) {
+        return _PickOutcome(
+          ok: true,
+          error: null,
+          noWork: smolOk.noWork,
+          fallback: 'smol=$smolLabel',
+          summary: smolOk.summary,
+          hiddenRecords: smolOk.hiddenRecords,
+          summarizedMessages: smolOk.summarizedMessages,
+        );
+      }
+      final mainOk = await _attempt(
+        'main=$mainLabel',
+        summarize: mainSummary,
+        pass: pass,
+        clock: clock,
+        summarizerWindow: window,
+      );
+      if (mainOk.ok) {
+        return _PickOutcome(
+          ok: true,
+          error: null,
+          noWork: mainOk.noWork,
+          fallback: 'main=$mainLabel',
+          summary: mainOk.summary,
+          hiddenRecords: mainOk.hiddenRecords,
+          summarizedMessages: mainOk.summarizedMessages,
+        );
+      }
+      return _PickOutcome(
+        ok: false,
+        error: mainOk.error ?? smolOk.error,
+        noWork: false,
+        fallback: null,
+        summary: null,
+        hiddenRecords: 0,
+        summarizedMessages: 0,
+      );
+    }
+
+    // No smol role, or smol == main: single attempt on the main stream.
+    final mainOk = await _attempt(
+      'main=$mainLabel',
+      summarize: mainSummary,
+      pass: pass,
+      clock: clock,
+      summarizerWindow: window,
+    );
+    if (mainOk.ok) {
+      return _PickOutcome(
+        ok: true,
+        error: null,
+        noWork: mainOk.noWork,
+        fallback: 'main=$mainLabel',
+        summary: mainOk.summary,
+        hiddenRecords: mainOk.hiddenRecords,
+        summarizedMessages: mainOk.summarizedMessages,
+      );
+    }
+    return _PickOutcome(
+      ok: false,
+      error: mainOk.error,
+      noWork: false,
+      fallback: null,
+      summary: null,
+      hiddenRecords: 0,
+      summarizedMessages: 0,
+    );
+  }
+
+  /// Runs one pass with up to [maxAttempts] retries on transient errors.
+  /// Returns the outcome plus, on success, the compaction record's summary
+  /// and the hidden/summarized counts (computed from the branch up to
+  /// `firstKeptEntryId`) for the pass report. `noWork` means the branch had
+  /// nothing left to compact (already compacted at the leaf) — the caller
+  /// stops the pass loop instead of spinning identical no-op passes to
+  /// [maxPasses].
+  Future<_AttemptOutcome> _attempt(
+    String label, {
+    required SummarizeFn summarize,
+    required int pass,
+    required Stopwatch clock,
+    required int? summarizerWindow,
+  }) async {
+    if (smolModel == null) {
+      // Resolved via the main chain only — skip the label-based attempt.
+    }
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (clock.elapsed >= totalBudget) {
+        return _AttemptOutcome(
+          ok: false,
+          error: TimeoutException(
+            'compaction total budget (${totalBudget.inSeconds}s) exhausted '
+            'before the $label attempt',
+            totalBudget,
+          ),
+          noWork: false,
+          summary: null,
+          hiddenRecords: 0,
+          summarizedMessages: 0,
+        );
+      }
+      hooks.onAttemptStart(label, attempt, attemptBudget);
+      try {
+        final manager = CompactionManager(
+          summarize: summarize,
+          settings: settings,
+          prompts: prompts,
+          memoryExtractionHook: memoryExtractionHook,
+          // Issue #729: bound this summarizer's outbound payloads to its
+          // own window — chunked summarization inside the pass.
+          summarizerWindow: summarizerWindow,
+          // gh-1409: pinned skill directives ride the verbatim-preserve
+          // block; the sanitizer protects them (AC3/AC4).
+          pinnedOperative: pinnedOperative,
+        );
+        // Issue #515: the budget kill must abort the underlying request,
+        // not abandon it — an endpoint that accepts and never answers
+        // would otherwise keep the connection (and the retry pass) alive
+        // past the timeout.
+        final attemptToken = CancelTokenSource();
+        // Issue #1085: a linked run token (mid-run relief) forwards its
+        // cancellation to the in-flight attempt — the user abort reaches
+        // the summarizer within a microtask hop instead of waiting out
+        // the whole relief.
+        final runToken = this.runToken;
+        if (runToken != null) {
+          unawaited(
+            runToken.onCancel.then(
+              (_) => attemptToken.cancel(runToken.cancelReason),
+            ),
+          );
+        }
+        final compacting = manager.compactSession(
+          session,
+          cancelToken: attemptToken.token,
+        );
+        final record = await compacting.timeout(
+          attemptBudget,
+          onTimeout: () {
+            final timeout = TimeoutException(
+              'compaction attempt exceeded the '
+              '${attemptBudget.inSeconds}s budget',
+              attemptBudget,
+            );
+            attemptToken.cancel(timeout);
+            compacting.ignore();
+            throw timeout;
+          },
+        );
+        if (record == null) {
+          return _AttemptOutcome(
+            ok: true,
+            error: null,
+            noWork: true,
+            summary: null,
+            hiddenRecords: 0,
+            summarizedMessages: 0,
+          );
+        }
+        final (hidden, summarized) = await _compactionCounts(record);
+        return _AttemptOutcome(
+          ok: true,
+          error: null,
+          noWork: false,
+          summary: record.summary,
+          hiddenRecords: hidden,
+          summarizedMessages: summarized,
+        );
+      } catch (error) {
+        final errorText = error.toString();
+        final isTransient = _transient.hasMatch(errorText);
+        // Issue #729 AC2: an overflow-classified failure is DETERMINISTIC —
+        // the payload cannot fit this endpoint no matter how often it is
+        // retried. Route immediately to the next summarizer / the local
+        // trim with ZERO backoff retries, even when the provider wraps the
+        // 400 in a transient-shaped message.
+        final isOverflow = _overflow.hasMatch(errorText);
+        if (isOverflow || attempt >= maxAttempts || !isTransient) {
+          return _AttemptOutcome(
+            ok: false,
+            error: error,
+            noWork: false,
+            summary: null,
+            hiddenRecords: 0,
+            summarizedMessages: 0,
+          );
+        }
+        final backoff = baseBackoff * attempt;
+        hooks.onRetry(attempt, maxAttempts, backoff, error);
+        await Future<void>.delayed(backoff);
+      }
+    }
+    return _AttemptOutcome(
+      ok: false,
+      error: StateError('unreachable: compact attempt loop'),
+      noWork: false,
+      summary: null,
+      hiddenRecords: 0,
+      summarizedMessages: 0,
+    );
+  }
+
+  /// Counts the records hidden behind [record]'s compaction boundary and
+  /// the message records folded into its summary — one branch walk, ids
+  /// only (never positions).
+  Future<(int, int)> _compactionCounts(CompactionRecord record) async {
+    final path = await session.getBranch();
+    final keptIndex = path.indexWhere((e) => e.id == record.firstKeptEntryId);
+    final hidden = keptIndex <= 0 ? 0 : keptIndex;
+    var summarized = 0;
+    for (final entry in path.take(hidden)) {
+      if (entry is MessageRecord) summarized++;
+    }
+    return (hidden, summarized);
+  }
+}
+
+String _modelLabel(Model m) => '${m.provider}/${m.id}';
+
+/// One summarizer attempt's outcome: the ok/error verdict plus, on
+/// success, the compaction record's summary and hidden/summarized
+/// counts. A class, not a record — 6 fields exceeded the record_size
+/// cap (issue #1997).
+final class _AttemptOutcome {
+  const _AttemptOutcome({
+    required this.ok,
+    required this.error,
+    required this.noWork,
+    required this.summary,
+    required this.hiddenRecords,
+    required this.summarizedMessages,
+  });
+
+  final bool ok;
+  final Object? error;
+  final bool noWork;
+  final String? summary;
+  final int hiddenRecords;
+  final int summarizedMessages;
+}
+
+/// [_AttemptOutcome] plus the fallback label that won (smol/main), for
+/// the pass report. A class for the same record_size reason (issue
+/// #1997).
+final class _PickOutcome {
+  const _PickOutcome({
+    required this.ok,
+    required this.error,
+    required this.noWork,
+    required this.fallback,
+    required this.summary,
+    required this.hiddenRecords,
+    required this.summarizedMessages,
+  });
+
+  final bool ok;
+  final Object? error;
+  final bool noWork;
+  final String? fallback;
+  final String? summary;
+  final int hiddenRecords;
+  final int summarizedMessages;
+}
+
+/// The mechanical over-window valve, host-callable (the resume boot cap
+/// applies it INSTANTLY when a resumed transcript cannot fit the window:
+/// an LM compaction pass there takes minutes on slow providers and blocks
+/// the whole boot — the goal_builder incident). Semantics are exactly
+/// [_localTrimFallback]'s; see there for the contract.
+({List<Message> messages, int dropped})? localTrimValve({
+  required List<Message> messages,
+  required String reason,
+  required int window,
+  required CompactionSettings settings,
+  required int overheadTokens,
+}) {
+  if (messages.isEmpty) return null;
+  // gh-1425: the valve must land UNDER the compaction trigger, not
+  // merely at keepRecentTokens — a keepRecent-sized tail plus the
+  // system-prompt/tool-schema overhead can sit above
+  // `window - reserveTokens`, so the next turn's auto-compact re-fires
+  // immediately and, with both summarizers still down, the session is
+  // stuck again (the exact marathon-resume cliff this valve exists
+  // for). Clamp the kept budget to the trigger minus the per-request
+  // overhead; keepRecentTokens still wins when it is smaller. Three
+  // edge guards (gh-1425 review + flutter_app IT-2):
+  // - reserve the [context trimmed] marker's own tokens (~64) so the
+  //   kept region plus marker still lands under the trigger;
+  // - floor the clamp at the newest message's tokens — a degenerate
+  //   overhead (≥ the trigger) must still trim SOMETHING, never return
+  //   an empty window (the projectedBranchBudgetCut rule);
+  // - but only up to keepRecentTokens: a newest message LARGER than
+  //   keepRecentTokens must keep the budget AT keepRecentTokens so the
+  //   walk still finds "nothing droppable" and returns null — that
+  //   null is the failure the summarizer-ladder exhaustion surfaces
+  //   (gh-1077 AC2: the app's fix-location notice fires on it, and the
+  //   transcript stays intact instead of silently dropping the user's
+  //   newest turn).
+  final overhead = overheadTokens;
+  final budget = math.min(
+    settings.keepRecentTokens,
+    math.max(
+      math.max(0, window - settings.reserveTokens - overhead - 64),
+      estimateTokens(messages.last), // never an empty window
+    ),
+  );
+  var cut = 0; // first kept index
+  var accumulated = 0;
+  for (var i = messages.length - 1; i >= 0; i--) {
+    accumulated += estimateTokens(messages[i]);
+    if (accumulated > budget) {
+      cut = i + 1;
+      break;
+    }
+  }
+  if (cut <= 0) return null;
+  final kept = messages.sublist(cut);
+  if (kept.isEmpty) return null;
+  // Pairing integrity (issue #85): a token-boundary cut can land between
+  // an assistant tool call and its result, leaving an orphaned result at
+  // ANY position of the kept region — the production wedge survived the
+  // old leading-only skip as the second block of a merged wire message
+  // (`messages.0.content.1`). The request-boundary repairer is the single
+  // generalization: drops orphan results (with a visible note),
+  // synthesizes missing results, hoists displaced ones. In-memory only —
+  // the session file keeps every record.
+  final rebuilt = repairToolPairing([
+    UserMessage.text(
+      '$localTrimMarkerPrefix $reason, '
+      '$cut older message(s) were dropped from the live context at '
+      '${DateTime.now().toUtc().toIso8601String()} — the full history '
+      'stays in the session file]',
+    ),
+    // Zero the kept generations' usage anchors — a stale generation-time
+    // anchor would keep the estimate over the window and retrigger the
+    // compactor on the next turn (same rule as the success pass).
+    for (final message in kept)
+      if (message is AssistantMessage)
+        message.copyWith(usage: Usage.zero)
+      else
+        message,
+  ]);
+  return (messages: rebuilt.messages, dropped: cut);
+}
+
+/// Source for the [AutoCompactor] smol/main summarizers. Hosts plug in
+/// their own resolver:
+/// - the CLI uses `config.modelRolesResolver?.resolveRole(smolModelRole)`
+/// - the Flutter app uses `_taskModelsStore?.overrideFor(TaskRole.smol)`
+///
+/// Either source may be `null` when no smol is configured; in that case
+/// [AutoCompactor.fromSources] falls back to [mainStream] for both
+/// summarizers and skips the smol→main fallback (one attempt only —
+/// retrying the same call wouldn't help).
+class AutoCompactorSources {
+  const AutoCompactorSources({
+    required this.smolStream,
+    required this.smolModel,
+    required this.mainStream,
+    required this.mainModel,
+  });
+
+  /// When `null`, the AutoCompactor uses [mainStream] + [mainModel] for
+  /// both summarizers and skips the fallback (single attempt).
+  final StreamFunction? smolStream;
+
+  /// The Model spec the smol summarizer should call. `null` together
+  /// with [smolStream] → no real smol.
+  final Model? smolModel;
+
+  /// Fallback summarizer stream (typically the main chat stream).
+  final StreamFunction mainStream;
+
+  /// Fallback summarizer model (typically the agent's main model).
+  final Model mainModel;
+}
+
+/// Builds the gh-1409 summarization payload for [skills]: the rendered
+/// verbatim-preserve block plus the raw pin lines for the sanitizer's
+/// exemption. `null` when the skills declare no operative lines (the
+/// ONE derivation shared by [AutoCompactor] and [AutoCompactorFactory]).
+PinnedOperativePayload? pinnedOperativePayloadOf(List<Skill> skills) {
+  if (skills.isEmpty) return null;
+  final registry = SkillOperativePins.build(skills);
+  if (registry.isEmpty) return null;
+  final block = pinnedOperativePromptBlock(registry);
+  if (block == null) return null;
+  return PinnedOperativePayload(
+    block: block,
+    lines: {for (final pin in registry.pins) pin.line},
+  );
+}
+
+/// Compact helper that owns the multi-pass + retry + smol→main logic for
+/// hosts that build their compactor through the factory: the factory
+/// wires the smol/main summarizers with the configured
+/// [CompactionPrompts] and optional memory hook, then runs the loop.
+///
+/// When [force] is `true` the compactor skips [shouldCompact] — used by
+/// manual `/compact` so the user can force a compaction regardless of
+/// the auto-trigger threshold.
+class AutoCompactorFactory {
+  const AutoCompactorFactory({
+    required this.session,
+    required this.state,
+    required this.window,
+    required this.settings,
+    required this.sources,
+    required this.hooks,
+    this.prompts = defaultCompactionPrompts,
+    this.memoryExtractionHook,
+    this.maxPasses = 8,
+    this.maxAttempts = 3,
+    this.baseBackoff = const Duration(seconds: 1),
+    this.force = false,
+    this.attemptBudget = const Duration(seconds: 300),
+    this.totalBudget = const Duration(minutes: 15),
+    this.engine = CompactionEngine.structured,
+    this.runToken,
+    this.operativeSkills = const [],
+    this.messageCap,
+    this.messageCapMargin = kMessageCapDefaultMargin,
+  });
+
+  final Session session;
+  final AgentState state;
+  final int window;
+  final CompactionSettings settings;
+  final AutoCompactorSources sources;
+  final AutoCompactorHooks hooks;
+  final CompactionPrompts prompts;
+  final Future<void> Function(String)? memoryExtractionHook;
+  final int maxPasses;
+  final int maxAttempts;
+  final Duration baseBackoff;
+  final bool force;
+
+  /// Which engine compactions use (issue #148 D8):
+  /// [CompactionEngine.structured] (the default since issue #287) or
+  /// [CompactionEngine.classic] (the legacy 1.0 rollback — lossy prefix
+  /// summary; the structured engine also falls back to it when it cannot
+  /// get the context under the window).
+  final CompactionEngine engine;
+
+  /// The owning run's cancellation token (issue #1085), forwarded to the
+  /// built [AutoCompactor] and linked to the structured engine's budget
+  /// token: a user abort during a mid-run relief cancels the in-flight
+  /// compaction on BOTH engines. `null` = standalone compaction.
+  final CancelToken? runToken;
+
+  /// gh-1409: the session's skills, forwarded to the built
+  /// [AutoCompactor] — their `operative:` lines ride every summarization
+  /// prompt as the verbatim-preserve pinned block.
+  final List<Skill> operativeSkills;
+
+  /// gh-1680: the learned per-model per-request message cap, forwarded to
+  /// the built [AutoCompactor]: `count ≥ cap − margin` fires the
+  /// pre-emptive trigger even when the token trigger is untouched (AC4).
+  /// Null = token-only behavior, byte-identical to today (AC8).
+  final int? messageCap;
+
+  /// The margin below [messageCap] at which the pre-emptive trigger
+  /// fires (see [messageCapTriggerReached]).
+  final int messageCapMargin;
+
+  /// The pinned-operative payload derived from [operativeSkills] (null
+  /// when the skills declare no operative lines).
+  PinnedOperativePayload? get pinnedOperative =>
+      pinnedOperativePayloadOf(operativeSkills);
+
+  /// Per-attempt wall-clock budget, forwarded to the built [AutoCompactor].
+  final Duration attemptBudget;
+
+  /// Whole-run wall-clock budget, forwarded to the built [AutoCompactor].
+  /// Defaults to 15 min (`attemptBudget × maxAttempts`); see the
+  /// [AutoCompactor.totalBudget] doc for why it must stay in step with
+  /// the per-attempt budget.
+  final Duration totalBudget;
+
+  /// The live request-size estimate on the same basis the structured
+  /// engine enforces (transcript + system-prompt/tool-schema overhead).
+  int _requestTokens() => estimateRequestTokens(
+    state.messages,
+    systemPrompt: state.systemPrompt,
+    tools: state.tools,
+  );
+
+  /// Builds the [AutoCompactor] and runs it. Hosts that want to
+  /// inspect the compactor before starting (e.g. for logging) can use
+  /// [build] instead.
+  Future<bool> run() async {
+    if (engine == CompactionEngine.structured) {
+      // gh-1680: a reached message-cap trigger forces the pass exactly
+      // like `force` — the structured engine's internal gate is
+      // token-only, so the additive message-count dimension must bypass
+      // it here (AC4). Computed up front so the zero-pass fall-through
+      // below covers the cap channel identically.
+      final capTriggered = messageCapTriggerReached(
+        state.messages.length,
+        messageCap,
+        margin: messageCapMargin,
+      );
+      final adapter = _StructuredHooksAdapter(hooks);
+      final outcome = await _runStructured(
+        adapter: adapter,
+        capTriggered: capTriggered,
+      );
+      // gh-1742 invariant 1: a FORCED run (observed usage over the line)
+      // that did zero passes is not relief — the structured engine's
+      // pass loops gate on its own transcript estimate, so an
+      // observation the estimate cannot see would come back `ok` with
+      // nothing done and the child would ride an over-window context
+      // into the next request. Fall through to the classic engine,
+      // whose forced semantics run the summarizer regardless of its
+      // own estimate. An unforced no-op stays the success short-circuit.
+      if (outcome.ok && (adapter.passCount > 0 || !(force || capTriggered))) {
+        // Close the hooks bracket the classic [AutoCompactor.run] closes
+        // on every terminal path: hosts key off [AutoCompactorHooks.onDone]
+        // (the CLI's HEP `compaction_end` frame, the Flutter chat sheet),
+        // so a structured run that skips it leaves them open forever.
+        hooks.onDone(adapter.passCount, _requestTokens());
+        return true;
+      }
+      if (outcome.timedOut) {
+        // Budget kill (issue #515): the summarizer/judge wedged past the
+        // watchdog budget and the underlying call was aborted. gh-1743:
+        // do NOT abort the live session — re-running the classic engine
+        // here would only re-wedge the same endpoint, but the mechanical
+        // local trim needs no endpoint at all: bound the live context
+        // (keepRecentTokens, pairing-repaired, `[context trimmed locally]`
+        // marker) so the run proceeds. The failure verdict is kept only
+        // when there is nothing left to trim.
+        final trimmed = build().applyLocalTrimFallback(
+          pass: adapter.passCount + 1,
+        );
+        if (trimmed) return true;
+        hooks.onBothRolesFailed(outcome.error!);
+        // This is a terminal path like any other: report the failed pass
+        // and close the host bracket (mirrors the classic engine's
+        // exhaustion branch). Skipping it left the CLI's HEP
+        // `compaction_start` bracket open and `_runTokensBefore` stale —
+        // the next compaction's freed-delta frame computed against the
+        // failed run's before-count.
+        hooks.onPass(
+          AutoCompactorPass(
+            pass: adapter.passCount + 1,
+            tokensBefore: _requestTokens(),
+            tokensAfter: _requestTokens(),
+            fallback: null,
+            ok: false,
+            error: outcome.error,
+          ),
+        );
+        hooks.onDone(adapter.passCount + 1, _requestTokens());
+        return false;
+      }
+      // Fall through: the classic prefix compactor is the residual
+      // fallback (issue #148 flowchart S7/D4) — its summary then renders
+      // under structured projection as an opaque legacy-ckpt segment.
+      // Its own run() closes the bracket.
+    }
+    return build().run();
+  }
+
+  Future<({bool ok, bool timedOut, Object? error})> _runStructured({
+    _StructuredHooksAdapter? adapter,
+    bool capTriggered = false,
+  }) async {
+    final smolStream = sources.smolStream ?? sources.mainStream;
+    final smolModel = sources.smolModel ?? sources.mainModel;
+    // One budget token for the whole structured run: both the judge and
+    // the summarizer adapters receive it, and the budget expiries below
+    // cancel it so the wedged call dies at the provider layer (#515).
+    final budgetSource = CancelTokenSource();
+    // Issue #1085: forward a linked run token's cancellation into the
+    // budget token — a user abort mid-relief kills the structured run's
+    // in-flight judge/summarizer calls promptly.
+    final runToken = this.runToken;
+    if (runToken != null) {
+      unawaited(
+        runToken.onCancel.then(
+          (_) => budgetSource.cancel(runToken.cancelReason),
+        ),
+      );
+    }
+    final compactor = StructuredCompactor(
+      session: session,
+      state: state,
+      window: window,
+      settings: settings,
+      // gh-2044 rework (review thread 3): the factory's run token is the
+      // AUTHORITATIVE user-abort signal for the engine's `_runCancelled`.
+      // Before this wiring the engine inferred "user abort" from a
+      // cancel-REASON type heuristic on the budget token
+      // (`cancelReason is! TimeoutException`), so a watchdog-shaped
+      // cancel (any TimeoutException reason — the link forwards
+      // `runToken.cancelReason` verbatim) was silently misclassified as
+      // a budget kill: the escalation proceeded, its LM call died, and
+      // the abort dissolved into a "summarizer returned no text" failed
+      // receipt while the run reported success (#1085). With the token
+      // wired, the first `_runCancelled` clause decides and the
+      // reason-type heuristic degrades to a harmless fallback for
+      // callers that only pass budgetSource.
+      cancelToken: runToken,
+      judge: streamFunctionHideJudge(
+        smolStream,
+        smolModel,
+        system: prompts.hideJudgeSystem,
+        onDelta: hooks.onDelta,
+        cancelToken: budgetSource.token,
+      ),
+      summarize: streamFunctionSummarizer(smolStream, smolModel),
+      // Issue #729: the checkpoint payloads are bounded by the
+      // SUMMARIZER's window (the smol role when configured), not the main
+      // model's.
+      summarizerWindow: (sources.smolModel ?? sources.mainModel).contextWindow,
+      checkpointPrompt: pinnedOperative == null
+          ? prompts.structuredCheckpoint
+          // gh-1409 E7: the structured checkpoint carries the
+          // verbatim-preserve duty too.
+          : '${prompts.structuredCheckpoint}\n\n${prompts.pinnedOperative}',
+      pinnedOperativeBlock: pinnedOperative?.block,
+      pinnedLines: pinnedOperative?.lines ?? const {},
+      hooks: adapter ?? _StructuredHooksAdapter(hooks),
+      budgetSource: budgetSource,
+      // #541: the knob actually bounds the judge — the factory's
+      // attemptBudget reaches the engine's per-call budget, and the
+      // named failure line carries the smol judge's identity.
+      attemptBudget: attemptBudget,
+      judgeTarget:
+          'role=smol, model=${smolModel.id} @ '
+          '${Uri.parse(smolModel.baseUrl).host}',
+    );
+    // gh-1680: the cap trigger is computed by [run] and handed in so a
+    // forced-but-zero-pass structured outcome can fall through to the
+    // classic engine there (gh-1742 invariant 1).
+    final running = compactor.run(force: force || capTriggered);
+    try {
+      final ok = await running.timeout(
+        totalBudget,
+        onTimeout: () {
+          final timeout = TimeoutException(
+            'structured compaction exceeded the '
+            '${totalBudget.inSeconds}s total budget (issue #515)',
+            totalBudget,
+          );
+          // Kill the wedged call at the provider layer, then surface.
+          compactor.cancelBudget(timeout);
+          throw timeout;
+        },
+      );
+      return (ok: ok, timedOut: false, error: null);
+    } on TimeoutException catch (error) {
+      // The engine run may settle later (the abort propagates
+      // asynchronously); drop that late settle — the named failure here
+      // is the authoritative outcome.
+      running.ignore();
+      return (ok: false, timedOut: true, error: error);
+    }
+  }
+
+  /// Builds the [AutoCompactor] from the factory's configuration without
+  /// starting it. Useful for tests or for hosts that want to wrap the
+  /// loop in extra logging.
+  AutoCompactor build() {
+    final smolStream = sources.smolStream ?? sources.mainStream;
+    final smolModel = sources.smolModel ?? sources.mainModel;
+    // gh-1433 E4: the summarizer adapters forward their streaming deltas
+    // (text + thinking) to the host hooks — on the classic engine the
+    // summarizer IS the whole compaction, and its stream used to vanish
+    // behind a busy row that does not exist in a captured log.
+    final smolSummarizer = streamFunctionSummarizer(
+      smolStream,
+      smolModel,
+      prompts: prompts,
+      onDelta: hooks.onDelta,
+    );
+    final mainSummarizer = streamFunctionSummarizer(
+      sources.mainStream,
+      sources.mainModel,
+      prompts: prompts,
+      onDelta: hooks.onDelta,
+    );
+    return AutoCompactor(
+      session: session,
+      state: state,
+      window: window,
+      settings: settings,
+      summary: smolSummarizer,
+      mainSummary: mainSummarizer,
+      smolModel: sources.smolModel,
+      hooks: hooks,
+      memoryExtractionHook: memoryExtractionHook,
+      prompts: prompts,
+      maxPasses: maxPasses,
+      maxAttempts: maxAttempts,
+      baseBackoff: baseBackoff,
+      force: force,
+      attemptBudget: attemptBudget,
+      totalBudget: totalBudget,
+      runToken: runToken,
+      operativeSkills: operativeSkills,
+      messageCap: messageCap,
+      messageCapMargin: messageCapMargin,
+    );
+  }
+}
+
+/// Adapts [StructuredCompactorHooks] onto [AutoCompactorHooks] so host UIs
+/// (CLI busy row, Flutter chat sheet) observe structured passes unchanged.
+final class _StructuredHooksAdapter implements StructuredCompactorHooks {
+  _StructuredHooksAdapter(this._hooks);
+
+  final AutoCompactorHooks _hooks;
+
+  /// Completed structured passes — the factory reports the count through
+  /// [AutoCompactorHooks.onDone] when the run succeeds.
+  int passCount = 0;
+
+  @override
+  void onDelta(String delta) => _hooks.onDelta(delta);
+
+  @override
+  void onPass(StructuredCompactionPass pass) {
+    passCount++;
+    _hooks.onPass(
+      AutoCompactorPass(
+        pass: pass.pass,
+        tokensBefore: pass.tokensBefore,
+        tokensAfter: pass.tokensAfter,
+        // Name the engine + pass kind: a host watching the report can
+        // tell a structured fold from a classic summary (issue #438),
+        // and the deterministic judge-less hide from a judged one
+        // (issue #541).
+        fallback: switch (pass.kind) {
+          'checkpoint' => 'structured·ckpt',
+          'checkpoint-escalation' => 'structured·ckpt-escalation',
+          'hide-fallback' => 'structured·hide-fallback',
+          'hide-lru' => 'structured·hide-lru',
+          _ => 'structured·hide',
+        },
+        ok: pass.ok,
+        error: pass.error,
+        hiddenRecords: pass.hiddenCount,
+        summarizedMessages: pass.summarizedCount,
+        summary: pass.summary,
+        // gh-2044: the escalation's numeric reason rides to the host
+        // reporting (margin/band/outcome) — counts only, never content.
+        marginTokens: pass.marginTokens,
+        bandTokens: pass.bandTokens,
+        hideableRemaining: pass.hideableRemaining,
+      ),
+    );
+  }
+}

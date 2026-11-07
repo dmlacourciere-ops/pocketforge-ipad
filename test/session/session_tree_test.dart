@@ -1,0 +1,581 @@
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+void main() {
+  late MemoryFileSystem fs;
+  late JsonlSessionRepo repo;
+
+  setUp(() {
+    fs = MemoryFileSystem();
+    repo = JsonlSessionRepo(fs: fs, sessionsRoot: '/sessions');
+  });
+
+  Future<Session> newSession({String cwd = '/work'}) {
+    return repo.create(JsonlSessionCreateOptions(cwd: cwd));
+  }
+
+  AssistantMessage assistant(String text, {int usageTokens = 0}) =>
+      AssistantMessage(
+        content: [TextContent(text: text)],
+        api: 'openai-completions',
+        provider: 'openrouter',
+        model: 'm1',
+        usage: usageTokens == 0
+            ? Usage.zero
+            : Usage(
+                input: usageTokens,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: usageTokens,
+                cost: const UsageCost(),
+              ),
+        stopReason: StopReason.stop,
+        timestamp: DateTime.utc(2026),
+      );
+
+  group('Session append and navigation', () {
+    test('appendMessage chains parent ids along the leaf', () async {
+      final session = await newSession();
+      final id1 = await session.appendMessage(UserMessage.text('one'));
+      final id2 = await session.appendMessage(assistant('two'));
+      final e1 = await session.getEntry(id1);
+      final e2 = await session.getEntry(id2);
+      expect(e1?.parentId, isNull);
+      expect(e2?.parentId, id1);
+      expect(await session.getLeafId(), id2);
+    });
+
+    test(
+      'branching: two children from one parent have independent paths',
+      () async {
+        final session = await newSession();
+        final root = await session.appendMessage(UserMessage.text('root'));
+        final branchA = await session.appendMessage(UserMessage.text('A'));
+        await session.moveTo(root);
+        final branchB = await session.appendMessage(UserMessage.text('B'));
+
+        final a = await session.getEntry(branchA);
+        final b = await session.getEntry(branchB);
+        expect(a?.parentId, root);
+        expect(b?.parentId, root);
+
+        final pathA = await session.getBranch(fromId: branchA);
+        final pathB = await session.getBranch(fromId: branchB);
+        expect(pathA.map((e) => e.id), [root, branchA]);
+        expect(pathB.map((e) => e.id), [root, branchB]);
+        expect(await session.getLeafId(), branchB);
+      },
+    );
+
+    test('getChildren groups records by parentId', () async {
+      final session = await newSession();
+      final root = await session.appendMessage(UserMessage.text('root'));
+      final a = await session.appendMessage(UserMessage.text('A'));
+      await session.moveTo(root);
+      final b = await session.appendMessage(UserMessage.text('B'));
+
+      final children = await session.getChildren(root);
+      expect(children.map((e) => e.id), containsAll([a, b]));
+      expect(await session.getChildren('ghost'), isEmpty);
+      final roots = await session.getChildren(null);
+      expect(roots.map((e) => e.id), contains(root));
+    });
+
+    test('moveTo to unknown entry throws not_found', () async {
+      final session = await newSession();
+      expect(
+        () => session.moveTo('ghost'),
+        throwsA(
+          isA<SessionException>().having(
+            (e) => e.code,
+            'code',
+            SessionErrorCode.notFound,
+          ),
+        ),
+      );
+    });
+
+    test('moveTo with summary appends a branch_summary record', () async {
+      final session = await newSession();
+      final root = await session.appendMessage(UserMessage.text('root'));
+      await session.appendMessage(UserMessage.text('detour'));
+      final summaryId = await session.moveTo(root, summary: 'went back');
+      final record = await session.getEntry(summaryId!);
+      expect(record, isA<BranchSummaryRecord>());
+      final summary = record! as BranchSummaryRecord;
+      expect(summary.fromId, root);
+      expect(summary.summary, 'went back');
+      expect(summary.parentId, root);
+    });
+
+    test('moveTo(null) jumps to the tree root', () async {
+      final session = await newSession();
+      await session.appendMessage(UserMessage.text('one'));
+      await session.moveTo(null);
+      expect(await session.getLeafId(), isNull);
+      final fresh = await session.appendMessage(UserMessage.text('new root'));
+      expect((await session.getEntry(fresh))?.parentId, isNull);
+    });
+
+    test('labels validate the target and support removal', () async {
+      final session = await newSession();
+      final id = await session.appendMessage(UserMessage.text('x'));
+      await session.appendLabel(id, 'marked');
+      expect(await session.getLabel(id), 'marked');
+      await session.appendLabel(id, null);
+      expect(await session.getLabel(id), isNull);
+      expect(
+        () => session.appendLabel('ghost', 'x'),
+        throwsA(
+          isA<SessionException>().having(
+            (e) => e.code,
+            'code',
+            SessionErrorCode.notFound,
+          ),
+        ),
+      );
+    });
+
+    test('session name is sanitized and the last one wins', () async {
+      final session = await newSession();
+      expect(await session.getSessionName(), isNull);
+      await session.appendSessionName('first');
+      await session.appendSessionName('second\nwith newlines');
+      expect(await session.getSessionName(), 'second with newlines');
+    });
+  });
+
+  group('Session context rebuild', () {
+    test('buildContextMessages walks leaf to root, oldest first', () async {
+      final session = await newSession();
+      await session.appendMessage(UserMessage.text('one'));
+      await session.appendMessage(assistant('two'));
+      await session.appendMessage(UserMessage.text('three'));
+      final messages = await session.buildContextMessages();
+      expect(messages.map((m) => m.role), ['user', 'assistant', 'user']);
+      expect((messages.first as UserMessage).content, 'one');
+    });
+
+    test(
+      'buildContextMessages drops stale structured-compaction usage anchors',
+      () async {
+        final session = await newSession();
+        final old = await session.appendMessage(UserMessage.text('old'));
+        await session.appendMessage(assistant('kept', usageTokens: 201798));
+        await session.appendHiddenRange(recordIds: [old]);
+        await session.appendMessage(UserMessage.text('after'));
+
+        final messages = (await session.buildContext()).messages;
+        final kept = messages.whereType<AssistantMessage>().single;
+
+        // The real projected context is tiny. The retained assistant's
+        // generation-time usage must not resurrect its 201k-token past.
+        expect(kept.usage.totalTokens, 0);
+        expect(estimateContextTokens(messages).tokens, lessThan(1000));
+      },
+    );
+
+    test(
+      'context rebuild resets classic-cut anchors but preserves fresh usage',
+      () async {
+        final session = await newSession();
+        await session.appendMessage(UserMessage.text('old'));
+        final kept = await session.appendMessage(
+          assistant('kept', usageTokens: 201798),
+        );
+        await session.appendCompaction(
+          summary: 'summary',
+          firstKeptEntryId: kept,
+          tokensBefore: 201798,
+        );
+        await session.appendMessage(assistant('fresh', usageTokens: 50));
+
+        final messages = await session.buildContextMessages();
+        final assistants = messages.whereType<AssistantMessage>().toList();
+
+        expect(assistants[0].usage.totalTokens, 0);
+        expect(assistants[1].usage.totalTokens, 50);
+        expect(estimateContextTokens(messages).tokens, 50);
+      },
+    );
+
+    test('context rebuild preserves live usage without compaction', () async {
+      final session = await newSession();
+      await session.appendMessage(assistant('live', usageTokens: 1234));
+
+      final messages = await session.buildContextMessages();
+
+      expect(
+        messages.whereType<AssistantMessage>().single.usage.totalTokens,
+        1234,
+      );
+      expect(estimateContextTokens(messages).tokens, 1234);
+    });
+
+    test('context follows the active branch after moveTo', () async {
+      final session = await newSession();
+      final root = await session.appendMessage(UserMessage.text('root'));
+      await session.appendMessage(UserMessage.text('A'));
+      await session.moveTo(root);
+      await session.appendMessage(UserMessage.text('B'));
+      final messages = await session.buildContextMessages();
+      expect(messages.map((m) => (m as UserMessage).content), ['root', 'B']);
+    });
+
+    test(
+      'compaction record replaces everything before firstKeptEntryId',
+      () async {
+        final session = await newSession();
+        await session.appendMessage(UserMessage.text('old 1'));
+        final kept = await session.appendMessage(UserMessage.text('kept 1'));
+        await session.appendMessage(UserMessage.text('kept 2'));
+        await session.appendCompaction(
+          summary: 'summary of old',
+          firstKeptEntryId: kept,
+          tokensBefore: 9000,
+        );
+        await session.appendMessage(UserMessage.text('after'));
+
+        final messages = await session.buildContextMessages();
+        expect(messages, hasLength(4));
+        final first = (messages.first as UserMessage).content as String;
+        expect(first, startsWith(compactionSummaryPrefix));
+        expect(first, contains('summary of old'));
+        expect(messages.skip(1).map((m) => (m as UserMessage).content), [
+          'kept 1',
+          'kept 2',
+          'after',
+        ]);
+      },
+    );
+
+    test(
+      'branch_summary records project into context as user messages',
+      () async {
+        final session = await newSession();
+        final root = await session.appendMessage(UserMessage.text('root'));
+        await session.appendMessage(UserMessage.text('detour'));
+        await session.moveTo(root, summary: 'the detour did X');
+        final messages = await session.buildContextMessages();
+        final last = (messages.last as UserMessage).content as String;
+        expect(last, startsWith(branchSummaryPrefix));
+        expect(last, contains('the detour did X'));
+      },
+    );
+
+    test(
+      'custom_message projects into context; custom records do not',
+      () async {
+        final session = await newSession();
+        await session.appendCustomMessageEntry(
+          customType: 'note',
+          content: 'a displayed note',
+          display: true,
+        );
+        await session.appendCustomEntry(
+          customType: 'checkpoint',
+          data: {'n': 1},
+        );
+        final messages = await session.buildContextMessages();
+        expect(messages, hasLength(1));
+        expect((messages.single as UserMessage).content, 'a displayed note');
+      },
+    );
+
+    test(
+      'buildContext derives model, thinking level, and active tools',
+      () async {
+        final session = await newSession();
+        await session.appendModelChange(
+          provider: 'anthropic',
+          modelId: 'claude',
+        );
+        await session.appendThinkingLevelChange('high');
+        await session.appendActiveToolsChange(const ['read', 'write']);
+        await session.appendMessage(UserMessage.text('hi'));
+        await session.appendMessage(assistant('hello'));
+
+        final context = await session.buildContext();
+        expect(context.thinkingLevel, 'high');
+        expect(context.model?.provider, 'openrouter'); // assistant message wins
+        expect(context.model?.modelId, 'm1');
+        expect(context.activeToolNames, ['read', 'write']);
+        expect(context.messages, hasLength(2));
+      },
+    );
+
+    test('buildContext derives the custom provider pin from model_change '
+        '(gh-1000)', () async {
+      final session = await newSession();
+      await session.appendModelChange(
+        provider: 'openai',
+        modelId: 'k3-256k',
+        baseUrl: 'https://api.kimi.com/coding/v1',
+        customProvider: 'kimi_me',
+      );
+      final context = await session.buildContext();
+      expect(context.model?.provider, 'openai');
+      expect(context.model?.modelId, 'k3-256k');
+      expect(context.model?.baseUrl, 'https://api.kimi.com/coding/v1');
+      expect(context.model?.customProvider, 'kimi_me');
+    });
+
+    test(
+      'an assistant-message-derived model carries no pin (migration-safe)',
+      () async {
+        final session = await newSession();
+        await session.appendMessage(assistant('hello'));
+        final context = await session.buildContext();
+        expect(context.model?.baseUrl, isNull);
+        expect(context.model?.customProvider, isNull);
+      },
+    );
+
+    test('a turn after the model_change keeps the serving pin (gh-1226): '
+        'an assistant message updates provider/modelId but carries the '
+        'endpoint/entry pin forward', () async {
+      final session = await newSession();
+      await session.appendModelChange(
+        provider: 'zai',
+        modelId: 'glm-5.3-flash',
+        baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+        customProvider: 'z_ai',
+      );
+      await session.appendMessage(UserMessage.text('hi'));
+      await session.appendMessage(
+        AssistantMessage(
+          content: [TextContent(text: 'hello')],
+          api: 'openai-completions',
+          provider: 'zai',
+          model: 'glm-5.3-flash',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+      final context = await session.buildContext();
+      expect(context.model?.provider, 'zai');
+      expect(context.model?.modelId, 'glm-5.3-flash');
+      expect(
+        context.model?.baseUrl,
+        'https://api.z.ai/api/coding/paas/v4',
+        reason:
+            'the pin a gh-1000 restore recorded must survive the '
+            'turns that followed it — wiping it here is what sent the '
+            'mail-wake turn onto the launch-default provider (gh-1226)',
+      );
+      expect(context.model?.customProvider, 'z_ai');
+    });
+
+    test('a turn served by a DIFFERENT provider than the pin does not '
+        'carry the pin forward (gh-1226 review): queue failover / roles '
+        'rotation swap the serving model with no model_change record — '
+        'fusing the z.ai endpoint onto the new provider would re-bind it '
+        'to the wrong endpoint and key slot on the next restore', () async {
+      final session = await newSession();
+      await session.appendModelChange(
+        provider: 'zai',
+        modelId: 'glm-5.3-flash',
+        baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+        customProvider: 'z_ai',
+      );
+      await session.appendMessage(UserMessage.text('hi'));
+      await session.appendMessage(
+        AssistantMessage(
+          content: [TextContent(text: 'hello from the queue')],
+          api: 'openai-completions',
+          // The provider queue's sticky-cursor failover / roles-mode
+          // per-turn rotation serve this turn on a catalog provider
+          // without appending a ModelChangeRecord.
+          provider: 'openai',
+          model: 'gpt-4o',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+      final context = await session.buildContext();
+      expect(context.model?.provider, 'openai');
+      expect(context.model?.modelId, 'gpt-4o');
+      expect(
+        context.model?.baseUrl,
+        isNull,
+        reason:
+            'the z.ai endpoint belongs to the z.ai pin — carrying '
+            'it onto the openai turn fuses provider+endpoint across '
+            'providers (the same fusion class gh-1226 AC2 fixes)',
+      );
+      expect(context.model?.customProvider, isNull);
+    });
+
+    test('buildContext defaults when nothing was recorded', () async {
+      final session = await newSession();
+      final context = await session.buildContext();
+      expect(context.messages, isEmpty);
+      expect(context.thinkingLevel, 'off');
+      expect(context.model, isNull);
+      expect(context.activeToolNames, isNull);
+    });
+  });
+
+  group('ensureCompactionBoundaryResident (windowed CLI resume, #503)', () {
+    test(
+      'a linear session longer than the residency cache pages everything, tail intact — no full-open fallback',
+      () async {
+        final session = await newSession();
+        for (var i = 0; i < 800; i++) {
+          await session.appendMessage(UserMessage.text('m$i'));
+        }
+        final meta = await session.getMetadata();
+        final reopened = await repo.open(meta, windowed: true);
+        final intact = await reopened.ensureCompactionBoundaryResident();
+        // The anchored walk (eviction suspended) keeps the leaf resident
+        // while paging to the file head: the old loadOlder loop slid the
+        // tail out, the branch read EMPTY, and the resume degenerated to
+        // a full open (10s+ on a marathon file — the observed 38s case).
+        expect(intact, isTrue);
+        final branch = await reopened.getBranch();
+        expect(branch, hasLength(800));
+        expect(branch.last.id, await reopened.getLeafId());
+        final full = await repo.open(meta);
+        final fullBranch = await full.getBranch();
+        expect(fullBranch.length, 800);
+        expect(fullBranch.last.id, await full.getLeafId());
+      },
+    );
+
+    test(
+      'a compaction boundary within the cache pages to it, tail intact',
+      () async {
+        final session = await newSession();
+        for (var i = 0; i < 250; i++) {
+          await session.appendMessage(UserMessage.text('m$i'));
+        }
+        final compactId = await session.appendCompaction(
+          summary: 'summarized',
+          firstKeptEntryId: 'kept',
+          tokensBefore: 100,
+        );
+        for (var i = 250; i < 300; i++) {
+          await session.appendMessage(UserMessage.text('m$i'));
+        }
+        final meta = await session.getMetadata();
+        final reopened = await repo.open(meta, windowed: true);
+        final intact = await reopened.ensureCompactionBoundaryResident();
+        expect(intact, isTrue);
+        final branch = await reopened.getBranch();
+        expect(branch.map((r) => r.id), contains(compactId));
+        expect(branch.last.id, await reopened.getLeafId());
+      },
+    );
+
+    test('a fresh (empty) session is intact without paging', () async {
+      final session = await newSession();
+      final meta = await session.getMetadata();
+      final reopened = await repo.open(meta, windowed: true);
+      expect(await reopened.ensureCompactionBoundaryResident(), isTrue);
+      expect(await reopened.getBranch(), isEmpty);
+    });
+
+    test('a full (non-windowed) storage is a no-op reporting intact', () async {
+      final session = await newSession();
+      await session.appendMessage(UserMessage.text('one'));
+      final meta = await session.getMetadata();
+      final reopened = await repo.open(meta);
+      expect(await reopened.ensureCompactionBoundaryResident(), isTrue);
+      expect((await reopened.getBranch()).length, 1);
+    });
+
+    test(
+      'tokenBudget stops the walk once the resident tail fills the model '
+      'window — no boundary, no file head (issue #503: resume reads only '
+      'what fits the context window; older history pages in on scroll)',
+      () async {
+        final session = await newSession();
+        for (var i = 0; i < 800; i++) {
+          await session.appendMessage(UserMessage.text('m$i'));
+        }
+        final meta = await session.getMetadata();
+        final reopened = await repo.open(meta, windowed: true);
+
+        final intact = await reopened.ensureCompactionBoundaryResident(
+          tokenBudget: 50,
+        );
+
+        expect(intact, isTrue);
+        final branch = await reopened.getBranch();
+        // The walk stopped long before the file head: the tiny budget is
+        // covered by the tail window alone.
+        expect(branch.length, lessThan(800));
+        expect(branch.last.id, await reopened.getLeafId());
+        // Context projects the resident tail as-is (no compaction record
+        // in the branch — the raw recent messages ARE the context).
+        final messages = await reopened.buildContextMessages();
+        expect(messages, hasLength(branch.length));
+      },
+    );
+  });
+
+  group('ensureWholeLedgerResident (gh-1555 W1 read-everything surfaces)', () {
+    test(
+      'a linear session longer than the window pages to the file head in '
+      'bounded blocks — the branch then matches the full open exactly '
+      '(semantic-drift property)',
+      () async {
+        final session = await newSession();
+        for (var i = 0; i < 800; i++) {
+          await session.appendMessage(UserMessage.text('m$i'));
+        }
+        final meta = await session.getMetadata();
+
+        final windowed = await repo.open(meta, windowed: true);
+        // The tail window alone does not cover 800 records.
+        expect((await windowed.getBranch()).length, lessThan(800));
+
+        await windowed.ensureWholeLedgerResident();
+        final branch = await windowed.getBranch();
+        expect(branch, hasLength(800));
+        expect(branch.last.id, await windowed.getLeafId());
+
+        final full = await repo.open(meta);
+        final fullBranch = await full.getBranch();
+        expect(
+          branch.map((r) => r.id).toList(),
+          fullBranch.map((r) => r.id).toList(),
+          reason: 'paged windowed reads must not drift from the full open',
+        );
+      },
+    );
+
+    test(
+      'a session below the window is already resident — a trivial true, '
+      'branch identical to the full open (no regression for the common '
+      'small session, gh-1555 AC7)',
+      () async {
+        final session = await newSession();
+        await session.appendMessage(UserMessage.text('one'));
+        await session.appendMessage(assistant('two'));
+        final meta = await session.getMetadata();
+
+        final windowed = await repo.open(meta, windowed: true);
+        await windowed.ensureWholeLedgerResident();
+        final branch = await windowed.getBranch();
+        final fullBranch = await (await repo.open(meta)).getBranch();
+        expect(
+          branch.map((r) => r.id).toList(),
+          fullBranch.map((r) => r.id).toList(),
+        );
+      },
+    );
+
+    test('a full (non-windowed) storage is a no-op reporting true', () async {
+      final session = await newSession();
+      await session.appendMessage(UserMessage.text('one'));
+      final meta = await session.getMetadata();
+      final reopened = await repo.open(meta);
+      await reopened.ensureWholeLedgerResident();
+      expect((await reopened.getBranch()).length, 1);
+    });
+  });
+}

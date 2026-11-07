@@ -1,0 +1,986 @@
+/// The cross-platform settings registry: the single source of truth for
+/// every shared concept that must exist on BOTH the CLI and the Flutter app.
+///
+/// When you add a new setting or interactive type that both platforms should
+/// support:
+/// 1. Add it to [SharedSetting] here.
+/// 2. Implement it on BOTH platforms.
+/// 3. If one platform genuinely cannot support it, add it to
+///    [cliOnlySettings] or [appOnlySettings] with a comment explaining WHY.
+/// 4. Run `dart test test/parity/` — the guard must pass.
+///
+/// The parity tests in `test/parity/` read [sharedSettingMetadata] and verify
+/// that the `cliRef` and `appRef` strings appear in the respective platform's
+/// source tree. This catches drift early — a new setting added to the CLI but
+/// forgotten in the app (or vice versa) fails the test.
+///
+/// ## Completeness contract (issue #288)
+///
+/// The registry also OWNS the yaml schema classification: every top-level
+/// key the real parsers read (`CliConfig.fromYaml` + the roles parser) is
+/// either
+/// - owned by a [SharedSetting] via its `yamlKeys` (settings-hub TUI entry
+///   + app surface, unless [cliOnlySettings] exempts the app side), or
+/// - listed in [fileOnlyConfigKeys] with a WHY (structural/infrastructure
+///   keys no interactive surface edits, on any platform, by design).
+///
+/// The completeness gate `test/parity/settings_completeness_test.dart`
+/// walks the parser sources and fails on any unclassified key — a new yaml
+/// key cannot land without a registry classification. CLI-only exemptions
+/// carry a user-readable justification in [cliOnlyJustifications] which the
+/// app renders in its "CLI-only settings" section (never silent absence),
+/// and [settingSurfaces] records the {macOS, iOS, web, extension}
+/// applicability audit with capability-named gap reasons.
+library;
+
+/// Every shared settings concept that must exist on both platforms unless
+/// explicitly exempted.
+enum SharedSetting {
+  /// Tool-approval mode (always-ask / write / yolo / autopilot — the
+  /// CLI label of the internal `unattended` enum).
+  approvalMode,
+
+  /// The default chat model (provider, modelId, baseUrl, apiKey).
+  modelDefault,
+
+  /// Fast/cheap model for compaction and subagents.
+  modelSmol,
+
+  /// Per-modality media model overrides (image/TTS/music/video/vision/transcription).
+  mediaSlots,
+
+  /// Saved custom provider endpoints.
+  customProviders,
+
+  /// API key store (env / keychain).
+  apiKeys,
+
+  /// External MCP tool servers.
+  mcpServers,
+
+  /// Time-traveling stream rules.
+  ttsrRules,
+
+  /// Prompt template overrides (system prompt, mode prompts, compaction prompts).
+  promptOverrides,
+
+  /// Consent for reading third-party skill roots (Claude/Copilot/Codex).
+  skillsAccess,
+
+  /// Per-skill enable/disable toggles — the `skills: {<name>: on|off}`
+  /// entries (issue #1151), persisted app-side in skills_toggles.json.
+  skillsToggles,
+
+  /// fa_cube sandbox profiles (declarative fs/shell/network clamps).
+  cubeSandbox,
+
+  /// DAP/1 hub connection (URL, agent name/identity, channels).
+  dapHub,
+
+  /// Capability-gated tool availability (hide unavailable/disabled tools).
+  tools,
+
+  /// Compaction engine choice (structured 2.0 default, issue #287; the
+  /// classic 1.0 prefix summary stays as the in-settings rollback).
+  compactionEngine,
+
+  /// The agent mode preset (code / ask / plan …) that picks the system
+  /// prompt of the coding REPL.
+  agentMode,
+
+  /// Long-term memory store locations (`memory.projectPath` /
+  /// `memory.userPath`).
+  memoryStores,
+
+  /// The automatic tool-result spilling (`spills:` section, issue #678):
+  /// boot wiring for the CLI host process's agent loop — hook attach +
+  /// boot notes, not an interactive preference on any surface.
+  spillHooks,
+
+  /// The merged project-context budget (`projectContext.maxBytes`,
+  /// issue #1761): the 32KB byte budget over AGENTS.md/CLAUDE.md and
+  /// friends, allocated leaf-first. Truncation is never silent on EITHER
+  /// surface — a head excerpt + read-the-full-file instruction for the
+  /// model, a dim/AppLog boot notice per truncated or dropped file.
+  projectContextBudget,
+
+  /// The layered redaction pipeline's `redact:` section (enabled/blockMode,
+  /// per-layer toggles, allowlist regexes, entropy knobs, per-tool policy,
+  /// issue #391).
+  redactionPolicy,
+
+  /// The session image registry's `images:` section — the registry kill
+  /// switch (`registry: false` reproduces the legacy request shape
+  /// byte-for-byte) and the per-request unique-image cap
+  /// (`maxPerRequest`, default 20), issue #395.
+  imageRegistry,
+
+  /// The host machine's sleep-prevention (`power:` section — the
+  /// `sleepPrevention` level and the `hold` lifecycle, issues
+  /// #325/#326): the assertion the long run holds so the machine does
+  /// not sleep under it, issue #397.
+  sleepPrevention,
+
+  /// The owner-side context cap (`agent.contextWindowCap`, issue #273)
+  /// clamping the EFFECTIVE window for the compaction thresholds, the ctx
+  /// meter and the loop's over-window guard (issue #394).
+  contextWindowCap,
+
+  /// The tool-load preset (`agent.mode: default|pi|omp`, issue #680):
+  /// the essential/discoverable schema curation (omp after oh-my-pi;
+  /// pi is #679's exact benchmark shape).
+  loadMode,
+
+  /// Provider failure resilience: the watchdog timeouts
+  /// (`providerTimeouts.connectTimeoutMs`/`streamIdleTimeoutMs`) and the
+  /// chain retry policy (`retry:`, issue #393).
+  resiliencePolicy,
+
+  /// TUI color palette (tui.theme + ~/.fah/themes/*.json, issue #279).
+  tuiTheme,
+
+  /// The main-model provider queue (`providersQueue:` yaml sections +
+  /// the `FA_PROVIDERS_QUEUE` env, issue #418): the ordered failover
+  /// chain, edited by the same list/add/remove/reorder editor on the
+  /// CLI (`/providers queue`) and in the app Settings; the env scope is
+  /// read-only everywhere.
+  providersQueue,
+
+  /// The harness benchmark mode (`agent.mode`: `default` | `pi`, issue
+  /// #679): `fa --pi` runs pi's exact benchmark shape — the 4-tool
+  /// surface, the bare prompt profile, the token-parity gate.
+  harnessMode,
+
+  /// The self-update policy (`auto_update` scalar, issue #1377):
+  /// `notify` (boot check, print once), `on` (download + restart onto the
+  /// new release), `off` (no update network traffic).
+  autoUpdate,
+}
+
+/// Settings that are currently CLI-only.
+///
+/// Each entry MUST have a comment explaining WHY the app cannot support it,
+/// and a matching user-readable justification in [cliOnlyJustifications]
+/// (the app surfaces the reason instead of silently omitting the setting).
+const cliOnlySettings = <SharedSetting>{
+  // MCP servers require spawning external processes — impossible on web and
+  // not yet wired in the Flutter app's sandbox.
+  SharedSetting.mcpServers,
+
+  // Host-process sandboxing primitives + a host shell: the app's mobile
+  // shells are already WASI/memory-confined and web has no shell at all.
+  SharedSetting.cubeSandbox,
+
+  // The app's agent surfaces compile their prompt templates in
+  // (flutter_app/lib/prompts.g.dart, generated from flutter_app/prompts/);
+  // there is no runtime prompt-override file for them to read.
+  SharedSetting.promptOverrides,
+
+  // Agent modes are REPL prompt presets (builtInAgentModes) driving the
+  // coding agent's system prompt; the app composes its own per-surface
+  // prompts and has no mode-preset concept to switch.
+  SharedSetting.agentMode,
+
+  // Memory store locations are host filesystem paths (project-relative and
+  // ~/ user roots). The app's sandbox owns its storage layout and resolves
+  // the section read-only (memory_config_loader); editing host paths from
+  // inside the sandbox would point the CLI at paths the app cannot see.
+  SharedSetting.memoryStores,
+
+  // Spilling is boot wiring INSIDE the CLI host process's agent loop
+  // (hook attach + boot notes, issue #678); the app composes its own
+  // agent loop and has no hook chain to attach to. File-tuned section.
+  SharedSetting.spillHooks,
+
+  // The image registry is process-wide state inside the CLI host's agent
+  // loop (the request-build rewrite reads a global published at boot);
+  // the app composes its own requests and consumes the section read-only
+  // per #288's umbrella (issue #395 is the CLI half).
+  SharedSetting.imageRegistry,
+
+  // The sleep-prevention assertion lifecycle (run-start/settle and
+  // session-open/close hooks) lives in the CLI host process; the app's
+  // power_guard only loads the section read-only and has no controller
+  // to re-arm live (issue #397 is the CLI half — per #288's umbrella).
+  SharedSetting.sleepPrevention,
+  // The context cap feeds the CLI's compaction math, ctx meter and the
+  // loop's over-window guard — all running in the CLI host process; the
+  // app has no agent loop to re-cap live (issue #394 is the CLI half —
+  // the app keeps consuming the section read-only per #288's umbrella).
+  SharedSetting.contextWindowCap,
+  // The TUI palette colors a terminal: the app renders through Flutter's
+  // own theming stack (separate system by design — issue #279 non-goal).
+  SharedSetting.tuiTheme,
+  // The harness benchmark mode (issue #679) presets the CLI REPL boot —
+  // the tool-scope pin and the bare prompt composition run in the CLI
+  // host process (`fa --pi`); the app has no fa benchmark runner.
+  SharedSetting.harnessMode,
+  // The self-update (issue #1377) downloads the new fa release and
+  // respawns the CLI executable over its own stdio; the app updates
+  // through its store/installer, never by re-exec-ing itself.
+  SharedSetting.autoUpdate,
+};
+
+/// Settings that are currently app-only.
+///
+/// Each entry MUST have a comment explaining WHY the CLI cannot support it.
+const appOnlySettings = <SharedSetting>{
+  // No app-only settings — everything the app has, the CLI should have too
+  // (or already has an equivalent for).
+};
+
+/// SharedSettings that own NO `~/.fah/config.yaml` key because their
+/// storage lives elsewhere. The completeness gate allows exactly these to
+/// have empty `yamlKeys` (issue #288 E1: secrets never ride the yaml).
+const nonYamlSettings = <SharedSetting>{
+  // API keys resolve env-first, then the platform secure store
+  // (SecureKeyCache / the app's keychain-backed stores) — never the yaml
+  // config file. Both surfaces edit the same secure store.
+  SharedSetting.apiKeys,
+
+  // The DAP/1 hub connection persists in ~/.dap/config.json plus the
+  // .fah/packages.yaml plugin opt-out — an E4-style whole-section entry
+  // that covers the connection, not a yaml key.
+  SharedSetting.dapHub,
+  // The harness mode rides the `agent:` top-level section
+  // (`agent.mode`), which the single-owner yaml classification already
+  // assigns to contextWindowCap (issue #394); sub-keys are not top-level
+  // keys, so this setting owns none itself.
+  SharedSetting.harnessMode,
+  // The load mode (agent.mode, issue #680) stores in the yaml but owns
+  // no TOP-LEVEL key: it is a leaf of the agent: section whose key
+  // contextWindowCap already owns (single-owner rule above) — the entry
+  // is here so the completeness gate accepts its empty yamlKeys while
+  // its interactive surface stays parity-tracked.
+  SharedSetting.loadMode,
+  // The per-skill toggles (issue #1151) are ENTRIES inside the `skills:`
+  // section (`skills: {<name>: on|off}`) whose top-level key skillsAccess
+  // already owns (single-owner rule above) — the entry is here so the
+  // completeness gate accepts its empty yamlKeys while its interactive
+  // surface stays parity-tracked.
+  SharedSetting.skillsToggles,
+};
+
+/// User-readable justifications for the [cliOnlySettings] exemptions.
+///
+/// The app renders these in its "CLI-only settings" section (issue #288
+/// AC4): where the app would naturally list a related setting, the CLI-only
+/// entry shows the marker + reason — never a silent absence. E3 discipline:
+/// the reason names the missing capability, not "didn't get to it".
+const cliOnlyJustifications = <SharedSetting, String>{
+  SharedSetting.mcpServers:
+      'MCP servers spawn external processes on the host; the app cannot '
+      'start them from its sandbox. Configure them in the CLI.',
+  SharedSetting.cubeSandbox:
+      'fa_cube sandbox profiles need host-process sandboxing and a host '
+      'shell; the app runs WASI/memory-confined (or in a browser with no '
+      'shell at all).',
+  SharedSetting.promptOverrides:
+      'The app ships its prompt templates compiled in; runtime prompt '
+      'overrides are a CLI config-file feature.',
+  SharedSetting.imageRegistry:
+      'The image registry is process-wide state inside the CLI host agent '
+      'loop (the request-build rewrite reads a global published at boot); '
+      'the app composes its own requests and consumes the section '
+      'read-only. Configure it in the CLI (issue #395).',
+  SharedSetting.sleepPrevention:
+      'The sleep-prevention assertion lifecycle (run-start/settle and '
+      'session-open/close hooks) runs inside the CLI host process; the '
+      'app\'s power_guard reads the section but has no controller to '
+      're-arm live. Configure it in the CLI (issue #397).',
+  SharedSetting.contextWindowCap:
+      'The context cap feeds the CLI agent loop and compaction math '
+      'running in the CLI host process; the app has no agent loop to '
+      're-cap live. Configure it in the CLI (issue #394).',
+  SharedSetting.agentMode:
+      'Agent modes are CLI REPL prompt presets; the app composes its own '
+      'prompts per surface and has no mode presets to switch.',
+  SharedSetting.memoryStores:
+      'Memory store locations are host filesystem paths; the app sandbox '
+      'resolves them read-only and cannot re-point the CLI at new paths.',
+  SharedSetting.tuiTheme:
+      'The TUI palette colors a terminal emulator; the app themes through '
+      'its own Flutter theming stack (separate system by design).',
+  SharedSetting.spillHooks:
+      'Spill hooks run inside the CLI host process\'s agent loop (result '
+      '→ redact → size check → spill → preview, issue #678); the app has '
+      'no hook chain to attach to. Configure the section in the file.',
+  SharedSetting.harnessMode:
+      'The harness benchmark mode presets the CLI REPL boot (the 4-tool '
+      'surface and bare prompt of `fa --pi`, issue #679); the app has no '
+      'fa benchmark runner. Configure it in the CLI.',
+  SharedSetting.autoUpdate:
+      'The self-update downloads the fa release and restarts the CLI '
+      'executable over its own stdio (issue #1377); the app updates '
+      'through its store/installer, never by re-exec-ing itself. '
+      'Configure it in the CLI.',
+};
+
+/// Top-level yaml keys that are intentionally NOT interactive settings on
+/// ANY surface — structural or infrastructure config, edited in the file by
+/// design. Every entry carries its WHY (issue #288 AC1: a documented
+/// structural-only key, reviewed).
+const fileOnlyConfigKeys = <String, String>{
+  // A2A gateway endpoints + credentials are deployment wiring (env-token
+  // references included) — infrastructure, not a user preference.
+  'a2a':
+      'A2A gateways are deployment infrastructure (endpoints and '
+      'credentials with env-token references); no surface edits them '
+      'interactively.',
+
+  // Trajectory capture tuning (opt-in raw wire dumps, issue #385): a
+  // deliberate, size/pII-sensitive escape hatch — file-only by design so
+  // it cannot be flipped casually mid-session.
+  'trajectory':
+      'Trajectory wire-dump capture is an opt-in, size/pII-sensitive '
+      'debugging escape hatch (issue #385); provisioned deliberately in '
+      'the file per environment.',
+
+  // Quota monitoring knobs (issue #823): the badge is a deliberate opt-in
+  // chrome choice and the TTL is an operational cadence — both provisioned
+  // in the file per environment; surfaces only READ quota state, no
+  // settings UI writes this section.
+  'quota':
+      'Quota-monitoring knobs (issue #823): opt-in badge and cache TTL, '
+      'provisioned per environment in the file; /quota and the surfaces '
+      'read quota state and change no setting.',
+
+  // Background-subagent heartbeat cadence and stall threshold (issue
+  // #383): operational knobs for long-running sessions, tuned in the
+  // file; 0/0 disables the heartbeat entirely.
+  'subagents':
+      'Heartbeat cadence and stall threshold for background-subagent '
+      'status digests (issue #383) — operational knobs, tuned in the '
+      'file.',
+
+  // Background-job registry knobs (issue #478): the stale-entry age
+  // belt (`staleHours`), the boot log GC (`logRetentionDays`), and the
+  // per-log size ceiling (`maxLogBytes`, issue #919) — operational knobs,
+  // tuned in the file; 0 disables the first two.
+  'jobs':
+      'Job-registry knobs (issue #478) — staleHours age belt '
+      '+ logRetentionDays boot GC + maxLogBytes per-log ceiling '
+      '(issue #919); operational, tuned in the file.',
+
+  // Visible-waiting heartbeat cadence + `--wait-for-jobs` ceiling
+  // (issue #450) and the per-call foreground liveness knobs (gh-1055:
+  // reminder start/cadence + the background-hint escalation threshold) —
+  // operational knobs for long waits, tuned in the file; 0 disables the
+  // heartbeat / the whole per-call liveness respectively.
+  'waiting':
+      'Waiting-heartbeat cadence, the headless --wait-for-jobs ceiling '
+      '(issue #450), and the per-call tool-liveness thresholds '
+      '(gh-1055) — operational knobs, tuned in the file.',
+
+  // Headless drain ceiling + liveness cadence (gh-1459): how long `fa -p`
+  // may keep draining live background jobs after the final answer before
+  // it detaches, and how often an interim still-running notice is steered
+  // while it waits — operational ceilings tuned per environment; 0
+  // disables the drain / the liveness steers.
+  'headless':
+      'The headless background-job drain ceiling and interim liveness '
+      'cadence (gh-1459) — how long `fa -p` stays alive for awaited '
+      'background jobs after the final answer, and how often it reminds '
+      'the model what it waits for; operational, tuned in the file.',
+  // The fabric section carries the HOST's discovery announcements (issue
+  // #27 phase 2) — written by hosts, read by the runtime, never user-edited.
+  'fabric':
+      'Host discovery announcements are written BY hosts (issue #27), not '
+      'by users; read-only config.',
+
+  // Roles-group member: per-path role pinning, parsed together with
+  // roles:. Superseded for interactive use by the roles: chains the
+  // agent-models flow edits; per-path pinning stays file-tuned.
+  'modelOverrides':
+      'Roles-group member (per-path role pinning), superseded for '
+      'interactive use by the roles: chains the agent-models flow edits; '
+      'per-path pinning stays file-tuned.',
+
+  // Product/store links (issue #691): routing data read by every
+  // surface (app Get banner, CLI, fa1.dev generator) — no interactive
+  // editor by design; the file is the single source of truth.
+  'links':
+      'Product/store links (issue #691) are routing data every surface '
+      'READS (app Get banner, CLI, fa1.dev generator); the config file '
+      'is the single source of truth and no surface edits it '
+      'interactively.',
+
+  // Console-output presentation flag (gh-1198): the opt-in live thinking
+  // stream for CLI line-mode/headless runs — a CI/log presentation choice
+  // with no app-side analog (the app renders thinking in its own UI),
+  // so it stays file/flag-tuned.
+  'output':
+      'The live thinking stream (gh-1198) is a CLI console/log '
+      'presentation choice (fa --stream-thinking or the file); the app '
+      'renders thinking in its own UI and has no console output to '
+      'configure.',
+
+  // Session disk retention (gh-1746): boot-time hygiene over the CLI's
+  // own sessions root — the app never opens that root, so there is no
+  // app surface to edit it; file-only by design.
+  'sessions':
+      'Session retention (gh-1746) is boot-time disk hygiene for the '
+      'CLI-owned sessions root; no app surface edits it interactively.',
+
+  // Per-provider proxy bindings (issue #1921): network infrastructure
+  // wiring (proxy URL + env-secret references), provisioned per
+  // environment in the file; no surface edits it interactively.
+  'providers':
+      'Per-provider proxy bindings (issue #1921) are network '
+      'infrastructure (proxy URLs with env-secret references), '
+      'provisioned per environment in the file.',
+};
+
+/// Which app surfaces carry a shared setting: the Flutter app on macOS,
+/// iOS and web, plus the browser extension panel (issue #288 AC3/AC5).
+/// Absent surfaces must name the CAPABILITY gap in [SettingSurfaces.gapWhy]
+/// (E3) — never "didn't get to it".
+final class SettingSurfaces {
+  /// Creates the audit record for one setting.
+  const SettingSurfaces({
+    required this.macos,
+    required this.ios,
+    required this.web,
+    required this.extensionPanel,
+    this.gapWhy,
+  });
+
+  /// Present in the macOS build of the Flutter app.
+  final bool macos;
+
+  /// Present in the iOS build of the Flutter app.
+  final bool ios;
+
+  /// Present in the web build of the Flutter app.
+  final bool web;
+
+  /// Present in the browser extension panel (its own capability floor).
+  final bool extensionPanel;
+
+  /// Why the absent surfaces cannot carry the setting; null when every
+  /// surface has it.
+  final String? gapWhy;
+
+  /// Whether any Flutter-app surface carries the setting.
+  bool get anyApp => macos || ios || web;
+}
+
+/// The {macOS, iOS, web, extension} applicability audit (issue #288 AC3).
+const settingSurfaces = <SharedSetting, SettingSurfaces>{
+  SharedSetting.approvalMode: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: true,
+  ),
+  SharedSetting.modelDefault: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: true,
+  ),
+  SharedSetting.modelSmol: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: false,
+    gapWhy:
+        'The extension panel runs single embedded turns; the auxiliary '
+        'role chains (quick/subagent model) have no selection surface there.',
+  ),
+  SharedSetting.mediaSlots: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: false,
+    gapWhy: 'Media generation tools are not wired into the extension panel.',
+  ),
+  SharedSetting.customProviders: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: false,
+    gapWhy:
+        'The extension panel stores a single provider triple '
+        '(settings_put provider.save), not a saved-provider registry.',
+  ),
+  SharedSetting.apiKeys: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: true,
+  ),
+  SharedSetting.skillsAccess: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'Third-party skill roots live on the HOST filesystem '
+        '(~/.claude, ~/.copilot, …); the browser sandbox and the extension '
+        'have no host filesystem to read them from.',
+  ),
+  SharedSetting.skillsToggles: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: false,
+    gapWhy:
+        'The extension panel runs single embedded turns; there is no '
+        'settings surface to list per-skill toggles.',
+  ),
+  SharedSetting.dapHub: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: false,
+    gapWhy: 'The extension panel has no DAP hub client.',
+  ),
+  SharedSetting.tools: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: true,
+  ),
+  SharedSetting.compactionEngine: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The app consumes the engine from the shared ~/.fah/config.yaml on '
+        'io hosts (read-only, loadAppCompactionEngine); the browser sandbox '
+        'and the extension have no shared config file — the web loader '
+        'keeps the classic engine.',
+  ),
+  SharedSetting.providersQueue: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The app edits the queue through the shared config yaml on io '
+        'hosts (providersQueueLoader); the browser sandbox has no config '
+        'file and no environment to read FA_PROVIDERS_QUEUE from.',
+  ),
+  SharedSetting.mcpServers: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy: 'MCP servers spawn host processes; no app surface can.',
+  ),
+  // The app applies the yaml rules at boot (issue #1078 AC3).
+  SharedSetting.ttsrRules: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The web stub reads no ~/.fah/config.yaml (browser sandbox has '
+        'no config file), so the rules have nothing to load from.',
+  ),
+  SharedSetting.cubeSandbox: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy: 'Needs host-process sandboxing and a host shell.',
+  ),
+  SharedSetting.promptOverrides: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy: 'App prompts are compiled in (prompts.g.dart).',
+  ),
+  SharedSetting.agentMode: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy: 'Mode presets are a CLI REPL concept; apps compose prompts.',
+  ),
+  SharedSetting.memoryStores: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'Memory roots are host filesystem paths; the app resolves them '
+        'read-only.',
+  ),
+  SharedSetting.spillHooks: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'Spill hooks live in the CLI host process\'s agent loop; no app '
+        'surface has a hook chain to configure.',
+  ),
+  SharedSetting.projectContextBudget: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: true,
+    extensionPanel: false,
+    gapWhy:
+        'The truncation notices ride the fa agent boot (AppLog seam); the '
+        'extension panel has no fa agent boot with project-context '
+        'loading to announce.',
+  ),
+  SharedSetting.tuiTheme: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The palette colors a terminal emulator; the app themes through '
+        'its own Flutter theming stack.',
+  ),
+  // The app ships the live toggle (issue #1078 AC4/E3).
+  SharedSetting.redactionPolicy: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The web stub reads no ~/.fah/config.yaml, so the toggle has '
+        'no yaml config to reflect or persist into.',
+  ),
+  SharedSetting.imageRegistry: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The image registry is process-wide state in the CLI host agent '
+        'loop (the request-build rewrite); the app composes its own '
+        'requests and reads the section read-only.',
+  ),
+  // providerTimeouts publishes the CLI's global in the app too
+  // (issue #1078 AC5); the retry policy rides the app roles resolver.
+  SharedSetting.resiliencePolicy: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The web stub reads no ~/.fah/config.yaml, so the overrides '
+        'have nothing to load from.',
+  ),
+  SharedSetting.sleepPrevention: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The assertion lifecycle (run-start/settle, session hooks) runs '
+        'in the CLI host process; the app\'s power_guard reads the '
+        'section read-only.',
+  ),
+  SharedSetting.contextWindowCap: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The cap clamps the CLI agent loop and compaction math in the CLI '
+        'host process; no app surface runs that loop.',
+  ),
+  SharedSetting.harnessMode: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The benchmark mode presets the CLI REPL boot (tool scope pin, '
+        'bare prompt composition); no app surface runs the fa REPL.',
+  ),
+  // The app pins the preset at agent build (issue #1078 AC2/E4).
+  SharedSetting.loadMode: SettingSurfaces(
+    macos: true,
+    ios: true,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The web stub reads no ~/.fah/config.yaml, so agent.mode has '
+        'nothing to load from.',
+  ),
+  // The self-update swaps the fa binary and respawns the CLI process
+  // (issue #1377); app builds update through their store/installer, and
+  // the browser sandbox has no config file to persist the flag into.
+  SharedSetting.autoUpdate: SettingSurfaces(
+    macos: false,
+    ios: false,
+    web: false,
+    extensionPanel: false,
+    gapWhy:
+        'The self-update restarts the CLI executable over its own stdio; '
+        'no app surface can re-exec itself, and the browser sandbox has '
+        'no ~/.fah/config.yaml to persist the flag into.',
+  ),
+};
+
+/// Metadata for each [SharedSetting]: what to search for in each platform's
+/// source tree. The parity test greps the `cliRef` pattern inside
+/// `lib/src/cli/` (recursively) and the `appRef` pattern inside
+/// `flutter_app/lib/` (recursively). A non-null pattern that is absent
+/// from the target tree fails the test.
+const sharedSettingMetadata = <SharedSetting, _SettingMeta>{
+  SharedSetting.approvalMode: _SettingMeta(
+    cliRef: 'approvalMode',
+    appRef: 'ApprovalModeStore',
+    yamlKeys: ['approvalMode'],
+    description:
+        'Tool-approval mode (always-ask / write / yolo / autopilot; '
+        'legacy alias: unattended).',
+  ),
+  SharedSetting.modelDefault: _SettingMeta(
+    cliRef: 'providerKind',
+    appRef: 'DefaultChatModelSection',
+    yamlKeys: ['provider', 'model', 'baseUrl'],
+    description: 'The default chat model.',
+  ),
+  SharedSetting.modelSmol: _SettingMeta(
+    cliRef: 'smolModelRole',
+    appRef: 'TaskModelsStore',
+    yamlKeys: ['roles'],
+    description: 'Fast/cheap model for compaction and subagents.',
+  ),
+  SharedSetting.mediaSlots: _SettingMeta(
+    cliRef: 'mediaModelSlotIds',
+    appRef: 'MediaSlot.all',
+    yamlKeys: ['models'],
+    description: 'Per-modality media model overrides.',
+  ),
+  SharedSetting.customProviders: _SettingMeta(
+    cliRef: 'CustomProviderEntry',
+    appRef: 'ProviderRegistry',
+    yamlKeys: ['customProviders'],
+    description: 'Saved custom provider endpoints.',
+  ),
+  SharedSetting.apiKeys: _SettingMeta(
+    cliRef: 'SecureKeyCache',
+    appRef: 'SessionKeysStore',
+    yamlKeys: [],
+    // apiKeys covers NO yaml key: keys live in env vars / the platform
+    // secure store (E1 — secrets never ride the yaml config). Classified
+    // as a SharedSetting because both surfaces edit the same store.
+    description: 'API key store.',
+  ),
+  SharedSetting.mcpServers: _SettingMeta(
+    cliRef: 'McpConfig',
+    appRef: null, // exempted — not yet supported in the app.
+    yamlKeys: ['mcp'],
+    description: 'External MCP tool servers.',
+  ),
+  SharedSetting.ttsrRules: _SettingMeta(
+    cliRef: 'TtsrConfig',
+    // The app applies the yaml rules at boot (issue #1078 AC3): the
+    // CLI's controller/manager pair over the app agent. No editor yet —
+    // the section stays file-driven on the app.
+    appRef: 'attachAppConfigTtsr',
+    yamlKeys: ['ttsr'],
+    description: 'Time-traveling stream rules.',
+  ),
+  SharedSetting.promptOverrides: _SettingMeta(
+    cliRef: 'promptOverrides',
+    appRef: null, // app does not expose prompt overrides — CLI-only.
+    yamlKeys: ['prompts'],
+    description: 'Prompt template overrides.',
+  ),
+  SharedSetting.skillsAccess: _SettingMeta(
+    cliRef: 'skillsAccess',
+    appRef: 'SkillsAccessStore',
+    yamlKeys: ['skills'],
+    description: 'Consent for reading third-party skill roots.',
+  ),
+  SharedSetting.skillsToggles: _SettingMeta(
+    cliRef: 'skillToggles',
+    appRef: 'SkillsTogglesStore',
+    // The per-skill toggles are ENTRIES inside the `skills:` section — no
+    // top-level key of their own (see nonYamlSettings).
+    yamlKeys: [],
+    description: 'Per-skill enable/disable toggles (issue #1151).',
+  ),
+  SharedSetting.cubeSandbox: _SettingMeta(
+    cliRef: '/cube',
+    appRef: null, // exempted — sandbox profiles are CLI-only (see above).
+    yamlKeys: ['cube'],
+    description: 'fa_cube sandbox profiles.',
+  ),
+  SharedSetting.dapHub: _SettingMeta(
+    cliRef: 'config.plugins',
+    appRef: 'DapHubSection',
+    yamlKeys: [],
+    // The hub connection is NOT a ~/.fah/config.yaml key: it lives in
+    // ~/.dap/config.json + the .fah/packages.yaml plugin opt-out (E4-style
+    // section entry covering the whole connection).
+    description: 'DAP/1 hub connection (URL, agent name, channels).',
+  ),
+  SharedSetting.tools: _SettingMeta(
+    cliRef: '/tools',
+    appRef: 'ToolsAvailabilityStore',
+    yamlKeys: ['tools', 'allowedTools'],
+    description:
+        'Capability-gated tool availability (hide unavailable/disabled '
+        'tools).',
+  ),
+  SharedSetting.compactionEngine: _SettingMeta(
+    cliRef: 'compactionEngine',
+    // #295 named the app surface `CompactionSection` (the richer loader
+    // symbol `loadAppCompactionEngine` also exists; the section is the
+    // settings-parity surface this registry tracks).
+    appRef: 'CompactionSection',
+    yamlKeys: ['compaction'],
+    description:
+        'Compaction engine (structured default | classic rollback, #287).',
+  ),
+  SharedSetting.providersQueue: _SettingMeta(
+    cliRef: 'providersQueue',
+    // The app settings surface is the queue editor section (the richer
+    // loader symbol resolveAppProviderQueue also exists).
+    appRef: 'ProviderQueueSection',
+    yamlKeys: ['providersQueue'],
+    description:
+        'Main-model provider queue (ordered failover chain, #418); the '
+        'FA_PROVIDERS_QUEUE env scope is read-only on every surface.',
+  ),
+  SharedSetting.agentMode: _SettingMeta(
+    cliRef: '_openModePicker',
+    appRef: null, // exempted — modes are CLI-only (see above).
+    yamlKeys: ['mode'],
+    description: 'Agent mode preset (code / ask / plan …).',
+  ),
+  SharedSetting.memoryStores: _SettingMeta(
+    cliRef: 'startMemoryStoresFlow',
+    appRef: null, // exempted — host paths, CLI-only (see above).
+    yamlKeys: ['memory'],
+    description: 'Long-term memory store locations.',
+  ),
+  SharedSetting.spillHooks: _SettingMeta(
+    cliRef: 'attachSpillWiring',
+    appRef: null, // exempted — hook chain lives in the CLI host (see above).
+    yamlKeys: ['spills'],
+    description: 'Automatic tool-result spilling wiring (issue #678).',
+  ),
+  SharedSetting.projectContextBudget: _SettingMeta(
+    cliRef: 'projectContext?.maxBytes',
+    // The app honors the never-silent contract through its boot notice
+    // seam: the loader's notices surface via AppLog (agent_service_skills).
+    appRef: "AppLog.i('context'",
+    yamlKeys: ['projectContext'],
+    description:
+        'Merged project-context budget + never-silent truncation notices '
+        '(issue #1761).',
+  ),
+  SharedSetting.tuiTheme: _SettingMeta(
+    cliRef: 'tuiTheme',
+    appRef: null, // exempted — terminal theming, CLI-only (see above).
+    yamlKeys: ['tui'],
+    description: 'TUI palette (tui.theme + user themes, issue #279).',
+  ),
+  SharedSetting.redactionPolicy: _SettingMeta(
+    cliRef: 'startRedactionFlow',
+    // The app's settings surface is the live toggle (issue #1078
+    // AC4/E3); the richer loader symbols live in the app config loader.
+    appRef: 'RedactionSection',
+    yamlKeys: ['redact'],
+    description: 'Redaction pipeline policy (issue #391).',
+  ),
+  SharedSetting.imageRegistry: _SettingMeta(
+    cliRef: 'startImagesFlow',
+    appRef: null, // exempted — request-build global lives in the CLI host.
+    yamlKeys: ['images'],
+    description: 'Image registry kill switch + per-request cap (issue #395).',
+  ),
+  SharedSetting.sleepPrevention: _SettingMeta(
+    cliRef: 'startPowerFlow',
+    appRef: null, // exempted — assertion lifecycle lives in the CLI host.
+    yamlKeys: ['power'],
+    description: 'Sleep-prevention level + hold lifecycle (issue #397).',
+  ),
+  SharedSetting.contextWindowCap: _SettingMeta(
+    cliRef: 'startContextCapFlow',
+    appRef: null, // exempted — CLI agent loop only (see above).
+    yamlKeys: ['agent'],
+    description: 'Owner-side context cap (issue #394).',
+  ),
+  SharedSetting.loadMode: _SettingMeta(
+    cliRef: 'startLoadModeFlow',
+    // The app pins the preset at agent build (issue #1078 AC2/E4).
+    appRef: 'AgentLoadMode',
+    // The load mode is the `agent.mode` LEAF of the agent: section: the
+    // top-level `agent` key stays owned by contextWindowCap above (the
+    // completeness gate's single-owner rule) — this entry owns the
+    // interactive surface (the settings-hub flow + /settings line), so
+    // it carries no yaml key of its own (see nonYamlSettings).
+    yamlKeys: [],
+    description: 'Tool-load preset: default | pi | omp (issue #680).',
+  ),
+  SharedSetting.resiliencePolicy: _SettingMeta(
+    cliRef: 'startResilienceFlow',
+    // The app publishes the same process-wide override (issue #1078
+    // AC5); the retry policy rides the app's roles resolver (AC1).
+    appRef: 'providerTimeoutsOverride',
+    yamlKeys: ['providerTimeouts', 'retry'],
+    description: 'Provider failure resilience (issue #393).',
+  ),
+  SharedSetting.harnessMode: _SettingMeta(
+    cliRef: 'startHarnessModeFlow',
+    appRef: null, // exempted — CLI REPL benchmark boot only (see above).
+    yamlKeys: [], // rides `agent:` — single-owned by contextWindowCap.
+    description: 'Harness benchmark mode preset (issue #679).',
+  ),
+  SharedSetting.autoUpdate: _SettingMeta(
+    cliRef: 'startAutoUpdateFlow',
+    appRef: null, // exempted — the CLI re-execs itself; the app cannot.
+    yamlKeys: ['auto_update'],
+    description: 'Self-update policy: notify | on | off (issue #1377).',
+  ),
+};
+
+/// The [SharedSetting] that owns the yaml top-level [key], or null when no
+/// shared setting covers it (the key must then be in [fileOnlyConfigKeys]
+/// or it is unclassified — the completeness gate fails).
+SharedSetting? settingForYamlKey(String key) {
+  for (final entry in sharedSettingMetadata.entries) {
+    if (entry.value.yamlKeys.contains(key)) return entry.key;
+  }
+  return null;
+}
+
+/// Whether [key] is classified: owned by a [SharedSetting] or documented
+/// as file-only. The completeness gate (test/parity/
+/// settings_completeness_test.dart) fails on any parsed key where this is
+/// false.
+bool isClassifiedYamlKey(String key) =>
+    settingForYamlKey(key) != null || fileOnlyConfigKeys.containsKey(key);
+
+/// Internal metadata record used by the parity tests.
+final class _SettingMeta {
+  const _SettingMeta({
+    required this.cliRef,
+    required this.appRef,
+    required this.yamlKeys,
+    required this.description,
+  });
+
+  /// A string that MUST appear in at least one file under `lib/src/cli/`.
+  final String cliRef;
+
+  /// A string that MUST appear in at least one file under `flutter_app/lib/`.
+  /// `null` means this setting is exempted from the app (must be listed in
+  /// [appOnlySettings]).
+  final String? appRef;
+
+  /// The top-level `~/.fah/config.yaml` keys this setting owns (empty for
+  /// settings that live outside the yaml — env/secure-store keys, the DAP
+  /// json config). The completeness gate maps every parsed key to exactly
+  /// one owner.
+  final List<String> yamlKeys;
+
+  /// Human-readable description shown in test failure messages.
+  final String description;
+}

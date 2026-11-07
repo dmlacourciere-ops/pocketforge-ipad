@@ -1,0 +1,2279 @@
+/// CLI user preferences: last model, provider, base URL, mode, approval
+/// policy, prompt overrides, and (optionally) model roles with fallback
+/// chains.
+///
+/// Stored in `~/.fah/config.yaml` so the terminal REPL remembers choices
+/// between runs.
+library;
+
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:yaml/yaml.dart';
+
+import '../a2a/a2a_config.dart';
+import '../compaction/compaction_engine.dart';
+import '../exceptions.dart';
+import '../mcp/mcp_config.dart';
+import '../model_roles/model_roles.dart';
+import '../prompts/prompt_overrides.dart';
+import '../prompts/project_context.dart' show ProjectContextConfig;
+import '../cube/config/cube_settings.dart';
+import '../session_retention.dart';
+import 'headless_config.dart';
+import 'waiting_heartbeat.dart';
+import '../providers/provider_common.dart';
+import '../providers/proxy_connector.dart';
+import '../spill/spill.dart';
+import '../skills/skill_availability.dart';
+import '../skills/skills_access.dart';
+import '../memory_config.dart';
+import '../messaging/fabric_config.dart';
+import '../redact/redaction_types.dart';
+import '../agent/image_registry.dart';
+import '../agent/stuck_tool.dart';
+import '../agent/foreground_call_budget.dart';
+import '../power_config.dart';
+import '../ttsr/ttsr.dart';
+import '../tools/availability.dart';
+import '../tools/load_modes.dart';
+import 'custom_providers.dart';
+import '../task/subagent_heartbeat.dart';
+import 'links_config.dart';
+import 'output_config.dart';
+import 'tui_status_line.dart';
+
+/// Parses the `providerTimeouts:` section: provider watchdog overrides
+/// (see [ProviderTimeoutsOverride]). Strict — a bad schema throws
+/// [ConfigException] instead of silently keeping the defaults. Public so
+/// the settings-hub resilience flow (issue #393) reloads the saved
+/// section with the SAME parser boot uses.
+ProviderTimeoutsOverride? parseProviderTimeouts(Object? node) {
+  if (node == null) return null;
+  if (node is! YamlMap) {
+    throw ConfigException('providerTimeouts must be a map, got: $node');
+  }
+  Duration? readTimeout(String key) {
+    final value = node[key];
+    if (value == null) return null;
+    if (value is! int || value <= 0) {
+      throw ConfigException(
+        '"providerTimeouts.$key" must be a positive integer (milliseconds)',
+      );
+    }
+    return Duration(milliseconds: value);
+  }
+
+  final connect = readTimeout('connectTimeoutMs');
+  final streamIdle = readTimeout('streamIdleTimeoutMs');
+  for (final key in node.keys) {
+    if (key != 'connectTimeoutMs' && key != 'streamIdleTimeoutMs') {
+      throw ConfigException('unknown "providerTimeouts" key: $key');
+    }
+  }
+  if (connect == null && streamIdle == null) return null;
+  return ProviderTimeoutsOverride(connect: connect, streamIdle: streamIdle);
+}
+
+/// Folds the `FA_PROVIDER_TIMEOUT_SECONDS` env override (issue #1036) into
+/// [base]: a positive integer number of seconds bounding every
+/// NON-streaming provider fetch (model lists, OAuth/token endpoints, quota
+/// probes) — [ProviderTimeoutsOverride.fetchRead].
+///
+/// Resolution order (one, documented): **env wins over the yaml section,
+/// both over the defaults** — a CI runner (the issue's leg 36353318722)
+/// tightens the bound at boot without editing `~/.fah/config.yaml`. Blank /
+/// unset keeps [base] as-is; any other invalid value throws
+/// [ConfigException] naming the env var, like every other `FA_*` input.
+ProviderTimeoutsOverride? applyProviderTimeoutEnvOverride(
+  ProviderTimeoutsOverride? base,
+  String? raw,
+) {
+  if (raw == null || raw.trim().isEmpty) return base;
+  final seconds = int.tryParse(raw.trim());
+  if (seconds == null || seconds <= 0) {
+    throw ConfigException(
+      'FA_PROVIDER_TIMEOUT_SECONDS must be a positive integer of seconds, '
+      'got: "$raw"',
+    );
+  }
+  return ProviderTimeoutsOverride(
+    connect: base?.connect,
+    streamIdle: base?.streamIdle,
+    fetchRead: Duration(seconds: seconds),
+  );
+}
+
+/// The parsed `trajectory:` section (issue #385 + gh-1745). Strict like
+/// every section: unknown keys and bad scalars throw [ConfigException] at
+/// boot; the defaults are never written so the file stays minimal.
+final class TrajectorySection {
+  const TrajectorySection({
+    this.wireDump = false,
+    this.requestBlobs = true,
+    this.requestBlobMaxMb = 50,
+    this.requestBlobTtlDays = 30,
+  });
+
+  /// Opt-in raw wire dumps (issue #385 F5).
+  final bool wireDump;
+
+  /// gh-1745: spill heavy request payloads out of the session JSONL into
+  /// `.fah/trajectories/<sid>/requests/`. `false` = legacy inline
+  /// persistence, byte-identical.
+  final bool requestBlobs;
+
+  /// Per-session blob-dir byte budget in MB.
+  final int requestBlobMaxMb;
+
+  /// Blob age bound in days.
+  final int requestBlobTtlDays;
+
+  /// The budget in bytes, as the blob store consumes it.
+  int get requestBlobMaxBytes => requestBlobMaxMb << 20;
+}
+
+/// Parses the `trajectory:` section (issue #385 + gh-1745). Unknown keys
+/// are strict errors (a typo must never silently skip the section).
+TrajectorySection _parseTrajectorySection(Object? node) {
+  if (node == null) return const TrajectorySection();
+  if (node is! YamlMap) {
+    throw ConfigException('trajectory must be a map, got: $node');
+  }
+  bool? wireDump;
+  bool? requestBlobs;
+  int? requestBlobMaxMb;
+  int? requestBlobTtlDays;
+  for (final key in node.keys) {
+    switch (key) {
+      case 'wireDump':
+        wireDump = _readTrajectoryBool(node, '$key');
+      case 'requestBlobs':
+        requestBlobs = _readTrajectoryBool(node, '$key');
+      case 'requestBlobMaxMb':
+        requestBlobMaxMb = _readTrajectoryPositiveInt(node, '$key');
+      case 'requestBlobTtlDays':
+        requestBlobTtlDays = _readTrajectoryPositiveInt(node, '$key');
+      default:
+        throw ConfigException('unknown "trajectory" key: $key');
+    }
+  }
+  // Unset keys keep the class defaults; duplicates last-win (as before).
+  return TrajectorySection(
+    wireDump: wireDump ?? false,
+    requestBlobs: requestBlobs ?? true,
+    requestBlobMaxMb: requestBlobMaxMb ?? 50,
+    requestBlobTtlDays: requestBlobTtlDays ?? 30,
+  );
+}
+
+bool _readTrajectoryBool(YamlMap node, String key) {
+  final value = node[key];
+  if (value is! bool) {
+    throw ConfigException('"trajectory.$key" must be a boolean');
+  }
+  return value;
+}
+
+int _readTrajectoryPositiveInt(YamlMap node, String key) {
+  final value = node[key];
+  if (value is! int || value < 1) {
+    throw ConfigException('"trajectory.$key" must be a positive integer');
+  }
+  return value;
+}
+
+/// The parsed `quota:` section (issue #823): the status-line badge opt-in
+/// and the quota-cache TTL. Strict like every section: unknown keys and
+/// bad scalars throw [ConfigException] at boot; defaults are never written
+/// so the file stays minimal.
+final class QuotaSection {
+  const QuotaSection({
+    this.badge = false,
+    this.ttlMinutes = defaultQuotaTtlMinutes,
+  });
+
+  /// Render the provider-quota badge on the status line (OQ2 lean: OFF by
+  /// default — the status line stays quiet until the user asks for it).
+  final bool badge;
+
+  /// The quota-cache TTL in minutes (fed to [ProviderQuotaService]).
+  final int ttlMinutes;
+
+  @override
+  bool operator ==(Object other) =>
+      other is QuotaSection &&
+      other.badge == badge &&
+      other.ttlMinutes == ttlMinutes;
+
+  @override
+  int get hashCode => Object.hash(badge, ttlMinutes);
+
+  @override
+  String toString() => 'QuotaSection(badge: $badge, ttlMinutes: $ttlMinutes)';
+}
+
+/// The `quota.badge` default (issue #823 OQ2): off.
+const defaultQuotaBadge = false;
+
+/// The `quota.ttl_minutes` default: the service's own 15-minute TTL.
+const defaultQuotaTtlMinutes = 15;
+
+/// Parses the `quota:` yaml section (issue #823). A null [node] means the
+/// section is absent — the caller applies the defaults. Any present-but-
+/// invalid shape, value or key throws [ConfigException], consistent with
+/// the other strict config sections.
+QuotaSection parseQuotaSection(Object? node) {
+  if (node == null) return const QuotaSection();
+  if (node is! YamlMap) {
+    throw ConfigException('quota must be a map, got: $node');
+  }
+  var badge = defaultQuotaBadge;
+  var ttlMinutes = defaultQuotaTtlMinutes;
+  for (final key in node.keys) {
+    switch (key) {
+      case 'badge':
+        final value = node[key];
+        if (value is! bool) {
+          throw ConfigException('"quota.badge" must be a boolean');
+        }
+        badge = value;
+      case 'ttl_minutes':
+        final value = node[key];
+        if (value is! int || value <= 0) {
+          throw ConfigException(
+            '"quota.ttl_minutes" must be a positive integer (minutes)',
+          );
+        }
+        ttlMinutes = value;
+      default:
+        throw ConfigException('unknown "quota" key: $key');
+    }
+  }
+  return QuotaSection(badge: badge, ttlMinutes: ttlMinutes);
+}
+
+/// The self-update policy (issue #1377): `notify` checks at boot for a
+/// newer release and prints once, `on` downloads and restarts onto it,
+/// `off` touches no update host at all.
+enum AutoUpdateMode {
+  notify,
+  on,
+  off;
+
+  /// The yaml spelling persisted under `auto_update`: the booleans
+  /// verbatim; `notify` is the default and is never written.
+  String get yamlValue => switch (this) {
+    AutoUpdateMode.notify => 'notify',
+    AutoUpdateMode.on => 'true',
+    AutoUpdateMode.off => 'false',
+  };
+}
+
+/// Parses the `auto_update` yaml scalar (issue #1377). Absent →
+/// [AutoUpdateMode.notify] (the default is never written, so an absent
+/// key and an explicit `"notify"` are the same policy). Strict like every
+/// scalar: anything but `true`, `false` or the `"notify"` string throws
+/// [ConfigException].
+AutoUpdateMode autoUpdateModeFromYaml(Object? node) => switch (node) {
+  null || 'notify' => AutoUpdateMode.notify,
+  true => AutoUpdateMode.on,
+  false => AutoUpdateMode.off,
+  _ => throw ConfigException(
+    '"auto_update" must be true, false, or "notify", got: $node',
+  ),
+};
+
+/// Validates one `agent.mode` value (issues #679/#680): the shared rule
+/// lives in [agentLoadModeValidationError] (load_modes.dart) — this
+/// parser and the settings validator (config_service.dart) throw its
+/// text as a ConfigException, so the two cannot drift. The label set is
+/// `default|pi|omp` (issue #680 owns the taxonomy; issue #679 owns pi's
+/// behavior). `default` normalizes to null so an absent and an
+/// explicit-off mode are indistinguishable downstream.
+String? _parseAgentModeValue(Object? value) {
+  final error = agentLoadModeValidationError(value);
+  if (error != null) throw ConfigException(error);
+  // The default needs no storage: absent == default keeps the written
+  // file minimal (the file's "defaults never written" rule).
+  return value == 'default' ? null : value as String;
+}
+
+bool? _parseAgentMisuseBreakerValue(Object? value) {
+  if (value is! bool) {
+    throw ConfigException('"agent.misuseBreaker" must be a boolean');
+  }
+  return value;
+}
+
+/// The compaction reserve the cap floor mirrors (see [_parseAgentSection]).
+const _agentContextWindowCapMin = 16384;
+
+int _parseAgentContextWindowCapValue(Object? value) {
+  if (value is! int || value <= 0) {
+    throw ConfigException(
+      '"agent.contextWindowCap" must be a positive integer (tokens)',
+    );
+  }
+  if (value < _agentContextWindowCapMin) {
+    throw ConfigException(
+      '"agent.contextWindowCap" must be at least $_agentContextWindowCapMin'
+      ' — below the compaction reserve the compaction trigger threshold '
+      'would go negative',
+    );
+  }
+  return value;
+}
+
+/// Parses the `agent:` section (issues #273/#679/#680):
+/// `contextWindowCap` — the owner-side effective context override — and
+/// `mode` — the `default|pi|omp` preset label. The cap SETS the EFFECTIVE
+/// context window everywhere it is consumed (compaction thresholds, the
+/// ctx meter/footer, the loop's over-window guard) while the model keeps
+/// its real window: below the catalog window it clamps down; above it, it
+/// raises the effective window to the served truth (issue #729 — a custom
+/// provider whose catalog entry under-reports). Strict like every section:
+/// a bad schema throws [ConfigException] at boot.
+///
+/// The cap must stay at or above the compaction reserve (16384 tokens):
+/// the compaction trigger is `window - reserve`, and a smaller cap would
+/// drive that threshold negative.
+///
+/// The label lands on [CliConfig.agentLoadMode] verbatim (the boot
+/// re-resolves it against `--omp`/`FA_AGENT_MODE`) and, when it is
+/// `pi`, also on [CliConfig.agentMode] — the harness-behavior tier
+/// (issue #679: bare prompt, 4-tool sweep, boot print) the executable
+/// re-resolves through its flag > env > config ladder. `omp` carries no
+/// harness behavior, so it never reaches that ladder.
+/// The parsed `agent:` section leaves ([_parseAgentSection] →
+/// [_composeAgentSection]). A class, not a record — 6 fields exceeded
+/// the record_size cap (issue #1997).
+final class _AgentSection {
+  const _AgentSection({
+    required this.contextWindowCap,
+    required this.mode,
+    required this.agentMode,
+    required this.misuseBreaker,
+    required this.stuckTool,
+    required this.foregroundCall,
+  });
+
+  final int? contextWindowCap;
+  final String? mode;
+  final String? agentMode;
+  final bool? misuseBreaker;
+  final StuckToolConfig? stuckTool;
+  final ForegroundCallBudgetConfig? foregroundCall;
+}
+
+_AgentSection? _parseAgentSection(Object? node) {
+  if (node == null) return null;
+  if (node is! YamlMap) {
+    throw ConfigException('agent must be a map, got: $node');
+  }
+  int? cap;
+  String? mode;
+  bool? misuseBreaker;
+  StuckToolConfig? stuckTool;
+  Object? fgBudgetSeconds;
+  Object? fgAutoConvert;
+  for (final key in node.keys) {
+    switch (key) {
+      case 'contextWindowCap':
+        cap = _parseAgentContextWindowCapValue(node[key]);
+      case 'mode':
+        mode = _parseAgentModeValue(node[key]);
+      case 'misuseBreaker':
+        misuseBreaker = _parseAgentMisuseBreakerValue(node[key]);
+      case 'stuckTool':
+        stuckTool = StuckToolConfig.fromYaml(node[key]);
+      // Issue #1786: the two flat leaves are kept raw here and composed
+      // once below — one [ForegroundCallBudgetConfig] per section, strict
+      // like every agent key (a bad schema throws [ConfigException]).
+      case 'foregroundCallBudgetSeconds':
+        fgBudgetSeconds = node[key];
+      case 'foregroundCallAutoConvert':
+        fgAutoConvert = node[key];
+      default:
+        throw ConfigException('unknown "agent" key: $key');
+    }
+  }
+  return _composeAgentSection(
+    contextWindowCap: cap,
+    mode: mode,
+    misuseBreaker: misuseBreaker,
+    stuckTool: stuckTool,
+    budgetSeconds: fgBudgetSeconds,
+    autoConvert: fgAutoConvert,
+  );
+}
+
+/// Composes the parsed `agent:` leaves into the section record. Issue
+/// #1786: both budget leaves absent → null (the loop's defaults apply);
+/// one present keeps the other's default via
+/// [ForegroundCallBudgetConfig.fromLeaves].
+_AgentSection _composeAgentSection({
+  required int? contextWindowCap,
+  required String? mode,
+  required bool? misuseBreaker,
+  required StuckToolConfig? stuckTool,
+  required Object? budgetSeconds,
+  required Object? autoConvert,
+}) {
+  return _AgentSection(
+    contextWindowCap: contextWindowCap,
+    mode: mode,
+    agentMode: mode == 'pi' ? 'pi' : null,
+    misuseBreaker: misuseBreaker,
+    stuckTool: stuckTool,
+    foregroundCall: budgetSeconds == null && autoConvert == null
+        ? null
+        : ForegroundCallBudgetConfig.fromLeaves(
+            budgetSeconds: budgetSeconds,
+            autoConvert: autoConvert,
+          ),
+  );
+}
+
+/// Whether a raw `customProviders:` list node is a ghost entry named
+/// after a built-in catalog provider (issue #221). Non-map nodes are NOT
+/// ghosts — they fall through to [CustomProviderEntry.fromYaml], which
+/// throws the usual strict [ConfigException].
+bool _isGhostProviderEntry(Object? node) =>
+    node is Map && isReservedCustomProviderName('${node['name']}');
+
+/// Parses the `providers:` section (issue #1921): a map of provider name
+/// → per-provider settings whose only key today is `network:` (the proxy
+/// binding). Strict like the rest of the config.
+Map<String, ProviderNetworkConfig> _parseProviderNetworks(Object? node) {
+  if (node == null) return const {};
+  if (node is! YamlMap) {
+    throw ConfigException('providers must be a map, got: $node');
+  }
+  return {
+    // A null value is a user error (the block was started but never
+    // written) — silently dropping it would degrade a binding to direct
+    // egress, which this section's contract forbids.
+    for (final entry in node.entries)
+      ...switch (entry.value) {
+        null => throw ConfigException(
+          'providers.${entry.key} has no value — write the network: block '
+          '(network: { proxy: … }) or remove the entry',
+        ),
+        _ => {
+          '${entry.key}': _parseProviderNetworkEntry(
+            '${entry.key}',
+            entry.value,
+          ),
+        },
+      },
+  };
+}
+
+ProviderNetworkConfig _parseProviderNetworkEntry(String name, Object? node) {
+  if (node is! YamlMap) {
+    throw ConfigException('providers.$name must be a map, got: $node');
+  }
+  for (final key in node.keys) {
+    if ('$key' != 'network') {
+      throw ConfigException(
+        'providers.$name: unknown key "$key" (only "network" is supported)',
+      );
+    }
+  }
+  return ProviderNetworkConfig.fromYaml(
+    node['network'],
+    configLabel: 'providers.$name.network',
+  );
+}
+
+/// Parses the `images:` section (session image registry, issue #171):
+/// `registry` (kill switch), `maxPerRequest` (per-request unique-image
+/// cap), `maxBytesPerRequest` (per-request image byte budget, issue
+/// #1916) and `perModel` (per-model cap overrides, issue #1750). Strict —
+/// a bad schema throws [ConfigException] instead of silently keeping the
+/// defaults. Public so the settings flow's reload-after-write (issue
+/// #395) reuses the same parser the boot runs.
+ImageRegistryConfig? parseImagesSection(Object? node) {
+  if (node == null) return null;
+  if (node is! YamlMap) {
+    throw ConfigException('images must be a map, got: $node');
+  }
+  final (registry, maxPerRequest, maxBytesPerRequest, perModel, autoInspect) =
+      _parseImagesEntries(node);
+  if (registry == null &&
+      maxPerRequest == null &&
+      maxBytesPerRequest == null &&
+      perModel == null &&
+      autoInspect == null) {
+    return null;
+  }
+  return ImageRegistryConfig(
+    enabled: registry ?? true,
+    maxPerRequest: maxPerRequest ?? defaultMaxImagesPerRequest,
+    maxBytesPerRequest: maxBytesPerRequest ?? defaultMaxImageBytesPerRequest,
+    perModel: perModel ?? const {},
+    autoInspect: autoInspect ?? true,
+  );
+}
+
+/// The five optional images knobs parsed from [node]; unset keys stay
+/// null (gh-1713 split of [parseImagesSection]).
+(bool?, int?, int?, Map<String, int>?, bool?) _parseImagesEntries(
+  YamlMap node,
+) {
+  bool? registry;
+  int? maxPerRequest;
+  int? maxBytesPerRequest;
+  Map<String, int>? perModel;
+  bool? autoInspect;
+  for (final key in node.keys) {
+    switch (key) {
+      case 'registry':
+        registry = _readImagesBool(node, '$key');
+      case 'maxPerRequest':
+        maxPerRequest = _readImagesPositiveInt(node, '$key');
+      case 'maxBytesPerRequest':
+        maxBytesPerRequest = _readImagesPositiveInt(node, '$key');
+      case 'perModel':
+        perModel = _readImagesPerModel(node);
+      case 'autoInspect':
+        autoInspect = _readImagesBool(node, '$key');
+      default:
+        throw ConfigException('unknown "images" key: $key');
+    }
+  }
+  return (registry, maxPerRequest, maxBytesPerRequest, perModel, autoInspect);
+}
+
+bool _readImagesBool(YamlMap node, String key) {
+  final value = node[key];
+  if (value is! bool) {
+    throw ConfigException('"images.$key" must be a boolean');
+  }
+  return value;
+}
+
+int _readImagesPositiveInt(YamlMap node, String key) {
+  final value = node[key];
+  if (value is! int || value <= 0) {
+    throw ConfigException('"images.$key" must be a positive integer');
+  }
+  return value;
+}
+
+/// True when [value] is a JSON integer at or above 1 — the cap shape
+/// shared by `images.maxPerRequest` and the `images.perModel` entries.
+bool _isPositiveInt(Object? value) => value is int && value > 0;
+
+int _readImagesPerModelCap(Object? key, Object? value) {
+  if (!_isPositiveInt(value)) {
+    throw ConfigException('"images.perModel.$key" must be a positive integer');
+  }
+  return value as int;
+}
+
+Map<String, int> _readImagesPerModel(YamlMap node) {
+  final value = node['perModel'];
+  if (value is! YamlMap) {
+    throw ConfigException(
+      '"images.perModel" must be a map of model id → cap, got: $value',
+    );
+  }
+  return {
+    for (final entry in value.entries)
+      '${entry.key}': _readImagesPerModelCap(entry.key, entry.value),
+  };
+}
+
+/// Persisted CLI configuration.
+final class CliConfig {
+  CliConfig({
+    this.providerKind = 'openai-completions',
+    this.modelId = 'openai/gpt-4o-mini',
+    this.baseUrl = 'https://openrouter.ai/api/v1',
+    this.mode = 'code',
+    this.approvalMode = 'yolo',
+    this.allowedTools = const [],
+    this.promptOverrides = const {},
+    this.modelRoles,
+    this.ttsr,
+    this.contextWindowCap,
+    this.stuckTool,
+    this.foregroundCall,
+    this.agentLoadMode,
+    this.customProviders = const [],
+    this.models,
+    this.mcp,
+    this.a2a,
+    this.providerTimeouts,
+    this.skillsAccess = SkillsAccess.granted,
+    this.skillsDisableShellExecution = false,
+    this.skillsLiveRediscovery = true,
+    this.skillToggles = const {},
+    this.memory,
+    this.fabric,
+    this.cube,
+    this.tools,
+    this.redact,
+    this.spills,
+    this.sessions,
+    this.projectContext,
+    this.compactionEngine,
+    this.compactionJudgeBudgetSeconds,
+    this.wireDump = false,
+    this.trajectoryRequestBlobs = true,
+    this.trajectoryRequestBlobMaxMb = 50,
+    this.trajectoryRequestBlobMaxBytes = 50 << 20,
+    this.trajectoryRequestBlobTtlDays = 30,
+    this.images,
+    this.agentMode,
+    this.misuseBreaker = true,
+    this.subagents = const SubagentsConfig(),
+    this.waiting = const WaitingConfig(),
+    this.jobs = const JobsConfig(),
+    this.headless = const HeadlessConfig(),
+    this.powerSleepPrevention,
+    this.powerHold,
+    this.quota = const QuotaSection(),
+    this.tuiTheme,
+    this.tuiClassic = false,
+    this.tuiShowCompactionDetails = false,
+    this.statusLine,
+    this.links = const LinksConfig(),
+    this.streamThinking = false,
+    this.autoUpdate = AutoUpdateMode.notify,
+    this.providerNetworks = const {},
+  });
+
+  factory CliConfig.fromYaml(YamlMap map) {
+    final skillsSection = _parseSkillsSection(map['skills']);
+    // The power section (sleep-prevention level + hold lifecycle) is
+    // parsed once, strictly (issues #325/#326).
+    final powerSection = parsePowerSection(map['power']);
+    // The quota section (issue #823) is parsed once, strictly too.
+    final quotaSection = parseQuotaSection(map['quota']);
+    final agentSection = _parseAgentSection(map['agent']);
+    // The tui section (issue #805) is strict: theme, classic kill
+    // switch and statusLine parsed once, schema errors throw.
+    final tui = parseTuiSection(map['tui']);
+    // The trajectory section (issue #385 + gh-1745) is strict too.
+    final trajectorySection = _parseTrajectorySection(map['trajectory']);
+    return CliConfig(
+      // Issue #772: the persisted provider identity is the catalog KIND.
+      // Old name-shaped values (`chatgpt`, `chatgpt.com`) canonicalize on
+      // load — the file itself is rewritten only on the next save.
+      providerKind:
+          _canonicalSavedProvider(map['provider']) ?? 'openai-completions',
+      modelId: map['model'] as String? ?? 'openai/gpt-4o-mini',
+      baseUrl: map['baseUrl'] as String? ?? 'https://openrouter.ai/api/v1',
+      mode: map['mode'] as String? ?? 'code',
+      approvalMode: map['approvalMode'] as String? ?? 'yolo',
+      allowedTools: switch (map['allowedTools']) {
+        final YamlList list => [for (final entry in list) '$entry'],
+        _ => const [],
+      },
+      // The prompts section is parsed strictly: unknown prompt names throw
+      // [ConfigException] instead of silently doing nothing.
+      promptOverrides: parsePromptOverrideMap(map['prompts']),
+      // The roles section is parsed strictly: schema errors throw
+      // [ConfigException] instead of silently resetting to defaults.
+      modelRoles: map['roles'] == null && map['modelOverrides'] == null
+          ? null
+          : ModelRolesConfig.fromYaml(map),
+      // The theme section: `tui.theme` names a built-in or user TUI theme;
+      // unknown names surface at boot (the default applies instead).
+      tuiTheme: tui.theme,
+      // The classic-chrome kill switch + statusLine section (issue #805);
+      // the renderer wires them in S3.
+      tuiClassic: tui.classic,
+      tuiShowCompactionDetails: tui.showCompactionDetails,
+      statusLine: tui.statusLine,
+      // The ttsr section is parsed strictly too (bad rules must surface).
+      ttsr: map['ttsr'] == null
+          ? null
+          : TtsrConfig.fromYaml(map['ttsr'], sourcePath: '~/.fah/config.yaml'),
+      // The memory section: storage path overrides; strict like the rest.
+      memory: map['memory'] == null
+          ? null
+          : MemoryConfig.fromYaml(map['memory']),
+      cube: map['cube'] == null ? null : CubeSettings.fromYaml(map['cube']),
+      // The tools section (capability-gated tool availability); strict too.
+      tools: map['tools'] == null ? null : ToolsConfig.fromYaml(map['tools']),
+      // The redact section (layered secret redaction); tolerant like
+      // RedactionConfig.fromJson — invalid values fall back to defaults.
+      redact: map['redact'] == null
+          ? null
+          : RedactionConfig.fromYaml(map['redact']),
+      // The spills section (issue #678); tolerant by design — unknown
+      // keys and mistyped scalars become notes, never boot failures.
+      spills: map['spills'] == null
+          ? null
+          : SpillsConfig.fromYaml(map['spills']),
+      // The sessions section (gh-1746); tolerant like spills — unknown
+      // keys and mistyped scalars become notes. Absent keeps the
+      // byte-identical legacy boot (AC1).
+      sessions: map['sessions'] == null
+          ? null
+          : SessionsConfig.fromYaml(map['sessions']),
+      // The projectContext section (issue #1761); tolerant by design —
+      // unknown keys and mistyped scalars become notes, never boot
+      // failures.
+      projectContext: map['projectContext'] == null
+          ? null
+          : ProjectContextConfig.fromYaml(map['projectContext']),
+      // Saved custom providers; entry-level errors throw [ConfigException].
+      // Entries named after a built-in catalog provider are dropped (issue
+      // #221's ghost "openai"): they shadow `/provider <name>` routing and
+      // must never re-enter memory — a stale snapshot save would
+      // re-persist them after the user deleted them.
+      customProviders: switch (map['customProviders']) {
+        null => const [],
+        final YamlList list => [
+          for (final entry in list)
+            if (!_isGhostProviderEntry(entry))
+              CustomProviderEntry.fromYaml(entry),
+        ],
+        final other => throw ConfigException(
+          'customProviders must be a list, got: $other',
+        ),
+      },
+      // The providers section (issue #1921): per-provider `network:` proxy
+      // blocks, keyed by provider name. Strict — bad config must surface,
+      // never silently degrade to direct egress.
+      providerNetworks: _parseProviderNetworks(map['providers']),
+      // The models section (media slot overrides + custom model
+      // definitions) is parsed strictly too.
+      models: map['models'] == null
+          ? null
+          : ModelsConfig.fromYaml(map['models']),
+      // The mcp section (external tool servers) is parsed strictly too.
+      mcp: map['mcp'] == null ? null : McpConfig.fromYaml(map['mcp']),
+      // The a2a section (remote Agent2Agent endpoints) is strict too; its
+      // `${NAME}` token references resolve against the environment.
+      a2a: map['a2a'] == null
+          ? null
+          : A2aConfig.fromYaml(
+              map['a2a'],
+              (name) => Platform.environment[name],
+            ),
+      // The providerTimeouts section (provider watchdog overrides) is strict
+      // too.
+      providerTimeouts: parseProviderTimeouts(map['providerTimeouts']),
+      // The compaction section (engine selector, issue #148; judge
+      // budget knob, issue #541) is strict: a typo throws instead of
+      // silently running the classic engine or restoring the default
+      // 300s budget.
+      compactionEngine: CompactionEngine.fromSection(
+        map['compaction'],
+        label: '~/.fah/config.yaml',
+      ),
+      compactionJudgeBudgetSeconds: parseJudgeBudgetSeconds(
+        map['compaction'] is Map
+            ? (map['compaction'] as Map)['judgeBudgetSeconds']
+            : null,
+        label: '~/.fah/config.yaml',
+      ),
+      // The trajectory section (issue #385 + gh-1745): `wireDump` opts the
+      // raw outbound payloads into the session ledger; `requestBlobs` and
+      // its rotation knobs spill the heavy payloads back out of it.
+      wireDump: trajectorySection.wireDump,
+      trajectoryRequestBlobs: trajectorySection.requestBlobs,
+      trajectoryRequestBlobMaxMb: trajectorySection.requestBlobMaxMb,
+      trajectoryRequestBlobMaxBytes: trajectorySection.requestBlobMaxBytes,
+      trajectoryRequestBlobTtlDays: trajectorySection.requestBlobTtlDays,
+      images: parseImagesSection(map['images']),
+      powerSleepPrevention: powerSection.sleepPrevention,
+      powerHold: powerSection.hold,
+      // The quota section (issue #823): badge opt-in + cache TTL, strict.
+      quota: quotaSection,
+      // The agent section (owner-side context cap + mode, issues
+      // #273/#679/#680) is strict too.
+      contextWindowCap: agentSection?.contextWindowCap,
+      stuckTool: agentSection?.stuckTool,
+      foregroundCall: agentSection?.foregroundCall,
+      agentMode: agentSection?.agentMode,
+      agentLoadMode: agentSection?.mode,
+      misuseBreaker: agentSection?.misuseBreaker ?? true,
+      // The subagents section (background-subagent heartbeat, issue #383)
+      subagents: SubagentsConfig.fromYaml(map['subagents']),
+      waiting: WaitingConfig.fromYaml(map['waiting']),
+      jobs: JobsConfig.fromYaml(map['jobs']),
+      // The headless section (gh-1459): the background-job drain ceiling.
+      headless: HeadlessConfig.fromYaml(map['headless']),
+      // The fabric section (issue #27 phase 2 discovery announcements) is
+      // strict too.
+      fabric: map['fabric'] == null
+          ? null
+          : FabricConfig.fromYaml(map['fabric']),
+      // The links section (issue #691) is strict on shape, tolerant on
+      // unknown keys (notes, never boot failures — AC7).
+      links: map['links'] == null
+          ? const LinksConfig()
+          : LinksConfig.fromYaml(map['links']),
+      // The skills section (third-party skills access consent + shell
+      // execution toggle + per-skill on/off entries) is strict too.
+      skillsAccess:
+          skillsSection['skillsAccess'] as SkillsAccess? ??
+          SkillsAccess.granted,
+      skillsDisableShellExecution:
+          skillsSection['skillsDisableShellExecution'] as bool? ?? false,
+      skillsLiveRediscovery:
+          skillsSection['skillsLiveRediscovery'] as bool? ?? true,
+      skillToggles:
+          skillsSection['skillToggles'] as Map<String, bool>? ?? const {},
+      // The output section (gh-1198) is strict: `streamThinking` opts
+      // line-mode/headless runs into the live dimmed thinking stream;
+      // absent = false = the byte-identical legacy output.
+      streamThinking: _outputStreamThinking(map['output']),
+      // The self-update policy (issue #1377) is one strict scalar:
+      // `true`/`false`/`"notify"` — anything else throws.
+      autoUpdate: autoUpdateModeFromYaml(map['auto_update']),
+    );
+  }
+
+  /// The `output.streamThinking` value: the strict parser validates the
+  /// section, the walk below reads the single key (defaults false).
+  static bool _outputStreamThinking(Object? node) {
+    parseOutputSection(node);
+    return outputStreamThinkingValue(node);
+  }
+
+  /// Parses the `skills:` section: `access` (ask/granted/denied — consent
+  /// to read third-party `.claude`/`.github`/`.codex` skill directories),
+  /// `disableShellExecution` (Claude-style `!`cmd`` skill injections), and
+  /// per-skill `<name>: on|off` toggles (issue #1151).
+  static Map<String, Object?> _parseSkillsSection(Object? node) {
+    if (node == null) return const {};
+    if (node is! YamlMap) {
+      throw ConfigException('skills must be a map, got: $node');
+    }
+    final result = <String, Object?>{};
+    for (final key in node.keys) {
+      switch (key) {
+        case 'access':
+          final value = '${node[key]}'.trim();
+          if (!{'ask', 'granted', 'denied'}.contains(value)) {
+            throw ConfigException(
+              'skills.access must be ask, granted or denied, got: $value',
+            );
+          }
+          result['skillsAccess'] = skillsAccessFromLabel(value);
+        case 'disableShellExecution':
+          final value = node[key];
+          if (value is! bool) {
+            throw ConfigException(
+              'skills.disableShellExecution must be a boolean, got: $value',
+            );
+          }
+          result['skillsDisableShellExecution'] = value;
+        case 'liveRediscovery':
+          // gh-1440: the per-composition freshness check. Off returns to
+          // boot-snapshot semantics with the prompt's staleness footer
+          // disclosing it; `/skill:` cold-resolve stays available.
+          final value = node[key];
+          if (value is! bool) {
+            throw ConfigException(
+              'skills.liveRediscovery must be a boolean, got: $value',
+            );
+          }
+          result['skillsLiveRediscovery'] = value;
+        default:
+          final name = '$key';
+          result['skillToggles'] = {
+            ...(result['skillToggles'] as Map<String, bool>? ?? const {}),
+            name: skillToggleValue(name, node[key]),
+          };
+      }
+    }
+    return result;
+  }
+
+  final String providerKind;
+  final String modelId;
+  final String baseUrl;
+  final String mode;
+
+  /// Approval mode label (`always-ask`, `write`, `yolo`, `autopilot` —
+  /// the pre-rename `unattended` spelling still parses); parsed with
+  /// `approvalModeFromLabel` from `lib/src/approval/`.
+  final String approvalMode;
+
+  /// Tools the user always-allowed (via `/allow` or an "approve always"
+  /// prompt answer), persisted across runs.
+  final List<String> allowedTools;
+
+  /// Raw prompt overrides from the `prompts:` yaml section: prompt name →
+  /// file path or inline text (validated by [parsePromptOverrideMap]). The
+  /// executable resolves it into a `PromptOverrides` via
+  /// `resolvePromptOverrides` (file reads live in `lib/io.dart`); an empty
+  /// map keeps the built-in prompts.
+  final Map<String, String> promptOverrides;
+
+  /// Optional model roles: role → fallback chains, path-scoped overrides,
+  /// and the retry policy (`roles:` / `modelOverrides:` / `retry:` yaml
+  /// sections). `null` keeps the legacy single provider/model behavior.
+  final ModelRolesConfig? modelRoles;
+
+  /// Optional TTSR stream rules (`ttsr:` yaml section). `null` disables
+  /// stream-rule monitoring.
+  final TtsrConfig? ttsr;
+
+  /// Saved custom providers (`customProviders:` yaml section), shown first
+  /// in the `/provider` picker and appended to by the `/provider custom`
+  /// wizard. Parsed strictly: a malformed entry throws [ConfigException].
+  final List<CustomProviderEntry> customProviders;
+
+  /// Per-provider proxy network config (`providers:` yaml section, issue
+  /// #1921): name → its `network:` block. A provider with a block rides
+  /// that proxy fail-closed; every other provider stays byte-identical
+  /// direct. Parsed strictly: a malformed block throws [ConfigException].
+  final Map<String, ProviderNetworkConfig> providerNetworks;
+
+  /// Optional models config (`models:` yaml section): per-slot media model
+  /// overrides (managed by `/models set`/`/models remove`) and named custom
+  /// model definitions (`/model <name>` targets). Parsed strictly: a schema
+  /// error throws [ConfigException]. `null` means the section is absent.
+  final ModelsConfig? models;
+
+  /// Optional MCP servers config (`mcp:` yaml section). Parsed strictly:
+  /// a schema error throws [ConfigException]. `null` disables MCP. Managed
+  /// by editing the config file only (no CLI commands yet).
+  final McpConfig? mcp;
+
+  /// Optional A2A remote agents config (`a2a:` yaml section). Parsed
+  /// strictly; `${NAME}` tokens resolve from the environment.
+  final A2aConfig? a2a;
+
+  /// Optional provider watchdog overrides (`providerTimeouts:` yaml
+  /// section, `connectTimeoutMs`/`streamIdleTimeoutMs`). Parsed strictly.
+  /// `bin/fah.dart` publishes it to [providerTimeoutsOverride] at startup.
+  final ProviderTimeoutsOverride? providerTimeouts;
+
+  /// Consent to read third-party skill/agent directories
+  /// (`.claude`/`.github`/`.codex` + their `~/` mirrors), from the
+  /// `skills.access` yaml key. [SkillsAccess.granted] is the default —
+  /// discovery is opt-out so migrating users get their existing skills with
+  /// zero setup; `ask` makes the interactive REPL prompt once at startup.
+  final SkillsAccess skillsAccess;
+
+  /// When true, Claude-style `!`cmd`` / ```` ```! ```` shell injections in
+  /// skill bodies render as a disabled placeholder instead of executing
+  /// (the `skills.disableShellExecution` yaml key).
+  final bool skillsDisableShellExecution;
+
+  /// Whether the per-composition skills freshness check runs (gh-1440, the
+  /// `skills.liveRediscovery` yaml key). On by default — a skill landing on
+  /// disk mid-session joins the index at the next prompt recomposition;
+  /// `false` returns to boot-snapshot semantics with the prompt's
+  /// staleness footer disclosing it (`/skills reload` and the `/skill:`
+  /// cold-resolve stay available either way).
+  final bool skillsLiveRediscovery;
+
+  /// Per-skill on/off toggles from the GLOBAL scope (`skills:` section,
+  /// `skillName: on|off` entries in `~/.fah/config.yaml`, issue #1151). The
+  /// project scope loads live via [loadProjectSkillsConfig] and wins per
+  /// key — the same deepest-wins rule as the `tools:` stack. Skills not
+  /// named here are enabled.
+  final Map<String, bool> skillToggles;
+
+  /// Optional `fabric:` section — the host's discovery announcements for
+  /// the agent messaging fabric (issue #27 phase 2): capabilities peers
+  /// see in `agent_directory`. Parsed strictly.
+  final FabricConfig? fabric;
+
+  /// Optional `memory:` section — long-term memory storage path overrides
+  /// (git-backed project memory). Null = the historical `.fah/memory`
+  /// layout.
+  final MemoryConfig? memory;
+
+  /// Optional `cube:` section — the default fa_cube sandbox profile applied
+  /// at startup when neither `--cube` nor `--cube-config` is passed. Parsed
+  /// strictly; `null` means the section is absent.
+  final CubeSettings? cube;
+
+  /// Optional `tools:` section — capability-gated tool availability for
+  /// the GLOBAL scope. Parsed strictly; `null` means the section is
+  /// absent. The project scope reads live via [loadProjectToolsConfig] and
+  /// the runtime scope arrives as `--tools`/`FA_TOOLS`; scopes stay
+  /// separate for the deepest-wins resolution.
+  final ToolsConfig? tools;
+
+  /// Optional `compaction:` section — the compaction engine selector
+  /// (issue #148): `classic` (lossy prefix summary) or `structured`
+  /// (hide → checkpoint + expand). `null` means the section is absent;
+  /// the effective engine resolves global < project < runtime.
+  final CompactionEngine? compactionEngine;
+
+  /// Optional `compaction.judgeBudgetSeconds` (issue #541) — the
+  /// per-call judge/summarizer budget in seconds. `null` keeps the
+  /// 300s default; the knob exists so owners of giant marathon sessions
+  /// can give a slow judge room without touching code. NOTE: the knob
+  /// scales only the per-attempt budget — the whole-run `totalBudget`
+  /// (default 15 min) is NOT scaled, so values above 300s shorten the
+  /// retry ladder (the total is exhausted after fewer full-timeout
+  /// attempts).
+  final int? compactionJudgeBudgetSeconds;
+
+  /// Optional `trajectory:` section (issue #385) — `wireDump: true` opts
+  /// the raw outbound request payloads into the session ledger as
+  /// redacted, capped `trajectory_wire_dump` records. Default false:
+  /// payloads are never persisted unconditionally.
+  final bool wireDump;
+
+  /// gh-1745: spill heavy request payloads (per-message block texts, raw
+  /// wire dumps) out of the session JSONL into
+  /// `.fah/trajectories/<sid>/requests/` under the rotation policy below.
+  /// Default true — the fix; `false` restores the legacy inline
+  /// persistence byte-identically.
+  final bool trajectoryRequestBlobs;
+
+  /// `trajectory.requestBlobMaxMb` — the per-session blob-dir byte budget
+  /// in MB (default 50).
+  final int trajectoryRequestBlobMaxMb;
+
+  /// The same budget in bytes ([TrajectorySection.requestBlobMaxBytes],
+  /// gh-1745 rework): the canonical MB→bytes derivation — hosts pass it
+  /// to the blob store instead of re-shifting inline.
+  final int trajectoryRequestBlobMaxBytes;
+
+  /// `trajectory.requestBlobTtlDays` — blob age bound in days (default
+  /// 30).
+  final int trajectoryRequestBlobTtlDays;
+
+  /// Optional `redact:` section — layered secret redaction. `null` means
+  /// the section is absent (redaction still runs with default config; the
+  /// pipeline assembly happens in the host startup, see
+  /// [buildRedactionPipeline]).
+  final RedactionConfig? redact;
+
+  /// Optional `spills:` section (issue #678) — automatic tool-result
+  /// spilling thresholds. Tolerant parse; `null` means the section is
+  /// absent (the project scope reads live via [loadProjectSpillsConfig]
+  /// and wins wholesale, like the other project sections).
+  final SpillsConfig? spills;
+
+  /// Optional `sessions:` section (gh-1746) — the opt-in retention
+  /// policy for the sessions root. Tolerant parse (deviations become
+  /// notes, never boot failures); `null` means the section is absent —
+  /// boot never sweeps and never notes (AC1's byte-identical legacy).
+  final SessionsConfig? sessions;
+
+  /// Optional `projectContext:` section (issue #1761) — the merged
+  /// project-context budget (`maxBytes`; `0` disables the section and
+  /// skips every file read). Tolerant parse; `null` means the section is
+  /// absent = the 32KB default.
+  final ProjectContextConfig? projectContext;
+
+  /// `registry` kill switch + `maxPerRequest` cap. `null` keeps the
+  /// defaults (registry on, [defaultMaxImagesPerRequest]).
+  final ImageRegistryConfig? images;
+
+  /// Owner-side effective context override from the `agent:` section
+  /// (`contextWindowCap`, issues #273/#729): sets the EFFECTIVE context
+  /// window everywhere it is consumed (compaction thresholds, ctx
+  /// meter/footer, the loop guard) — clamped down below the catalog
+  /// window, raised above it to the served truth. `null` = uncapped (the
+  /// raw model window).
+  final int? contextWindowCap;
+
+  /// Stuck-call supervision config (`agent.stuckTool`, gh-1054): liveness
+  /// heartbeats for long-running tool calls plus the autonomous
+  /// cancel/retry/convert follow-up. `null` = unsupervised.
+  final StuckToolConfig? stuckTool;
+
+  /// Foreground tool-call budget (`agent.foregroundCallBudgetSeconds` +
+  /// `agent.foregroundCallAutoConvert`, issue #1786): bounds the
+  /// wall-clock window a running foreground call can escape steering
+  /// through (offer at B/2, force-escalate at B). Both leaves absent →
+  /// `null` — the loop applies its own defaults (600s, offer).
+  final ForegroundCallBudgetConfig? foregroundCall;
+
+  /// The parsed harness mode preset (`agent.mode`, issue #679): `'pi'` or
+  /// null (absent or explicit `default`). Resolved against the flag/env
+  /// tiers by the executable via `resolveHarnessMode`.
+  final String? agentMode;
+
+  /// The tool-misuse circuit breaker switch (`agent.misuseBreaker`,
+  /// issue #862, default true): 3 consecutive identical tool-call
+  /// rejections arm a corrective note in the next request; 6 stop executing
+  /// that identical call for the run. `false` preserves the pre-breaker
+  /// behavior byte-identically (E5).
+  final bool misuseBreaker;
+
+  /// Tool-load preset from `agent.mode` (`default|pi|omp`, issue #680):
+  /// the curated essential set that boots into the schema; everything
+  /// else stays discoverable. `null` = default mode (no preset,
+  /// byte-identical behavior).
+  final String? agentLoadMode;
+
+  /// The `waiting:` section (issue #450): visible-waiting heartbeat
+  /// cadence (`waitHeartbeatMinutes`, 0 = off), the `--wait-for-jobs`
+  /// ceiling (`waitCeilingMinutes`, default 30), and the per-call
+  /// foreground liveness knobs (gh-1055: `toolLivenessSeconds`,
+  /// `toolLivenessTickSeconds`, `toolEscalateSeconds`) plus the #1185
+  /// stuck-call nudge kill switch (`toolNudge`, default on).
+  final WaitingConfig waiting;
+
+  /// The `jobs:` section (issue #478): boot-maintenance knobs for the
+  /// cross-run shell-job state — `staleHours` (manifest age belt,
+  /// default 24), `logRetentionDays` (log GC, default 3; 0 keeps all),
+  /// and `maxLogBytes` (per-log ceiling, issue #919, default 50 MB).
+  final JobsConfig jobs;
+
+  /// The `headless:` section (gh-1459): the wall-clock ceiling
+  /// (`shellJobDrainMs`, default 30 min; 0 = off) for the headless
+  /// background-job drain after the final answer.
+  final HeadlessConfig headless;
+
+  /// The `subagents:` section (issue #383): heartbeat cadence
+  /// (`heartbeatMinutes`, 0 = off) and stall threshold (`stallMinutes`,
+  /// 0 = flags off) for background-subagent status digests.
+  final SubagentsConfig subagents;
+
+  /// Sleep-prevention level from the `power:` section
+  /// (`power.sleepPrevention`, issue #325 — after oh-my-pi's
+  /// `power.sleepPrevention`). `null` means the section is absent; the
+  /// host resolves the `idle` default, keeping "not configured" and
+  /// "explicitly off" distinct.
+  final PowerAssertionLevel? powerSleepPrevention;
+
+  /// Sleep-assertion hold lifecycle (`power.hold`, #326): `null` means
+  /// absent — the host resolves the `per-run` default (acquire at run
+  /// start, release at settle); `session` is the explicit hold-the-whole-
+  /// session opt-in.
+  final PowerAssertionHold? powerHold;
+
+  /// The `quota:` section (issue #823): status-line badge opt-in and the
+  /// quota-cache TTL. Defaults (`badge: false`, `ttl_minutes: 15`) are
+  /// never written so the file stays minimal.
+  final QuotaSection quota;
+
+  /// Persisted TUI theme name (`tui.theme`): a built-in key or a user
+  /// theme file stem from `~/.fah/themes/<name>.json`. `null` = default
+  /// theme; an unknown name warns at boot and keeps the default.
+  final String? tuiTheme;
+
+  /// The classic-chrome kill switch (`tui.classic`, issue #805): when
+  /// set, S3's composer renders the legacy `_statusLine()` footer
+  /// byte-identically instead of the omp status bar. Parsed here so the
+  /// key validates strictly; consumed by the S3 rendering concern.
+  final bool tuiClassic;
+
+  /// The compaction-report detail opt-in (`tui.showCompactionDetails`,
+  /// gh-1636): default false — an auto-compaction pass prints ONE short
+  /// marker line and the internal checkpoint summary stays in the session
+  /// file (reachable via `compact_expand`); true restores the full
+  /// report block (records + fenced summary) and the headless log face's
+  /// live summarizer-delta stream. The manual `/compact` report always
+  /// renders details.
+  final bool tuiShowCompactionDetails;
+
+  /// The statusLine section (`tui.statusLine`, issue #805): preset or
+  /// custom segment groups + separator + options. `null` = the default
+  /// preset. Consumed by [TuiStatusLine] via [resolveStatusLineSpec].
+  final StatusLineConfig? statusLine;
+
+  /// The `links:` section (issue #691): the single source of truth for
+  /// product/store links — the app banners, the CLI (`fa config get
+  /// links.…`) and the site generator all resolve the same values.
+  final LinksConfig links;
+
+  /// The opt-in live thinking stream for line-mode/headless runs
+  /// (gh-1198, `output.streamThinking` yaml key, default false): when
+  /// true, thinking deltas print dimmed, live, like the TUI's progress
+  /// signal. `--stream-thinking` wins for the run. The default keeps the
+  /// byte-identical legacy output (machine consumers, AC3).
+  final bool streamThinking;
+
+  /// The self-update policy (issue #1377, `auto_update` yaml key):
+  /// [AutoUpdateMode.notify] (the never-written default) checks at boot
+  /// and prints once, `on` downloads + restarts onto the new release,
+  /// `off` touches no update host at all.
+  final AutoUpdateMode autoUpdate;
+
+  /// Returns a copy with the given fields replaced; every omitted field
+  /// carries over (null = keep). The base for the boot's `persistConfig`
+  /// save (gh-1572): the loaded config is the base, only the session-live
+  /// overlays are passed, so a save can never reset a section the caller
+  /// did not mention. Nullable sections model absence as null — a
+  /// `copyWith` cannot CLEAR one (pass the parsed value or keep it).
+  CliConfig copyWith({
+    String? providerKind,
+    String? modelId,
+    String? baseUrl,
+    String? mode,
+    String? approvalMode,
+    List<String>? allowedTools,
+    Map<String, String>? promptOverrides,
+    Map<String, ProviderNetworkConfig>? providerNetworks,
+    ModelRolesConfig? modelRoles,
+    TtsrConfig? ttsr,
+    int? contextWindowCap,
+    StuckToolConfig? stuckTool,
+    ForegroundCallBudgetConfig? foregroundCall,
+    String? agentLoadMode,
+    List<CustomProviderEntry>? customProviders,
+    ModelsConfig? models,
+    McpConfig? mcp,
+    A2aConfig? a2a,
+    ProviderTimeoutsOverride? providerTimeouts,
+    SkillsAccess? skillsAccess,
+    bool? skillsDisableShellExecution,
+    bool? skillsLiveRediscovery,
+    Map<String, bool>? skillToggles,
+    MemoryConfig? memory,
+    FabricConfig? fabric,
+    CubeSettings? cube,
+    ToolsConfig? tools,
+    RedactionConfig? redact,
+    SpillsConfig? spills,
+    SessionsConfig? sessions,
+    ProjectContextConfig? projectContext,
+    CompactionEngine? compactionEngine,
+    int? compactionJudgeBudgetSeconds,
+    bool? wireDump,
+    bool? trajectoryRequestBlobs,
+    int? trajectoryRequestBlobMaxMb,
+    int? trajectoryRequestBlobMaxBytes,
+    int? trajectoryRequestBlobTtlDays,
+    ImageRegistryConfig? images,
+    String? agentMode,
+    bool? misuseBreaker,
+    SubagentsConfig? subagents,
+    WaitingConfig? waiting,
+    JobsConfig? jobs,
+    HeadlessConfig? headless,
+    PowerAssertionLevel? powerSleepPrevention,
+    PowerAssertionHold? powerHold,
+    QuotaSection? quota,
+    String? tuiTheme,
+    bool? tuiClassic,
+    bool? tuiShowCompactionDetails,
+    StatusLineConfig? statusLine,
+    LinksConfig? links,
+    bool? streamThinking,
+    AutoUpdateMode? autoUpdate,
+  }) {
+    return CliConfig(
+      providerKind: providerKind ?? this.providerKind,
+      modelId: modelId ?? this.modelId,
+      baseUrl: baseUrl ?? this.baseUrl,
+      mode: mode ?? this.mode,
+      approvalMode: approvalMode ?? this.approvalMode,
+      allowedTools: allowedTools ?? this.allowedTools,
+      promptOverrides: promptOverrides ?? this.promptOverrides,
+      modelRoles: modelRoles ?? this.modelRoles,
+      ttsr: ttsr ?? this.ttsr,
+      contextWindowCap: contextWindowCap ?? this.contextWindowCap,
+      stuckTool: stuckTool ?? this.stuckTool,
+      foregroundCall: foregroundCall ?? this.foregroundCall,
+      agentLoadMode: agentLoadMode ?? this.agentLoadMode,
+      customProviders: customProviders ?? this.customProviders,
+      models: models ?? this.models,
+      mcp: mcp ?? this.mcp,
+      a2a: a2a ?? this.a2a,
+      providerTimeouts: providerTimeouts ?? this.providerTimeouts,
+      skillsAccess: skillsAccess ?? this.skillsAccess,
+      skillsDisableShellExecution:
+          skillsDisableShellExecution ?? this.skillsDisableShellExecution,
+      skillsLiveRediscovery:
+          skillsLiveRediscovery ?? this.skillsLiveRediscovery,
+      skillToggles: skillToggles ?? this.skillToggles,
+      providerNetworks: providerNetworks ?? this.providerNetworks,
+      memory: memory ?? this.memory,
+      fabric: fabric ?? this.fabric,
+      cube: cube ?? this.cube,
+      tools: tools ?? this.tools,
+      redact: redact ?? this.redact,
+      spills: spills ?? this.spills,
+      sessions: sessions ?? this.sessions,
+      projectContext: projectContext ?? this.projectContext,
+      compactionEngine: compactionEngine ?? this.compactionEngine,
+      compactionJudgeBudgetSeconds:
+          compactionJudgeBudgetSeconds ?? this.compactionJudgeBudgetSeconds,
+      wireDump: wireDump ?? this.wireDump,
+      trajectoryRequestBlobs:
+          trajectoryRequestBlobs ?? this.trajectoryRequestBlobs,
+      trajectoryRequestBlobMaxMb:
+          trajectoryRequestBlobMaxMb ?? this.trajectoryRequestBlobMaxMb,
+      trajectoryRequestBlobMaxBytes:
+          trajectoryRequestBlobMaxBytes ?? this.trajectoryRequestBlobMaxBytes,
+      trajectoryRequestBlobTtlDays:
+          trajectoryRequestBlobTtlDays ?? this.trajectoryRequestBlobTtlDays,
+      images: images ?? this.images,
+      agentMode: agentMode ?? this.agentMode,
+      misuseBreaker: misuseBreaker ?? this.misuseBreaker,
+      subagents: subagents ?? this.subagents,
+      waiting: waiting ?? this.waiting,
+      jobs: jobs ?? this.jobs,
+      headless: headless ?? this.headless,
+      powerSleepPrevention: powerSleepPrevention ?? this.powerSleepPrevention,
+      powerHold: powerHold ?? this.powerHold,
+      quota: quota ?? this.quota,
+      tuiTheme: tuiTheme ?? this.tuiTheme,
+      tuiClassic: tuiClassic ?? this.tuiClassic,
+      tuiShowCompactionDetails:
+          tuiShowCompactionDetails ?? this.tuiShowCompactionDetails,
+      statusLine: statusLine ?? this.statusLine,
+      links: links ?? this.links,
+      streamThinking: streamThinking ?? this.streamThinking,
+      autoUpdate: autoUpdate ?? this.autoUpdate,
+    );
+  }
+
+  /// Returns a copy with [entries] as the custom-providers list; every
+  /// other field carries over. [saveCliConfig] uses it for its
+  /// merge-before-write union (issue #221). A [copyWith] delegation, so
+  /// the field list can never drift from the constructor again (the old
+  /// hand-rolled copy silently dropped whole sections — gh-1572).
+  CliConfig withCustomProviders(List<CustomProviderEntry> entries) =>
+      copyWith(customProviders: entries);
+
+  String toYaml() {
+    final buffer = StringBuffer()
+      ..write('provider: $providerKind\n')
+      ..write('model: $modelId\n')
+      ..write('baseUrl: $baseUrl\n')
+      ..write('mode: $mode\n')
+      ..write('approvalMode: $approvalMode\n')
+      ..write(_autoUpdateYaml())
+      ..write(_allowedToolsYaml())
+      ..write(_promptOverridesYaml())
+      ..write(_optionalSectionsYaml())
+      ..write(_tuiSectionYaml());
+    return buffer.toString();
+  }
+
+  /// The `auto_update` scalar (issue #1377), only when non-default; the
+  /// file stays minimal (defaults are never written).
+  String _autoUpdateYaml() {
+    if (autoUpdate == AutoUpdateMode.notify) return '';
+    return 'auto_update: ${autoUpdate.yamlValue}\n';
+  }
+
+  /// The optional config sections, only when explicitly configured; the
+  /// file stays minimal (defaults are never written).
+  String _optionalSectionsYaml() {
+    final buffer = StringBuffer()
+      ..write(_modelSectionsYaml())
+      ..write(_hostSectionsYaml());
+    return buffer.toString();
+  }
+
+  /// The `tui:` section, only the persisted parts (theme, classic kill
+  /// switch, compaction-detail opt-in, statusLine); the file stays
+  /// minimal.
+  String _tuiSectionYaml() {
+    final statusLineYaml = statusLine?.toYaml();
+    if (tuiTheme == null &&
+        !tuiClassic &&
+        !tuiShowCompactionDetails &&
+        (statusLineYaml == null || statusLineYaml.isEmpty)) {
+      return '';
+    }
+    return 'tui:\n'
+        '${tuiTheme == null ? '' : '  theme: $tuiTheme\n'}'
+        '${tuiClassic ? '  classic: true\n' : ''}'
+        '${tuiShowCompactionDetails ? '  showCompactionDetails: true\n' : ''}'
+        '${statusLineYaml ?? ''}';
+  }
+
+  String _modelSectionsYaml() {
+    final buffer = StringBuffer();
+    final roles = modelRoles;
+    if (roles != null) buffer.write(roles.toYaml());
+    final ttsrConfig = ttsr;
+    if (ttsrConfig != null) buffer.write(ttsrConfig.toYaml());
+    buffer.write(_customProvidersYaml());
+    buffer.write(_providerNetworksYaml());
+    final modelsConfig = models;
+    if (modelsConfig != null && !modelsConfig.isEmpty) {
+      buffer.write(modelsConfig.toYaml());
+    }
+    final mcpConfig = mcp;
+    if (mcpConfig != null) buffer.write(mcpConfig.toYaml());
+    buffer.write(_providerTimeoutsYaml());
+    buffer.write(_skillsYaml());
+    return buffer.toString();
+  }
+
+  /// Host/environment-related optional sections.
+  String _hostSectionsYaml() {
+    final buffer = StringBuffer();
+    final fabricConfig = fabric;
+    if (fabricConfig != null) buffer.write(fabricConfig.toYaml());
+    final cubeConfig = cube;
+    if (cubeConfig != null) buffer.write(cubeConfig.toYamlFragment());
+    final toolsConfig = tools;
+    if (toolsConfig != null && !toolsConfig.isEmpty) {
+      buffer.write(toolsConfig.toYaml());
+    }
+    buffer.write(_redactYaml());
+    buffer.write(_compactionYaml());
+    buffer.write(_trajectoryYaml());
+    if (images != null) buffer.write(_imagesYaml());
+    buffer.write(_spillsYaml());
+    buffer.write(_sessionsYaml());
+    buffer.write(_projectContextYaml());
+    buffer.write(_agentSectionYaml());
+    // The subagents section (issue #383 heartbeat, gh-1956 spill
+    // switch), only when explicitly configured; defaults are never
+    // written so the file stays minimal.
+    final subagentsConfig = subagents;
+    if (subagentsConfig.heartbeatMinutes != defaultSubagentHeartbeatMinutes ||
+        subagentsConfig.stallMinutes != defaultSubagentStallMinutes ||
+        subagentsConfig.replyAutoSpill != defaultReplyAutoSpill) {
+      buffer.write(subagentsConfig.toYaml());
+    }
+    buffer.write(_jobsYaml());
+    buffer.write(_headlessYaml());
+    buffer.write(_linksYaml());
+    buffer.write(_powerYaml());
+    buffer.write(_quotaYaml());
+    buffer.write(_outputYaml());
+    return buffer.toString();
+  }
+
+  /// The `output:` section (gh-1198), only when explicitly opted in;
+  /// defaults are never written so the file stays minimal.
+  String _outputYaml() =>
+      streamThinking ? 'output:\n  streamThinking: true\n' : '';
+
+  /// The `agent:` section, only when a cap, a load mode, a stuck-tool
+  /// config, the foreground-call budget, or the misuse-breaker kill
+  /// switch is persisted; defaults are never written so the file stays
+  /// minimal.
+  String _agentSectionYaml() {
+    final stuckYaml = _stuckToolYaml();
+    final fgYaml = _foregroundCallYaml();
+    if (contextWindowCap == null &&
+        agentLoadMode == null &&
+        misuseBreaker &&
+        stuckYaml.isEmpty &&
+        fgYaml.isEmpty) {
+      return '';
+    }
+    final section = StringBuffer('agent:\n');
+    if (contextWindowCap != null) {
+      section.write('  contextWindowCap: $contextWindowCap\n');
+    }
+    if (agentLoadMode != null) {
+      section.write('  mode: $agentLoadMode\n');
+    }
+    if (!misuseBreaker) {
+      section.write('  misuseBreaker: false\n');
+    }
+    section.write(stuckYaml);
+    section.write(fgYaml);
+    return section.toString();
+  }
+
+  /// The `agent.foregroundCallBudgetSeconds` / `agent.
+  /// foregroundCallAutoConvert` leaves (issue #1786), only when
+  /// non-default (600 / offer) — defaults are never written so the file
+  /// stays minimal.
+  String _foregroundCallYaml() {
+    final fg = foregroundCall;
+    if (fg == null) return '';
+    final budget = fg.budget.inSeconds;
+    final buffer = StringBuffer();
+    if (budget != defaultForegroundCallBudgetSeconds) {
+      buffer.write('  foregroundCallBudgetSeconds: $budget\n');
+    }
+    if (fg.autoConvert) {
+      buffer.write('  foregroundCallAutoConvert: auto\n');
+    }
+    return buffer.toString();
+  }
+
+  /// The `agent.stuckTool:` sub-map, only when explicitly configured
+  /// (defaults are never written so the file stays minimal).
+  String _stuckToolYaml() {
+    final stuck = stuckTool;
+    if (stuck == null) return '';
+    final map = stuck.toYamlMap();
+    if (map.isEmpty) return '';
+    final buffer = StringBuffer('  stuckTool:\n');
+    for (final entry in map.entries) {
+      final value = entry.value;
+      if (value is List) {
+        buffer.write('    ${entry.key}: [${value.join(', ')}]\n');
+      } else {
+        buffer.write('    ${entry.key}: $value\n');
+      }
+    }
+    return buffer.toString();
+  }
+
+  /// The `links:` section (issue #691), only when explicitly configured;
+  /// defaults are never written so the file stays minimal.
+  String _linksYaml() {
+    final linksConfig = links;
+    if (linksConfig.isDefault) return '';
+    return linksConfig.toYaml();
+  }
+
+  /// The `jobs:` boot-maintenance section (issue #478), only when
+  /// explicitly configured; defaults are never written so the file stays
+  /// minimal.
+  String _jobsYaml() {
+    final jobsConfig = jobs;
+    if (jobsConfig.staleHours == defaultJobsStaleHours &&
+        jobsConfig.logRetentionDays == defaultJobsLogRetentionDays) {
+      return '';
+    }
+    return jobsConfig.toYaml();
+  }
+
+  /// The `headless:` section (gh-1459), only when explicitly configured;
+  /// defaults are never written so the file stays minimal.
+  String _headlessYaml() {
+    final lines = <String>[
+      if (headless.shellJobDrainMs != defaultShellJobDrainMs)
+        '  shellJobDrainMs: ${headless.shellJobDrainMs}',
+      if (headless.shellJobQuietMs != defaultShellJobQuietMs)
+        '  shellJobQuietMs: ${headless.shellJobQuietMs}',
+    ];
+    if (lines.isEmpty) return '';
+    return 'headless:\n${lines.join('\n')}\n';
+  }
+
+  /// The `compaction:` section, only when explicitly configured; defaults
+  /// are never written so the file stays minimal.
+  String _compactionYaml() {
+    final engine = compactionEngine;
+    final judgeBudgetSeconds = compactionJudgeBudgetSeconds;
+    if (engine == null && judgeBudgetSeconds == null) return '';
+    final section = <String>[
+      if (engine != null) '  engine: ${engine.value}',
+      if (judgeBudgetSeconds != null)
+        '  judgeBudgetSeconds: $judgeBudgetSeconds',
+    ];
+    return 'compaction:\n${section.join('\n')}\n';
+  }
+
+  /// The `power:` section (issue #325), only when sleep prevention or hold
+  /// is explicitly configured; defaults are never written so the file stays
+  /// minimal.
+  String _powerYaml() {
+    final sleepPrevention = powerSleepPrevention;
+    final hold = powerHold;
+    if (sleepPrevention == null && hold == null) return '';
+    final buffer = StringBuffer('power:\n');
+    if (sleepPrevention != null) {
+      buffer.write('  sleepPrevention: ${sleepPrevention.value}\n');
+    }
+    if (hold != null) {
+      buffer.write('  hold: ${hold.value}\n');
+    }
+    return buffer.toString();
+  }
+
+  /// The `quota:` section (issue #823), only when explicitly configured;
+  /// defaults are never written so the file stays minimal.
+  String _quotaYaml() {
+    if (quota == const QuotaSection()) return '';
+    final buffer = StringBuffer('quota:\n');
+    if (quota.badge) buffer.write('  badge: true\n');
+    if (quota.ttlMinutes != defaultQuotaTtlMinutes) {
+      buffer.write('  ttl_minutes: ${quota.ttlMinutes}\n');
+    }
+    return buffer.toString();
+  }
+
+  /// The `redact:` section, only when explicitly configured; defaults are
+  /// never written so the file stays minimal.
+  String _redactYaml() {
+    final config = redact;
+    if (config == null || config == const RedactionConfig()) return '';
+    final buffer = StringBuffer('redact:\n')
+      ..write('  enabled: ${config.enabled}\n')
+      ..write('  blockMode: ${config.blockMode}\n');
+    if (config.layerToggles.isNotEmpty) {
+      buffer.write('  layers:\n');
+      config.layerToggles.forEach(
+        (key, value) => buffer.write('    ${key.name}: $value\n'),
+      );
+    }
+    String listYaml(String key, Iterable<String> values) {
+      if (values.isEmpty) return '';
+      // Values are single-quoted: regex patterns (allowlist) routinely
+      // start with `[` or contain other YAML flow indicators.
+      final items = values
+          .map((value) => "    - '${value.replaceAll("'", "''")}'\n")
+          .join();
+      return '  $key:\n$items';
+    }
+
+    buffer
+      ..write(
+        listYaml('allowlist', [
+          for (final regex in config.allowlistRegexes) regex.pattern,
+        ]),
+      )
+      ..write(listYaml('toolAllow', config.toolAllow))
+      ..write(listYaml('toolDeny', config.toolDeny));
+    return buffer.toString();
+  }
+
+  String _providerTimeoutsYaml() {
+    final timeouts = providerTimeouts;
+    if (timeouts == null) return '';
+    final buffer = StringBuffer('providerTimeouts:\n');
+    final connect = timeouts.connect;
+    if (connect != null) {
+      buffer.write('  connectTimeoutMs: ${connect.inMilliseconds}\n');
+    }
+    final streamIdle = timeouts.streamIdle;
+    if (streamIdle != null) {
+      buffer.write('  streamIdleTimeoutMs: ${streamIdle.inMilliseconds}\n');
+    }
+    return buffer.toString();
+  }
+
+  String _skillsYaml() {
+    if (!_skillsSectionNeeded) return '';
+    final buffer = StringBuffer('skills:\n');
+    _writeSkillsAccess(buffer);
+    _writeSkillsDisableShellExecution(buffer);
+    // gh-1440: only the non-default (opt-out) value is written — the file
+    // stays minimal.
+    if (!skillsLiveRediscovery) buffer.write('  liveRediscovery: false\n');
+    for (final entry in skillToggles.entries) {
+      buffer.write('  ${entry.key}: ${entry.value}\n');
+    }
+    return buffer.toString();
+  }
+
+  bool get _skillsSectionNeeded =>
+      skillsAccess != SkillsAccess.granted ||
+      skillsDisableShellExecution ||
+      !skillsLiveRediscovery ||
+      skillToggles.isNotEmpty;
+
+  void _writeSkillsAccess(StringBuffer buffer) {
+    if (skillsAccess != SkillsAccess.granted) {
+      buffer.write('  access: ${skillsAccessLabel(skillsAccess)}\n');
+    }
+  }
+
+  void _writeSkillsDisableShellExecution(StringBuffer buffer) {
+    if (skillsDisableShellExecution) {
+      buffer.write('  disableShellExecution: true\n');
+    }
+  }
+
+  String _imagesYaml() {
+    final config = images;
+    if (config == null) return '';
+    final buffer = StringBuffer('images:\n');
+    if (!config.enabled) buffer.write('  registry: false\n');
+    if (config.maxPerRequest != defaultMaxImagesPerRequest) {
+      buffer.write('  maxPerRequest: ${config.maxPerRequest}\n');
+    }
+    if (config.maxBytesPerRequest != defaultMaxImageBytesPerRequest) {
+      buffer.write('  maxBytesPerRequest: ${config.maxBytesPerRequest}\n');
+    }
+    if (!config.autoInspect) buffer.write('  autoInspect: false\n');
+    return buffer.toString();
+  }
+
+  /// The `spills:` section (issue #678), only when explicitly
+  /// configured; defaults are never written so the file stays minimal
+  /// (gh-1572: the emitter used to be unable to render the section at
+  /// all, so every save dropped it).
+  String _spillsYaml() => spills?.toYaml() ?? '';
+
+  /// The `sessions:` section (gh-1746), only when explicitly configured
+  /// (defaults are never written so the file stays minimal).
+  String _sessionsYaml() => sessions?.toYaml() ?? '';
+
+  /// The `projectContext:` section (issue #1761), only when explicitly
+  /// configured; the default budget is never written so the file stays
+  /// minimal (same rule as `_spillsYaml`).
+  String _projectContextYaml() => projectContext?.toYaml() ?? '';
+
+  /// The `trajectory:` section, defaults never written (the file stays
+  /// minimal — same convention as every other section).
+  String _trajectoryYaml() {
+    final lines = <String>[];
+    if (wireDump) lines.add('  wireDump: true');
+    if (!trajectoryRequestBlobs) lines.add('  requestBlobs: false');
+    if (trajectoryRequestBlobMaxMb != 50) {
+      lines.add('  requestBlobMaxMb: $trajectoryRequestBlobMaxMb');
+    }
+    if (trajectoryRequestBlobTtlDays != 30) {
+      lines.add('  requestBlobTtlDays: $trajectoryRequestBlobTtlDays');
+    }
+    if (lines.isEmpty) return '';
+    return 'trajectory:\n${lines.join('\n')}\n';
+  }
+
+  String _allowedToolsYaml() {
+    if (allowedTools.isEmpty) return 'allowedTools: []\n';
+    final buffer = StringBuffer('allowedTools:\n');
+    for (final tool in allowedTools) {
+      buffer.write('  - $tool\n');
+    }
+    return buffer.toString();
+  }
+
+  String _promptOverridesYaml() {
+    if (promptOverrides.isEmpty) return '';
+    // JSON-quoted values are valid yaml scalars and keep inline multi-line
+    // prompt text round-trippable (same convention as the ttsr section).
+    final buffer = StringBuffer('prompts:\n');
+    for (final entry in promptOverrides.entries) {
+      buffer.write('  ${entry.key}: ${jsonEncode(entry.value)}\n');
+    }
+    return buffer.toString();
+  }
+
+  /// The `providers:` yaml section (issue #1921) — written back verbatim
+  /// so config edits never drop a user's proxy binding.
+  String _providerNetworksYaml() {
+    if (providerNetworks.isEmpty) return '';
+    final buffer = StringBuffer('providers:\n');
+    for (final MapEntry(key: name, value: network)
+        in providerNetworks.entries) {
+      buffer.write('  ${_yamlScalar(name)}:\n    network:\n');
+      buffer.write('      proxy: ${_yamlScalar(network.proxy.toString())}\n');
+      final username = network.proxyUsername;
+      if (username != null) {
+        buffer.write('      proxyUsername: ${_yamlScalar(username)}\n');
+      }
+      final passwordEnv = network.proxyPasswordEnv;
+      if (passwordEnv != null) {
+        buffer.write('      proxyPasswordEnv: ${_yamlScalar(passwordEnv)}\n');
+      }
+    }
+    return buffer.toString();
+  }
+
+  String _customProvidersYaml() {
+    if (customProviders.isEmpty) return '';
+    final buffer = StringBuffer('customProviders:\n');
+    for (final entry in customProviders) {
+      buffer.write(
+        '  - name: ${_yamlScalar(entry.name)}\n'
+        '    apiType: ${entry.apiType}\n'
+        '    baseUrl: ${_yamlScalar(entry.baseUrl)}\n',
+      );
+      if (entry.keyName != null) {
+        buffer.write('    keyName: ${_yamlScalar(entry.keyName!)}\n');
+      }
+      final authHeader = entry.authHeader;
+      if (authHeader != null) {
+        buffer.write('    authHeader: ${_yamlScalar(authHeader)}\n');
+      }
+      // Per-provider stall-recovery tuning (issue #1398) — optional keys,
+      // written back only when the entry declares them.
+      if (entry.connectTimeout != null) {
+        buffer.write(
+          '    connectTimeoutMs: ${entry.connectTimeout!.inMilliseconds}\n',
+        );
+      }
+      if (entry.streamIdleTimeout != null) {
+        buffer.write(
+          '    streamIdleTimeoutMs: ${entry.streamIdleTimeout!.inMilliseconds}\n',
+        );
+      }
+      buffer.write('    modelId: ${_yamlScalar(entry.modelId)}\n');
+    }
+    return buffer.toString();
+  }
+
+  /// The yaml scalar for a user-data value: plain when unambiguously
+  /// plain-safe, single-quoted otherwise. Issue #555 backstop: a bare
+  /// `name: ?` throws "Mapping keys are not allowed here" on the next
+  /// load — the CLI then starts from defaults (the saved config is
+  /// lost). A trailing `:` breaks the same way ("mapping values are not
+  /// allowed here").
+  String _yamlScalar(String value) {
+    const plain = r'^[A-Za-z0-9][A-Za-z0-9._+/:?=&~-]*$';
+    return !value.endsWith(':') && RegExp(plain).hasMatch(value)
+        ? value
+        : "'${value.replaceAll("'", "''")}'";
+  }
+}
+
+/// Returns the user's home directory, or `null` if it cannot be determined.
+String? homeDirectory() {
+  if (Platform.isWindows) {
+    return Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'];
+  }
+  return Platform.environment['HOME'];
+}
+
+/// Loads [CliConfig] from `~/.fah/config.yaml`.
+///
+/// Returns defaults when the file is missing or unreadable. A syntactically
+/// valid file whose model-roles section is invalid throws [ConfigException]
+/// (bad roles must surface, never silently vanish).
+CliConfig loadCliConfig(String homeDir) {
+  final file = File('$homeDir/.fah/config.yaml');
+  if (!file.existsSync()) return CliConfig();
+  try {
+    final content = file.readAsStringSync();
+    final doc = loadYaml(content);
+    if (doc is YamlMap) {
+      final config = CliConfig.fromYaml(doc);
+      _warnCanonicalizedProvider(doc, config);
+      _warnDroppedGhostProviders(doc, config);
+      return config;
+    }
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    // Ignore corrupt config and fall back to defaults.
+  }
+  return CliConfig();
+}
+
+/// The saved `provider:` value, canonicalized to the catalog kind
+/// (issue #772): old name-shaped spellings (`chatgpt`, `chatgpt.com`)
+/// fold onto `chatgpt-codex` on LOAD — the file is rewritten only on the
+/// next save. Absent stays null (the default applies); an id no version
+/// knows returns unchanged so the boot boundary keeps its
+/// warn-and-degrade stance (issue #760, forward-compat E2).
+String? _canonicalSavedProvider(Object? raw) {
+  if (raw is! String) return null;
+  return canonicalProviderKind(canonicalProviderName(raw));
+}
+
+/// Note for the kind canonicalization (issue #772, E1): a saved
+/// name-shaped `provider:` (`chatgpt`, `chatgpt.com`) loads as the catalog
+/// kind (`chatgpt-codex`). The note prints on EVERY load until the next
+/// save persists the kind into the file — boot never mutates the config
+/// (no de-dup state; it self-extinguishes after the first save).
+void _warnCanonicalizedProvider(YamlMap doc, CliConfig config) {
+  final raw = doc['provider'];
+  if (raw == null) {
+    return;
+  }
+  if (raw is! String) {
+    // Type-invalid value (e.g. `provider: 123`): degrades to the default —
+    // say so instead of swallowing it silently (the
+    // _warnDroppedGhostProviders named-note precedent).
+    stderr.writeln(
+      "note: provider '$raw' is not a string — ignoring it; the default "
+      "'${config.providerKind}' applies (issue #772)",
+    );
+    return;
+  }
+  if (raw.trim().toLowerCase() == config.providerKind) {
+    return;
+  }
+  stderr.writeln(
+    "note: provider '$raw' loads as kind '${config.providerKind}' — the "
+    'next config save persists the kind (issue #772)',
+  );
+}
+
+/// Loud note for the ghost cleanup (issue #221): entries named after
+/// built-in catalog providers were dropped from the loaded
+/// `customProviders:` list — they shadow `/provider <name>` routing and
+/// the next save removes them from the file for good.
+void _warnDroppedGhostProviders(YamlMap doc, CliConfig config) {
+  final raw = doc['customProviders'];
+  if (raw is! YamlList || raw.length == config.customProviders.length) {
+    return;
+  }
+  final names = [
+    for (final node in raw)
+      if (_isGhostProviderEntry(node)) '${(node as Map)['name']}',
+  ];
+  if (names.isEmpty) return;
+  stderr.writeln(
+    'warning: dropped customProviders entries named after built-in '
+    'providers (${names.join(', ')}) — reserved names, see issue #221',
+  );
+}
+
+/// Loads the PROJECT-level `memory:` section from
+/// `<projectDir>/.fah/config.yaml` — the git-backed memory path travels
+/// with the repo (anyone cloning gets the pointer AND the memory).
+/// Project wins over the user-level `memory:` section. Null when the
+/// file or the section is absent/unreadable; a present-but-invalid
+/// section throws [ConfigException] (strict, like the user config).
+MemoryConfig? loadProjectMemoryConfig(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    final node = doc['memory'];
+    return node == null ? null : MemoryConfig.fromYaml(node);
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    return null;
+  }
+}
+
+/// Loads the PROJECT-level `cube:` section from
+/// `<projectDir>/.fah/config.yaml` — the git-backed sandbox default
+/// travels with the repo. Project wins over the user-level `cube:`
+/// section. Null when the file or the section is absent/unreadable; a
+/// present-but-invalid section throws [ConfigException] (strict, like the
+/// user config).
+CubeSettings? loadProjectCubeSettings(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    final node = doc['cube'];
+    return node == null ? null : CubeSettings.fromYaml(node);
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    return null;
+  }
+}
+
+/// Loads the PROJECT-level `spills:` section from
+/// `<projectDir>/.fah/config.yaml` (issue #678) — the spilling thresholds
+/// travel with the repo. Project wins wholesale over the user-level
+/// `spills:` section, like the other project sections. Null when the
+/// file or the section is absent; the parse itself is tolerant, so this
+/// never throws.
+SpillsConfig? loadProjectSpillsConfig(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    final node = doc['spills'];
+    return node == null ? null : SpillsConfig.fromYaml(node);
+  } on Object {
+    return null;
+  }
+}
+
+/// Loads the PROJECT-level `compaction:` section from
+/// `<projectDir>/.fah/config.yaml` — the engine choice travels with the
+/// repo (issue #148). Project wins over the user-level `compaction:`
+/// section; the runtime flag wins over both. Null when the file or the
+/// section is absent/unreadable; a present-but-invalid section throws
+/// [ConfigException] (strict, like the user config).
+CompactionEngine? loadProjectCompactionEngine(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    return CompactionEngine.fromSection(
+      doc['compaction'],
+      label: '$projectDir/.fah/config.yaml',
+    );
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    return null;
+  }
+}
+
+/// Loads the PROJECT-level `trajectory:` section from
+/// `<projectDir>/.fah/config.yaml` (issue #385 + gh-1745) — the whole
+/// section travels with the repo, the same way `wireDump` always did.
+/// Null when the file or the section is absent/unreadable; a
+/// present-but-invalid section throws [ConfigException] (strict, like
+/// the user config).
+TrajectorySection? loadProjectTrajectorySection(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    final node = doc['trajectory'];
+    return node == null ? null : _parseTrajectorySection(node);
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    return null;
+  }
+}
+
+/// Loads the PROJECT-level `trajectory:` section's `wireDump` flag from
+/// `<projectDir>/.fah/config.yaml` (issue #385). Null when the file or the
+/// section is absent/unreadable; a present-but-invalid section throws
+/// [ConfigException] (strict, like the user config).
+bool? loadProjectWireDump(String projectDir) =>
+    loadProjectTrajectorySection(projectDir)?.wireDump;
+
+/// Loads the PROJECT-level `agent.contextWindowCap` from
+/// `<projectDir>/.fah/config.yaml` (gh-1077) — the owner-side effective
+/// window cap travels with the repo the same way it does for the CLI.
+/// Null when the file or the section is absent/unreadable; a
+/// present-but-invalid section throws [ConfigException] (strict, like the
+/// user config — same [agent-section rules](_parseAgentSection)).
+int? loadProjectContextWindowCap(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    final node = doc['agent'];
+    if (node == null) return null;
+    return _parseAgentSection(node)?.contextWindowCap;
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    return null;
+  }
+}
+
+/// Loads the PROJECT-level `tools:` section from
+/// `<projectDir>/.fah/config.yaml` — the git-backed availability policy
+/// travels with the repo. The PROJECT scope is consumed live (separate
+/// from the saved global [CliConfig.tools]) so the deepest-wins resolution
+/// can stack both. Null when the file or the section is absent/unreadable;
+/// a present-but-invalid section throws [ConfigException] (strict, like
+/// the user config).
+ToolsConfig? loadProjectToolsConfig(String projectDir) {
+  final file = File('$projectDir/.fah/config.yaml');
+  if (!file.existsSync()) return null;
+  try {
+    final doc = loadYaml(file.readAsStringSync());
+    if (doc is! YamlMap) return null;
+    final node = doc['tools'];
+    return node == null ? null : ToolsConfig.fromYaml(node);
+  } on ConfigException {
+    rethrow;
+  } on Object {
+    return null;
+  }
+}
+
+/// Parses the `FA_TOOLS` env twin of the `--tools` flag: the same csv
+/// spec, for Docker/headless hosts that cannot pass flags. Absent or empty
+/// yields null (no runtime intent); a malformed value throws
+/// [ConfigException] naming the bad token.
+ToolsConfig? toolsSpecFromEnv(Map<String, String> env) {
+  final spec = env['FA_TOOLS'];
+  if (spec == null || spec.trim().isEmpty) return null;
+  return parseToolsSpec(spec);
+}
+
+/// The `FA_LOG_FILE` env twin of the `--log-file` flag: the tee path, for
+/// Docker/headless hosts that cannot pass flags. Absent or blank yields
+/// null (no tee intent); the flag wins when both are set.
+String? logFileFromEnv(Map<String, String> env) {
+  final path = env['FA_LOG_FILE'];
+  if (path == null || path.trim().isEmpty) return null;
+  return path;
+}
+
+/// The startup cube source (fa_cube): explicit flags win, then the project
+/// `cube:` section, then the user `cube:` section — each config section
+/// applies only when enabled. Null = start unsandboxed.
+String? resolveStartupCubeSource({
+  String? flagConfigPath,
+  String? flagName,
+  CubeSettings? project,
+  CubeSettings? user,
+}) {
+  if (flagConfigPath != null) return flagConfigPath;
+  if (flagName != null) return flagName;
+  if (project != null && project.enabled) return project.configPath;
+  if (user != null && user.enabled) return user.configPath;
+  return null;
+}
+
+/// One write chain per config file path, shared by every [saveCliConfig]
+/// call in this isolate (the session layer's `_sessionFileOps` pattern):
+/// concurrent saves queue instead of interleaving their
+/// read-merge-write into a lost update.
+final Map<String, Future<void>> _configWriteOps = <String, Future<void>>{};
+
+/// Runs [op] after every previously queued write on [filePath] completes.
+/// A failure never poisons the chain for later callers.
+Future<T> _serializedConfigWrite<T>(String filePath, Future<T> Function() op) {
+  final result = (_configWriteOps[filePath] ?? Future<void>.value()).then(
+    (_) => op(),
+  );
+  _configWriteOps[filePath] = result.then<void>((_) {}, onError: (Object _) {});
+  return result;
+}
+
+int _configTmpCounter = 0;
+
+/// Saves [CliConfig] to `~/.fah/config.yaml`.
+///
+/// Merge-before-write (issue #221): several fa processes run concurrently
+/// on the same machine, each with a config parsed at boot. A whole-file
+/// rewrite from such a possibly-hours-old snapshot clobbers whatever the
+/// other processes saved since — this machine lost the `kimi_me` custom
+/// provider repeatedly to exactly that. So the save re-reads the on-disk
+/// file first and merges the `customProviders:` section as a name-keyed
+/// union (the caller's entries win per name; on-disk entries the caller
+/// never loaded survive). Every other section is caller-wins, as before.
+///
+/// An unparseable on-disk file makes the save REFUSE with a loud
+/// [ConfigException] instead of clobbering the file with defaults (E3).
+/// The write itself is atomic (unique temp file + rename): a concurrent
+/// reader never observes a torn document and a crash mid-write leaves the
+/// previous file intact.
+Future<void> saveCliConfig(String homeDir, CliConfig config) async {
+  final dir = Directory('$homeDir/.fah');
+  if (!dir.existsSync()) dir.createSync(recursive: true);
+  final file = File('${dir.path}/config.yaml');
+  await _serializedConfigWrite(file.path, () async {
+    final diskText = file.existsSync() ? file.readAsStringSync() : '';
+    final merged = _mergeWithOnDisk(file, config, diskText);
+    final finalText = _preserveDiskSections(diskText, merged.toYaml());
+    // gh-1572: boot calls the save unconditionally — an unchanged save
+    // must not touch the file (no mtime churn, no canonicalizing rewrite
+    // when the emitter already matches the disk, no writer race noise).
+    if (finalText == diskText) return;
+    final tmp = File('${file.path}.tmp.$pid.${_configTmpCounter++}');
+    await tmp.writeAsString(finalText);
+    try {
+      await tmp.rename(file.path);
+    } on FileSystemException {
+      // Windows cannot rename over an existing file.
+      if (!Platform.isWindows) rethrow;
+      try {
+        await file.delete();
+      } on PathNotFoundException {
+        // Raced away — the rename below recreates it.
+      }
+      await tmp.rename(file.path);
+    }
+  });
+}
+
+/// Top-level sections whose on-disk block survives a save when the
+/// emitter omitted them (issue #288: the settings-parity audit found the
+/// whole-file rewrite silently dropping sections a forgetful caller did
+/// not carry). `a2a:` and `memory:` have NO typed renderer at all — their
+/// raw block is the only faithful form (`a2a:` keeps `${NAME}` env-token
+/// references literal; a typed round-trip would materialize the resolved
+/// secret into the file). The rest render when the caller carries them —
+/// caller wins wherever it rendered. Excluded on purpose: `models:`,
+/// `tools:` (an EMPTY render is their removal semantics) and `skills:`
+/// (its default is a real value, not "no opinion").
+const _diskPreservedSections = {
+  'memory',
+  'cube',
+  'roles',
+  'ttsr',
+  'prompts',
+  'redact',
+  'compaction',
+  'a2a',
+  'providerTimeouts',
+  'images',
+  'fabric',
+  'mcp',
+  // The links section (issue #691) defaults are baked in, so the emitter
+  // omits a default-valued section — the raw block (future keys the
+  // typed renderer does not know yet) survives untouched.
+  'links',
+  // The output section (gh-1198): the emitter writes only the opt-in
+  // `streamThinking: true`; a hand-written block (the default-false
+  // form, comments, future keys) survives a save untouched.
+  'output',
+  // gh-1572: the sections the boot's persistConfig used to drop — every
+  // known top-level key is backstopped, so a save can never silently
+  // delete one. `waiting:` has no typed renderer at all (its raw block
+  // is the only faithful form, like `memory:`/`a2a:`); the rest render
+  // when the caller carries them — caller wins wherever it rendered.
+  'spills',
+  'sessions',
+  'projectContext',
+  'subagents',
+  'waiting',
+  'jobs',
+  'headless',
+  'agent',
+  'quota',
+  'tui',
+  'trajectory',
+  // The power section (issues #325/#326) and the `auto_update` scalar
+  // (issue #1377): known top-level keys the emitter writes only when
+  // non-default — a hand-written block survives a save from a config
+  // that does not carry them.
+  'power',
+  'auto_update',
+  // The main-model provider queue (issue #418): a top-level section the
+  // emitter can NEVER render (no CliConfig field — the queue resolver in
+  // startup.dart reads it straight from the yaml), so without the
+  // backstop any save silently deleted the user's queue. Raw-block
+  // survival, like `waiting:`/`memory:`.
+  'providersQueue',
+};
+
+/// Re-attaches the [_diskPreservedSections] blocks of [diskText] to
+/// [emitted] when the emitter did not render them itself (the caller
+/// wins wherever it rendered the section). "Rendered" means a top-level
+/// `key:` line at column 0 — an ANCHORED match: an unanchored substring
+/// check would let a scalar or nested key mentioning `memory:` (or an
+/// `xmemory:`-style key) count as rendered and silently drop the real
+/// on-disk section.
+String _preserveDiskSections(String diskText, String emitted) {
+  var result = emitted;
+  if (diskText.trim().isEmpty) return result;
+  for (final key in _diskPreservedSections) {
+    if (_topLevelYamlBlockOf(result, key) != null) continue;
+    final block = _topLevelYamlBlockOf(diskText, key);
+    if (block != null) result = '$result$block';
+  }
+  return result;
+}
+
+/// The `key:` top-level block of [text] (key line + indented body) as a
+/// trailing-newline-terminated string, or null when absent. Column-0
+/// comment lines continue the block: comments are invisible to yaml
+/// indentation, so a `# …` line between the section's own lines is
+/// still inside the section (stopping at it would truncate the block
+/// and silently drop every line below the comment).
+String? _topLevelYamlBlockOf(String text, String key) {
+  final lines = text.split('\n');
+  var start = -1;
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('$key:')) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  var end = start + 1;
+  while (end < lines.length &&
+      (lines[end].isEmpty ||
+          lines[end].startsWith(' ') ||
+          lines[end].startsWith('\t') ||
+          lines[end].startsWith('#'))) {
+    end++;
+  }
+  return '${lines.sublist(start, end).join('\n').trimRight()}\n';
+}
+
+/// Re-reads [file] and merges its `customProviders:` section into
+/// [config]'s intended save (name-keyed union, see [saveCliConfig]).
+/// A missing or empty file merges nothing; an unparseable one throws
+/// [ConfigException] — never merge onto (and thereby persist) defaults.
+CliConfig _mergeWithOnDisk(File file, CliConfig config, String diskText) {
+  if (!file.existsSync()) return config;
+  final content = diskText;
+  if (content.trim().isEmpty) return config;
+  final Object? doc;
+  try {
+    doc = loadYaml(content);
+  } on Object catch (error) {
+    throw ConfigException(
+      'refusing to overwrite unparseable ${file.path}: $error',
+    );
+  }
+  if (doc is! YamlMap) {
+    throw ConfigException(
+      'refusing to overwrite ${file.path}: expected a yaml map, got: $doc',
+    );
+  }
+  final onDisk = CliConfig.fromYaml(doc);
+  return config.withCustomProviders(
+    mergeCustomProviderEntries(config.customProviders, onDisk.customProviders),
+  );
+}

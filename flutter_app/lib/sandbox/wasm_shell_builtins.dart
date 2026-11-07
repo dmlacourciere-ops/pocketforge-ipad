@@ -1,0 +1,1018 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:fa/sandbox/shell_parser.dart';
+import 'package:path/path.dart' as p;
+
+export 'package:fa/sandbox/grep_args.dart';
+
+/// Pure, shell-semantics helpers extracted from [WasiSandboxShell] so the
+/// CRAP descent (#475) can unit test them without loading WASM cores.
+///
+/// Every function here is synchronous, allocation-only, and side-effect
+/// free; the WASM shell owns the I/O around them. Behavior is IDENTICAL to
+/// the inline code it replaced.
+
+/// Whether [sandboxPath] is the null device after lexical normalization —
+/// the redirect sink that discards bytes and never materializes a file
+/// (gh-1393 WS-1). Shared by the WASI shell and the web MemoryShell so the
+/// conformance table can pin one behavior.
+bool isNullDevicePath(String sandboxPath) =>
+    normalizeLexicalPath(sandboxPath) == '/dev/null';
+
+/// Redirect targets resolved for one pipeline stage.
+final class StageRedirects {
+  /// Creates the resolved targets.
+  const StageRedirects({
+    required this.stdoutFile,
+    required this.stderrFile,
+    required this.stdinFile,
+    required this.appendStdout,
+    required this.appendStderr,
+    this.stdinBody,
+    this.dupStderrIntoStdout = false,
+    this.dupStdoutIntoStderr = false,
+  });
+
+  /// `> file` / `>> file` target for stdout, or `null`.
+  final String? stdoutFile;
+
+  /// `2> file` / `2>> file` target for stderr, or `null`.
+  final String? stderrFile;
+
+  /// `< file` stdin source, or `null`.
+  final String? stdinFile;
+
+  /// `<<`/`<<<` inline stdin body (gh-1086), already expanded; wins over
+  /// [stdinFile] by POSIX last-redirect-wins (the collector clears the
+  /// other field).
+  final String? stdinBody;
+
+  /// Stdout target opened for append (`>>`).
+  final bool appendStdout;
+
+  /// Stderr target opened for append (`2>>`).
+  final bool appendStderr;
+
+  /// `2>&1`: stderr folds into stdout's destination (file, pipe, capture).
+  final bool dupStderrIntoStdout;
+
+  /// `1>&2` / `>&2`: stdout folds into stderr's destination.
+  final bool dupStdoutIntoStderr;
+}
+
+/// Resolves a stage's redirect list into targets.
+///
+/// Replicates the original precedence exactly: fd 0 read wins first, then
+/// `fd == 1 || fd == -1`, then `fd == 2 || fd == -1` - so `&>` (fd -1
+/// write) lands on stdout only, and a later redirect for the same stream
+/// overwrites an earlier one.
+///
+/// gh-1848 tier 3 split: the loop dispatches one redirect at a time to the
+/// fd-0 reader ([_applyStdinRedirect]), the `2>&1`/`1>&2` duplicator
+/// ([_applyDupRedirect], per-direction in [_applyDupPair]) and the
+/// stream-file writers ([_applyStreamFileRedirect] over
+/// [_applyStdoutFile]/[_applyStderrFile]); the collected fields live in a
+/// [_RedirectState] until the final [StageRedirects] is built.
+StageRedirects collectStageRedirects(List<Redirect> redirects) {
+  final s = _RedirectState();
+  for (final redirect in redirects) {
+    if (_applyStdinRedirect(redirect, s)) continue;
+    if (_applyDupRedirect(redirect, s)) continue;
+    _applyStreamFileRedirect(redirect, s);
+  }
+  return StageRedirects(
+    stdoutFile: s.stdoutFile,
+    stderrFile: s.stderrFile,
+    stdinFile: s.stdinFile,
+    stdinBody: s.stdinBody,
+    appendStdout: s.appendStdout,
+    appendStderr: s.appendStderr,
+    dupStderrIntoStdout: s.dupStderrIntoStdout,
+    dupStdoutIntoStderr: s.dupStdoutIntoStderr,
+  );
+}
+
+/// Mutable collection state for [collectStageRedirects]: one field per
+/// [StageRedirects] target, updated in redirect order.
+class _RedirectState {
+  String? stdoutFile;
+  String? stderrFile;
+  var dupStderrIntoStdout = false;
+  var dupStdoutIntoStderr = false;
+  String? stdinFile;
+  var appendStdout = false;
+  var appendStderr = false;
+  String? stdinBody;
+}
+
+/// Handles the fd-0 redirects: `<` read (clearing an earlier inline body)
+/// and the `<<`/`<<<` inline bodies (clearing an earlier read target).
+/// Returns whether [redirect] was an fd-0 stdin redirect; other fd-0
+/// redirects fall through unhandled, exactly as in the original chain.
+bool _applyStdinRedirect(Redirect redirect, _RedirectState s) {
+  if (redirect.fd != 0) return false;
+  switch (redirect.kind) {
+    case RedirectKind.read:
+      s.stdinFile = redirect.target;
+      s.stdinBody = null;
+    case RedirectKind.heredoc:
+      s.stdinBody = redirect.body ?? '';
+      s.stdinFile = null;
+    case RedirectKind.hereString:
+      // POSIX here-strings append a trailing newline after expansion.
+      s.stdinBody = '${redirect.target}\n';
+      s.stdinFile = null;
+    default:
+      return false;
+  }
+  return true;
+}
+
+/// Handles the `2>&1`/`1>&2`/`>&2` duplicates (any fd). Returns whether
+/// [redirect] was a dup.
+bool _applyDupRedirect(Redirect redirect, _RedirectState s) {
+  if (redirect.kind != RedirectKind.dup) return false;
+  _applyDupPair(redirect, s);
+  return true;
+}
+
+/// One dup direction: `2>&1` folds stderr into stdout's destination;
+/// `1>&2`/`>&2` the reverse. POSIX: the dup snapshots the target AT THIS
+/// POINT — `2>&1 > f` sends stderr to the pre-redirect stdout, `> f 2>&1`
+/// sends it to f. Applied by the WASI pipeline stage runner only. A dup
+/// naming an unknown pair is ignored.
+void _applyDupPair(Redirect redirect, _RedirectState s) {
+  if (redirect.target == '1' && redirect.fd == 2) {
+    if (s.stdoutFile != null) {
+      s.stderrFile = s.stdoutFile;
+      s.appendStderr = true;
+    } else {
+      s.dupStderrIntoStdout = true;
+    }
+  } else if (redirect.target == '2' && redirect.fd == 1) {
+    if (s.stderrFile != null) {
+      s.stdoutFile = s.stderrFile;
+      s.appendStdout = true;
+    } else {
+      s.dupStdoutIntoStderr = true;
+    }
+  }
+}
+
+/// Terminal chain node for the file redirects: fd 1 (or the `&`-style -1)
+/// writes/append to stdout, fd 2 (or -1, after the stdout check) to
+/// stderr. A file redirect replaces the fd, so an earlier dup of (or
+/// into) it no longer routes there.
+void _applyStreamFileRedirect(Redirect redirect, _RedirectState s) {
+  if (redirect.fd == 1 || redirect.fd == -1) {
+    _applyStdoutFile(redirect, s);
+  } else if (redirect.fd == 2 || redirect.fd == -1) {
+    _applyStderrFile(redirect, s);
+  }
+}
+
+/// Applies a stdout-bound write/append redirect (and clears the dup
+/// flags); other kinds on fd 1 are ignored.
+void _applyStdoutFile(Redirect redirect, _RedirectState s) {
+  if (redirect.kind == RedirectKind.write ||
+      redirect.kind == RedirectKind.append) {
+    s.stdoutFile = redirect.target;
+    s.appendStdout = redirect.kind == RedirectKind.append;
+    s.dupStderrIntoStdout = false;
+    s.dupStdoutIntoStderr = false;
+  }
+}
+
+/// Applies a stderr-bound write/append redirect (and clears the dup
+/// flags); other kinds on fd 2 are ignored.
+void _applyStderrFile(Redirect redirect, _RedirectState s) {
+  if (redirect.kind == RedirectKind.write ||
+      redirect.kind == RedirectKind.append) {
+    s.stderrFile = redirect.target;
+    s.appendStderr = redirect.kind == RedirectKind.append;
+    s.dupStderrIntoStdout = false;
+    s.dupStdoutIntoStderr = false;
+  }
+}
+
+/// Matches SIGPIPE stderr noise only: bare `Broken pipe` or the
+/// `<tool>: <stream>: Broken pipe` shape busybox tools emit. Deliberately
+/// does NOT match python tracebacks (`BrokenPipeError: [Errno 32] ...`).
+final RegExp _sigpipeNoise = RegExp(
+  r'^(Broken pipe|[\w./-]+: (?:stdout|stderr): Broken pipe)$',
+);
+
+bool _isSigpipeNoise(String line) => _sigpipeNoise.hasMatch(line.trim());
+
+/// Strips WASI SIGPIPE noise lines from captured stderr (issue #337 AC5).
+///
+/// Only the bare `<tool>: stdout: Broken pipe` shape is removed; a python
+/// `BrokenPipeError: [Errno 32] Broken pipe` traceback stays. Returns the
+/// input bytes untouched when no noise line is present.
+List<int> stripSigpipeNoise(List<int> stderrBytes) {
+  final text = utf8.decode(stderrBytes, allowMalformed: true);
+  final lines = text.split('\n');
+  final hasNoise = lines.any(_isSigpipeNoise);
+  if (!hasNoise) return stderrBytes;
+  return utf8.encode(lines.where((l) => !_isSigpipeNoise(l)).join('\n'));
+}
+
+/// Evaluates a `test` binary operator ([op]) between string operands.
+///
+/// Returns `null` for an unsupported operator so the caller can raise the
+/// shell's `unsupported binary operator` error. Numeric comparisons parse
+/// both sides as ints and propagate FormatException on garbage.
+bool? evalTestBinaryOp(String op, String left, String right) {
+  switch (op) {
+    case '=':
+      return left == right;
+    case '!=':
+      return left != right;
+    case '-eq':
+      return int.parse(left) == int.parse(right);
+    case '-ne':
+      return int.parse(left) != int.parse(right);
+    case '-lt':
+      return int.parse(left) < int.parse(right);
+    case '-le':
+      return int.parse(left) <= int.parse(right);
+    case '-gt':
+      return int.parse(left) > int.parse(right);
+    case '-ge':
+      return int.parse(left) >= int.parse(right);
+    default:
+      return null;
+  }
+}
+
+/// Declarative flag table for a builtin argv family: boolean [flags],
+/// [valueFlags] consuming the next token, everything else positional or
+/// skipped (issue #559).
+final class FlagSpec {
+  /// Creates a spec; both sets default to empty.
+  const FlagSpec({this.flags = const {}, this.valueFlags = const {}});
+
+  /// Boolean flags the builtin understands.
+  final Set<String> flags;
+
+  /// Flags whose value is the next argv token.
+  final Set<String> valueFlags;
+}
+
+/// Scan result: which flags toggled, what values were captured, and the
+/// positional operands in order. Unknown dash-args are skipped (the frozen
+/// du/tac behavior).
+final class ScannedArgs {
+  const ScannedArgs({
+    required this.flags,
+    required this.values,
+    required this.positional,
+  });
+
+  /// Toggled boolean flags.
+  final Set<String> flags;
+
+  /// Captured `valueFlag -> value` pairs.
+  final Map<String, String> values;
+
+  /// Non-dash operands in argv order.
+  final List<String> positional;
+
+  /// True when [flag] (short or long form) was toggled.
+  bool has(String flag) => flags.contains(flag);
+}
+
+/// Generic spec-driven argv scanner shared by the flag-taking builtins
+/// (issue #559): dash-args matching [FlagSpec.flags] toggle, those matching
+/// [FlagSpec.valueFlags] consume the following token, unknown dash-args are
+/// ignored, non-dash args collect as positionals.
+ScannedArgs scanFlags(Iterable<String> args, FlagSpec spec) {
+  final flags = <String>{};
+  final values = <String, String>{};
+  final positional = <String>[];
+  final it = args.iterator;
+  while (it.moveNext()) {
+    final arg = it.current;
+    if (!arg.startsWith('-')) {
+      positional.add(arg);
+      continue;
+    }
+    if (spec.flags.contains(arg)) {
+      flags.add(arg);
+      continue;
+    }
+    if (spec.valueFlags.contains(arg) && it.moveNext()) {
+      values[arg] = it.current;
+    }
+  }
+  return ScannedArgs(flags: flags, values: values, positional: positional);
+}
+
+/// Parsed `du` argv (issue #559).
+final class DuArgs {
+  const DuArgs({
+    required this.human,
+    required this.summarize,
+    required this.paths,
+  });
+
+  /// `-h`/`--human-readable` was given.
+  final bool human;
+
+  /// `-s`/`--summarize` was given.
+  final bool summarize;
+
+  /// Operand paths; `.` when none were given.
+  final List<String> paths;
+}
+
+const _duFlagSpec = FlagSpec(
+  flags: {'-h', '--human-readable', '-s', '--summarize'},
+);
+
+/// Parses `du` argv: the human/summarize flags plus operand paths.
+DuArgs parseDuArgs(List<String> args) {
+  final scanned = scanFlags(args, _duFlagSpec);
+  return DuArgs(
+    human: scanned.has('-h') || scanned.has('--human-readable'),
+    summarize: scanned.has('-s') || scanned.has('--summarize'),
+    paths: scanned.positional.isEmpty ? const ['.'] : scanned.positional,
+  );
+}
+
+/// Sizes [bytes] for `du` output: K-rounded 1024 blocks, or the human
+/// B/K/M/G/T ladder with one decimal below 10 (issue #559).
+String formatDuSize(int bytes, {required bool human}) {
+  if (!human) return '${(bytes + 1023) ~/ 1024}';
+  const units = ['B', 'K', 'M', 'G', 'T'];
+  var size = bytes.toDouble();
+  var unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit++;
+  }
+  final text = size >= 10 || unit == 0
+      ? size.round().toString()
+      : size.toStringAsFixed(1);
+  return '$text${units[unit]}';
+}
+
+/// Reverses the lines of [content] the way `tac` does: a trailing newline
+/// survives as the record separator of the last (now first) line, and
+/// empty input stays empty (issue #559).
+String reverseLines(String content) {
+  final hadTrailingNewline = content.endsWith('\n');
+  final lines = content.split('\n');
+  if (hadTrailingNewline) lines.removeLast();
+  final reversed = lines.reversed.join('\n');
+  return hadTrailingNewline || reversed.isNotEmpty ? '$reversed\n' : reversed;
+}
+
+/// POSIX character classes understood by the sandbox `tr` (issue #559).
+const _trCharClasses = <String, String>{
+  '[:lower:]': 'abcdefghijklmnopqrstuvwxyz',
+  '[:upper:]': 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+  '[:digit:]': '0123456789',
+  '[:alnum:]': 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+  '[:space:]': ' \t\n\r\f\v',
+};
+
+/// Expands POSIX character classes (`[:lower:]`) and ranges (`a-z`) used by
+/// the `tr` builtin (issue #559).
+List<String> expandTrSet(String set) {
+  final result = <String>[];
+  var i = 0;
+  while (i < set.length) {
+    String? matchedClass;
+    for (final cls in _trCharClasses.keys) {
+      if (set.startsWith(cls, i)) {
+        matchedClass = cls;
+        break;
+      }
+    }
+    if (matchedClass != null) {
+      result.addAll(_trCharClasses[matchedClass]!.split(''));
+      i += matchedClass.length;
+      continue;
+    }
+    if (i + 2 < set.length && set[i + 1] == '-') {
+      for (var c = set.codeUnitAt(i); c <= set.codeUnitAt(i + 2); c++) {
+        result.add(String.fromCharCode(c));
+      }
+      i += 3;
+      continue;
+    }
+    result.add(set[i]);
+    i++;
+  }
+  return result;
+}
+
+/// Parsed `tr` argv. [set1] may be null only for the malformed argv the
+/// validator reports; any non-`-d` token becomes a set, exactly like the
+/// frozen builtin (issue #559).
+final class TrInvocation {
+  const TrInvocation({
+    required this.delete,
+    required this.set1,
+    required this.set2,
+  });
+
+  /// `-d` was given.
+  final bool delete;
+
+  /// First set operand.
+  final String? set1;
+
+  /// Second set operand (null for delete mode).
+  final String? set2;
+}
+
+/// Parses `tr` argv: `-d` toggles delete mode, the remaining tokens fill
+/// set1 then set2 in order (issue #559).
+TrInvocation parseTrArgs(List<String> args) {
+  var delete = false;
+  String? set1;
+  String? set2;
+  for (final arg in args) {
+    if (arg == '-d') {
+      delete = true;
+    } else if (set1 == null) {
+      set1 = arg;
+    } else {
+      set2 ??= arg;
+    }
+  }
+  return TrInvocation(delete: delete, set1: set1, set2: set2);
+}
+
+/// Validates a parsed [invocation]; returns the GNU-shaped error message or
+/// null when the invocation is executable (issue #559).
+String? validateTrInvocation(TrInvocation invocation) {
+  if (invocation.set1 == null) return 'tr: missing operand';
+  if (!invocation.delete && invocation.set2 == null) {
+    return 'tr: missing operand after "${invocation.set1}"';
+  }
+  return null;
+}
+
+/// Applies a validated [invocation] to [input]: translate set1 to set2
+/// (the last set2 char extends for the tail), or delete set1 characters
+/// (issue #559).
+String applyTr(String input, TrInvocation invocation) {
+  final set1 = expandTrSet(invocation.set1!);
+  if (invocation.delete) {
+    final chars = set1.toSet();
+    return input.split('').where((c) => !chars.contains(c)).join();
+  }
+  final set2 = expandTrSet(invocation.set2!);
+  final map = <String, String>{};
+  for (var i = 0; i < set1.length; i++) {
+    map[set1[i]] = i < set2.length ? set2[i] : set2.last;
+  }
+  return input.split('').map((c) => map.containsKey(c) ? map[c]! : c).join();
+}
+
+/// Parsed `xargs` argv: the `-I` placeholder (or null) and the index of
+/// the command token (issue #559).
+final class XargsPlan {
+  const XargsPlan({required this.placeholder, required this.commandIndex});
+
+  /// `-I` placeholder string, or null for plain append mode.
+  final String? placeholder;
+
+  /// Index of the command token in the original argv.
+  final int commandIndex;
+}
+
+const _xargsDefaultPlaceholder = '{}';
+
+/// Parses `xargs` argv (issue #559): `-I` takes an attached value
+/// (`-I{}`), else the next token, defaulting to `{}`; any other dash-arg is
+/// skipped; the first positional token is the command.
+XargsPlan parseXargsArgs(List<String> args) {
+  String? placeholder;
+  var commandIndex = 0;
+  for (var i = 0; i < args.length; i++) {
+    final arg = args[i];
+    if (arg.startsWith('-I')) {
+      placeholder = arg.length > 2
+          ? arg.substring(2)
+          : (i + 1 < args.length ? args[++i] : null);
+      if (placeholder == null || placeholder.isEmpty) {
+        placeholder = _xargsDefaultPlaceholder;
+      }
+      commandIndex = i + 1;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      commandIndex = i + 1;
+      continue;
+    }
+    commandIndex = i;
+    break;
+  }
+  return XargsPlan(placeholder: placeholder, commandIndex: commandIndex);
+}
+
+/// Plans the concrete `xargs` invocations (issue #559): one per input line
+/// with the placeholder substituted in append mode, or a single invocation
+/// with all lines appended.
+List<List<String>> xargsInvocations(
+  List<String> initialArgs,
+  List<String> lines,
+  String? placeholder,
+) {
+  if (placeholder == null) {
+    return [
+      [...initialArgs, ...lines],
+    ];
+  }
+  return [
+    for (final line in lines)
+      [for (final a in initialArgs) a.replaceAll(placeholder, line)],
+  ];
+}
+
+/// Validates `test`/`[` argv; returns the GNU-shaped error message (the
+/// caller appends the trailing newline) or null (issue #559).
+String? validateTestInvocation(String command, List<String> rawArgs) {
+  if (command == '[' && (rawArgs.isEmpty || rawArgs.last != ']')) {
+    return '[[: missing `]]';
+  }
+  if (rawArgs.isEmpty) return 'test: missing expression';
+  return null;
+}
+
+/// Error thrown by [TestEvaluator] for malformed `test` expressions.
+final class TestExpressionError implements Exception {
+  TestExpressionError(this.message);
+
+  /// Human-readable reason (no command prefix).
+  final String message;
+}
+
+/// Unary `test` operators taking a path operand; `-z`/`-n` take strings
+/// and are handled separately.
+const _testFileOps = {'-e', '-f', '-d', '-s'};
+
+/// Minimal evaluator for POSIX `test`/`[` expressions (issue #559; moved
+/// from the WASM shell and split per token class).
+final class TestEvaluator {
+  TestEvaluator({
+    required this.fileExists,
+    required this.dirExists,
+    required this.fileSize,
+  });
+
+  final Future<bool> Function(String path) fileExists;
+  final Future<bool> Function(String path) dirExists;
+  final Future<int> Function(String path) fileSize;
+
+  late List<String> _args;
+  int _pos = 0;
+
+  /// Evaluates [args] as a full `test` expression.
+  Future<bool> evaluate(List<String> args) async {
+    _args = args;
+    _pos = 0;
+    return _parseOr();
+  }
+
+  String? get _peek => _pos < _args.length ? _args[_pos] : null;
+
+  String _advance() {
+    final token = _args[_pos];
+    _pos++;
+    return token;
+  }
+
+  Future<bool> _parseOr() async {
+    var result = await _parseAnd();
+    while (_peek == '-o') {
+      _advance();
+      result = result || await _parseAnd();
+    }
+    return result;
+  }
+
+  Future<bool> _parseAnd() async {
+    var result = await _parseUnary();
+    while (_peek == '-a') {
+      _advance();
+      result = result && await _parseUnary();
+    }
+    return result;
+  }
+
+  Future<bool> _parseUnary() async {
+    if (_peek == '!') {
+      _advance();
+      return !(await _parseUnary());
+    }
+    return _parsePrimary();
+  }
+
+  Future<bool> _parsePrimary() async {
+    final token = _advance();
+    if (token == '(') return _parseParenGroup();
+    if (token.startsWith('-')) return _parseUnaryPrimary(token);
+    return _parseBinaryComparison(token);
+  }
+
+  Future<bool> _parseParenGroup() async {
+    final result = await _parseOr();
+    if (_peek != ')') throw TestExpressionError('missing `)`');
+    _advance();
+    return result;
+  }
+
+  Future<bool> _parseUnaryPrimary(String op) async {
+    if (op == '-z') return _advance().isEmpty;
+    if (op == '-n') return _advance().isNotEmpty;
+    final path = _advance();
+    if (!_testFileOps.contains(op)) {
+      throw TestExpressionError('unsupported unary operator: $op');
+    }
+    final exists = await fileExists(path);
+    return switch (op) {
+      '-e' => exists,
+      '-f' => exists && !await dirExists(path),
+      '-d' => await dirExists(path),
+      _ => exists && await fileSize(path) > 0,
+    };
+  }
+
+  Future<bool> _parseBinaryComparison(String left) async {
+    final op = _advance();
+    final right = _advance();
+    final result = evalTestBinaryOp(op, left, right);
+    if (result == null) {
+      throw TestExpressionError('unsupported binary operator: $op');
+    }
+    return result;
+  }
+}
+
+/// `env` argv split (issue #563 CRAP descent): leading `NAME=value`
+/// assignments vs. the remaining operands. An assignment is any non-flag
+/// argument whose first `=` sits past position 0 — identical to the inline
+/// classification this replaced.
+({Map<String, String> assignments, List<String> remaining}) splitEnvArgs(
+  List<String> args,
+) {
+  final assignments = <String, String>{};
+  final remaining = <String>[];
+  for (final arg in args) {
+    final idx = arg.indexOf('=');
+    if (idx > 0 && !arg.startsWith('-')) {
+      assignments[arg.substring(0, idx)] = arg.substring(idx + 1);
+    } else {
+      remaining.add(arg);
+    }
+  }
+  return (assignments: assignments, remaining: remaining);
+}
+
+/// Valid shell/WASI environment variable names. Special shell parameters
+/// like `'?'` are expansion-only: exports must not shadow them.
+final RegExp exportEnvVarName = RegExp(r'^[A-Za-z_][A-Za-z0-9_]*$');
+
+/// Applies `export NAME=value` arguments to [env]. Names that are not valid
+/// environment variables (e.g. the special `'?'` parameter) are ignored —
+/// `$?` is shell-owned (issue #1335).
+void applyExportArgs(Map<String, String> env, List<String> args) {
+  for (final arg in args) {
+    final idx = arg.indexOf('=');
+    if (idx > 0) {
+      final name = arg.substring(0, idx);
+      if (!exportEnvVarName.hasMatch(name)) continue;
+      env[name] = arg.substring(idx + 1);
+    } else {
+      env.putIfAbsent(arg, () => '');
+    }
+  }
+}
+
+/// Renders `export`'s no-argument listing: sorted `declare -x NAME="value"`
+/// lines, newline-terminated when non-empty.
+String formatExportListings(Map<String, String> env) {
+  final names = env.keys.toList()..sort();
+  final lines = names.map((n) => 'declare -x $n="${env[n]}"').toList();
+  return lines.isEmpty ? '' : '${lines.join('\n')}\n';
+}
+
+/// Output of the `id` builtin for the sandbox's fixed identity: `-u`/`-g`
+/// select a single field, `-n` names it instead of the numeric id.
+String idOutput(List<String> args) {
+  const user = 'Fa';
+  if (args.contains('-u') || args.contains('-g')) {
+    return '${args.contains('-n') ? user : '0'}\n';
+  }
+  return 'uid=0($user) gid=0($user) groups=0($user)\n';
+}
+
+/// Non-flag operands, in order (`relpath`'s positional paths).
+List<String> nonFlagArgs(List<String> args) => [
+  for (final arg in args)
+    if (!arg.startsWith('-')) arg,
+];
+
+/// `relpath TARGET [START]` over sandbox-absolute paths: both are stripped
+/// of the leading `/` (the WASI root maps onto the relative namespace) and
+/// delegated to `package:path`.
+String sandboxRelativePath(String from, String start) => p.relative(
+  from == '/' ? '/' : from.substring(1),
+  from: start == '/' ? '/' : start.substring(1),
+);
+
+/// Commands whose positional arguments are file paths and therefore get
+/// rewritten relative to the shell's current directory by
+/// `WasiSandboxShell._rewriteRelativeArgs` (issue #558 family: pure operand
+/// classification data, kept beside the other parse helpers).
+const Set<String> pathPositionalCommands = {
+  'basename',
+  'cat',
+  'cksum',
+  'comm',
+  'cp',
+  'csplit',
+  'cut',
+  'dir',
+  'dirname',
+  'du',
+  'expand',
+  'fmt',
+  'fold',
+  'gzip',
+  'head',
+  'install',
+  'join',
+  'link',
+  'ln',
+  'ls',
+  'md5sum',
+  'mkdir',
+  'mv',
+  'nl',
+  'od',
+  'paste',
+  'readlink',
+  'realpath',
+  'relpath',
+  'rm',
+  'rmdir',
+  'sha1sum',
+  'sha224sum',
+  'sha256sum',
+  'sha384sum',
+  'sha512sum',
+  'b2sum',
+  'shred',
+  'sort',
+  'split',
+  'stat',
+  'sum',
+  'tac',
+  'tail',
+  'tar',
+  'tee',
+  'touch',
+  'truncate',
+  'tsort',
+  'unexpand',
+  'uniq',
+  'unlink',
+  'vdir',
+  'wc',
+};
+
+/// Flags whose following argument is NOT a path, per command. Used by the
+/// positional-arg rewrite to avoid rewriting flag values.
+const Map<String, Set<String>> nonPathFlagValues = {
+  'cut': {'-b', '-c', '-d', '-f'},
+  'head': {'-c', '-n'},
+  'join': {'-1', '-2', '-e', '-t'},
+  'rg': {'-A', '-B', '-C', '-e', '-g', '-m', '-t', '-T'},
+  'sort': {'-k', '-t'},
+  'split': {'-a', '-b', '-l', '-n'},
+  'tail': {'-c', '-n'},
+  'find': {'-iname', '-mmin', '-mtime', '-name', '-size', '-type'},
+  'mktemp': {'-t'},
+};
+
+/// Parsed `cat` invocation (gh-1444 C1: the mobile shell runs cat as a Dart
+/// builtin so skill-path reads follow `.pointer` files — the coreutils.wasm
+/// applet reads through WASI and cannot). GNU subset: `-n` numbers every
+/// line, `-b` numbers non-blank lines, `-` reads stdin, `--` ends flags.
+final class CatInvocation {
+  const CatInvocation({
+    this.number = false,
+    this.numberNonBlank = false,
+    this.files = const <String>[],
+    this.error,
+  });
+
+  /// `-n`.
+  final bool number;
+
+  /// `-b` (overrides `-n` where both apply, like GNU cat).
+  final bool numberNonBlank;
+
+  /// Operand files in order; `-` means stdin.
+  final List<String> files;
+
+  /// GNU-shaped usage error, or null when the invocation is executable.
+  final String? error;
+}
+
+/// Mutable parse state threaded through [parseCatArgs]'s per-argument
+/// helpers.
+final class _CatParseState {
+  var number = false;
+  var numberNonBlank = false;
+  final files = <String>[];
+  var noMoreFlags = false;
+
+  CatInvocation toInvocation() => CatInvocation(
+    number: number,
+    numberNonBlank: numberNonBlank,
+    files: files,
+  );
+}
+
+/// Pure `cat` argument parser. See [CatInvocation].
+CatInvocation parseCatArgs(List<String> args) {
+  final s = _CatParseState();
+  for (final arg in args) {
+    final error = _applyCatArg(s, arg);
+    if (error != null) return CatInvocation(error: error);
+  }
+  return s.toInvocation();
+}
+
+/// Applies one `cat` argument to [s]; returns the invalid-option error
+/// message for an unknown flag, or null when handled.
+String? _applyCatArg(_CatParseState s, String arg) {
+  if (s.noMoreFlags) return _catOperand(s, arg);
+  if (arg == '--') {
+    s.noMoreFlags = true;
+    return null;
+  }
+  return _applyCatFlagOrOperand(s, arg);
+}
+
+/// Routes a not-yet-`--` argument: `-`-prefixed operands go to the flag
+/// handler, everything else (including bare `-` and the empty string) is
+/// an operand file.
+String? _applyCatFlagOrOperand(_CatParseState s, String arg) {
+  if (!arg.startsWith('-') || arg == '-' || arg.isEmpty) {
+    return _catOperand(s, arg);
+  }
+  return _applyCatFlag(s, arg);
+}
+
+/// Applies `-n`/`-b`; unknown flags yield the GNU `invalid option` error.
+String? _applyCatFlag(_CatParseState s, String arg) {
+  if (arg == '-n' || arg == '--number') {
+    s.number = true;
+    return null;
+  }
+  if (arg == '-b' || arg == '--number-nonblank') {
+    s.numberNonBlank = true;
+    return null;
+  }
+  return _catUnknownOption(arg);
+}
+
+/// The option name GNU cat reports for an unknown flag (the `-x` short
+/// form, or the long form with its dashes stripped).
+String _catUnknownOption(String arg) {
+  final short = arg.startsWith('--') ? arg : arg.substring(0, 2);
+  return "invalid option -- '${short.replaceAll('-', '')}'";
+}
+
+/// Records an operand file (`-` means stdin).
+String? _catOperand(_CatParseState s, String arg) {
+  s.files.add(arg);
+  return null;
+}
+
+/// Applies `-n`/`-b` numbering to [input] the way GNU cat renders it:
+/// right-aligned 6-width number, tab, line; `-b` numbers only non-blank
+/// lines and the counter advances ONLY for numbered lines (GNU semantics:
+/// `printf 'a\n\nb\n' | cat -b` labels b as 2, not 3).
+String applyCatNumbering(String input, {required bool nonBlankOnly}) {
+  final endsWithNewline = input.endsWith('\n');
+  final lines = endsWithNewline
+      ? input.substring(0, input.length - 1).split('\n')
+      : input.split('\n');
+  final out = StringBuffer();
+  var counter = 0;
+  for (final line in lines) {
+    if (nonBlankOnly && line.isEmpty) {
+      out.write('$line\n');
+      continue;
+    }
+    counter++;
+    out.write('${counter.toString().padLeft(6)}\t$line\n');
+  }
+  return out.toString();
+}
+
+/// Parses the WASI exit status from a wasmtime trap message:
+/// `I32Exit(n)` / "i32 exit with value N" / "Exited with i32 exit status N"
+/// (older and newer wasmtime shapes), 1 for the invalid-exit-status trap,
+/// null for everything else. Extracted from WasiSandboxShell so the log
+/// line classifier and the outcome resolver share one grammar.
+int? parseWasiExitCode(Object? error) {
+  if (error == null) return 0;
+  final message = error.toString();
+
+  final i32Match = RegExp(
+    r'i32\s+(?:exit\s+with\s+value|exit\s+status)\s*(\d+)',
+  ).firstMatch(message);
+  if (i32Match != null) {
+    return int.tryParse(i32Match.group(1)!);
+  }
+
+  // wasmtime 14 with the wasi command adapter can report an invalid exit
+  // status; treat that as a non-zero failure.
+  if (message.contains('exit with invalid exit status')) {
+    return 1;
+  }
+
+  return null;
+}
+
+/// The app.log line for a finished WASI `_start` (gh-1444 AC7): a NORMAL
+/// exit status is logged WITHOUT the word "error" — grep misses and other
+/// exit-1/2 commands are debug noise, not harness faults, and triage greps
+/// for "error". Only a non-exit trap keeps the `_start error:` shape.
+String wasmStartLogLine(Object? runError) {
+  if (runError == null) return '[wasm_shell] _start completed';
+  final code = parseWasiExitCode(runError);
+  if (code != null) {
+    return '[wasm_shell] _start exited with status $code';
+  }
+  return '[wasm_shell] _start error: $runError';
+}
+
+/// The WASI python build prints this platform-libraries warning on every
+/// launch (gh-1444 C8, second tier): it is build noise the agent cannot
+/// act on — the stderr filter drops these exact lines for python stages.
+const wasiPythonStderrNoise = <String>[
+  'Could not find platform dependent libraries',
+  'Consider setting PYTHONHOME',
+];
+
+/// True when [line] is one of the WASI python launch warnings suppressed
+/// from captured stderr (gh-1444 AC8).
+bool isWasiPythonStderrNoise(String line) {
+  final trimmed = line.trim();
+  if (trimmed.isEmpty) return false;
+  return wasiPythonStderrNoise.any(trimmed.startsWith);
+}
+
+/// Line-wise stderr filter dropping the WASI python launch warnings
+/// (gh-1444 AC8, second tier): chunks are latin-1 decoded (binary-safe
+/// round trip), complete lines are tested against
+/// [isWasiPythonStderrNoise], and a trailing partial line is held back
+/// until it completes or the stage ends ([flush]).
+class WasiPythonNoiseFilter {
+  String _carry = '';
+
+  /// Filters one stderr chunk; returns the bytes that survive.
+  List<int> process(List<int> chunk) {
+    var text = _carry + latin1.decode(chunk);
+    _carry = '';
+    final newline = text.lastIndexOf('\n');
+    if (newline == -1) {
+      _carry = text;
+      return const <int>[];
+    }
+    final complete = text.substring(0, newline + 1);
+    _carry = text.substring(newline + 1);
+    final parts = complete.split('\n');
+    final lines = parts.sublist(0, parts.length - 1);
+    final kept = [
+      for (final line in lines)
+        if (!isWasiPythonStderrNoise(line)) line,
+    ].map((line) => '$line\n').join();
+    return latin1.encode(kept);
+  }
+
+  /// Returns the held-back tail (a final line without its newline), minus
+  /// warning noise; call once when the stage ends.
+  List<int> flush() {
+    final rest = _carry;
+    _carry = '';
+    if (rest.isEmpty || isWasiPythonStderrNoise(rest)) return const <int>[];
+    return latin1.encode(rest);
+  }
+}

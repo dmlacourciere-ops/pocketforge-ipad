@@ -1,0 +1,678 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+// Part of agent_service.dart: the session persistence + lifecycle members
+// of [AgentService] live here so the main file stays under the 2800-line
+// guard. Same library, so private members resolve; notifications go
+// through `_notify()` (`notifyListeners` is @protected, callable only
+// inside the class).
+
+part of 'agent_service.dart';
+
+extension AgentServiceSessions on AgentService {
+  /// Session-correlation env vars injected into bash tool executions (see
+  /// [SessionVarsExecutionEnv]). Read live per exec, so a session (re)load
+  /// or a provider/model switch is picked up by later commands. Never
+  /// secret values — ids, paths, provider kinds, model ids.
+  Map<String, String> _sessionEnvVars() => {
+    sessionIdEnvVar: ?_sessionId,
+    sessionFileEnvVar: ?_sessionFile,
+    providerEnvVar: _providerKind,
+    modelEnvVar: _agent.state.model.id,
+  };
+
+  /// Initializes session persistence — WITHOUT creating an empty JSONL file.
+  ///
+  /// The session file (and the agent's mailbox address in the messaging
+  /// fabric) are materialised lazily on the first [_persist] run; a service
+  /// that is initialised but never receives a user message leaves no file
+  /// behind. [loadSession] still creates an OS-backed [_session] for the
+  /// restored session.
+  Future<void> initialize() async {
+    // A fresh/cleared session invalidates in-flight loaders (issue #199).
+    _loadGeneration++;
+    // The session FILE materialises lazily on the first persist (an
+    // untouched session never hits the disk), but the id is allocated
+    // eagerly: hosts (FlutterSessionManager) key sessions by id from the
+    // moment the service exists, and the prompt's messaging section needs
+    // the real mailbox address before the first message.
+    if (_session == null && _sessionId == null) {
+      final id = createSessionId();
+      _sessionId = id;
+      _setMailboxPrefix(id);
+    }
+    // Compose the system prompt eagerly — messaging address defaults to the
+    // host's local id (`main`) until the session materialises (so a brand
+    // new, no-message service doesn't crash on prompt render).
+    final config = _config;
+    if (config != null) {
+      _agent.state.systemPrompt = _composeSystemPrompt(config);
+    }
+    // Best-effort cleanup of legacy empty sessions (no transcript — only the
+    // JSONL header). Runs in the background so it never slows startup.
+    unawaited(_cleanupLegacyEmptySessions());
+    // The watcher only exists with a messaging fabric (production ctor);
+    // lightweight test services never start a timer.
+    if (_subagentManager != null) _startInboxWatcher();
+    // Sleep prevention (issues #325/#326): only the EXPLICIT session
+    // hold acquires here — the default per-run hold acquires when a run
+    // goes in flight (the isStreaming bracket), so an idle app never
+    // pins the machine awake. A failure logs and the session continues.
+    unawaited(powerAssertion?.onSessionOpened());
+  }
+
+  /// Removes every legacy empty `.jsonl` (only header) left on disk by the
+  /// previous eager session-creation code paths. Idempotent and silently
+  /// best-effort.
+  Future<void> _cleanupLegacyEmptySessions() async {
+    try {
+      await _repo.cleanupEmptySessions();
+    } on Object {
+      // Never propagate — cleanup is best-effort, the next launch will
+      // retry.
+    }
+  }
+
+  /// Materialises the JSONL session file the first time persistence is
+  /// required — no-op when the session is already open (e.g. loadSession).
+  /// All callers that may produce a transcript ([_persist], subagent
+  /// follow-up messages) must go through here.
+  Future<void> _materialiseSessionIfNeeded() async {
+    if (_session != null) return;
+    final session = await _repo.create(
+      JsonlSessionCreateOptions(
+        cwd: env.sessionCwd,
+        // Allocated eagerly in [initialize] — the file adopts it so the
+        // id the host already keyed this session by stays stable.
+        id: _sessionId,
+        metadata: {'agent': 'fa', 'model': _agent.state.model.id},
+      ),
+    );
+    _session = session;
+    final sessionMetadata = await session.getMetadata();
+    _sessionId = sessionMetadata.id;
+    _sessionFile = sessionMetadata.path;
+    _sessionCwd = sessionMetadata.cwd;
+    _setMailboxPrefix(sessionMetadata.id);
+    // Follow external appends (a running fa CLI on the same session).
+    _startSessionWatch();
+    // The messaging section now carries the real mailbox address.
+    final config = _config;
+    if (config != null) {
+      _agent.state.systemPrompt = _composeSystemPrompt(config);
+    }
+    // Presence in the messaging fabric once an id is available.
+    unawaited(
+      _subagentManager?.messaging?.register(
+        _subagentManager!.mailboxOf(_subagentManager!.selfId),
+      ),
+    );
+  }
+
+  /// Waits until the agent becomes idle.
+  Future<void> waitForIdle() => _agent.waitForIdle();
+
+  /// Clears the in-memory transcript and starts a new session.
+  Future<void> reset() async {
+    // Any in-flight load/page/fold for the outgoing session goes stale.
+    _loadGeneration++;
+    await deleteSessionIfEmpty();
+    // Detach the old session so [initialize] allocates a fresh id — the
+    // old file (when it has content) stays on disk for the session list.
+    _session = null;
+    _sessionId = null;
+    _sessionFile = null;
+    _agent.reset();
+    messages.clear();
+    await dynamicMessages.forgetAll();
+    error = null;
+    _persistedCount = 0;
+    _historyAboveCount = null;
+    _viewBranch = null;
+    _historyLoadError = null;
+    _loadingHistory = false;
+    _trajectory.reset();
+    _currentAssistantMessage = null;
+    await initialize();
+    _notify();
+  }
+
+  /// Deletes the session file when nothing was ever said in it: a session
+  /// the user never typed into must not litter the session list. Called on
+  /// close/reset; best-effort — never throws.
+  Future<void> deleteSessionIfEmpty() async {
+    if (_agent.state.messages.isNotEmpty) return;
+    final session = _session;
+    if (session == null) return;
+    try {
+      await _repo.delete(
+        await session.getMetadata(),
+        actor: 'app:empty-cleanup',
+      );
+      _session = null;
+      _sessionId = null;
+      _sessionFile = null;
+    } on Object {
+      // Best-effort cleanup.
+    }
+  }
+
+  /// Creates a new [AgentService] with the same config and env, for a fresh
+  /// session. The clone shares the [env] and the session repository but owns
+  /// its own [Agent], transcript, and session persistence.
+  AgentService clone() {
+    final config = _config;
+    if (config == null) {
+      throw StateError(
+        'Cannot clone an AgentService built from a pre-constructed Agent',
+      );
+    }
+    // Reuse the current stream function so test doubles keep working; a real
+    // service would recreate it from the provider kind.
+    return AgentService._withEnv(
+      env: env,
+      config: config,
+      sessionsRoot: sessionsRoot,
+      redactor: _redactor,
+      streamFunction: _agent.streamFunction,
+      // Clones inherit the external-watch setting (tests disable it).
+      watchExternalSessions: _watchExternalSessions,
+      includeSharedSessionRoots: _includeSharedSessionRoots,
+      resolveSecretName: _resolveSecretName,
+      // Clones share the live secrets env and the Keys store, so a
+      // `request_secret` grant in one session is live and persisted for all.
+      secretsEnv: _secretsEnv,
+      sessionKeys: _sessionKeys,
+      taskModelsStore: _taskModelsStore,
+      // Clones inherit the CURRENT approval mode (not a fresh disk read) and
+      // share the store so their mode changes persist too.
+      initialApprovalMode: approval.mode,
+      approvalModeStore: _approvalModeStore,
+      // Same for the skills-access consent: the live choice + shared store.
+      initialSkillsAccess: _skillsAccess,
+      skillsAccessStore: _skillsAccessStore,
+      // Same for the per-skill toggles (issue #1151): the live wishes +
+      // shared store.
+      initialSkillToggles: Map.of(_skillToggles),
+      skillTogglesStore: _skillTogglesStore,
+      // Same for the per-tool availability: the live config + shared store.
+      initialToolsConfig: _toolsAvailability.config,
+      toolsAvailabilityStore: _toolsAvailabilityStore,
+    );
+  }
+
+  /// Loads a persisted session into the chat: the agent's context and the
+  /// visible transcript are replaced by the session's active branch, and new
+  /// messages append to that session. The session's effective model (the
+  /// last `model_change` record at the leaf — every provider/model switch
+  /// in the CLI and the app appends one) is restored: the DEFAULT chat
+  /// model only applies to NEW sessions, not to reopening an old one.
+  ///
+  /// With [allowFullOpenFallback] (the default) a windowed-open failure
+  /// degrades to the FULL open — the compatibility path. Over-budget
+  /// callers (issue #381) pass false: there the fallback would whole-file
+  /// read exactly the multi-hundred-MB session the load budget exists
+  /// for, so the failure must propagate to the caller's refuse-guard.
+  Future<void> loadSession(
+    SessionMetadata metadata, {
+    bool allowFullOpenFallback = true,
+  }) async {
+    // Generation guard (issue #199 AC5/E3): every stage re-checks — a
+    // newer load owns the state and a stale loader abandons silently.
+    final gen = ++_loadGeneration;
+    abort();
+    await waitForIdle();
+    final opened = await _openSessionSkeleton(
+      metadata,
+      allowFullOpenFallback: allowFullOpenFallback,
+      gen: gen,
+    );
+    if (opened == null) return;
+    final (session, openSw) = opened;
+    final storageMs = openSw.elapsedMilliseconds;
+    final history = await _loadBranchAndContext(
+      session,
+      gen: gen,
+      storageMs: storageMs,
+      openSw: openSw,
+    );
+    if (history == null) return;
+    final (context, contextMessages, branchMs, contextMs) = history;
+    final ledgerMs = await _resumeLoadedSession(
+      metadata,
+      session,
+      context,
+      contextMessages,
+      gen,
+    );
+    if (ledgerMs == null) return;
+    if (!await _replayDynamicMessages(session, contextMessages, gen)) return;
+    // First interactive frame landed (composer + latest window): the
+    // summary line names every phase owner (issue #262 AC0).
+    AppLog.i(
+      'open',
+      '${metadata.id}: storage=${storageMs}ms branch=${branchMs}ms '
+          'context=${contextMs}ms ledger=${ledgerMs}ms total='
+          '${openSw.elapsedMilliseconds}ms '
+          '(${_viewBranch?.length ?? 0} records in view)',
+    );
+    // Background count of the records above the window (newline stream,
+    // no decode): fills in the banner count without blocking the load.
+    unawaited(_refreshHistoryAbove());
+  }
+
+  /// Stage 1 of [loadSession]: the post-idle generation check, the
+  /// skeleton render (issue #199 AC2 — the session shell renders BEFORE
+  /// the history parses, so the composer is live while the open runs),
+  /// and the windowed open. Returns null when a newer load superseded
+  /// this one; the master stopwatch starts here (issue #262 AC0 phase
+  /// timing).
+  Future<(Session, Stopwatch)?> _openSessionSkeleton(
+    SessionMetadata metadata, {
+    required bool allowFullOpenFallback,
+    required int gen,
+  }) async {
+    if (gen != _loadGeneration) return null;
+    final openSw = Stopwatch()..start();
+    _sessionId = metadata.id;
+    _sessionFile = metadata.path;
+    _sessionCwd = metadata.cwd;
+    _historyAboveCount = null;
+    messages.clear();
+    _notify();
+    final session = await _openSessionWindowed(
+      metadata,
+      allowFullOpenFallback: allowFullOpenFallback,
+    );
+    if (gen != _loadGeneration) return null;
+    return (session, openSw);
+  }
+
+  /// Stage 2 of [loadSession]: the branch read and the provider-context
+  /// build, re-anchored for resume parity (issue #1332 — loaded usage
+  /// anchors are generation-time and phantom-report pre-compaction
+  /// sizes; re-anchoring at chars/4 over the REAL projected context
+  /// lets the first live turn stamp fresh usage). Returns null when a
+  /// newer load superseded this one; phase timings ride the record
+  /// ([openSw] is the load's master stopwatch, issue #262 AC0).
+  Future<(SessionContext, List<Message>, int, int)?> _loadBranchAndContext(
+    Session session, {
+    required int gen,
+    required int storageMs,
+    required Stopwatch openSw,
+  }) async {
+    // The count belongs to the session being opened; the background
+    // refresh at the end of the load fills it in.
+    _historyAboveCount = null;
+    _viewBranch = await session.getBranch();
+    if (gen != _loadGeneration) return null;
+    final branchMs = openSw.elapsedMilliseconds - storageMs;
+    final context = await session.buildContext();
+    if (gen != _loadGeneration) return null;
+    final contextMs = openSw.elapsedMilliseconds - storageMs - branchMs;
+    if (gen != _loadGeneration) return null;
+    final contextMessages = resetLoadedUsageAnchors(context.messages);
+    _agent.reset();
+    _agent.state.messages = contextMessages;
+    return (context, contextMessages, branchMs, contextMs);
+  }
+
+  /// Stage 3 of [loadSession]: seed the orphan-report latch (gh-1449
+  /// AC6), take ownership (mailbox prefix, external-append watch),
+  /// rebuild the ledger, restore the session's own model and system
+  /// prompt. Returns the ledger phase time, or null when a newer load
+  /// superseded this one.
+  Future<int?> _resumeLoadedSession(
+    SessionMetadata metadata,
+    Session session,
+    SessionContext context,
+    List<Message> contextMessages,
+    int gen,
+  ) async {
+    // gh-1449 AC6: seed the one-shot orphan-report latch from the
+    // persisted `orphan_report` records — a resumed session never
+    // re-reports an orphan it already reported. Best-effort: a scan
+    // failure must not break the open.
+    //
+    // lastSegmentOnly (gh-1449 rework): this rides the UI OPEN PATH, so
+    // it reads the primary segment only — orphan_report records are
+    // tail-appended during runs and the primary is rotation-bounded
+    // (kSessionSegmentRotateBytes); a record already rotated into a
+    // `.part-NN` segment may cost one re-report, the accepted trade
+    // against a whole-chain scan here (issue #503 precedent).
+    // clear() first: the same Agent serves every subsequently opened
+    // session, so the latch must be strictly per-session.
+    try {
+      final reports = await _repo.readCustomRecordsOfType(metadata, {
+        orphanReportRecordType,
+      }, lastSegmentOnly: true);
+      _agent.reportedOrphanKeys
+        ..clear()
+        ..addAll(orphanReportKeysFromRecords(reports));
+    } on Object catch (error) {
+      AppLog.i('open', 'orphan_report seed failed: $error');
+    }
+    _session = session;
+    _setMailboxPrefix(metadata.id);
+    // Follow external appends (a running fa CLI on the same session).
+    _startSessionWatch();
+    // The ledger re-projects the active branch (records carry richer
+    // structure than the rebuilt message list).
+    final ledgerSw = Stopwatch()..start();
+    await _rebuildTrajectory(records: _viewBranch);
+    if (gen != _loadGeneration) return null;
+    final ledgerMs = ledgerSw.elapsedMilliseconds;
+    // Restore the session's own model: same wire kind → modelId
+    // override, never a hard failure (see [_restoreSessionModel]).
+    _restoreSessionModel(context.model);
+    // The prompt's messaging section carries the live mailbox address.
+    final activeConfig = _config;
+    if (activeConfig != null) {
+      _agent.state.systemPrompt = _composeSystemPrompt(activeConfig);
+    }
+    unawaited(
+      _subagentManager?.messaging?.register(
+        _subagentManager!.mailboxOf(_subagentManager!.selfId),
+      ),
+    );
+    _persistedCount = contextMessages.length;
+    _currentAssistantMessage = null;
+    error = null;
+    return ledgerMs;
+  }
+
+  /// Stage 4 of [loadSession]: dynamic messages replay (issue #102) —
+  /// materialise the session's widget definitions and splice their
+  /// transcript markers back into position (the branch walk counts
+  /// message records, so each marker lands right after the reply that
+  /// emitted it), then swap the transcript. Returns false when a newer
+  /// load superseded this one (the transcript swap must not land).
+  Future<bool> _replayDynamicMessages(
+    Session session,
+    List<Message> contextMessages,
+    int gen,
+  ) async {
+    await dynamicMessages.forgetAll();
+    if (gen != _loadGeneration) return false;
+    final widgetMarkers = await dynamicMessages.adoptBranch(
+      await session.getBranch(),
+    );
+    if (gen != _loadGeneration) return false;
+    final rebuilt = contextMessages.map(_toChatMessage).toList();
+    for (final (index, marker) in widgetMarkers) {
+      final at = index > rebuilt.length ? rebuilt.length : index;
+      rebuilt.insert(at, marker);
+      dynamicMessages.byId(marker.data?.toString() ?? '')?.markerIndex = at;
+    }
+    messages
+      ..clear()
+      ..addAll(rebuilt);
+    _notify();
+    return true;
+  }
+
+  /// Windowed open (issue #135): header + newest chunk only; older
+  /// records page in through loadOlderHistory. Small sessions load
+  /// completely either way. A windowed-open failure (a corrupt tail,
+  /// an IO hiccup on the ranged-read path) falls back to the FULL
+  /// Windowed open (issue #135): header + newest chunk only; older
+  /// records page in through loadOlderHistory. Small sessions load
+  /// completely either way. A windowed-open failure (a corrupt tail,
+  /// an IO hiccup on the ranged-read path) falls back to the classic
+  /// WHOLE-FILE open rather than failing the session — the compatibility
+  /// path (round-4 review); paging surfaces stay null for full-open.
+  /// The fallback is `wholeFileOnly`: the default full open streams over
+  /// ranged reads (gh-1073), i.e. the very capability that just failed —
+  /// an error-recovery retry must load through plain whole-file reads
+  /// only, or a real ranged-read breakage fails the fallback identically.
+  Future<Session> _openSessionWindowed(
+    SessionMetadata metadata, {
+    required bool allowFullOpenFallback,
+  }) async {
+    try {
+      return await _repo.open(metadata, windowed: true);
+    } on Object {
+      if (!allowFullOpenFallback) rethrow;
+      return _repo.open(metadata, wholeFileOnly: true);
+    }
+  }
+
+  /// Restores the session's own model: same wire kind → modelId override;
+  /// the provider itself stays the configured connection (its key lives
+  /// in the Keychain, not in the session). An unresolvable or
+  /// cross-kind mismatch keeps the current model — reopening a session
+  /// must never hard-fail on this. Works with a config-less service
+  /// too (pre-constructed agents): the kind check then compares against
+  /// the agent's live model.
+  ///
+  /// The pin's [SessionModelPin.baseUrl]/[SessionModelPin.customProvider]
+  /// fields are deliberately not consumed here: the app's restore stays
+  /// the conservative kind-checked modelId override (the CLI honors the
+  /// entry-name pin; the app keeps the configured Keychain connection).
+  void _restoreSessionModel(SessionModelPin? sessionModel) {
+    final config = _config;
+    if (sessionModel == null ||
+        sessionModel.modelId.isEmpty ||
+        !_sessionModelApplies(config, sessionModel)) {
+      return;
+    }
+    if (config != null) {
+      reconfigure(config.withModelId(sessionModel.modelId));
+    } else {
+      final model = _agent.state.model;
+      _agent.state.model = Model(
+        id: sessionModel.modelId,
+        name: sessionModel.modelId,
+        api: model.api,
+        provider: model.provider,
+        baseUrl: model.baseUrl,
+        reasoning: model.reasoning,
+        input: inputModalitiesFor(sessionModel.modelId),
+        cost: model.cost,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        headers: model.headers,
+        compat: model.compat,
+      );
+    }
+    debugPrint(
+      '[Fa] session model restored: ${sessionModel.provider}/'
+      '${sessionModel.modelId}',
+    );
+  }
+
+  /// Whether [sessionModel] is a same-kind model id worth restoring
+  /// (compared against the configured provider kind, falling back to the
+  /// agent's live wire kind when no config owns the service).
+  bool _sessionModelApplies(AgentConfig? config, SessionModelPin sessionModel) {
+    if (sessionModel.modelId == _agent.state.model.id) return false;
+    final activeApi = _agent.state.model.api;
+    return config == null
+        ? sessionModel.provider == activeApi
+        : (sessionModel.provider == config.providerKind ||
+              sessionModel.provider == config.toModel().api);
+  }
+
+  /// Deletes a persisted session. Deleting the ACTIVE session starts a new
+  /// empty one, so the chat never points at a removed file.
+  Future<void> deleteSession(SessionMetadata metadata) async {
+    final isActive = metadata.id == _sessionId;
+    if (isActive) {
+      // In-flight loaders/pager work must not land on a deleted session.
+      _loadGeneration++;
+      // Stop any in-flight run and let its persistence settle before the
+      // session file disappears underneath it.
+      abort();
+      await waitForIdle();
+    }
+    await _repo.delete(metadata);
+    if (isActive) await reset();
+  }
+
+  void _startSessionWatch() {
+    _stopSessionWatch();
+    if (!_watchExternalSessions) return;
+    final file = _sessionFile;
+    if (file == null) return;
+    _sessionWatchBytes = -1;
+    _sessionWatchTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      unawaited(_checkSessionFileGrew());
+    });
+  }
+
+  Future<void> _checkSessionFileGrew() async {
+    final file = _sessionFile;
+    if (file == null || _disposed) return;
+    final info = (await env.fileInfo(file)).valueOrNull;
+    if (info == null) return;
+    if (_sessionWatchBytes < 0) {
+      _sessionWatchBytes = info.size;
+      return;
+    }
+    if (info.size > _sessionWatchBytes) {
+      _sessionWatchBytes = info.size;
+      await _reloadExternalMessages();
+      externalSessionRevision.value++;
+    }
+  }
+
+  /// Pulls externally-appended rows into the visible transcript. Only
+  /// while IDLE: mid-run the agent owns the state machine (streaming,
+  /// tool calls) and a concurrent reload would corrupt it. A windowed
+  /// session ingests just the appended tail (any history the user paged
+  /// in stays put); a full-open session is re-opened fresh (cheap:
+  /// header + tree index).
+  Future<void> _reloadExternalMessages() async {
+    final session = _session;
+    if (session == null || isStreaming) return;
+    await _reloadExternalTail(session, _loadGeneration);
+  }
+
+  /// The guarded tail reload ([_reloadExternalMessages] minus the idle
+  /// gate): windowed ingest or fresh re-open; a torn read (the CLI
+  /// mid-append) is ignored — the next poll retries.
+  Future<void> _reloadExternalTail(Session session, int gen) async {
+    try {
+      if (session.getStorage() case final WindowedSessionStorage windowed) {
+        await _ingestExternalWindowed(session, windowed, gen);
+        return;
+      }
+      await _reopenExternalSession(session, gen);
+    } on Object {
+      // A torn read (the CLI mid-append): the next poll retries.
+    }
+  }
+
+  /// The windowed external-append ingest: a truncation/rotation
+  /// re-anchors view AND provider context (stale anything is never
+  /// kept), a plain append joins the view and grows the context, and
+  /// the banner count refreshes in the background either way.
+  Future<void> _ingestExternalWindowed(
+    Session session,
+    WindowedSessionStorage windowed,
+    int gen,
+  ) async {
+    final ingest = await windowed.ingestAppended();
+    if (gen != _loadGeneration) return;
+    final ingested = ingest.reanchored
+        ? await _reanchorExternalWindow(session, ingest.delta, gen)
+        : ingest.delta.isEmpty ||
+              await _appendExternalDelta(session, ingest.delta, gen);
+    if (!ingested) return;
+    unawaited(_refreshHistoryAbove());
+  }
+
+  /// Truncation/rotation: the view (and the provider context) reset to
+  /// the new tail. Returns false when a newer load superseded this one.
+  Future<bool> _reanchorExternalWindow(
+    Session session,
+    List<SessionRecord> delta,
+    int gen,
+  ) async {
+    _viewBranch = delta;
+    await _applyViewBranch();
+    if (gen != _loadGeneration) return false;
+    final context = await session.buildContext();
+    if (gen != _loadGeneration) return false;
+    // Same resume parity as [loadSession] (issue #1332): records
+    // reloaded off disk carry generation-time anchors that
+    // phantom-report a pre-compaction request size.
+    _agent.state.messages = resetLoadedUsageAnchors(context.messages);
+    _persistedCount = context.messages.length;
+    return true;
+  }
+
+  /// Plain append: the delta joins the view and grows the provider
+  /// context. Returns false when a newer load superseded this one.
+  Future<bool> _appendExternalDelta(
+    Session session,
+    List<SessionRecord> delta,
+    int gen,
+  ) async {
+    _viewBranch?.addAll(delta);
+    await _applyViewBranch();
+    if (gen != _loadGeneration) return false;
+    await _growProviderContext(session, delta);
+    return gen == _loadGeneration;
+  }
+
+  /// Full-open external reload: a fresh open (cheap: header + tree
+  /// index) and a full reprojection.
+  Future<void> _reopenExternalSession(Session session, int gen) async {
+    final metadata = await session.getMetadata();
+    if (gen != _loadGeneration) return;
+    final fresh = await _repo.open(metadata);
+    if (gen != _loadGeneration) return;
+    _session = fresh;
+    await _reprojectLoadedWindow(fresh);
+  }
+
+  /// Grows the provider context append-only by the ingested delta
+  /// (issue #135 round 2, provider-context full-fidelity: paging never
+  /// touches the context; external appends only ever ADD). A compaction
+  /// record inside the delta invalidates append-only growth — the
+  /// context is rebuilt from the full view branch instead.
+  Future<void> _growProviderContext(
+    Session session,
+    List<SessionRecord> delta,
+  ) async {
+    final hasCompaction = delta.any((r) => r is CompactionRecord);
+    final branch = _viewBranch;
+    // Disk-reloaded records re-anchor (issue #1332): generation-time
+    // usage describes the WRITER's context — pre-compaction for a
+    // compaction delta — never this host's projection.
+    if (hasCompaction || branch == null) {
+      final full = session.projectPath(branch ?? delta);
+      _agent.state.messages = resetLoadedUsageAnchors(full);
+      _persistedCount = full.length;
+      return;
+    }
+    final projected = resetLoadedUsageAnchors(session.projectPath(delta));
+    // state.messages hands out an unmodifiable view — grow through the
+    // setter (the old addAll on the getter threw UnsupportedError,
+    // silently swallowed by the watcher's catch, and external appends
+    // never reached the provider context).
+    _agent.state.messages = [..._agent.state.messages, ...projected];
+    _persistedCount += projected.length;
+  }
+
+  void _stopSessionWatch() {
+    _sessionWatchTimer?.cancel();
+    _sessionWatchTimer = null;
+  }
+
+  /// Id of the session new messages persist to (`null` until [initialize]).
+  String? get currentSessionId => _sessionId;
+
+  /// The cwd of the OPEN session (from its on-disk metadata): the folder
+  /// that conversation belongs to, regardless of the app's current mount
+  /// (the env is shared across sessions; the session's own folder is not).
+  /// Null until a session materializes.
+  String? get currentSessionCwd => _sessionCwd;
+
+  /// The config this service was created with, kept so a new session can be
+  /// cloned from it (see [clone]). `null` when the service was built from a
+  /// pre-constructed [Agent] (tests).
+  AgentConfig? get configForClone => _config;
+}

@@ -1,0 +1,284 @@
+# CI: daily auto-publish
+
+`daily-publish.yml` is a thin orchestrator that runs the five publish
+channels once a day as isolated **legs**: one leg failing never kills the
+others, and every failure self-files a GitHub issue. It duplicates no build
+logic — each leg dispatches an existing workflow via `gh workflow run` and
+watches the run.
+
+## Schedule and change detection
+
+- Cron `17 5 * * *` (daily, 05:17 UTC), plus manual `workflow_dispatch`.
+- Legs run only when `main` moved since the last **green** daily run
+  (compared by head SHA). No movement → every leg skips → the run stays
+  **green** (the #159 lesson: a no-op must never be red). A dispatch can
+  override with `force: true`.
+- One daily at a time (`concurrency: daily-publish`, queued, never
+  cancelled).
+
+## Legs
+
+| Leg | Runs | Publishes |
+| --- | --- | --- |
+| TestFlight | `build-mobile.yml` (`ios_content=all`, `android_content=none`) | iOS IPA → TestFlight, distributed straight to the EXTERNAL group (`TESTFLIGHT_EXTERNAL_GROUP` repo variable + Beta App Review contact variables — lanes fail loudly without them). Android stays excluded (standing owner decision). |
+| pub.dev | in-job | **Verifier + recovery**, never publishes directly: pub.dev trusted publishing only accepts OIDC from tag-push runs, which a schedule/dispatch run can never be. When behind, it classifies first (gh-1192): a tag-publish still **executing** (tag-run queued/in-progress at any age, or not visible yet / tag not cut while the bump is fresh) is a neutral **skipped: release in flight** — no error, no issue; the next daily re-verifies. Past the grace windows the recovery path applies: re-run the failed ci.yml tag-publish run (a rerun keeps the original tag-push event/OIDC claims); unrecoverable states fail loudly → issue with a manual-publish instruction. |
+| CLI + desktop | `build-macos.yml` (`create_release=true`) | macOS DMG/ZIP (signed + notarized), macOS CLI bundles, `fa-extension.zip` → GitHub Release. |
+| Website | `pages.yml` | fa1.dev: landing + web demo + `/extension/` + `/outlook/` slice. |
+| Outlook add-in | `office-addin.yml` | Acceptance suite (manifest validation, dart2js taskpane, Node + Playwright e2e). The fa1.dev `/outlook` deploy itself rides the Website leg — `pages.yml` assembles the same add-in into the Pages artifact. |
+
+Manual, version-by-version: `release-appstore.yml` (workflow_dispatch) submits the
+version's latest processed TestFlight build straight to App Store review (iOS and/or
+macOS). Pre-flight fails before any mutation — version must exist (create it via
+`store-metadata.yml`), a processed build must exist, an already-submitted version is a
+green no-op — and `confirm` must repeat `version` exactly. Release-after-approval stays
+a manual ASC click (`APP_STORE_AUTOMATIC_RELEASE` repo variable flips it).
+
+`workflow_dispatch` input `legs` selects a single leg (`all` by default) —
+the safe way to smoke one channel.
+
+## Versioning
+
+The scheme (gh-1522): the git TAG is the single source of truth —
+`scripts/auto_release.sh` cuts an annotated tag (latest tag + 1) directly
+on `origin/main` plus the GitHub Release, authenticated as the fa-release-bot
+GitHub App (gh-1172 — its token triggers the tag-scoped jobs, which
+`GITHUB_TOKEN` pushes never do). ZERO commits land on main: the retired
+flow pushed a 4-file `chore(release):` bot commit (`pubspec.yaml`,
+`CHANGELOG.md`, `flutter_app/pubspec.{yaml,lock}`) per release — noisy
+history, a direct-to-main bot path, CHANGELOG growth toward the pub.dev
+256 KiB cap (gh-1452) and pubspec.lock churn invalidating
+`--enforce-lockfile` (gh-1265). Both pubspecs now carry the FIXED
+`0.0.0-dev` placeholder (a hand-bump fails the Static
+`Version placeholder guard` — it would desync the tag↔staged-file
+invariant), and CI stamps the real version at every edge:
+
+- **pub.dev** — the `publish` job stages the package
+  (`scripts/stage_publish_package.sh /tmp/publish-stage "${GITHUB_REF_NAME#v}"`)
+  and the stage-time stamper (`scripts/stamp_staged_release.sh`) writes the
+  tag version into the staged pubspec, guards staged == tag pre-upload, and
+  PREPENDS the tag's generated changelog section to the staged CHANGELOG
+  (the repo file is never mutated). CHANGELOG.md in-repo is curated-only:
+  PRs add lines under `## Unreleased`; `scripts/release_notes.sh` picks
+  curated `## <version>` → curated `## Unreleased` body → conventional
+  commits since the previous tag. The pub.dev 262144-byte changelog cap is
+  enforced on the STAGED file (oldest staged sections trim), so it can
+  never block a release again — the publish job's repo-file check is
+  ADVISORY (`::warning::` pointing at `CHANGELOG_ARCHIVE.md`), never a
+  hard gate (gh-1522 rework, PR #1526).
+- **App builds** — `build-mobile.yml` / `build-macos.yml` derive
+  `latest tag + 1` and pass it via `--build-name`/`--build-number`
+  (BUILD_NUMBER = run number); the fastlane `store_pubspec_version` helper
+  prefers the derived `BUILD_NAME` env.
+- **Local / CLI** — `install_local.sh` stamps `version.txt` from
+  `git describe --tags`; `fa --version` reads the stamped `version.txt`
+  first, the placeholder pubspec second (a plain `dart run` shows
+  `0.0.0-dev` — self-explanatory).
+
+Manual `workflow_dispatch` runs are input-gated: `releaseDryRun: true`
+exercises the whole pipeline without the tag push (AC1), and
+`releaseDispatch: true` on `refs/heads/main` is the real release — bare
+validation dispatches (the SM's per-PR `gh workflow run ci.yml --ref
+<branch>`) arm nothing. Since gh-1537 retired the post-merge main CI run,
+ci.yml has no main-push trigger at all: merging to main fires NO CI and
+cuts NO tag — the release job arms on the 2h coalesce schedule (≤1 release
+per 2h, catching up merged commits) and on `releaseDispatch` only. The
+release checklist is: wait for a schedule tick (or fire `releaseDispatch`)
+→ watch the ci.yml `release` job cut the tag → watch
+the tag-scoped `publish`/`binaries` jobs. The daily:
+
+- lets `build-mobile.yml` / `build-macos.yml` derive their version
+  themselves (`latest tag + 1` at the child's own dispatch moment). A tag
+  pinned once in the orchestrator would race `auto_release.sh` — the daily
+  could attach assets to a tag minted at a different commit than the built
+  code. Self-derivation keeps tag and code consistent; the two children
+  derive within minutes of each other and converge on the same tag
+  (`gh release create` attaches to an existing tag rather than moving it);
+- **never lets a leg REST-mint a missing release tag** (gh-2026): a
+  `gh release create vX --draft` on a tag that does not exist yet mints a
+  lightweight API tag with NO push event, so the ci.yml tag train never
+  fires and the draft is stranded (the v0.1.408 silent class, issue #597 —
+  recurred as v1.0.663 / v1.0.665, whose minted pushes also rode
+  actions/checkout's persisted GITHUB_TOKEN extraheader). Both
+  `scripts/release_attach_or_create.sh` and `scripts/release_lazy_draft.sh`
+  probe `git ls-remote --exit-code` first and, when the ref is definitely
+  missing, mint through `scripts/release_tag_mint.sh`: an annotated tag
+  pushed via token-URL with the PAT the job already carries
+  (`GH_TOKEN=RELEASE_PAT` on the dispatch-time call sites), the persisted
+  extraheader stripped, and the train start verified with
+  `gh run list --branch <tag>` BEFORE any draft is created — a mint whose
+  train does not start fails the leg loudly instead of stranding a draft
+  for the sweeper. The probe authenticates with the RELEASE_PAT (`gh`
+  prefers `GH_TOKEN`), so the PAT itself needs `actions: read`; the job
+  tokens carry the grant too (uniformly on every mint-reachable job) as
+  defense-in-depth in case the probe is ever switched to the job token,
+  and a failing probe is reported as its own error — never read as "no
+  train". The mint tolerates the raced-mint push (a sibling leg landing
+  the same tag first — the 2-arch `build-macos-cli` matrix plus
+  `build-extension` race the same fresh tag) by re-probing the ref, and
+  rolls an untrained tag back before failing so the prescribed re-run
+  re-mints instead of stranding the draft. Identity note (vs the AGENTS.md
+  gh-1402 invariant that release-path automation uses the fa-release-bot
+  App token): leg-time tag mints keep the pre-existing
+  `release_attach_or_create.sh` RELEASE_PAT pattern because the PAT is
+  what the dispatch-time call sites already hold, an App token would work
+  identically (it also fires workflow runs), and swapping the credential
+  is a follow-up not owned by the gh-2026 fix; until then, leg-time tag
+  mints are a documented exception to gh-1402's release-tags scope, which
+  continues to govern release-path file commits;
+- never publishes to pub.dev itself (see the pub.dev row above) — pub.dev
+  movement stays 100% in the auto_release → ci.yml tag job path, with the
+  daily as verifier and rerun-recovery;
+- keeps NO daily-side wedge alarm for a tag that never publishes (#1368):
+  a freshly cut tag reads `release-in-flight` ⏭️ in the daily for as long
+  as its outcome is unobservable (young tag inside the grace window, run
+  queued past the terminal-wait budget). The version under test is the
+  LATEST REMOTE TAG (`git ls-remote`), never a file read. The remaining
+  tripwires for a genuinely stuck release: the plan job's
+  release-unresolved re-arm (every daily re-verifies while pub.dev is
+  behind the latest tag), and the tag-run selector in
+  `scripts/verify_pubdev_release.sh`, which alarms `only non-push run(s)`
+  once a tag exists but only non-push runs registered.
+
+**Change baseline**: legs run only when `main` moved since the last green
+daily **that ran all legs** (schedule runs, or `legs=all` dispatches). A
+single-leg green dispatch never advances the baseline, so a partial smoke
+can't make the next scheduled run skip the legs it never exercised.
+One exception (gh-1192, reworked gh-1522): a release-in-flight pubdev leg
+exits 0, so that green daily becomes the baseline — the plan gate
+(`scripts/daily_plan.sh`) therefore still forces the legs while the
+LATEST TAG's version is not yet served by pub.dev, keeping the
+re-verification and the failed-run recovery alive on a quiet main. A
+failing `plan` job
+(not just legs) files its own
+`[daily-publish] plan leg failed` issue — nothing escapes the loop.
+
+## Self-healing issues
+
+On a failing (or timed-out) leg the `report` job files an issue:
+
+- title `[daily-publish] <leg> leg failed`, label `bug` + `daily-publish`,
+  assigned to `vabhzw17eg2qu4m9-bit`;
+- body: daily run link, leg run link, failing job/step names, the last ~50
+  lines of the failed step's log;
+- **dedup**: an open issue with the same signature gets a comment instead
+  of a duplicate;
+- **auto-close**: when the leg goes green in a later daily run, the open
+  issue is closed with a comment.
+
+Each run also writes a single job-summary table (leg → version → status →
+links) and exits red itself when any leg failed.
+
+## Release hygiene (issue #282)
+
+No orphan drafts, one naming scheme, a truthful `Latest`, useful notes:
+
+- **Draft lifecycle invariant** — every workflow step that creates a
+  release draft (`gh release create <tag> <assets…>` uploads assets
+  through a *draft* first and only publishes afterwards) is paired with a
+  `Draft lifecycle guard` step in the same job:
+  `if: always() && job.status != 'success'` + `scripts/release_draft_guard.sh`
+  — a failed **or cancelled** run deletes its orphaned draft instead of
+  leaving it to rot. The delete is **ownership-scoped** (review of #294):
+  the guard only deletes a draft whose body carries this very run+job's
+  `<!-- release-draft-owner: run/<id>/job/<job> -->` marker — daily-publish
+  runs the mobile and macOS legs concurrently on the same derived tag, and
+  a failed leg's guard must never destroy the sibling leg's mid-upload
+  draft (foreign or unmarked drafts are left to the sweeper). Pinned by
+  `test/release_hygiene_test.dart` (a job with an asset-carrying create
+  and no guard fails CI).
+- **Attach-or-create** — the draft-capable creates of build-macos.yml /
+  build-mobile.yml live in `scripts/release_attach_or_create.sh`, which is
+  idempotent under the view→create race (#282 E3): a create that loses to
+  a concurrent winner uploads into the winner's release instead of
+  failing (a failing create would fire the guard against the winner's
+  in-flight draft), and the create stamps the ownership marker the guard
+  verifies.
+- **Daily sweeper** — the `sweep-drafts` job in `daily-publish.yml` runs
+  `scripts/sweep_stale_drafts.sh` on **every** daily invocation (leg
+  results and change-gating never gate hygiene): drafts older than 24h
+  are deleted when the PIPELINE created them — a Bot author / `*[bot]`
+  login, or the body carries a well-formed
+  `release-draft-owner: run/<id>/job/<job>` marker (the drafts
+  are created with the owner's RELEASE_PAT, so the API author is a human
+  and the marker is the only ownership proof — gh-2008; the bucket rule
+  keys on the exact stamped shape, so prose merely mentioning the
+  substring or a malformed marker stays human — review thread
+  PRRT_kwDOTXdlLc6yOzIh; id-based API
+  delete, tag and git history untouched — draft assets are unpublished by
+  definition, E2), human drafts (no marker) are listed but kept (E1),
+  fresh (<24h) drafts are left for their in-flight run. The job grants
+  `actions: read` — unmarked swept drafts name their creating run via
+  `gh run list`, which 403s without it; marker drafts name the marker's
+  run id directly. Anything
+  stale files **one** deduplicated `release-hygiene` issue (comment on the
+  open one, auto-close on a clean sweep — same convention as the leg
+  issues) naming each swept draft and its creating run, so a recurring
+  stuck draft points at its broken step. The test stub enforces the
+  workflow-declared token permissions, so a dropped grant fails CI instead
+  of silently degrading the issue to "no run on ref".
+- **Naming** — titles are the bare `vX.Y.Z` tag everywhere (matches the
+  tag, matches pub.dev). No `Fa ` prefixes, no untitled creates; both are
+  lint-failed by `test/release_hygiene_test.dart`. Pre-existing published
+  titles (e.g. `Fa v0.1.362`) are deliberately not rewritten — backfill
+  is opt-in per release.
+- **Latest** — every publish path passes `--latest` explicitly (and
+  re-asserts it via `gh release edit --latest` when attaching to a
+  release another path created first). Guards and the sweeper only ever
+  delete — a failed run can never capture the badge.
+- **Notes** — `scripts/release_notes.sh` renders the curated CHANGELOG.md
+  `## <version>` section when one exists, else the curated `## Unreleased`
+  body (gh-1522: the release folds Unreleased into the tag's section at
+  stage time, never in-repo), else conventional commits since the
+  previous tag grouped Features/Fixes/Maintenance (capped at 50 +
+  "…and N more"), with a clean "No changes" body for re-tags. The literal
+  `Release vX.Y.Z` filler bodies are gone.
+
+One-time cleanup (this card): the 3-week-old draft `v0.1.190` that sat
+above `Latest` was already gone by the time this landed (`gh release
+delete v0.1.190` → *release not found*, `gh api releases` → zero drafts);
+the delete was executed and verified on 2026-09-14. The guards + sweeper
+are what keep it that way.
+
+## Pausing
+
+```sh
+gh workflow disable daily-publish.yml -R IstiN/flutter_agent_harness
+```
+
+`enable` to resume. (Deleting the `schedule:` block from the workflow works
+too.) Legs can also be paused per channel by not passing them — scheduled
+runs always run all legs.
+
+## Testing the failure path
+
+`workflow_dispatch` input `inject_failure` fails one leg synthetically
+**before anything is dispatched** — it exercises the issue-filing, dedup
+and auto-close cycle with zero publish side effects:
+
+1. dispatch `legs=pubdev force=true inject_failure=pubdev` → red, issue
+   filed **whose digest quotes the injected `::error::` line** (the report
+   job's `Verify injected-failure excerpt (TEST)` step fails the run if the
+   excerpt regressed to the old "no failed-step log available" shrug);
+2. dispatch the same again → the existing issue gets a comment (no
+   duplicate);
+3. dispatch `legs=pubdev force=true` (no inject) → green up-to-date check,
+   issue auto-closed.
+
+Digests are signal-first: the report greps the failed job's log for error
+lines (`::error::`, `Message from server`, `error:`, `FAIL`, exit-code) and
+quotes the first matches with context, falling back to the raw tail only
+when nothing matches. A cancelled leg job gets a dedicated section (which
+job was in flight, its `timeout-minutes` ceiling, elapsed-vs-ceiling)
+resolved from the jobs API and the workflow file. Before filing, the
+normalized error signature is searched against open issues' bodies/comments
+— a match (e.g. a symptom of the #1452 CHANGELOG > 256 KiB root cause)
+gets a comment on that issue instead of a daily symptom duplicate.
+
+## Secrets
+
+No new secrets. The orchestrator never publishes anywhere itself — each
+child workflow uses its own secrets/OIDC (`id-token: write` lives only in
+the tag-triggered ci.yml publish job). The daily needs `github.token` with
+`actions`/`issues` write (dispatch + rerun + issue filing). Failed-step
+log excerpts are taken verbatim from the child run's log — the child
+workflows never echo secret values.

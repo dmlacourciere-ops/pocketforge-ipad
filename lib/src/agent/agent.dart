@@ -1,0 +1,1073 @@
+/// The stateful [Agent]: owns the transcript, queues steering/follow-up
+/// messages, and exposes lifecycle hooks on top of the low-level loop.
+///
+/// Ported from pi-mono `packages/agent/src/agent.ts`. Deliberate divergences
+/// from the TypeScript original:
+///
+/// - `AbortSignal` is [CancelToken]; `agent.abort()` cancels the run's token.
+/// - `continue()` is [Agent.continueRun] (`continue` is a Dart keyword).
+/// - pi's `prepareNextTurn` / `prepareNextTurnWithContext` pair collapses
+///   into a single [PrepareNextTurnHook], which always receives the turn
+///   context (the no-context variant is a closure that ignores it).
+/// - pi's `convertToLlm` is absent: our messages are already LLM-shaped.
+/// - pi defaults `streamFn` to `streamSimple` and tools self-execute; here
+///   [Agent.streamFunction] is required and tool execution is injected —
+///   either directly via [Agent.toolExecutor] or via a
+///   [ToolRegistry] (`Agent(toolRegistry: ...)`), which also seeds the tool
+///   list unless `tools` is passed explicitly.
+/// - pi's `sessionId`, `thinkingLevel`/`thinkingBudgets`, `transport`,
+///   `onPayload`/`onResponse`, `getApiKey`, and `maxRetryDelayMs` arrive with
+///   the provider-options work they belong to.
+library;
+
+import 'dart:async';
+
+import '../cancel_token.dart';
+import '../context.dart';
+import '../model.dart';
+import '../skills/skills.dart' show Skill;
+import '../types.dart';
+import '../providers/payload_stall.dart'
+    show lastOutboundEstimateBytes, payloadStallScaleFor;
+import '../providers/provider_tuning.dart';
+import 'agent_loop.dart';
+import 'image_recovery.dart' show ImagePayloadRecoveryState;
+import 'message_cap.dart' show MessageCapPolicy;
+import 'misuse_breaker.dart';
+import 'stuck_tool.dart';
+import 'foreground_call_budget.dart';
+import 'tool_registry.dart';
+
+/// Thrown (as [ArgumentError]) when neither a tool executor nor a tool
+/// registry is provided to [Agent.new].
+Never _missingToolExecutor() {
+  throw ArgumentError(
+    'Agent requires either a toolExecutor or a toolRegistry.',
+  );
+}
+
+/// Controls how many queued messages are injected when the loop reaches a
+/// queue drain point. Ported from pi's `QueueMode`.
+enum QueueMode {
+  /// Drain and inject every queued message at that point.
+  all,
+
+  /// Drain and inject only the oldest queued message, leaving the rest for
+  /// later drain points.
+  oneAtATime,
+}
+
+/// Listener for agent lifecycle events (pi's `Agent.subscribe` callback).
+///
+/// Listeners are awaited in subscription order and are included in the
+/// current run's settlement: the agent does not become idle until all
+/// awaited listeners for `agent_end` have finished. [cancelToken] is the
+/// active run's token.
+typedef AgentListener =
+    FutureOr<void> Function(AgentEvent event, CancelToken cancelToken);
+
+/// Public agent state. Ported from pi's `AgentState`.
+///
+/// Assigning [tools] or [messages] copies the provided top-level list.
+/// The runtime fields ([isStreaming], [streamingMessage],
+/// [pendingToolCalls], [errorMessage]) are read-only for consumers; the
+/// owning [Agent] mutates them as it processes loop events.
+final class AgentState {
+  AgentState({
+    this.systemPrompt = '',
+    required this.model,
+    List<Tool> tools = const [],
+    List<Message> messages = const [],
+  }) : _tools = List.of(tools),
+       _messages = List.of(messages);
+
+  /// System prompt sent with each model request.
+  String systemPrompt;
+
+  /// Active model used for future turns.
+  Model model;
+
+  List<Tool> _tools;
+  List<Message> _messages;
+
+  /// Tools available to the model. Assigning copies the list.
+  List<Tool> get tools => List.unmodifiable(_tools);
+  set tools(List<Tool> value) => _tools = List.of(value);
+
+  /// Conversation transcript. Assigning copies the list.
+  List<Message> get messages => List.unmodifiable(_messages);
+  set messages(List<Message> value) => _messages = List.of(value);
+
+  /// True while the agent is processing a prompt or continuation.
+  ///
+  /// Remains true until awaited `agent_end` listeners settle.
+  bool get isStreaming => _isStreaming;
+  bool _isStreaming = false;
+
+  /// Partial assistant message for the current streamed response, if any.
+  Message? get streamingMessage => _streamingMessage;
+  Message? _streamingMessage;
+
+  /// Tool call ids currently executing.
+  Set<String> get pendingToolCalls => Set.unmodifiable(_pendingToolCalls);
+  final _pendingToolCalls = <String>{};
+
+  /// Error message from the most recent failed or aborted assistant turn.
+  String? get errorMessage => _errorMessage;
+  String? _errorMessage;
+}
+
+/// Placeholder model mirroring pi's `DEFAULT_MODEL`, used when the caller
+/// does not configure one.
+const _defaultModel = Model(
+  id: 'unknown',
+  name: 'unknown',
+  api: 'unknown',
+  provider: 'unknown',
+  baseUrl: '',
+  contextWindow: 0,
+  maxTokens: 0,
+);
+
+/// A FIFO of pending [Message]s with pi's drain semantics.
+final class _PendingMessageQueue {
+  _PendingMessageQueue(this.mode);
+
+  /// How many messages [drain] returns.
+  QueueMode mode;
+
+  /// Fires synchronously on every [enqueue] — the agent loop's tool phase
+  /// turns a mid-phase arrival into a soft-yield request.
+  void Function()? onEnqueue;
+
+  final _messages = <Message>[];
+
+  void enqueue(Message message) {
+    _messages.add(message);
+    onEnqueue?.call();
+  }
+
+  bool hasItems() => _messages.isNotEmpty;
+
+  /// How many messages are queued (issue #1786: the budget ladder's rung-1
+  /// "steering FIFO non-empty" gate and its announcement counts).
+  int get pendingCount => _messages.length;
+
+  List<Message> drain() {
+    if (mode == QueueMode.all) {
+      final drained = List.of(_messages);
+      _messages.clear();
+      return drained;
+    }
+    if (_messages.isEmpty) return const [];
+    return [_messages.removeAt(0)];
+  }
+
+  void clear() => _messages.clear();
+}
+
+final class _ActiveRun {
+  _ActiveRun(this.source);
+
+  final CancelTokenSource source;
+  final completer = Completer<void>();
+}
+
+/// Stateful wrapper around the low-level agent loop.
+///
+/// Default for [Agent.runIdleTimeout]: eight minutes of event silence
+/// outside tool execution. Legitimate silent windows are bounded well below
+/// this — the connect timeout (180s) covers request setup and the provider
+/// stream idle watchdog (300s) covers mid-stream gaps. The one declared
+/// exception is the over-window relief compaction (issue #1085): it is
+/// suspended around `overWindowRelief` instead of being allowed to fire
+/// mid-relief and kill the run the relief is trying to save.
+const defaultRunIdleTimeout = Duration(minutes: 8);
+
+/// `Agent` owns the current transcript, emits lifecycle events, executes
+/// tools, and exposes queueing APIs for steering and follow-up messages.
+/// Port of pi's `Agent`.
+class Agent {
+  /// Creates an agent. See the library doc for the pi mapping.
+  ///
+  /// [toolExecutor] is optional when a [toolRegistry] is provided: the
+  /// registry then supplies both the executor and (unless [tools] is given
+  /// explicitly) the tool list. Passing both [toolExecutor] and
+  /// [toolRegistry] is allowed; [toolExecutor] wins.
+  Agent({
+    Model? model,
+    String? systemPrompt,
+    List<Tool>? tools,
+    List<Message>? messages,
+    required this.streamFunction,
+    ToolExecutor? toolExecutor,
+    ToolRegistry? toolRegistry,
+    this.beforeToolCall,
+    this.afterToolCall,
+    this.transformContext,
+    this.budgetLineProvider,
+    this.prepareNextTurn,
+    this.externalSteeringSource,
+    this.externalSteeringProbe,
+    QueueMode steeringMode = QueueMode.oneAtATime,
+    QueueMode followUpMode = QueueMode.oneAtATime,
+    this.toolExecution = ToolExecutionMode.parallel,
+    this.maxEmptyRetries = 1,
+    this.emptyHiccupRetries = 3,
+    this.emptyHiccupBaseDelay = const Duration(milliseconds: 500),
+    this.emptyHiccupMaxBackoff = const Duration(milliseconds: 8000),
+    this.runIdleTimeout = defaultRunIdleTimeout,
+    this.onRunIdleTimeout,
+    this.onRunWatchdogPaused,
+    this.contextWindowCap,
+    this.wireDump = false,
+    this.overWindowRelief,
+    this.messageCapPolicy,
+    this.messageCapRelief,
+    this.toolMisuseBreaker,
+    this.stuckTool,
+    this.foregroundCall,
+    this.finalizeGate = false,
+    this.operativeSkills = const [],
+    Set<String>? reportedOrphanKeys,
+  }) : toolExecutor =
+           toolExecutor ?? toolRegistry?.executor ?? _missingToolExecutor(),
+       _reportedOrphanKeys = reportedOrphanKeys ?? <String>{},
+       _state = AgentState(
+         model: model ?? _defaultModel,
+         systemPrompt: systemPrompt ?? '',
+         tools: tools ?? toolRegistry?.tools ?? const [],
+         messages: messages ?? const [],
+       ),
+       _steeringQueue = _PendingMessageQueue(steeringMode),
+       _followUpQueue = _PendingMessageQueue(followUpMode) {
+    _steeringQueue.onEnqueue = () {
+      if (!_steeringArrived.isClosed) _steeringArrived.add(null);
+    };
+  }
+
+  final AgentState _state;
+  final _listeners = <AgentListener>{};
+  final _PendingMessageQueue _steeringQueue;
+  final _PendingMessageQueue _followUpQueue;
+  final _steeringArrived = StreamController<void>.broadcast(sync: true);
+  _ActiveRun? _activeRun;
+  Timer? _runWatchdogTimer;
+
+  /// The window info the armed timer currently waits under — captured at
+  /// arm time (gh-1617); the fire reports exactly what governed the wait.
+  ({Duration window, String source, bool raised}) _armedRunIdleInfo = (
+    window: defaultRunIdleTimeout,
+    source: 'default',
+    raised: false,
+  );
+
+  /// Backstop for wedged runs: when no [AgentEvent] arrives for this long
+  /// outside tool execution (a stalled provider connection whose socket
+  /// never errors, a hook future that never completes), the run's cancel
+  /// token is cancelled with a [TimeoutException] reason and
+  /// [onRunIdleTimeout] fires, so the turn ends as `aborted` instead of
+  /// pinning the host's busy state forever. Streaming deltas and tool
+  /// phases reset/disarm the timer — a long legitimate tool call (a full
+  /// test gate) never trips it. [Duration.zero] disables the watchdog.
+  /// Defaults to [defaultRunIdleTimeout].
+  final Duration runIdleTimeout;
+
+  /// Reports every run-idle watchdog fire (after [runIdleTimeout] of event
+  /// silence); hosts log it for post-mortem "who held the busy row".
+  final void Function(Object error)? onRunIdleTimeout;
+
+  /// Reports every run-idle watchdog PAUSE (issue #1085 M3): the
+  /// over-window relief is a declared long silent window, so [Agent]
+  /// suspends the watchdog for its duration — hosts surface that pause
+  /// visibly (a dim note), not only in the diagnostic log. Default: none.
+  final void Function()? onRunWatchdogPaused;
+
+  /// Opt-in raw wire dumps (issue #385 F5, default off): when on, every
+  /// [ModelRequestEvent] carries the raw serialized outbound payload for
+  /// the host to redact, cap, and persist. OFF by default — payloads can
+  /// carry secrets and bloat the session file.
+  final bool wireDump;
+
+  /// The FinalizeGate (gh-1412, default off; attendance-corrected
+  /// gh-1516): hosts set it on UNATTENDED runs (headless `fa -p`/bench —
+  /// `AgentCliConfig.headlessRun`, never the approval mode). When on,
+  /// every run parses the `task-ledger` block out of the final assistant
+  /// answer (fenced or the unfenced near-miss shape), rewrites the
+  /// answer so the transcript never shows the ledger, and emits
+  /// [TaskLedgerEvent] for the host to persist as the hidden
+  /// `task_ledger` session record. Runs with no tool calls (pure Q&A)
+  /// fire nothing — no produced state, nothing to verify. Off =
+  /// interactive behavior is byte-identical.
+  ///
+  /// Mutable: only the CLI host flips this today (boot `headlessRun`);
+  /// the builder's `AgentWiringSpec` has no knob for it in v1 — hosts
+  /// that want the gate must set the field after the stack lands.
+  bool finalizeGate;
+
+  /// gh-1409: the skills known to the session — their `operative:` lines
+  /// ride every post-compaction request as the verbatim pinned carrier.
+  /// Hosts republish on skill reload (the same way the system prompt's
+  /// skills section recomposes). Empty (default) → byte-identical legacy
+  /// requests. Mutable by design: `/skills reload` and availability
+  /// toggles swap the list.
+  List<Skill> operativeSkills;
+
+  /// gh-1449: the session's one-shot latch of already-reported orphan
+  /// results ([orphanReportKey]s, mutable — the agent loop adds every key
+  /// it reports back into this same set). Hosts seed it from the
+  /// persisted `orphan_report` custom records when a session resumes
+  /// ([orphanReportKeysFromRecords]), so a restored session never
+  /// re-reports an orphan it already reported (AC6).
+  Set<String> get reportedOrphanKeys => _reportedOrphanKeys;
+  final Set<String> _reportedOrphanKeys;
+
+  /// Issue #1750: run-lifetime learned image caps, keyed by
+  /// [imageCapLatchKey] — the loop latches a provider-refused cap here;
+  /// runtime-only, never persisted.
+  final Map<String, int> _imageCapLatches = {};
+
+  /// gh-1934: the session-scoped 413 image-payload recovery state — the
+  /// loop's ladder halves the adaptive budget and latches the strip-all
+  /// here on a payload-size refusal; every later request build of the
+  /// session rides the recovered state (runtime-only, never persisted —
+  /// session-scoped v1 per the ticket's open question 1).
+  final ImagePayloadRecoveryState imageRecovery = ImagePayloadRecoveryState();
+
+  /// Provider adapter used for every model call. See [StreamFunction].
+  StreamFunction streamFunction;
+
+  /// Executes tool calls requested by the model. See [ToolExecutor].
+  ToolExecutor toolExecutor;
+
+  /// The tool-misuse circuit breaker (issue #862): 3 consecutive identical
+  /// tool-call rejections arm a corrective note in the next request
+  /// payload; 6 stop executing that identical call for the rest of the run.
+  /// `null` (default) disables it — byte-identical to the pre-breaker
+  /// harness.
+  ToolMisuseBreaker? toolMisuseBreaker;
+
+  /// Called before a tool is executed; can block it. See [BeforeToolCallHook].
+  BeforeToolCallHook? beforeToolCall;
+
+  /// Called after a tool finishes; can override the result.
+  /// See [AfterToolCallHook].
+  AfterToolCallHook? afterToolCall;
+
+  /// Rewrites the message list sent to the provider before each call.
+  /// See [TransformContextHook].
+  TransformContextHook? transformContext;
+
+  /// gh-1556: the session deadline's per-turn budget line provider
+  /// (`time-left: 5min`), threaded into every [AgentLoopConfig] the agent
+  /// builds. Consulted live before each provider call; null/absent keeps
+  /// the request payload byte-for-byte. Mutable like [transformContext]:
+  /// hosts attach it after construction.
+  String? Function()? budgetLineProvider;
+
+  /// Adjusts context/model between turns. See [PrepareNextTurnHook].
+  PrepareNextTurnHook? prepareNextTurn;
+
+  /// Owner-side effective context override (`agent.contextWindowCap`,
+  /// issues #273/#729), threaded into every [AgentLoopConfig] the agent
+  /// builds so the loop's over-window guard trips at the overridden
+  /// window — clamped down under the catalog value, raised above it when
+  /// the endpoint serves more than the catalog reports. `null` = the raw
+  /// model window.
+  final int? contextWindowCap;
+
+  /// Emergency relief for the loop's over-window guard (issue #387),
+  /// threaded into every [AgentLoopConfig]. `null` = the guard keeps
+  /// today's behavior (verbatim error, no mid-turn compaction). Mutable
+  /// like the other late-wirable host knobs ([streamFunction],
+  /// [externalSteeringSource]): hosts that build the agent before the
+  /// service exists (the app's pre-constructed-agent constructor) attach
+  /// the relief right after (gh-1077).
+  OverWindowRelief? overWindowRelief;
+
+  /// gh-1680: the learned per-model message-cap policy threaded into every
+  /// [AgentLoopConfig]. `null` = the loop keeps the pre-gh-1680 behavior
+  /// (a cap-400 refusal is terminal). Mutable like [overWindowRelief].
+  MessageCapPolicy? messageCapPolicy;
+
+  /// gh-1680: the host compaction pass for the message-cap self-heal
+  /// (see [MessageCapRelief]), threaded into every [AgentLoopConfig].
+  /// Only fires when [messageCapPolicy] classified the refusal.
+  MessageCapRelief? messageCapRelief;
+
+  /// Observer for output-truncated tool calls (issue #1829, Core flow B),
+  /// threaded into every [AgentLoopConfig]. The task executor wires the
+  /// deliverable capture here so a truncated `reply`/`agent_message` body
+  /// survives as a partial artifact; the calls themselves stay failed
+  /// unexecuted. Mutable like the other late-wirable knobs. The loop
+  /// awaits the observer (gh-1956 review): the capture's salvage persist
+  /// must finish its restore-before-id-allocation dance before the
+  /// failure result is emitted.
+  Future<void> Function(ToolCall call)? onTruncatedToolCall;
+
+  /// Stuck-call supervision (gh-1054), threaded into every
+  /// [AgentLoopConfig]: liveness heartbeats for long-running tool calls
+  /// plus the autonomous cancel/retry/convert follow-up. `null` =
+  /// unsupervised.
+  final StuckToolConfig? stuckTool;
+
+  /// Foreground tool-call budget (issue #1786), threaded into every
+  /// [AgentLoopConfig]: bounds how long a running foreground tool call can
+  /// keep the agent unreachable by steering. `null` = the 10-minute
+  /// default applies.
+  final ForegroundCallBudgetConfig? foregroundCall;
+
+  /// Late-wirable host controls for the budget ladder's one-key offer and
+  /// the watchdog escalate hook (issue #1786) — set by the interactive host
+  /// after construction, same pattern as [externalSteeringSource]. `null` =
+  /// headless/unattended: rung 1 waits for rung 2 (or auto-converts).
+  ForegroundCallBudgetControls? foregroundBudgetControls;
+
+  /// External messages merged into the steering poll at every turn boundary
+  /// (before the first turn and after each one) — e.g. the agent's inbox in
+  /// the messaging fabric. Drained BEFORE the in-process steering queue.
+  /// Contract: must not throw; return an empty list when nothing arrived.
+  QueuedMessagesSource? externalSteeringSource;
+
+  /// Non-draining probe paired with [externalSteeringSource]: returns true
+  /// when the external source has messages pending. Polled on a slow timer
+  /// during tool-call phases so external mail also triggers the soft-yield
+  /// of long-running tools (steering delivery itself stays at the boundary).
+  Future<bool> Function()? externalSteeringProbe;
+
+  /// Fires whenever a message is enqueued into the steering queue mid-run;
+  /// the agent loop subscribes per tool-call phase to request soft-yields.
+  Stream<void> get steeringArrived => _steeringArrived.stream;
+
+  /// Tool execution strategy for assistant messages that contain multiple
+  /// tool calls.
+  ToolExecutionMode toolExecution;
+
+  /// How many times a degenerate-empty assistant response is retried within
+  /// the loop before the turn is accepted. Default: 1.
+  final int maxEmptyRetries;
+
+  /// gh-1577: how many times an empty completion that follows PARTIAL
+  /// content is retried with exponential backoff before the run ends with
+  /// the explicit empty-exhaustion error. See
+  /// [AgentLoopConfig.emptyHiccupRetries]. Default: 3.
+  final int emptyHiccupRetries;
+
+  /// gh-1577: first backoff sleep between empty-hiccup retries. See
+  /// [AgentLoopConfig.emptyHiccupBaseDelay]. Default: 500ms.
+  final Duration emptyHiccupBaseDelay;
+
+  /// gh-1577: cap on the exponential empty-hiccup backoff. See
+  /// [AgentLoopConfig.emptyHiccupMaxBackoff]. Default: 8s.
+  final Duration emptyHiccupMaxBackoff;
+
+  /// Current agent state.
+  AgentState get state => _state;
+
+  /// Controls how queued steering messages are drained.
+  QueueMode get steeringMode => _steeringQueue.mode;
+  set steeringMode(QueueMode mode) => _steeringQueue.mode = mode;
+
+  /// Controls how queued follow-up messages are drained.
+  QueueMode get followUpMode => _followUpQueue.mode;
+  set followUpMode(QueueMode mode) => _followUpQueue.mode = mode;
+
+  /// Subscribe to agent lifecycle events. Returns an unsubscribe function.
+  ///
+  /// Listener futures are awaited in subscription order and included in the
+  /// current run's settlement. `agent_end` is the final loop event for a
+  /// run; `agent_settled` follows once the run and all queued follow-ups are
+  /// fully idle, and the agent does not become idle until all awaited
+  /// listeners for those events have settled (pi semantics).
+  void Function() subscribe(AgentListener listener) {
+    _listeners.add(listener);
+    return () => _listeners.remove(listener);
+  }
+
+  /// Queue a message to be injected after the current assistant turn
+  /// finishes.
+  void steer(Message message) => _steeringQueue.enqueue(message);
+
+  /// Queue a message to run only after the agent would otherwise stop.
+  void followUp(Message message) => _followUpQueue.enqueue(message);
+
+  /// Fires the steering-arrived notification WITHOUT queueing a message —
+  /// the external-inbox fast path (issue #647): the owner of the external
+  /// source (e.g. the task executor seeing mail land on a running child's
+  /// handle) pokes the run so the tool-call phase's soft-yield fires
+  /// instantly instead of waiting out the 2s external probe. Delivery
+  /// itself still happens once, at the boundary drain.
+  void pokeSteering() {
+    if (!_steeringArrived.isClosed) _steeringArrived.add(null);
+  }
+
+  /// Host-visible notices for the provider-phase steering interrupt
+  /// (issue #1923 AC4). Null keeps the core silent; interactive hosts
+  /// print the lines verbatim (the copy is pinned by the issue).
+  void Function(String line)? onSteeringInterruptNotice;
+
+  /// The mid-stream steering stall window PROVIDER (issue #1923 AC1):
+  /// re-EVALUATED at every steering signal and stall re-arm — never a
+  /// per-run snapshot (bot r2, thread `PRRT_kwDOTXdlLc6wfxlV`: the
+  /// watchdog re-windows on every arm, so the steering interrupt must
+  /// chase the window that is actually armed or a mid-run failover to a
+  /// shorter entry lets the whole-run kill win the race AC1 says steering
+  /// always wins). Prefers [_armedRunIdleInfo] — the window the watchdog
+  /// timer is ACTUALLY armed with — over a fresh derivation, and keeps
+  /// the 30s margin (payload scaling included, since the armed window was
+  /// resolved through [runIdleWindow]). `Duration.zero` when the watchdog
+  /// is disabled: the mid-stream interrupt stays off, the zero-byte
+  /// immediate interrupt is unaffected.
+  Duration get _steeringStallWindowNow {
+    if (runIdleTimeout == Duration.zero) return Duration.zero;
+    final armed = _armedRunIdleInfo.window;
+    final base = armed > Duration.zero ? armed : runIdleWindow.window;
+    final window = base - const Duration(seconds: 30);
+    return window <= Duration.zero ? Duration.zero : window;
+  }
+
+  /// Remove all queued steering messages.
+  void clearSteeringQueue() => _steeringQueue.clear();
+
+  /// Drain the steering queue and return its messages (abort path: the
+  /// queued steers must land in the transcript, not vanish).
+  List<Message> drainSteeringQueue() => _steeringQueue.drain();
+
+  /// Returns true when steering messages are still queued (e.g. they
+  /// arrived after the run's last drain point — the host decides whether
+  /// to run or drop them, but never silently).
+  bool get hasSteering => _steeringQueue.hasItems();
+
+  /// Remove all queued follow-up messages.
+  void clearFollowUpQueue() => _followUpQueue.clear();
+
+  /// Remove all queued steering and follow-up messages.
+  void clearAllQueues() {
+    clearSteeringQueue();
+    clearFollowUpQueue();
+  }
+
+  /// Oversized user-message intake guard (issue #1760): hosts install a
+  /// [UserMessageSpillGuard].guard here to bound every incoming user
+  /// message from ONE choke point. Applied at every seam user messages
+  /// enter the loop — the prompt batch, the mid-run steering drain (in-run
+  /// and external-inbox), and the follow-up drain. Null (default) =
+  /// legacy pass-through.
+  Future<UserMessage> Function(UserMessage message)? userMessageGuard;
+
+  /// Runs [userMessageGuard] over the user messages of [messages], in
+  /// order. Null guard = the list verbatim.
+  Future<List<Message>> _guardIncomingUserMessages(
+    List<Message> messages,
+  ) async {
+    final guard = userMessageGuard;
+    if (guard == null) return messages;
+    return [
+      for (final message in messages)
+        message is UserMessage ? await guard(message) : message,
+    ];
+  }
+
+  /// Returns true when either queue still contains pending messages.
+  bool hasQueuedMessages() {
+    return _steeringQueue.hasItems() || _followUpQueue.hasItems();
+  }
+
+  /// Active cancel token for the current run, if any. Hosts use it to
+  /// LINK secondary work (issue #1085: the over-window relief's
+  /// compaction tokens) to the run, so a user abort reaches in-flight
+  /// work the watchdog never owned.
+  CancelToken? get cancelToken => _activeRun?.source.token;
+
+  /// Aborts the current run, if one is active. Also disarms the idle
+  /// watchdog: it guards against a WEDGED stream going silent, not against
+  /// a host that cancelled on purpose — keeping it armed after an explicit
+  /// abort (or host teardown) leaks the timer past the run's grave.
+  void abort() {
+    _disarmRunWatchdog();
+    _activeRun?.source.cancel();
+  }
+
+  /// Resolves when the current run and all awaited event listeners have
+  /// finished (after `agent_end` listeners settle).
+  Future<void> waitForIdle() {
+    return _activeRun?.completer.future ?? Future<void>.value();
+  }
+
+  /// Clear transcript state, runtime state, and queued messages.
+  void reset() {
+    _state._messages = [];
+    _state._isStreaming = false;
+    _state._streamingMessage = null;
+    _state._pendingToolCalls.clear();
+    _state._errorMessage = null;
+    clearAllQueues();
+  }
+
+  /// Start a new prompt from plain text.
+  Future<void> prompt(String text) {
+    return promptMessages([UserMessage.text(text)]);
+  }
+
+  /// Start a new prompt from a single message.
+  Future<void> promptMessage(Message message) {
+    return promptMessages([message]);
+  }
+
+  /// Start a new prompt from a batch of messages.
+  Future<void> promptMessages(List<Message> messages) {
+    if (_activeRun != null) {
+      throw StateError(
+        'Agent is already processing a prompt. Use steer() or followUp() to '
+        'queue messages, or wait for completion.',
+      );
+    }
+    return _runPromptMessages(messages);
+  }
+
+  /// Continue from the current transcript. The last message must be a user
+  /// or tool-result message, unless queued steering/follow-up messages can
+  /// start a fresh prompt run (pi's `continue()`).
+  Future<void> continueRun() async {
+    if (_activeRun != null) {
+      throw StateError(
+        'Agent is already processing. Wait for completion before continuing.',
+      );
+    }
+
+    final messages = _state._messages;
+    if (messages.isEmpty) {
+      throw StateError('No messages to continue from');
+    }
+
+    if (messages.last.role == 'assistant') {
+      final queuedSteering = _steeringQueue.drain();
+      if (queuedSteering.isNotEmpty) {
+        await _runPromptMessages(queuedSteering, skipInitialSteeringPoll: true);
+        return;
+      }
+
+      final queuedFollowUps = _followUpQueue.drain();
+      if (queuedFollowUps.isNotEmpty) {
+        await _runPromptMessages(queuedFollowUps);
+        return;
+      }
+
+      throw StateError('Cannot continue from message role: assistant');
+    }
+
+    await _runContinuation();
+  }
+
+  Future<void> _runPromptMessages(
+    List<Message> messages, {
+    bool skipInitialSteeringPoll = false,
+  }) {
+    // Issue #1760: bound oversized user prompts before they join the
+    // transcript or the first request. The guard runs INSIDE the run
+    // lifecycle: _runWithLifecycle registers _activeRun/_isStreaming
+    // synchronously, so a prompt();abort() sequence — and every host
+    // busy gate reading isStreaming right after send — observes the run
+    // exactly like the unguarded shape, and a token cancelled while the
+    // guard is in flight becomes the loop's aborted terminal
+    // (_streamAssistantResponse's pre-cancelled short-circuit). The
+    // no-guard path keeps the ORIGINAL synchronous executor shape — zero
+    // added microtask hops for hosts without a guard (the CI failure this
+    // guards against: an async executor re-ordered the run start against
+    // same-tick abort() and busy-gate reads).
+    final guard = userMessageGuard;
+    if (guard == null) {
+      return _runWithLifecycle((token, source) {
+        return runAgentLoop(
+          prompts: messages,
+          context: _createContextSnapshot(),
+          config: _createLoopConfig(
+            skipInitialSteeringPoll: skipInitialSteeringPoll,
+          ),
+          emit: _processEvent,
+          streamFunction: streamFunction,
+          toolExecutor: toolExecutor,
+          cancelToken: token,
+          cancelTokenSource: source,
+        );
+      });
+    }
+    return _runWithLifecycle((token, source) async {
+      final guarded = await _guardIncomingUserMessages(messages);
+      await runAgentLoop(
+        prompts: guarded,
+        context: _createContextSnapshot(),
+        config: _createLoopConfig(
+          skipInitialSteeringPoll: skipInitialSteeringPoll,
+        ),
+        emit: _processEvent,
+        streamFunction: streamFunction,
+        toolExecutor: toolExecutor,
+        cancelToken: token,
+        cancelTokenSource: source,
+      );
+    });
+  }
+
+  Future<void> _runContinuation() {
+    return _runWithLifecycle((token, source) {
+      return runAgentLoopContinue(
+        context: _createContextSnapshot(),
+        config: _createLoopConfig(),
+        emit: _processEvent,
+        streamFunction: streamFunction,
+        toolExecutor: toolExecutor,
+        cancelToken: token,
+        cancelTokenSource: source,
+      );
+    });
+  }
+
+  Context _createContextSnapshot() {
+    return Context(
+      systemPrompt: _state.systemPrompt.isEmpty ? null : _state.systemPrompt,
+      messages: List.of(_state._messages),
+      tools: List.of(_state._tools),
+    );
+  }
+
+  AgentLoopConfig _createLoopConfig({bool skipInitialSteeringPoll = false}) {
+    var skip = skipInitialSteeringPoll;
+    final relief = overWindowRelief;
+    return AgentLoopConfig(
+      model: _state.model,
+      contextWindowCap: contextWindowCap,
+      // Issue #1085 M1: the over-window relief is a DECLARED long silent
+      // window (structured ≤15 min + classic fallback ≤15 min, zero agent
+      // events) — like tool execution, not a wedge. Suspend the run idle
+      // watchdog for its duration; the disarm happens synchronously BEFORE
+      // the relief await, so a watchdog firing exactly as relief starts
+      // has no race window left. Re-armed after relief unless the run was
+      // cancelled meanwhile (an explicit user abort must not be revived
+      // into a fresh timer). User aborts themselves are unaffected: they
+      // cancel the run token directly, never through this timer.
+      overWindowRelief: relief == null
+          ? null
+          : (messages) async {
+              // Signal BEFORE disarming: the pause is observable only if
+              // the check sees the still-armed timer (a watchdog that was
+              // actually running — with runIdleTimeout disabled nothing
+              // was armed and no fiction is reported).
+              final watchdogWasArmed = _runWatchdogTimer != null;
+              _disarmRunWatchdog();
+              if (watchdogWasArmed) onRunWatchdogPaused?.call();
+              try {
+                return await relief(messages);
+              } finally {
+                final run = _activeRun;
+                if (run != null && !run.source.token.isCancelled) {
+                  _armRunWatchdog();
+                }
+              }
+            },
+      messageCapPolicy: messageCapPolicy,
+      messageCapRelief: messageCapRelief,
+      onTruncatedToolCall: onTruncatedToolCall,
+      stuckTool: stuckTool,
+      foregroundCallBudget: foregroundCall,
+      foregroundBudgetControls: foregroundBudgetControls,
+      pendingSteeringCount: () => _steeringQueue.pendingCount,
+      toolExecution: toolExecution,
+      finalizeGate: finalizeGate,
+      operativeSkills: operativeSkills,
+      beforeToolCall: beforeToolCall,
+      afterToolCall: afterToolCall,
+      transformContext: transformContext,
+      budgetLineProvider: budgetLineProvider,
+      prepareNextTurn: prepareNextTurn == null
+          ? null
+          : (context) => prepareNextTurn?.call(context),
+      toolMisuseBreaker: toolMisuseBreaker,
+      reportedOrphanKeys: _reportedOrphanKeys,
+      imageCapLatches: _imageCapLatches,
+      imageRecovery: imageRecovery,
+      getSteeringMessages: () async {
+        if (skip) {
+          skip = false;
+          return const <Message>[];
+        }
+        final external =
+            await externalSteeringSource?.call() ?? const <Message>[];
+        final drained = [...external, ..._steeringQueue.drain()];
+        // Issue #1760: mid-run steering (in-process queue and external
+        // inbox alike) passes the same intake guard — but only when one is
+        // installed. The no-guard path keeps the original synchronous
+        // drain-to-return shape: an extra await hop here re-ordered the
+        // boundary drains and broke steer-queue/busy-gate consumers.
+        final guard = userMessageGuard;
+        if (guard == null) return drained;
+        return _guardIncomingUserMessages(drained);
+      },
+      // Issue #1760: follow-ups drained by the loop at the run boundary
+      // pass the same intake guard — sync tear-off when no guard is
+      // installed (same reason as the steering drain above).
+      getFollowUpMessages: () {
+        final guard = userMessageGuard;
+        if (guard == null) return _followUpQueue.drain();
+        return _guardIncomingUserMessages(_followUpQueue.drain());
+      },
+      steeringNotifications: _steeringArrived.stream,
+      // Issue #1923 AC1: the mid-stream steering stall window rides the
+      // SAME window the run-idle watchdog uses, margin'd 30s below it so
+      // the steering interrupt (drain + inject + resubmit) always wins
+      // the race against the watchdog's whole-run kill. Watchdog-disabled
+      // hosts keep `Duration.zero` — the mid-stream interrupt stays off,
+      // the zero-byte immediate interrupt stays armed.
+      steeringStallWindow: () => _steeringStallWindowNow,
+      steeringInterruptNotice: onSteeringInterruptNotice,
+      // The in-process queue notifies via [steeringArrived]; the probe is
+      // only needed for the external (file-inbox) source, which cannot
+      // notify on its own.
+      hasPendingSteering: externalSteeringProbe == null
+          ? null
+          : () => externalSteeringProbe!(),
+      maxEmptyRetries: maxEmptyRetries,
+      emptyHiccupRetries: emptyHiccupRetries,
+      emptyHiccupBaseDelay: emptyHiccupBaseDelay,
+      emptyHiccupMaxBackoff: emptyHiccupMaxBackoff,
+      wireDump: wireDump,
+    );
+  }
+
+  Future<void> _runWithLifecycle(
+    Future<void> Function(CancelToken token, CancelTokenSource source) executor,
+  ) async {
+    if (_activeRun != null) {
+      throw StateError('Agent is already processing.');
+    }
+
+    final run = _ActiveRun(CancelTokenSource());
+    _activeRun = run;
+    _state._isStreaming = true;
+    _state._streamingMessage = null;
+    _state._errorMessage = null;
+    _armRunWatchdog();
+
+    try {
+      await executor(run.source.token, run.source);
+    } catch (error) {
+      await _handleRunFailure(error, run.source.token.isCancelled);
+    } finally {
+      await _settleRun();
+    }
+  }
+
+  /// Converts an unexpected loop failure (e.g. a throwing
+  /// [TransformContextHook]) into a normal event sequence ending the run,
+  /// exactly like pi's `handleRunFailure`.
+  Future<void> _handleRunFailure(Object error, bool aborted) async {
+    final failureMessage = AssistantMessage(
+      content: const [TextContent(text: '')],
+      api: _state.model.api,
+      provider: _state.model.provider,
+      model: _state.model.id,
+      usage: Usage.zero,
+      stopReason: aborted ? StopReason.aborted : StopReason.error,
+      errorMessage: '$error',
+      timestamp: DateTime.now(),
+    );
+    await _processEvent(MessageStartEvent(failureMessage));
+    await _processEvent(MessageEndEvent(failureMessage));
+    await _processEvent(
+      TurnEndEvent(message: failureMessage, toolResults: const []),
+    );
+    await _processEvent(AgentEndEvent([failureMessage]));
+  }
+
+  /// Emits [AgentSettledEvent] once the run and every queued follow-up have
+  /// drained, then finishes the run. The event goes out BEFORE the idle
+  /// completer, so its awaited listeners are part of the settlement:
+  /// [waitForIdle] resolves only after they have run (pi's `agent_settled`
+  /// semantics).
+  Future<void> _settleRun() async {
+    try {
+      await _processEvent(const AgentSettledEvent());
+    } finally {
+      // A throwing settled listener must not strand the run: the idle
+      // completer and runtime state are always settled.
+      _finishRun();
+    }
+  }
+
+  void _finishRun() {
+    _disarmRunWatchdog();
+    _state._isStreaming = false;
+    _state._streamingMessage = null;
+    _state._pendingToolCalls.clear();
+    _activeRun?.completer.complete();
+    _activeRun = null;
+  }
+
+  /// Reduce internal state for a loop event, then await listeners.
+  ///
+  /// `agent_end` only means no further loop events will be emitted. The run
+  /// is considered idle later, after all awaited listeners for `agent_end`
+  /// finish and [_finishRun] clears runtime-owned state (pi semantics).
+  Future<void> _processEvent(AgentEvent event) async {
+    _reduceState(event);
+    _touchRunWatchdog(event);
+
+    final token = _activeRun?.source.token;
+    if (token == null) {
+      throw StateError('Agent listener invoked outside active run');
+    }
+    for (final listener in List.of(_listeners)) {
+      await listener(event, token);
+    }
+  }
+
+  /// Re-arms the run idle watchdog on progress and disarms it while tool
+  /// calls are in flight (a long legitimate tool must never trip it) and on
+  /// terminal events. Must run after [_reduceState] so `_pendingToolCalls`
+  /// reflects the event being processed.
+  void _touchRunWatchdog(AgentEvent event) {
+    if (runIdleTimeout == Duration.zero) return;
+    if (event is AgentEndEvent || event is AgentSettledEvent) {
+      _disarmRunWatchdog();
+      return;
+    }
+    if (_state._pendingToolCalls.isEmpty) {
+      _armRunWatchdog();
+    } else {
+      _disarmRunWatchdog();
+    }
+  }
+
+  void _armRunWatchdog() {
+    if (runIdleTimeout == Duration.zero) return;
+    _runWatchdogTimer?.cancel();
+    // gh-1617 I1: the window re-derives on EVERY arm, so a mid-run
+    // roles-chain OR providers-queue failover re-windows the watchdog
+    // around the model actually being streamed (AC2 — the entry override
+    // wins for its entry only; the queue lane's `agent.state.model` is
+    // re-synced by its failover listener in agent_cli.dart), and a boot
+    // re-seed of the tuning table applies from the next arm (E3: no live
+    // re-arm of an already-armed timer). Nothing configured keeps
+    // [runIdleTimeout] byte-for-byte (AC3). The getter is evaluated ONCE
+    // per arm (review r2): arms run on every agent event, so the
+    // Uri.tryParse + registry walk must not be paid twice.
+    final info = runIdleWindow;
+    _armedRunIdleInfo = info;
+    _runWatchdogTimer = Timer(info.window, _onRunWatchdogFired);
+  }
+
+  /// The run-idle watchdog window for the CURRENT model and where it
+  /// came from (gh-1617 I1/AC5): [runIdleTimeout] (the backstop floor)
+  /// raised to cover the model's explicitly configured stream-idle
+  /// patience — a warming-up model gets exactly the patience its
+  /// `providerTimeouts.streamIdleTimeoutMs` declares. `source` names the
+  /// precedence layer (`role <role> override` / `provider:<name>` /
+  /// `global`) and — when payload scaling moved the window — says so,
+  /// because a wide patience must name its real governor (#1916 review:
+  /// `raised`/`source` never silently re-purpose). `raised` is true when
+  /// anything governs above the floor (a configured window OR payload
+  /// scaling). Hosts render this on the stall surfaces so a wide window
+  /// never reads as a hang.
+  ///
+  /// Issue #1916 AC3: the resolved window then scales for the outbound
+  /// payload size ([lastOutboundEstimateBytes]) — a multi-MB image upload
+  /// legitimately needs more first-token patience than a text request,
+  /// and starving it produced the submit livelock. Capped at 2x; no
+  /// request build yet (or a text-sized request) keeps the window
+  /// byte-for-byte.
+  ({Duration window, String source, bool raised}) get runIdleWindow {
+    final explicit = explicitStreamIdleForModel(_state.model);
+    final resolved = runIdleWatchdogWindow(
+      floor: runIdleTimeout,
+      explicitIdle: explicit?.$1,
+    );
+    final scale = payloadStallScaleFor(lastOutboundEstimateBytes);
+    final window = Duration(
+      milliseconds: (resolved.inMilliseconds * scale).round(),
+    );
+    final payloadNote = scale > 1.0
+        ? ', payload-scaled for a ~${(lastOutboundEstimateBytes / (1024 * 1024)).toStringAsFixed(0)}MB '
+              'request'
+        : '';
+    return (
+      window: window,
+      source: '${explicit?.$2 ?? 'default'}$payloadNote',
+      raised: window > runIdleTimeout,
+    );
+  }
+
+  void _disarmRunWatchdog() {
+    _runWatchdogTimer?.cancel();
+    _runWatchdogTimer = null;
+  }
+
+  void _onRunWatchdogFired() {
+    _runWatchdogTimer = null;
+    final run = _activeRun;
+    if (run == null) return;
+    // gh-1617 AC5: the fire names the window it actually waited out and
+    // — when a configured window governs (raised) — its precedence
+    // source, so a wide patience never reads as a hang in the post-
+    // mortem. Nothing configured keeps the pre-ticket wording
+    // byte-for-byte (AC3).
+    final window = _armedRunIdleInfo.window;
+    final naming = _armedRunIdleInfo.raised
+        ? ', ${describeRunIdleWindow(window, _armedRunIdleInfo.source)}'
+        : '';
+    final error = RunIdleWatchdogFire(
+      'agent run produced no events for '
+      '${window.inSeconds}s (run idle watchdog$naming)',
+      window,
+    );
+    onRunIdleTimeout?.call(error);
+    run.source.cancel(error);
+    // gh-1308: the transient-retry ladder replays the watchdog-cancelled
+    // request (the machine-cancel resume class) — the replayed silent
+    // attempt must be bounded by the SAME interval, or it lives to the
+    // caller's cap (the bench's zero-token trials died with this timer
+    // dead after its one shot). Re-arm while this fire owns the latch: a
+    // replay that produces events re-arms per event anyway, run
+    // settlement disarms (`_finishRun`), and a user abort that won the
+    // race leaves a bare cancel reason — that run is ending.
+    if (run.source.token.cancelReason is! RunIdleWatchdogFire) return;
+    _armRunWatchdog();
+  }
+
+  /// Folds the message-lifecycle and turn events into [_state].
+  void _reduceState(AgentEvent event) {
+    switch (event) {
+      case MessageStartEvent(:final message):
+        _state._streamingMessage = message;
+      case MessageUpdateEvent(:final message):
+        _state._streamingMessage = message;
+      case MessageEndEvent(:final message):
+        _state._streamingMessage = null;
+        _state._messages.add(message);
+      case TurnEndEvent(:final message):
+        _recordTurnError(message);
+      case AgentEndEvent():
+        _state._streamingMessage = null;
+      default:
+        _reduceToolCallState(event);
+    }
+  }
+
+  /// Tracks pending tool calls from the tool-execution lifecycle events.
+  void _reduceToolCallState(AgentEvent event) {
+    switch (event) {
+      case ToolExecutionStartEvent(:final toolCallId):
+        _state._pendingToolCalls.add(toolCallId);
+      case ToolExecutionEndEvent(:final toolCallId):
+        _state._pendingToolCalls.remove(toolCallId);
+      default:
+        break;
+    }
+  }
+
+  /// Remembers the turn's error message when the turn ended in failure.
+  void _recordTurnError(AssistantMessage message) {
+    if (message case AssistantMessage(:final errorMessage?)) {
+      _state._errorMessage = errorMessage;
+    }
+  }
+}

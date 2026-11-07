@@ -1,0 +1,162 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+
+/// Owns the capability-gated tool availability wiring for one agent
+/// (issue #19): the shared [toolAvailabilityIdOf] name→id resolution, the
+/// capability floor
+/// derived from the actual wiring, the [ToolAvailabilityGate] over the
+/// initial tool set, and the apply/re-apply cycle — the tool list and
+/// prompt update without a restart.
+///
+/// Persistence (the [ToolsAvailabilityStore] write) and change
+/// notification stay with the owning [AgentService]; this class only
+/// mutates its [config] and re-applies it.
+class AgentToolAvailability {
+  /// Builds the gate from the INITIAL tool set (the full wiring, before
+  /// anything is hidden): tools grouped by id via [toolAvailabilityIdOf] — the
+  /// gate's originals — plus the capability floor, then applies
+  /// [initialConfig]. Idempotent thereafter.
+  ///
+  /// [registry] is `null` for services built around a pre-constructed
+  /// [Agent] (tests): availability still resolves, but the registry is not
+  /// re-synced on toggle (the caller owns it).
+  AgentToolAvailability({
+    required Agent agent,
+    required Iterable<Tool> tools,
+    required bool onDevice,
+    required this.registry,
+    required this.rebuildPrompt,
+    ToolsConfig initialConfig = const ToolsConfig(),
+    // yaml scope entries under the runtime one (issue #1078): user
+    // `~/.fah/config.yaml` (global) + project `.fah/config.yaml`
+    // (project) — the app-UI store stays the runtime scope above them
+    // (E1: explicit choice wins, yaml fills the gaps).
+    List<(ToolScope, ToolsConfig)> configScopes = const [],
+    AgentLoadMode loadMode = AgentLoadMode.defaultMode,
+    // ignore: prefer_initializing_formals — private fields, public params
+  }) : _agent = agent,
+       _config = initialConfig,
+       // ignore: prefer_initializing_formals
+       _configScopes = configScopes,
+       // ignore: prefer_initializing_formals
+       _loadMode = loadMode {
+    final agentTools = tools.whereType<AgentTool>().toList();
+    _capabilities = _capabilitiesFor(agentTools, onDevice: onDevice);
+    final toolsById = <String, List<AgentTool>>{};
+    for (final tool in agentTools) {
+      final id = toolAvailabilityIdOf(tool.name);
+      if (id != null) toolsById.putIfAbsent(id, () => []).add(tool);
+    }
+    _gate = ToolAvailabilityGate(toolsById: toolsById);
+    // Load-mode discovery surface (issue #680): omp keeps the
+    // `discover_tools` path live, pi keeps the exact benchmark shape.
+    _gate.discoveryEnabled = discoveryEnabledByLoadMode[_loadMode] ?? false;
+    // Tombstones calls to disabled tools even when the model names one.
+    agent.toolExecutor = _gate.wrapExecutor(agent.toolExecutor);
+    _apply();
+  }
+
+  /// The live registry the resolution re-applies to; `null` on the
+  /// pre-constructed-[Agent] path (tests).
+  final ToolRegistry? registry;
+
+  /// Refreshes the provider-facing prompt after a re-apply.
+  final void Function() rebuildPrompt;
+
+  final Agent _agent;
+  ToolsConfig _config;
+  final List<(ToolScope, ToolsConfig)> _configScopes;
+  final AgentLoadMode _loadMode;
+  late final ToolAvailabilityGate _gate;
+  Map<String, ToolCapability> _capabilities = const {};
+
+  /// The user's per-tool availability choices (the app twin of the CLI
+  /// `tools:` section; persisted via `ToolsAvailabilityStore`).
+  ToolsConfig get config => _config;
+
+  /// The availability decision per known tool id (capabilities + config).
+  Map<String, ResolvedToolAvailability> get availability => _resolve().byId;
+
+  /// Switches one tool's availability and re-applies the resolution to the
+  /// live registry. Returns `false` when the resolved intent already
+  /// matches [enabled] (no-op). An absent capability stays off (the hard
+  /// floor); persistence is the caller's job.
+  bool setEnabled(String id, bool enabled) {
+    // The RESOLVED intent decides the no-op (issue #1078 E1): a yaml
+    // `tools:` scope can shadow the runtime default, so `_config.tools[
+    // id] ?? true` alone would wrongly skip a flip back to visible.
+    if ((_resolve().byId[id]?.enabled ?? true) == enabled) return false;
+    _config = ToolsConfig(tools: {..._config.tools, id: enabled});
+    _apply();
+    return true;
+  }
+
+  /// The resolved availability decision for the current config + wiring.
+  /// The full scope stack: yaml global < project < the app-UI runtime
+  /// store (deepest wins per key), with the load mode's essential pin +
+  /// discovery surface (issue #1078 AC2/E4).
+  ToolAvailabilityResolution _resolve() => resolveToolAvailability(
+    capabilities: _capabilities,
+    scopes: [..._configScopes, (ToolScope.runtime, _config)],
+    essentialToolIds: essentialToolIdsByLoadMode[_loadMode],
+  );
+
+  /// Re-applies the availability resolution to the live registry and
+  /// recomposes the prompt. No-op without a registry.
+  void _apply() {
+    final registry = this.registry;
+    if (registry == null) return;
+    _gate.apply(_resolve(), registry, _agent, rebuildPrompt: rebuildPrompt);
+  }
+}
+
+/// The media-generation ids that are simply not wired on the on-device
+/// (JS) engine.
+const _onDeviceAbsentTools = {
+  'web_search',
+  'transcribe_audio',
+  'generate_image',
+  'generate_video',
+};
+
+/// Why the app cannot wire [id] — CLI-only transports and desktop-only
+/// engines (exact ids; `checkpoint`/`rewind` share a reason; office
+/// tools register only inside the Outlook add-in host, issue #327 AC5).
+/// An id missing here reads as the generic "not wired by this host".
+const _absentToolReasons = <String, String>{
+  'sqlite': 'requires the FFI SQLite engine — not available in the app sandbox',
+  'lsp': 'language-server process transport is CLI-only',
+  'mcp': 'MCP servers connect through the CLI harness',
+  'dap': 'DAP hub transport is CLI-only',
+  'checkpoint': 'checkpointing is CLI-only',
+  'rewind': 'checkpointing is CLI-only',
+  'outlook': 'available in the Outlook add-in host only',
+};
+
+/// Why the app cannot wire [id] — structural facts about this host.
+String _absentToolReason(String id, {required bool onDevice}) {
+  if (onDevice && _onDeviceAbsentTools.contains(id)) {
+    return 'not available on-device';
+  }
+  return _absentToolReasons[id] ?? 'not wired by this host';
+}
+
+/// Builds the capability floor for every known id from the ACTUAL tool
+/// wiring: an id is present iff at least one of its tools was registered.
+Map<String, ToolCapability> _capabilitiesFor(
+  Iterable<AgentTool> tools, {
+  required bool onDevice,
+}) {
+  final wired = <String>{
+    for (final tool in tools) ?toolAvailabilityIdOf(tool.name),
+  };
+  return {
+    for (final id in knownToolIds)
+      id: wired.contains(id)
+          ? const ToolCapability.available()
+          : ToolCapability.absent(_absentToolReason(id, onDevice: onDevice)),
+  };
+}

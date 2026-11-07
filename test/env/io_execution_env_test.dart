@@ -1,0 +1,641 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter_agent_harness/io.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+void main() {
+  late Directory tempDir;
+  late LocalFileSystem fs;
+
+  setUp(() {
+    tempDir = Directory.systemTemp.createTempSync('harness-io-test-');
+    fs = LocalFileSystem(cwd: tempDir.path);
+  });
+
+  tearDown(() {
+    if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
+  });
+
+  group('LocalFileSystem', () {
+    test('write/append/read round-trip on real disk', () async {
+      expect((await fs.writeFile('a/b.txt', 'one\n')).isOk, isTrue);
+      expect((await fs.appendFile('a/b.txt', 'two\n')).isOk, isTrue);
+      expect((await fs.readTextFile('a/b.txt')).valueOrNull, 'one\ntwo\n');
+      expect(File('${tempDir.path}/a/b.txt').readAsStringSync(), 'one\ntwo\n');
+    });
+
+    test('binary write/read round-trip on real disk', () async {
+      final bytes = Uint8List.fromList([0, 1, 2, 255]);
+      expect((await fs.writeBinaryFile('bin.dat', bytes)).isOk, isTrue);
+      final read = await fs.readBinaryFile('bin.dat');
+      expect(read.valueOrNull, bytes);
+      expect(File('${tempDir.path}/bin.dat').readAsBytesSync(), bytes);
+    });
+
+    test('exists, listDir, createDir, remove against real disk', () async {
+      await fs.createDir('d/sub');
+      await fs.writeFile('d/f.txt', 'data');
+      expect((await fs.exists('d')).valueOrNull, isTrue);
+      expect((await fs.exists('d/missing')).valueOrNull, isFalse);
+
+      final infos = (await fs.listDir('d')).getOrThrow();
+      expect(infos.map((i) => i.name), containsAll(['sub', 'f.txt']));
+      expect(infos.firstWhere((i) => i.name == 'sub').kind, FileKind.directory);
+
+      await fs.remove('d', recursive: true);
+      expect((await fs.exists('d')).valueOrNull, isFalse);
+    });
+
+    test('readTextLines and missing-file errors', () async {
+      await fs.writeFile('l.txt', 'a\nb\n');
+      expect((await fs.readTextLines('l.txt')).getOrThrow(), ['a', 'b']);
+      final missing = await fs.readTextFile('nope.txt');
+      expect(missing.errorOrNull?.code, FileErrorCode.notFound);
+    });
+
+    test('readTextLines with maxLines truncates the output', () async {
+      await fs.writeFile('many.txt', 'a\nb\nc\nd\n');
+      expect((await fs.readTextLines('many.txt', maxLines: 2)).getOrThrow(), [
+        'a',
+        'b',
+      ]);
+    });
+
+    test(
+      'readTextLines with maxLines above the line count reads all',
+      () async {
+        await fs.writeFile('few.txt', 'a\nb\n');
+        expect((await fs.readTextLines('few.txt', maxLines: 10)).getOrThrow(), [
+          'a',
+          'b',
+        ]);
+      },
+    );
+
+    test('readTextLines with non-positive maxLines returns empty', () async {
+      await fs.writeFile('z.txt', 'a\nb\n');
+      expect(
+        (await fs.readTextLines('z.txt', maxLines: 0)).getOrThrow(),
+        isEmpty,
+      );
+      expect(
+        (await fs.readTextLines('z.txt', maxLines: -3)).getOrThrow(),
+        isEmpty,
+      );
+    });
+
+    test('readTextLines on a missing file maps to notFound', () async {
+      final result = await fs.readTextLines('nope.txt');
+      expect(result.errorOrNull?.code, FileErrorCode.notFound);
+      expect(result.errorOrNull?.path, '${tempDir.path}/nope.txt');
+    });
+
+    test('readRange reads a byte slice from real disk', () async {
+      final bytes = Uint8List.fromList(List.generate(10, (i) => i));
+      await fs.writeBinaryFile('r.bin', bytes);
+      expect(
+        (await fs.readRange('r.bin', 2, 5)).getOrThrow(),
+        Uint8List.fromList([2, 3, 4]),
+      );
+    });
+
+    test('readRange clamps end past EOF and start at EOF', () async {
+      final bytes = Uint8List.fromList([1, 2, 3]);
+      await fs.writeBinaryFile('r.bin', bytes);
+      expect(
+        (await fs.readRange('r.bin', 1, 999)).getOrThrow(),
+        Uint8List.fromList([2, 3]),
+      );
+      expect((await fs.readRange('r.bin', 3, 999)).getOrThrow(), isEmpty);
+      expect((await fs.readRange('r.bin', 99, 999)).getOrThrow(), isEmpty);
+    });
+
+    test('readRange with inverted range returns empty without I/O', () async {
+      await fs.writeFile('r.bin', 'abc');
+      expect((await fs.readRange('r.bin', 2, 2)).getOrThrow(), isEmpty);
+      expect((await fs.readRange('r.bin', 3, 1)).getOrThrow(), isEmpty);
+    });
+
+    test('readRange on a missing file maps to notFound', () async {
+      final result = await fs.readRange('nope.bin', 0, 10);
+      expect(result.errorOrNull?.code, FileErrorCode.notFound);
+      expect(result.errorOrNull?.path, '${tempDir.path}/nope.bin');
+    });
+
+    test('absolutePath resolves relatives against cwd', () async {
+      expect(
+        (await fs.absolutePath('x.txt')).getOrThrow(),
+        '${tempDir.path}/x.txt',
+      );
+    });
+
+    test('fileInfo reports real size', () async {
+      await fs.writeFile('s.txt', 'hello');
+      final info = (await fs.fileInfo('s.txt')).getOrThrow();
+      expect(info.size, 5);
+      expect(info.kind, FileKind.file);
+    });
+
+    group('error mapping', () {
+      test('missing file maps to notFound', () async {
+        final missing = await fs.readTextFile('nope.txt');
+        final error = missing.errorOrNull;
+        expect(error?.code, FileErrorCode.notFound);
+        expect(error?.path, '${tempDir.path}/nope.txt');
+      });
+
+      test('reading a directory maps to isDirectory', () async {
+        await fs.createDir('a-dir');
+        expect(
+          (await fs.readTextFile('a-dir')).errorOrNull?.code,
+          FileErrorCode.isDirectory,
+        );
+        expect(
+          (await fs.readBinaryFile('a-dir')).errorOrNull?.code,
+          FileErrorCode.isDirectory,
+        );
+      });
+
+      test('unreadable file maps to permissionDenied', () async {
+        await fs.writeFile('locked.txt', 'secret');
+        final locked = '${tempDir.path}/locked.txt';
+        Process.runSync('chmod', ['000', locked]);
+        try {
+          final result = await fs.readTextFile('locked.txt');
+          expect(result.errorOrNull?.code, FileErrorCode.permissionDenied);
+        } finally {
+          Process.runSync('chmod', ['644', locked]);
+        }
+      }, skip: Platform.isWindows ? 'POSIX chmod semantics only' : false);
+
+      test('path through a regular file maps to notDirectory', () async {
+        await fs.writeFile('plain.txt', 'data');
+        final result = await fs.listDir('plain.txt/child');
+        expect(result.errorOrNull?.code, FileErrorCode.notDirectory);
+      });
+
+      test('a symlink loop maps to unknown', () async {
+        Link('${tempDir.path}/loop-a').createSync('loop-b');
+        Link('${tempDir.path}/loop-b').createSync('loop-a');
+        final result = await fs.readTextFile('loop-a');
+        expect(result.errorOrNull?.code, FileErrorCode.unknown);
+      }, skip: Platform.isWindows ? 'POSIX symlink semantics only' : false);
+    });
+
+    group('remove', () {
+      test('removes a file', () async {
+        await fs.writeFile('gone.txt', 'data');
+        expect((await fs.remove('gone.txt')).isOk, isTrue);
+        expect((await fs.exists('gone.txt')).valueOrNull, isFalse);
+      });
+
+      test('removes an empty directory non-recursively', () async {
+        await fs.createDir('empty-dir');
+        expect((await fs.remove('empty-dir')).isOk, isTrue);
+        expect((await fs.exists('empty-dir')).valueOrNull, isFalse);
+      });
+
+      test('missing path without force maps to notFound', () async {
+        final result = await fs.remove('missing.txt');
+        expect(result.errorOrNull?.code, FileErrorCode.notFound);
+      });
+
+      test('missing path with force succeeds', () async {
+        expect((await fs.remove('missing.txt', force: true)).isOk, isTrue);
+      });
+
+      test('non-empty directory without recursive maps to invalid', () async {
+        await fs.writeFile('full-dir/f.txt', 'data');
+        final result = await fs.remove('full-dir');
+        expect(result.errorOrNull?.code, FileErrorCode.invalid);
+        expect((await fs.exists('full-dir')).valueOrNull, isTrue);
+      }, skip: Platform.isWindows ? 'POSIX delete semantics only' : false);
+
+      test('non-empty directory with recursive succeeds', () async {
+        await fs.writeFile('tree/sub/f.txt', 'data');
+        expect((await fs.remove('tree', recursive: true)).isOk, isTrue);
+        expect((await fs.exists('tree')).valueOrNull, isFalse);
+      });
+    });
+  });
+
+  group('LocalShell', () {
+    test('exec captures stdout and exit code', () async {
+      const shell = LocalShell();
+      final result = await shell.exec('echo hello');
+      final exec = result.getOrThrow();
+      expect(exec.stdout.trim(), 'hello');
+      expect(exec.exitCode, 0);
+    });
+
+    test('exec reports non-zero exit codes without throwing', () async {
+      const shell = LocalShell();
+      final result = await shell.exec('exit 3');
+      expect(result.getOrThrow().exitCode, 3);
+    });
+
+    test('exec honors timeout', () async {
+      const shell = LocalShell();
+      final result = await shell.exec(
+        'sleep 5',
+        options: const ShellExecOptions(timeout: Duration(milliseconds: 200)),
+      );
+      expect(result.errorOrNull?.code, ExecutionErrorCode.timeout);
+    });
+
+    test('exec supports env overrides', () async {
+      const shell = LocalShell();
+      final result = await shell.exec(
+        'echo \$HARNESS_TEST_VAR',
+        options: const ShellExecOptions(env: {'HARNESS_TEST_VAR': 'injected'}),
+      );
+      expect(result.getOrThrow().stdout.trim(), 'injected');
+    });
+
+    test('exec PATH gains common tool directories (Homebrew)', () async {
+      const shell = LocalShell();
+      final result = await shell.exec(r'echo "$PATH"');
+      final path = result.getOrThrow().stdout.trim();
+      for (final dir in const ['/opt/homebrew/bin', '/usr/local/bin']) {
+        if (Directory(dir).existsSync()) {
+          expect(path.split(':'), contains(dir));
+        }
+      }
+    });
+
+    test('an explicit env PATH is preserved, not replaced', () async {
+      const shell = LocalShell();
+      final result = await shell.exec(
+        r'echo "$PATH"',
+        options: const ShellExecOptions(env: {'PATH': '/bin'}),
+      );
+      final path = result.getOrThrow().stdout.trim();
+      final parts = path.split(':');
+      // gh-1763: the bash-guard shim dir leads PATH so the shims always
+      // win; the caller's PATH follows intact (preserved, never replaced).
+      // The shim dir only exists when the host has the real tools (procps
+      // provides pgrep) — a minimal container without procps provisions
+      // no shims and keeps `/bin` at the head.
+      final hostHasPgrep = Process.runSync('sh', <String>[
+        '-c',
+        'command -v pgrep',
+      ]).exitCode;
+      if (hostHasPgrep == 0) {
+        expect(parts.first, contains('fa_sh_guard_'));
+      }
+      expect(parts, contains('/bin'));
+    });
+
+    test('env overrides merge over the host environment', () async {
+      // Injected vars (secrets, FAH_SESSION_*) must not strip the inherited
+      // environment — the doc contract is "values override the defaults".
+      final result = await const LocalShell().exec(
+        'echo "\$HOME|\$HARNESS_TEST_VAR"',
+        options: ShellExecOptions(env: const {'HARNESS_TEST_VAR': 'injected'}),
+      );
+      final out = result.getOrThrow().stdout.trim();
+      if (Platform.environment.containsKey('HOME')) {
+        expect(out.split('|').first, Platform.environment['HOME']);
+      }
+      expect(out.split('|').last, 'injected');
+    });
+
+    test('exec closes stdin so commands like ripgrep do not hang '
+        'when no path is given', () async {
+      const shell = LocalShell();
+      final result = await shell.exec('read line; echo "x\${line}x"');
+      final exec = result.getOrThrow();
+      expect(exec.stdout.trim(), 'xx');
+    });
+
+    test(
+      'git terminal prompts are disabled by default (fa_tui hang)',
+      () async {
+        // A git clone against an auth-requiring remote used to open
+        // /dev/tty ("Username for …:") and block the whole agent run on the
+        // TUI-owned terminal — the session looked stuck at the input zone.
+        const shell = LocalShell();
+        final result = await shell.exec(
+          'echo "\$GIT_TERMINAL_PROMPT|\$GIT_ASKPASS"',
+        );
+        final parts = result.getOrThrow().stdout.trim().split('|');
+        expect(parts[0], '0');
+        expect(parts[1], 'echo');
+      },
+    );
+
+    test('an explicit GIT_TERMINAL_PROMPT wins over the default', () async {
+      const shell = LocalShell();
+      final result = await shell.exec(
+        'echo "\$GIT_TERMINAL_PROMPT"',
+        options: const ShellExecOptions(env: {'GIT_TERMINAL_PROMPT': '1'}),
+      );
+      expect(result.getOrThrow().stdout.trim(), '1');
+    });
+
+    // gh-1053: on timeout the foreground path used to signal ONLY the direct
+    // `sh -c` child and then waited UNBOUNDED for the stdout/stderr pipes to
+    // close — a surviving descendant (a `flutter test` stuck on a flock, a
+    // detached `(... &)`) held the write end forever and the tool call never
+    // returned. The contract: the exec future completes in
+    // ≤ timeout + kill grace + drain grace, is marked timedOut/aborted, and
+    // the whole tree is reaped.
+    Future<Set<String>> liveMarkerProcesses(String marker) async {
+      final ps = await Process.run('ps', ['-ax', '-o', 'command=']);
+      return (ps.stdout as String)
+          .split('\n')
+          .where((line) => line.contains(marker))
+          .toSet();
+    }
+
+    /// Runs [run] and asserts the gh-1053 contract: bounded completion,
+    /// the expected error marking, and no [marker] process left in the
+    /// process table after the kill round.
+    Future<void> expectBoundedTreeKill(
+      String marker, {
+      required Future<Result<ShellExecResult, ExecutionError>> Function() run,
+      required ExecutionErrorCode code,
+    }) async {
+      // Best-effort cleanup so a failed run never leaks sleep orphans.
+      addTearDown(() => Process.run('pkill', ['-f', marker]));
+      final watch = Stopwatch()..start();
+      final result = await run();
+      watch.stop();
+      // 2 s timeout + 400 ms kill grace + 3 s drain grace < 6 s — with the
+      // wedge the future never completes (30 s suite timeout).
+      expect(watch.elapsed, lessThan(const Duration(seconds: 6)));
+      expect(result.isErr, isTrue, reason: '${result.valueOrNull}');
+      expect(result.errorOrNull?.code, code);
+
+      // No descendant survives the kill round: poll briefly — the KILL
+      // round lands one 400 ms grace after the TERM round.
+      for (var i = 0; i < 20; i++) {
+        if (await liveMarkerProcesses(marker).then((s) => s.isEmpty)) {
+          return;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      final survivors = await liveMarkerProcesses(marker);
+      expect(survivors, isEmpty, reason: 'orphaned descendant survived');
+    }
+
+    test(
+      'timeout reaps the whole tree and returns bounded (gh-1053)',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        await expectBoundedTreeKill(
+          'sleep 601.1053',
+          code: ExecutionErrorCode.timeout,
+          run: () => const LocalShell().exec(
+            'sleep 601.1053',
+            options: const ShellExecOptions(timeout: Duration(seconds: 2)),
+          ),
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    test(
+      'timeout reaps a detached grandchild that outlived the shell '
+      '(gh-1053 wedge: run 36421037356)',
+      skip: Platform.isWindows
+          ? 'POSIX process semantics only'
+          // Reaping a grandchild whose parent shell already exited needs the
+          // process-group kill (setsid): the reparented orphan is invisible
+          // to the live ps descendant walk.
+          : (LocalShell.ownProcessGroupAvailable
+                ? false
+                : 'setsid unavailable — no group kill to reach the orphan'),
+      () async {
+        // `(sleep … &); wait` — the subshell forks the sleeper, exits, sh's
+        // `wait` returns instantly, so the DIRECT child is long gone when
+        // the timeout fires; only the group kill can reach the sleeper.
+        await expectBoundedTreeKill(
+          'sleep 602.1053',
+          code: ExecutionErrorCode.timeout,
+          run: () => const LocalShell().exec(
+            '(sleep 602.1053 &); wait',
+            options: const ShellExecOptions(timeout: Duration(seconds: 2)),
+          ),
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    test(
+      'cancel token: bounded abort with the tree reaped',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        await expectBoundedTreeKill(
+          'sleep 603.1053',
+          code: ExecutionErrorCode.aborted,
+          run: () {
+            final source = CancelTokenSource();
+            Future<void>.delayed(
+              const Duration(milliseconds: 300),
+              source.cancel,
+            );
+            return const LocalShell().exec(
+              'sleep 603.1053',
+              options: ShellExecOptions(cancelToken: source.token),
+            );
+          },
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    test(
+      'cancel token reaps a detached grandchild that outlived the shell',
+      skip: Platform.isWindows
+          ? 'POSIX process semantics only'
+          : (LocalShell.ownProcessGroupAvailable
+                ? false
+                : 'setsid unavailable — no group kill to reach the orphan'),
+      () async {
+        await expectBoundedTreeKill(
+          'sleep 604.1053',
+          code: ExecutionErrorCode.aborted,
+          run: () {
+            final source = CancelTokenSource();
+            Future<void>.delayed(
+              const Duration(milliseconds: 300),
+              source.cancel,
+            );
+            return const LocalShell().exec(
+              '(sleep 604.1053 &); wait',
+              options: ShellExecOptions(cancelToken: source.token),
+            );
+          },
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    test(
+      'the walk fallback (no setsid) reaps the tree identically (AC3)',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        LocalShell.ownProcessGroupOverride = false;
+        addTearDown(() => LocalShell.ownProcessGroupOverride = null);
+        // The shell stays alive under the timeout, so the live ps descendant
+        // walk roots at an observable pid and reaches the sleeper without any
+        // group leadership.
+        await expectBoundedTreeKill(
+          'sleep 605.1053',
+          code: ExecutionErrorCode.timeout,
+          run: () => const LocalShell().exec(
+            'sleep 605.1053',
+            options: const ShellExecOptions(timeout: Duration(seconds: 2)),
+          ),
+        );
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    // Review rework (PR #1058): the bounded return must carry the evidence —
+    // the whole point of gh-1053's fix is that a 10-minute hung `flutter
+    // test` comes back with the output that explains where it stalled.
+    test(
+      'timeout error carries the captured partial stdout/stderr',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        addTearDown(() => Process.run('pkill', ['-f', 'sleep 609.1053']));
+        final result = await const LocalShell().exec(
+          'echo out-marker-609.1; echo err-marker-609.1 1>&2; sleep 609.1053',
+          options: const ShellExecOptions(timeout: Duration(seconds: 2)),
+        );
+        expect(result.isErr, isTrue, reason: '${result.valueOrNull}');
+        expect(result.errorOrNull?.code, ExecutionErrorCode.timeout);
+        expect(result.errorOrNull?.stdout, contains('out-marker-609.1'));
+        expect(result.errorOrNull?.stderr, contains('err-marker-609.1'));
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+    // Review rework (PR #1058 thread 8): the capture is tail-capped AT THE
+    // SOURCE — a chatty killed command (megabytes before the timeout) must
+    // not retain its full output on the error object; the diagnostic tail
+    // (last ≤ 64 KiB) is what a bounded return needs.
+    test(
+      'timeout capture is tail-capped at the source',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        addTearDown(() => Process.run('pkill', ['-f', 'sleep 611.1053']));
+        final result = await const LocalShell().exec(
+          'head -c 70000 /dev/zero; echo TAIL-MARKER-611; sleep 611.1053',
+          options: const ShellExecOptions(timeout: Duration(seconds: 2)),
+        );
+        expect(result.isErr, isTrue, reason: '${result.valueOrNull}');
+        expect(result.errorOrNull?.code, ExecutionErrorCode.timeout);
+        final stdout = result.errorOrNull?.stdout ?? '';
+        // Capped at the source: bounded (64 KiB tail + marker), newest
+        // bytes win, marker on top. 70000 bytes in → 65536 + marker out.
+        expect(stdout.length, lessThan(70 * 1024));
+        expect(stdout.length, greaterThan(64 * 1024));
+        expect(stdout, contains('TAIL-MARKER-611'));
+        expect(stdout, startsWith('…[truncated]'));
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    test(
+      'aborted error carries the captured partial stdout/stderr',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        addTearDown(() => Process.run('pkill', ['-f', 'sleep 610.1053']));
+        final source = CancelTokenSource();
+        Future<void>.delayed(const Duration(milliseconds: 300), source.cancel);
+        final result = await const LocalShell().exec(
+          'echo out-marker-610.1; sleep 610.1053',
+          options: ShellExecOptions(cancelToken: source.token),
+        );
+        expect(result.isErr, isTrue, reason: '${result.valueOrNull}');
+        expect(result.errorOrNull?.code, ExecutionErrorCode.aborted);
+        expect(result.errorOrNull?.stdout, contains('out-marker-610.1'));
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+
+    // Review rework (PR #1058 thread 4): the reported wedge shape with NO
+    // timeout and NO cancel used to hang forever — after the direct child
+    // is reaped every remaining byte comes from an orphan holding the
+    // write end, so the drain is capped unconditionally. Deliberately no
+    // kill round here: a no-timeout caller that detached a daemon
+    // (`nohup server &`) wants it to KEEP running — the call just returns.
+    test(
+      'no-timeout exec returns once the direct child has exited '
+      '(orphan-capped drain)',
+      skip: Platform.isWindows ? 'POSIX process semantics only' : false,
+      () async {
+        addTearDown(() => Process.run('pkill', ['-f', 'sleep 611.1053']));
+        final watch = Stopwatch()..start();
+        final result = await const LocalShell().exec(
+          '(sleep 611.1053 &); wait',
+        );
+        watch.stop();
+        expect(watch.elapsed, lessThan(const Duration(seconds: 6)));
+        // The command itself succeeded — the orphan is not ours to kill.
+        expect(result.isOk, isTrue, reason: '${result.errorOrNull}');
+        expect(result.valueOrNull?.exitCode, 0);
+      },
+      timeout: const Timeout(Duration(seconds: 30)),
+    );
+  });
+
+  group('LocalExecutionEnv custom shell', () {
+    test('uses the provided shell instead of LocalShell', () async {
+      final captured = <String>[];
+      final fakeShell = _FakeShell((command, {options}) async {
+        captured.add(command);
+        return const Ok(
+          ShellExecResult(stdout: 'fake', stderr: '', exitCode: 42),
+        );
+      });
+      final env = LocalExecutionEnv(cwd: tempDir.path, shell: fakeShell);
+      final result = await env.exec('hello');
+      expect(result.getOrThrow().exitCode, 42);
+      expect(captured, ['hello']);
+    });
+
+    test('LocalExecutionEnv exposes renamePath (RenamableFileSystem) — '
+        'kernel-mode cube profile staging depends on it (the #803 '
+        'regression)', () async {
+      final env = LocalExecutionEnv(cwd: tempDir.path);
+      // The capability probe the kernel staging path runs before it will
+      // even try: without the capability kernel mode refuses to exec
+      // ("renamePath not supported by LocalExecutionEnv").
+      expect(env, isA<RenamableFileSystem>());
+      final source = '${tempDir.path}/profile.sb.1.tmp';
+      final target = '${tempDir.path}/profile.sb';
+      await File(source).writeAsString('sandbox profile bytes');
+      final renamed = await env.renamePath(source, target);
+      expect(renamed.isOk, isTrue, reason: '${renamed.errorOrNull}');
+      expect(File(target).readAsStringSync(), 'sandbox profile bytes');
+      expect(File(source).existsSync(), isFalse);
+      // Renaming onto an existing target overwrites (POSIX semantics) —
+      // the atomic restage relies on it.
+      await File(source).writeAsString('restaged bytes');
+      final over = await env.renamePath(source, target);
+      expect(over.isOk, isTrue, reason: '${over.errorOrNull}');
+      expect(File(target).readAsStringSync(), 'restaged bytes');
+    });
+  });
+}
+
+class _FakeShell implements Shell {
+  _FakeShell(this._handler);
+
+  final Future<Result<ShellExecResult, ExecutionError>> Function(
+    String command, {
+    ShellExecOptions? options,
+  })
+  _handler;
+
+  @override
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  }) => _handler(command, options: options);
+}

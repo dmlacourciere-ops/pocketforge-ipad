@@ -1,0 +1,246 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show isAiinBaseUrl, isCodeMieBaseUrl;
+
+import 'package:fa_ui/src/providers/provider_preset.dart';
+import 'package:fa_ui/src/stores/provider_registry.dart';
+
+/// The [ProviderMark] key for a provider entry — a [ProviderPreset], a
+/// saved [CustomProvider], or a raw base URL — so the providers list shows
+/// the SAME branded mark the add-provider picker tiles use. Unknown
+/// endpoints fall back to the generic server-stack mark.
+String providerMarkKey(Object provider) => switch (provider) {
+  ProviderPreset preset => _presetMarkKey(preset),
+  CustomProvider custom => providerMarkKeyForBaseUrl(custom.baseUrl),
+  String baseUrl => providerMarkKeyForBaseUrl(baseUrl),
+  _ => 'custom',
+};
+
+/// The branded mark keys of the hosted presets; on-device and the ad-hoc
+/// custom presets render the generic stack (the `_` fallback).
+const _presetMarkKeys = {
+  ProviderPreset.aiin: 'aiin',
+  ProviderPreset.openrouter: 'openrouter',
+  ProviderPreset.ollamaCloud: 'ollama',
+  ProviderPreset.gemini: 'google',
+  ProviderPreset.dial: 'dial',
+};
+
+String _presetMarkKey(ProviderPreset preset) =>
+    _presetMarkKeys[preset] ?? 'custom';
+
+/// The [ProviderMark] key inferred from an endpoint URL (see
+/// [providerMarkKey]).
+String providerMarkKeyForBaseUrl(String baseUrl) {
+  if (isAiinBaseUrl(baseUrl)) return 'aiin';
+  if (isCodeMieBaseUrl(baseUrl)) return 'codemie';
+  for (final entry in _baseUrlMarkRules.entries) {
+    if (baseUrl.contains(entry.key)) return entry.value;
+  }
+  return 'custom';
+}
+
+/// The substring-to-mark table of the hosted endpoints, checked in order
+/// (gh-1848 tier-3: the flat if-chain as data, `_presetMarkKeys` doctrine).
+const _baseUrlMarkRules = <String, String>{
+  'openrouter.ai': 'openrouter',
+  'ollama.com': 'ollama',
+  'generativelanguage.googleapis.com': 'google',
+  'ai-proxy.lab.epam.com': 'dial',
+  'api.openai.com': 'openai',
+  'anthropic.com': 'anthropic',
+  'kimi.com': 'kimi',
+  'z.ai': 'zai',
+};
+
+/// The marks that carry a quota gauge (the quota service ids — one id per
+/// mark). The providers list renders gauges for these and the add flow's
+/// endpoint-confirmation probe (gh-1378) refreshes them at add time.
+/// Deliberately broader than the app's `QuotaStore._markToQuotaId`
+/// (adapter-backed ids only, no `dial`): a mark here without an app
+/// adapter just probes as a harmless no-op — the sets must not silently
+/// drift the other way (a gauge mark that never probes).
+const quotaMarkIds = {'openrouter', 'codemie', 'dial'};
+
+/// Brand marks for the provider list (onboarding page 2). Real brand SVGs
+/// where a permissive source exists (simple-icons.org, CC0) plus the
+/// official in-house marks (CodeMie — auth.codemie.lab.epam.com, DIAL —
+/// the epam/ai-dial favicon, the same mark dialx.ai uses) rendered
+/// full-color, and the generic fallbacks (Z.AI lettermark, Custom server
+/// stack).
+class ProviderMark extends StatelessWidget {
+  const ProviderMark(this.presetKey, {super.key, this.size = 20});
+
+  /// A key from `defaultAddProviderPresets` (`openrouter`, `codemie`, ...).
+  final String presetKey;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final mark = _mark(presetKey);
+    final tint = mark.$2;
+    return Container(
+      width: size,
+      height: size,
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: mark.$3,
+        borderRadius: BorderRadius.circular(size * 0.28),
+      ),
+      // Full-color marks (tint == null) carry their own background and
+      // bleed to the tile edge; monochrome marks get padded and tinted.
+      padding: tint == null ? EdgeInsets.zero : EdgeInsets.all(size * 0.24),
+      child: SvgPicture.string(
+        mark.$1,
+        colorFilter: tint == null
+            ? null
+            : ColorFilter.mode(tint, BlendMode.srcIn),
+      ),
+    );
+  }
+
+  /// (svg, tint, background) — a null tint renders the SVG as-is
+  /// (full-color official marks bleeding to the tile edge); otherwise the
+  /// SVG is monochrome-tinted with [BlendMode.srcIn]. The mark table is
+  /// data, not logic: one lookup instead of an 11-arm switch.
+  static (String, Color?, Color) _mark(String key) =>
+      _marks[key] ?? _customMark;
+
+  static final (String, Color?, Color) _customMark = (
+    _custom,
+    Color(0xFF6B768B),
+    Color(0xFFECEFF5),
+  );
+
+  static final _marks = <String, (String, Color?, Color)>{
+    'openrouter': (
+      _openrouter,
+      const Color(0xFF5B61F6),
+      const Color(0xFFEEF1FE),
+    ),
+    // Full-color official aiin.by mark (their favicon) — carries its own
+    // dark background and bleeds to the tile edge.
+    'aiin': (_aiin, null, const Color(0xFF07080D)),
+    'chatgpt': (_openai, Colors.white, const Color(0xFF172033)),
+    'openai': (_openai, Colors.white, const Color(0xFF172033)),
+    'codemie': (_codemie, null, const Color(0xFF230230)),
+    'anthropic': (_anthropic, const Color(0xFFD97757), const Color(0xFFF7EEE8)),
+    'google': (_gemini, const Color(0xFF8E75B2), const Color(0xFFF3EEF9)),
+    'dial': (_dial, null, const Color(0xFFFFFFFF)),
+    'kimi': (_kimi, const Color(0xFF172033), const Color(0xFFEEF0F4)),
+    'zai': (_zai, const Color(0xFF3566FF), const Color(0xFFE8EDFF)),
+    'ollama': (_ollama, const Color(0xFF172033), const Color(0xFFF0F0F2)),
+  };
+}
+
+String _svg24(String body) =>
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">$body</svg>';
+
+/// simple-icons OpenRouter mark (CC0).
+final String _openrouter = _svg24(
+  '<path d="M16.778 1.844v1.919q-.569-.026-1.138-.032-.708-.008-1.415.037c-1.93.126-4.023.728-6.149 2.237-2.911 2.066-2.731 1.95-4.14 2.75-.396.223-1.342.574-2.185.798-.841.225-1.753.333-1.751.333v4.229s.768.108 1.61.333c.842.224 1.789.575 2.185.799 1.41.798 1.228.683 4.14 2.75 2.126 1.509 4.22 2.11 6.148 2.236.88.058 1.716.041 2.555.005v1.918l7.222-4.168-7.222-4.17v2.176c-.86.038-1.611.065-2.278.021-1.364-.09-2.417-.357-3.979-1.465-2.244-1.593-2.866-2.027-3.68-2.508.889-.518 1.449-.906 3.822-2.59 1.56-1.109 2.614-1.377 3.978-1.466.667-.044 1.418-.017 2.278.02v2.176L24 6.014Z"/>',
+);
+
+/// simple-icons Anthropic mark (CC0).
+final String _anthropic = _svg24(
+  '<path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z"/>',
+);
+
+/// simple-icons Google Gemini mark (CC0).
+final String _gemini = _svg24(
+  '<path d="M11.04 19.32Q12 21.51 12 24q0-2.49.93-4.68.96-2.19 2.58-3.81t3.81-2.55Q21.51 12 24 12q-2.49 0-4.68-.93a12.3 12.3 0 0 1-3.81-2.58 12.3 12.3 0 0 1-2.58-3.81Q12 2.49 12 0q0 2.49-.96 4.68-.93 2.19-2.55 3.81a12.3 12.3 0 0 1-3.81 2.58Q2.49 12 0 12q2.49 0 4.68.96 2.19.93 3.81 2.55t2.55 3.81"/>',
+);
+
+/// simple-icons Kimi mark (CC0).
+final String _kimi = _svg24(
+  '<path d="M21.765.351C22.998.351 24 1.353 24 2.586S22.998 4.82 21.765 4.82h-1.974c-.15 0-.26-.12-.26-.26V2.586A2.237 2.237 0 0 1 21.765.35M9.41 13.388l8.447-8.377c.16-.16.07-.471-.14-.471h-4.55s-.1.02-.14.06l-9.099 9.029c-.14.14-.35.02-.35-.21V4.81c0-.15-.1-.27-.221-.27H.22c-.12 0-.22.12-.22.27v18.57c0 .15.1.27.22.27h3.137c.12 0 .22-.12.22-.27v-3.79c0-.08.03-.16.08-.21l2.826-2.796c.07-.07.16-.08.241-.03l7.546 5.551a8.9 8.9 0 0 0 4.018 1.493c.12.01.23-.11.23-.27V19.76c0-.14-.08-.25-.19-.26a5.8 5.8 0 0 1-2.355-.942l-6.533-4.73c-.14-.09-.15-.32-.03-.441"/>',
+);
+
+/// simple-icons Ollama mark (CC0).
+final String _ollama = _svg24(
+  '<path d="M16.361 10.26a.894.894 0 0 0-.558.47l-.072.148.001.207c0 .193.004.217.059.353.076.193.152.312.291.448.24.238.51.3.872.205a.86.86 0 0 0 .517-.436.752.752 0 0 0 .08-.498c-.064-.453-.33-.782-.724-.897a1.06 1.06 0 0 0-.466 0zm-9.203.005c-.305.096-.533.32-.65.639a1.187 1.187 0 0 0-.06.52c.057.309.31.59.598.667.362.095.632.033.872-.205.14-.136.215-.255.291-.448.055-.136.059-.16.059-.353l.001-.207-.072-.148a.894.894 0 0 0-.565-.472 1.02 1.02 0 0 0-.474.007Zm4.184 2c-.131.071-.223.25-.195.383.031.143.157.288.353.407.105.063.112.072.117.136.004.038-.01.146-.029.243-.02.094-.036.194-.036.222.002.074.07.195.143.253.064.052.076.054.255.059.164.005.198.001.264-.03.169-.082.212-.234.15-.525-.052-.243-.042-.28.087-.355.137-.08.281-.219.324-.314a.365.365 0 0 0-.175-.48.394.394 0 0 0-.181-.033c-.126 0-.207.03-.355.124l-.085.053-.053-.032c-.219-.13-.259-.145-.391-.143a.396.396 0 0 0-.193.032zm.39-2.195c-.373.036-.475.05-.654.086-.291.06-.68.195-.951.328-.94.46-1.589 1.226-1.787 2.114-.04.176-.045.234-.045.53 0 .294.005.357.043.524.264 1.16 1.332 2.017 2.714 2.173.3.033 1.596.033 1.896 0 1.11-.125 2.064-.727 2.493-1.571.114-.226.169-.372.22-.602.039-.167.044-.23.044-.523 0-.297-.005-.355-.045-.531-.288-1.29-1.539-2.304-3.072-2.497a6.873 6.873 0 0 0-.855-.031zm.645.937a3.283 3.283 0 0 1 1.44.514c.223.148.537.458.671.662.166.251.26.508.303.82.02.143.01.251-.043.482-.08.345-.332.705-.672.957a3.115 3.115 0 0 1-.689.348c-.382.122-.632.144-1.525.138-.582-.006-.686-.01-.853-.042-.57-.107-1.022-.334-1.35-.68-.264-.28-.385-.535-.45-.946-.03-.192.025-.509.137-.776.136-.326.488-.73.836-.963.403-.269.934-.46 1.422-.512.187-.02.586-.02.773-.002zm-5.503-11a1.653 1.653 0 0 0-.683.298C5.617.74 5.173 1.666 4.985 2.819c-.07.436-.119 1.04-.119 1.503 0 .544.064 1.24.155 1.721.02.107.031.202.023.208a8.12 8.12 0 0 1-.187.152 5.324 5.324 0 0 0-.949 1.02 5.49 5.49 0 0 0-.94 2.339 6.625 6.625 0 0 0-.023 1.357c.091.78.325 1.438.727 2.04l.13.195-.037.064c-.269.452-.498 1.105-.605 1.732-.084.496-.095.629-.095 1.294 0 .67.009.803.088 1.266.095.555.288 1.143.503 1.534.071.128.243.393.264.407.007.003-.014.067-.046.141a7.405 7.405 0 0 0-.548 1.873c-.062.417-.071.552-.071.991 0 .56.031.832.148 1.279L3.42 24h1.478l-.05-.091c-.297-.552-.325-1.575-.068-2.597.117-.472.25-.819.498-1.296l.148-.29v-.177c0-.165-.003-.184-.057-.293a.915.915 0 0 0-.194-.25 1.74 1.74 0 0 1-.385-.543c-.424-.92-.506-2.286-.208-3.451.124-.486.329-.918.544-1.154a.787.787 0 0 0 .223-.531c0-.195-.07-.355-.224-.522a3.136 3.136 0 0 1-.817-1.729c-.14-.96.114-2.005.69-2.834.563-.814 1.353-1.336 2.237-1.475.199-.033.57-.028.776.01.226.04.367.028.512-.041.179-.085.268-.19.374-.431.093-.215.165-.333.36-.576.234-.29.46-.489.822-.729.413-.27.884-.467 1.352-.561.17-.035.25-.04.569-.04.319 0 .398.005.569.04a4.07 4.07 0 0 1 1.914.997c.117.109.398.457.488.602.034.057.095.177.132.267.105.241.195.346.374.43.14.068.286.082.503.045.343-.058.607-.053.943.016 1.144.23 2.14 1.173 2.581 2.437.385 1.108.276 2.267-.296 3.153-.097.15-.193.27-.333.419-.301.322-.301.722-.001 1.053.493.539.801 1.866.708 3.036-.062.772-.26 1.463-.533 1.854a2.096 2.096 0 0 1-.224.258.916.916 0 0 0-.194.25c-.054.109-.057.128-.057.293v.178l.148.29c.248.476.38.823.498 1.295.253 1.008.231 2.01-.059 2.581a.845.845 0 0 0-.044.098c0 .006.329.009.732.009h.73l.02-.074.036-.134c.019-.076.057-.3.088-.516.029-.217.029-1.016 0-1.258-.11-.875-.295-1.57-.597-2.226-.032-.074-.053-.138-.046-.141.008-.005.057-.074.108-.152.376-.569.607-1.284.724-2.228.031-.26.031-1.378 0-1.628-.083-.645-.182-1.082-.348-1.525a6.083 6.083 0 0 0-.329-.7l-.038-.064.131-.194c.402-.604.636-1.262.727-2.04a6.625 6.625 0 0 0-.024-1.358 5.512 5.512 0 0 0-.939-2.339 5.325 5.325 0 0 0-.95-1.02 8.097 8.097 0 0 1-.186-.152.692.692 0 0 1 .023-.208c.208-1.087.201-2.443-.017-3.503-.19-.924-.535-1.658-.98-2.082-.354-.338-.716-.482-1.15-.455-.996.059-1.8 1.205-2.116 3.01a6.805 6.805 0 0 0-.097.726c0 .036-.007.066-.015.066a.96.96 0 0 1-.149-.078A4.857 4.857 0 0 0 12 3.03c-.832 0-1.687.243-2.456.698a.958.958 0 0 1-.148.078c-.008 0-.015-.03-.015-.066a6.71 6.71 0 0 0-.097-.725C8.997 1.392 8.337.319 7.46.048a2.096 2.096 0 0 0-.585-.041Zm.293 1.402c.248.197.523.759.682 1.388.03.113.06.244.069.292.007.047.026.152.041.233.067.365.098.76.102 1.24l.002.475-.12.175-.118.178h-.278c-.324 0-.646.041-.954.124l-.238.06c-.033.007-.038-.003-.057-.144a8.438 8.438 0 0 1 .016-2.323c.124-.788.413-1.501.696-1.711.067-.05.079-.049.157.013zm9.825-.012c.17.126.358.46.498.888.28.854.36 2.028.212 3.145-.019.14-.024.151-.057.144l-.238-.06a3.693 3.693 0 0 0-.954-.124h-.278l-.119-.178-.119-.175.002-.474c.004-.669.066-1.19.214-1.772.157-.623.434-1.185.68-1.382.078-.062.09-.063.159-.012z"/>',
+);
+
+/// OpenAI knot (worldvectorlogo).
+final String _openai =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="-1 -.1 949.1 959.8"><path d="m925.8 456.3c10.4 23.2 17 48 19.7 73.3 2.6 25.3 1.3 50.9-4.1 75.8-5.3 24.9-14.5 48.8-27.3 70.8-8.4 14.7-18.3 28.5-29.7 41.2-11.3 12.6-23.9 24-37.6 34-13.8 10-28.5 18.4-44.1 25.3-15.5 6.8-31.7 12-48.3 15.4-7.8 24.2-19.4 47.1-34.4 67.7-14.9 20.6-33 38.7-53.6 53.6-20.6 15-43.4 26.6-67.6 34.4-24.2 7.9-49.5 11.8-75 11.8-16.9.1-33.9-1.7-50.5-5.1-16.5-3.5-32.7-8.8-48.2-15.7s-30.2-15.5-43.9-25.5c-13.6-10-26.2-21.5-37.4-34.2-25 5.4-50.6 6.7-75.9 4.1-25.3-2.7-50.1-9.3-73.4-19.7-23.2-10.3-44.7-24.3-63.6-41.4s-35-37.1-47.7-59.1c-8.5-14.7-15.5-30.2-20.8-46.3s-8.8-32.7-10.6-49.6c-1.8-16.8-1.7-33.8.1-50.7 1.8-16.8 5.5-33.4 10.8-49.5-17-18.9-31-40.4-41.4-63.6-10.3-23.3-17-48-19.6-73.3-2.7-25.3-1.3-50.9 4-75.8s14.5-48.8 27.3-70.8c8.4-14.7 18.3-28.6 29.6-41.2s24-24 37.7-34 28.5-18.5 44-25.3c15.6-6.9 31.8-12 48.4-15.4 7.8-24.3 19.4-47.1 34.3-67.7 15-20.6 33.1-38.7 53.7-53.7 20.6-14.9 43.4-26.5 67.6-34.4 24.2-7.8 49.5-11.8 75-11.7 16.9-.1 33.9 1.6 50.5 5.1s32.8 8.7 48.3 15.6c15.5 7 30.2 15.5 43.9 25.5 13.7 10.1 26.3 21.5 37.5 34.2 24.9-5.3 50.5-6.6 75.8-4s50 9.3 73.3 19.6c23.2 10.4 44.7 24.3 63.6 41.4 18.9 17 35 36.9 47.7 59 8.5 14.6 15.5 30.1 20.8 46.3 5.3 16.1 8.9 32.7 10.6 49.6 1.8 16.9 1.8 33.9-.1 50.8-1.8 16.9-5.5 33.5-10.8 49.6 17.1 18.9 31 40.3 41.4 63.6zm-333.2 426.9c21.8-9 41.6-22.3 58.3-39s30-36.5 39-58.4c9-21.8 13.7-45.2 13.7-68.8v-223q-.1-.3-.2-.7-.1-.3-.3-.6-.2-.3-.5-.5-.3-.3-.6-.4l-80.7-46.6v269.4c0 2.7-.4 5.5-1.1 8.1-.7 2.7-1.7 5.2-3.1 7.6s-3 4.6-5 6.5a32.1 32.1 0 0 1 -6.5 5l-191.1 110.3c-1.6 1-4.3 2.4-5.7 3.2 7.9 6.7 16.5 12.6 25.5 17.8 9.1 5.2 18.5 9.6 28.3 13.2 9.8 3.5 19.9 6.2 30.1 8 10.3 1.8 20.7 2.7 31.1 2.7 23.6 0 47-4.7 68.8-13.8zm-455.1-151.4c11.9 20.5 27.6 38.3 46.3 52.7 18.8 14.4 40.1 24.9 62.9 31s46.6 7.7 70 4.6 45.9-10.7 66.4-22.5l193.2-111.5.5-.5q.2-.2.3-.6.2-.3.3-.6v-94l-233.2 134.9c-2.4 1.4-4.9 2.4-7.5 3.2-2.7.7-5.4 1-8.2 1-2.7 0-5.4-.3-8.1-1-2.6-.8-5.2-1.8-7.6-3.2l-191.1-110.4c-1.7-1-4.2-2.5-5.6-3.4-1.8 10.3-2.7 20.7-2.7 31.1s1 20.8 2.8 31.1c1.8 10.2 4.6 20.3 8.1 30.1 3.6 9.8 8 19.2 13.2 28.2zm-50.2-417c-11.8 20.5-19.4 43.1-22.5 66.5s-1.5 47.1 4.6 70c6.1 22.8 16.6 44.1 31 62.9 14.4 18.7 32.3 34.4 52.7 46.2l193.1 111.6q.3.1.7.2h.7q.4 0 .7-.2.3-.1.6-.3l81-46.8-233.2-134.6c-2.3-1.4-4.5-3.1-6.5-5a32.1 32.1 0 0 1 -5-6.5c-1.3-2.4-2.4-4.9-3.1-7.6-.7-2.6-1.1-5.3-1-8.1v-227.1c-9.8 3.6-19.3 8-28.3 13.2-9 5.3-17.5 11.3-25.5 18-7.9 6.7-15.3 14.1-22 22.1-6.7 7.9-12.6 16.5-17.8 25.5zm663.3 154.4c2.4 1.4 4.6 3 6.6 5 1.9 1.9 3.6 4.1 5 6.5 1.3 2.4 2.4 5 3.1 7.6.6 2.7 1 5.4.9 8.2v227.1c32.1-11.8 60.1-32.5 80.8-59.7 20.8-27.2 33.3-59.7 36.2-93.7s-3.9-68.2-19.7-98.5-39.9-55.5-69.5-72.5l-193.1-111.6q-.3-.1-.7-.2h-.7q-.3.1-.7.2-.3.1-.6.3l-80.6 46.6 233.2 134.7zm80.5-121h-.1v.1zm-.1-.1c5.8-33.6 1.9-68.2-11.3-99.7-13.1-31.5-35-58.6-63-78.2-28-19.5-61-30.7-95.1-32.2-34.2-1.4-68 6.9-97.6 23.9l-193.1 111.5q-.3.2-.5.5l-.4.6q-.1.3-.2.7-.1.3-.1.7v93.2l233.2-134.7c2.4-1.4 5-2.4 7.6-3.2 2.7-.7 5.4-1 8.1-1 2.8 0 5.5.3 8.2 1 2.6.8 5.1 1.8 7.5 3.2l191.1 110.4c1.7 1 4.2 2.4 5.6 3.3zm-505.3-103.2c0-2.7.4-5.4 1.1-8.1.7-2.6 1.7-5.2 3.1-7.6 1.4-2.3 3-4.5 5-6.5 1.9-1.9 4.1-3.6 6.5-4.9l191.1-110.3c1.8-1.1 4.3-2.5 5.7-3.2-26.2-21.9-58.2-35.9-92.1-40.2-33.9-4.4-68.3 1-99.2 15.5-31 14.5-57.2 37.6-75.5 66.4-18.3 28.9-28 62.3-28 96.5v223q.1.4.2.7.1.3.3.6.2.3.5.6.2.2.6.4l80.7 46.6zm43.8 294.7 103.9 60 103.9-60v-119.9l-103.8-60-103.9 60z"/></svg>';
+
+/// Official CodeMie mark (auth.codemie.lab.epam.com): a gradient "C" with
+/// a white spark on the dark-purple brand tile. Full-color, full-bleed.
+final String _codemie =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640">'
+    '<rect width="640" height="640" fill="#230230"/>'
+    '<path d="M117 320.5C117 208.662 207.662 118 319.5 118C379.76 118 433.902 144.359 470.953 186.079L426.091 225.921C399.944 196.479 361.899 178 319.5 178C240.799 178 177 241.799 177 320.5C177 399.201 240.799 463 319.5 463C361.899 463 399.944 444.521 426.091 415.079L470.953 454.921C433.902 496.641 379.76 523 319.5 523C207.662 523 117 432.338 117 320.5Z" fill="url(#paint0)"/>'
+    '<path d="M229.277 320.785C285.131 324.684 315.286 354.311 319.716 409.723C319.744 410.092 320.256 410.092 320.284 409.723C324.742 354.311 354.869 324.655 410.723 320.785C411.092 320.785 411.092 320.244 410.723 320.215C354.869 316.316 324.714 286.689 320.284 231.277C320.256 230.908 319.744 230.908 319.716 231.277C315.258 286.689 285.131 316.345 229.277 320.215C228.908 320.215 228.908 320.756 229.277 320.785Z" fill="white"/>'
+    '<defs><linearGradient id="paint0" x1="410" y1="61.5" x2="-71.0294" y2="651.221" gradientUnits="userSpaceOnUse">'
+    '<stop offset="0.0192308" stop-color="#ECB1FF"/>'
+    '<stop offset="0.375" stop-color="#C447EB"/>'
+    '<stop offset="1" stop-color="#3E1866"/>'
+    '</linearGradient></defs></svg>';
+
+/// Official DIAL mark (epam/ai-dial favicon — the same brand dialx.ai
+/// uses): a double "D" with the #00DBDE→#FC00FF gradient on white.
+/// Full-color, full-bleed.
+final String _dial =
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">'
+    '<path d="M29.9982 22.6909C29.9982 28.3121 28.4144 32.6021 25.2471 35.5608C22.0798 38.5192 17.661 39.9986 11.9907 39.9986H2.43806C2.09472 39.9986 1.81641 39.7157 1.81641 39.3667V6.08505C1.81641 5.73604 2.09472 5.45312 2.43806 5.45312H11.3184C14.1768 5.45312 16.7339 5.79569 18.9897 6.48085C21.2455 7.15042 23.2 8.17815 24.8532 9.56401C26.5219 10.9343 27.7965 12.7328 28.6772 14.9596C29.5579 17.1708 29.9982 19.7478 29.9982 22.6909Z" fill="url(#dialBack)" fill-opacity="0.18"/>'
+    '<path d="M29.9982 22.6909C29.9982 28.3121 28.4144 32.6021 25.2471 35.5608C22.0798 38.5192 17.661 39.9986 11.9907 39.9986H2.43806C2.09472 39.9986 1.81641 39.7157 1.81641 39.3667V6.08505C1.81641 5.73604 2.09472 5.45312 2.43806 5.45312H11.3184C14.1768 5.45312 16.7339 5.79569 18.9897 6.48085C21.2455 7.15042 23.2 8.17815 24.8532 9.56401C26.5219 10.9343 27.7965 12.7328 28.6772 14.9596C29.5579 17.1708 29.9982 19.7478 29.9982 22.6909Z" fill="#7799FF" fill-opacity="0.22"/>'
+    '<path d="M38.3903 17.4646C38.3903 23.1598 36.7877 27.5062 33.5829 30.5038C30.3781 33.5012 25.9071 35 20.1696 35H10.504C10.1566 35 9.875 34.7134 9.875 34.3598V0.640244C9.875 0.286637 10.1566 0 10.504 0H19.4895C22.3817 0 24.969 0.347077 27.2515 1.04125C29.534 1.71963 31.5116 2.76088 33.1843 4.16498C34.8728 5.5533 36.1625 7.37548 37.0536 9.63151C37.9447 11.8718 38.3903 14.4827 38.3903 17.4646Z" fill="url(#dialFront)"/>'
+    '<defs>'
+    '<linearGradient id="dialBack" x1="1.81641" y1="2.68949" x2="1.81641" y2="39.9986" gradientUnits="userSpaceOnUse">'
+    '<stop stop-color="#00DBDE"/><stop offset="1" stop-color="#FC00FF"/>'
+    '</linearGradient>'
+    '<linearGradient id="dialFront" x1="9.875" y1="17.5" x2="38.3903" y2="17.5" gradientUnits="userSpaceOnUse">'
+    '<stop stop-color="#00DBDE"/><stop offset="1" stop-color="#FC00FF"/>'
+    '</linearGradient>'
+    '</defs></svg>';
+
+/// The official aiin.by mark — their favicon (https://aiin.by/favicon.svg),
+/// verbatim except the "AI" wordmark: flutter_svg does not render
+/// `text` elements, so the letters are redrawn as ultra-bold paths
+/// at the same metrics.
+final String _aiin = '''
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8B5CF6"/>
+      <stop offset="0.45" stop-color="#6D6AF0"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <radialGradient id="aura" cx="0.5" cy="0.46" r="0.55">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="hl" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#07080D"/>
+  <rect width="512" height="512" rx="112" fill="url(#aura)"/>
+  <circle cx="256" cy="256" r="196" fill="none" stroke="#8B5CF6" stroke-opacity="0.3" stroke-width="2" stroke-dasharray="4 5"/>
+  <circle cx="256" cy="60" r="7" fill="#A78BFA"/>
+  <circle cx="120" cy="436" r="5.5" fill="#67E8F9"/>
+  <rect x="106" y="106" width="300" height="300" rx="68" fill="url(#g)"/>
+  <rect x="106" y="106" width="300" height="150" rx="68" fill="url(#hl)"/>
+  <g fill="#FFFFFF">
+    <path fill-rule="evenodd" d="M163 318 L201 182 L247 182 L285 318 L251 318 L243 288 L205 288 L197 318 Z M224 215 L238 261 L210 261 Z"/>
+    <path d="M310 182 L348 182 L348 318 L310 318 Z"/>
+  </g>
+</svg>
+''';
+
+/// simple-icons Z.AI mark (CC0).
+final String _zai = _svg24(
+  '<path d="M12.606 1.806l-1.677 2.388c-0.258 0.374-0.697 0.606-1.161 0.606h-9.162V1.794C0.594 1.806 12.606 1.806 12.606 1.806zM24 1.806L9.6 22.206 0 22.206 14.4 1.806zM11.394 22.206l1.69-2.4c0.258-0.374 0.697-0.606 1.161-0.606h9.149v3.006H11.394z"/>',
+);
+
+/// Hand-drawn Custom mark: a server stack.
+final String _custom = _svg24(
+  '<path fill-rule="evenodd" d="M4 4h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm2.5 1.8a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4ZM4 11h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1Zm2.5 1.8a1.2 1.2 0 1 0 0 2.4 1.2 1.2 0 0 0 0-2.4ZM4 18h16a1 1 0 0 1 1 1v.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 19.5V19a1 1 0 0 1 1-1Zm2.5 1a.8.8 0 1 0 0 1.6.8.8 0 0 0 0-1.6Z"/>',
+);

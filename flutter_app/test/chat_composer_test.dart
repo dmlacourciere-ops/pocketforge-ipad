@@ -1,0 +1,783 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:fa/l10n/app_localizations.dart';
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/ui/app_theme.dart';
+import 'package:fa/ui/screens/chat_screen.dart';
+import 'package:fa/ui/widgets/chat_composer.dart';
+import 'package:fa_ui/fa_ui.dart' show FaClipboardReader;
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+StreamFunction _singleTextResponse(String text) {
+  return (model, context, {cancelToken}) {
+    final stream = AssistantMessageEventStream();
+    final message = AssistantMessage(
+      content: [TextContent(text: text)],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: Usage.zero,
+      stopReason: StopReason.stop,
+      timestamp: DateTime.now(),
+    );
+    stream.push(DoneEvent(reason: StopReason.stop, message: message));
+    stream.end();
+    return stream;
+  };
+}
+
+StreamFunction _hungResponse() {
+  fn(Model model, dynamic context, {cancelToken}) {
+    final stream = AssistantMessageEventStream();
+    final partial = AssistantMessage(
+      content: const [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: Usage.zero,
+      stopReason: StopReason.stop,
+      timestamp: DateTime(2026),
+    );
+    stream.push(StartEvent(partial: partial));
+    cancelToken?.onCancel.then((_) {
+      stream.push(
+        ErrorEvent(
+          reason: StopReason.aborted,
+          error: partial.copyWith(
+            stopReason: StopReason.aborted,
+            errorMessage: 'Operation aborted',
+          ),
+        ),
+      );
+      stream.end();
+    });
+    return stream; // stays open until aborted
+  }
+
+  return fn;
+}
+
+AgentService _fakeService(ExecutionEnv env, StreamFunction streamFunction) {
+  return AgentService(
+    agent: Agent(
+      model: Model(
+        id: 'test-model',
+        api: 'test-api',
+        provider: 'test',
+        baseUrl: 'https://example.com',
+        contextWindow: 100000,
+        maxTokens: 4096,
+      ),
+      systemPrompt: 'You are Fa.',
+      streamFunction: streamFunction,
+      toolRegistry: ToolRegistry(const []),
+    ),
+    env: env,
+    sessionsRoot: '/sessions',
+  );
+}
+
+Future<void> _pumpComposer(
+  WidgetTester tester,
+  AgentService service, {
+  FaClipboardReader? clipboardReader,
+  bool Function(BuildContext context, String text)? onSubmit,
+}) async {
+  await tester.pumpWidget(
+    MaterialApp(
+      theme: buildFahTheme(),
+      locale: const Locale('en'),
+      localizationsDelegates: AppLocalizations.localizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      home: Scaffold(
+        body: ChatComposer(
+          service: service,
+          clipboardReader: clipboardReader,
+          onSubmit: onSubmit,
+        ),
+      ),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+/// Simulates Cmd+V: the composer's Focus handler reads meta/control from
+/// HardwareKeyboard, so the modifier must be held across the key event.
+Future<void> _pressPaste(WidgetTester tester) async {
+  await tester.sendKeyDownEvent(LogicalKeyboardKey.metaLeft);
+  await tester.sendKeyEvent(LogicalKeyboardKey.keyV);
+  await tester.sendKeyUpEvent(LogicalKeyboardKey.metaLeft);
+  // The smart-paste chain is async (clipboard channel + staging).
+  await tester.runAsync(() => Future<void>.delayed(_pasteSettle));
+  await tester.pump();
+}
+
+const _pasteSettle = Duration(milliseconds: 100);
+
+Future<void> _typeAndSend(WidgetTester tester, String text) async {
+  await tester.enterText(find.byType(TextField), text);
+  await tester.pump();
+  await tester.tap(find.byIcon(Icons.arrow_upward));
+  await tester.pump();
+}
+
+/// The composer's `_send` → `service.sendText` future chain runs on whatever
+/// zone the tap happened in; the fake widget-test zone never advances those
+/// futures, so the send and the waits ride ONE runAsync block (real event
+/// loop + real delays, the js_app_chrome_test pattern).
+void main() {
+  testWidgets('send while IDLE starts a run that completes (never aborted '
+      'by the steer logic — the "empty session" regression)', (tester) async {
+    final env = MemoryExecutionEnv();
+    final service = _fakeService(env, _singleTextResponse('the answer'));
+    addTearDown(service.dispose);
+    await service.initialize();
+    await _pumpComposer(tester, service);
+
+    await tester.runAsync(() async {
+      await _typeAndSend(tester, 'hello there');
+      for (
+        var i = 0;
+        i < 100 && service.messages.where((m) => m.role == 'assistant').isEmpty;
+        i++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        await tester.pump();
+      }
+    });
+    await tester.pump();
+
+    expect(
+      service.messages.where((m) => m.role == 'user').map((m) => m.content),
+      contains('hello there'),
+    );
+    expect(service.messages.last.role, 'assistant');
+    expect(service.messages.last.content, 'the answer');
+    expect(service.messages.where((m) => m.isError), isEmpty);
+    expect(service.isStreaming, isFalse);
+  });
+
+  testWidgets('send while STREAMING interrupts the in-flight turn and the '
+      'follow-up gets its own run', (tester) async {
+    final env = MemoryExecutionEnv();
+    var call = 0;
+    streams(Model model, dynamic context, {cancelToken}) {
+      call++;
+      if (call == 1) {
+        return _hungResponse()(model, context, cancelToken: cancelToken);
+      }
+      return _singleTextResponse('follow-up answer')(
+        model,
+        context,
+        cancelToken: cancelToken,
+      );
+    }
+
+    final service = _fakeService(env, streams);
+    addTearDown(service.dispose);
+    await service.initialize();
+    await _pumpComposer(tester, service);
+
+    // Start a long run through the composer, then send a second message
+    // mid-flight: it must interrupt (abort) the first turn and run itself.
+    await tester.runAsync(() async {
+      await _typeAndSend(tester, 'long task');
+      for (var i = 0; i < 100 && call == 0; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        await tester.pump();
+      }
+    });
+    expect(call, 1);
+    expect(service.isStreaming, isTrue);
+
+    await tester.runAsync(() async {
+      await _typeAndSend(tester, 'actually, follow up');
+      for (var i = 0; i < 200 && (call < 2 || service.isStreaming); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        await tester.pump();
+      }
+    });
+    await tester.pump();
+
+    expect(call, 2);
+    expect(service.messages.last.role, 'assistant');
+    expect(service.messages.last.content, 'follow-up answer');
+  });
+
+  group('multiline composer (Enter = newline, send = button / Ctrl+Enter)', () {
+    /// Simulates the IME inserting a newline the way the real one does on
+    /// touch and hardware keyboards: the platform sends the updated editing
+    /// value (composing run intact) — the widget never sees a key event.
+    /// Enter itself (a raw key down) must stay inert: with
+    /// `TextInputAction.newline` there is no submit action to fire.
+    Future<void> imeNewline(WidgetTester tester, String before) async {
+      final controller = tester
+          .widget<TextField>(find.byType(TextField))
+          .controller!;
+      tester.testTextInput.updateEditingValue(
+        TextEditingValue(
+          text: '$before\n',
+          selection: TextSelection.collapsed(offset: before.length + 1),
+          composing: TextRange(start: before.length, end: before.length + 1),
+        ),
+      );
+      await tester.pump();
+      // The IME's state must land in the controller untouched (E1: an
+      // in-flight composing run survives the newline).
+      expect(
+        controller.value.composing,
+        TextRange(start: before.length, end: before.length + 1),
+      );
+    }
+
+    Future<void> waitForAssistant(
+      WidgetTester tester,
+      AgentService service,
+    ) async {
+      for (
+        var i = 0;
+        i < 100 && service.messages.where((m) => m.role == 'assistant').isEmpty;
+        i++
+      ) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        await tester.pump();
+      }
+    }
+
+    testWidgets('AC1: Enter inserts a newline and never submits; the legacy '
+        'send action is inert', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(tester, service);
+
+      await tester.enterText(find.byType(TextField), 'hello');
+      await tester.pump();
+      await imeNewline(tester, 'hello');
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.controller!.text, 'hello\n');
+      // The field is wired as the IME contract demands: multiline return
+      // key (newline action), so the touch keyboard offers Return, not
+      // Send, and hardware Enter follows the same path.
+      expect(field.keyboardType, TextInputType.multiline);
+      expect(field.textInputAction, TextInputAction.newline);
+      // Nothing was sent — newline insertion is not a submission.
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+
+      // Even the platform's legacy send action does nothing: submit no
+      // longer lives on the IME action.
+      await tester.testTextInput.receiveAction(TextInputAction.send);
+      await tester.pump();
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+    });
+
+    testWidgets('AC1: Ctrl+Enter submits (trimmed)', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(tester, service);
+
+      await tester.enterText(find.byType(TextField), 'hello\n');
+      await tester.pump();
+
+      await tester.runAsync(() async {
+        await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+        await tester.sendKeyEvent(LogicalKeyboardKey.enter);
+        await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+        await tester.pump();
+        await waitForAssistant(tester, service);
+      });
+      expect(
+        service.messages.where((m) => m.role == 'user').map((m) => m.content),
+        contains('hello'),
+      );
+      // The Enter-with-modifier never fell into the field as a newline.
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        isEmpty,
+      );
+    });
+
+    testWidgets('AC2: the field grows 1→6 lines, then scrolls internally '
+        '(the height caps)', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(tester, service);
+
+      Future<double> heightOf(int lines) async {
+        await tester.enterText(
+          find.byType(TextField),
+          List.generate(lines, (i) => 'line ${i + 1}').join('\n'),
+        );
+        await tester.pump();
+        return tester.getSize(find.byType(TextField)).height;
+      }
+
+      final oneLine = await heightOf(1);
+      final threeLines = await heightOf(3);
+      final sixLines = await heightOf(6);
+      final sevenLines = await heightOf(7);
+      expect(threeLines, greaterThan(oneLine));
+      expect(sixLines, greaterThan(threeLines));
+      // Past the budget the field scrolls internally — the composer height
+      // never exceeds the 6-line cap.
+      expect(sevenLines, sixLines);
+    });
+
+    testWidgets('AC3: whitespace-only stays blocked; trailing newlines are '
+        'trimmed; send clears the field back to 1 line', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(tester, service);
+
+      final oneLine = tester.getSize(find.byType(TextField)).height;
+
+      // Whitespace-only: the send button does nothing.
+      await tester.enterText(find.byType(TextField), '  \n\n ');
+      await tester.pump();
+      await tester.tap(find.byIcon(Icons.arrow_upward));
+      await tester.pump();
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+
+      // Trailing newlines are trimmed on send; the field clears and
+      // collapses back to the 1-line height.
+      await tester.runAsync(() async {
+        await tester.enterText(find.byType(TextField), 'hello\n\n');
+        await tester.pump();
+        await tester.tap(find.byIcon(Icons.arrow_upward));
+        await tester.pump();
+        await waitForAssistant(tester, service);
+      });
+      expect(
+        service.messages.where((m) => m.role == 'user').map((m) => m.content),
+        contains('hello'),
+      );
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        isEmpty,
+      );
+      await tester.pumpAndSettle();
+      expect(tester.getSize(find.byType(TextField)).height, oneLine);
+    });
+
+    testWidgets('AC2/E2: a 50-line paste caps the visible field but submit '
+        'sends every line', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(tester, service);
+
+      // Baseline: exactly 6 lines fills the budget.
+      await tester.enterText(
+        find.byType(TextField),
+        List.generate(6, (i) => 'line ${i + 1}').join('\n'),
+      );
+      await tester.pump();
+      final sixLineHeight = tester.getSize(find.byType(TextField)).height;
+      final longText = List.generate(50, (i) => 'log line $i').join('\n');
+
+      await tester.runAsync(() async {
+        await tester.enterText(find.byType(TextField), longText);
+        await tester.pump();
+        // Visible growth is capped at the 6-line budget; the content is
+        // intact behind the internal scroll.
+        expect(tester.getSize(find.byType(TextField)).height, sixLineHeight);
+        await tester.tap(find.byIcon(Icons.arrow_upward));
+        await tester.pump();
+        await waitForAssistant(tester, service);
+      });
+      expect(
+        service.messages.where((m) => m.role == 'user').map((m) => m.content),
+        contains(longText),
+      );
+    });
+  });
+
+  group('smart paste (Cmd/Ctrl+V)', () {
+    // flutter_test has no clipboard mock — an unanswered
+    // Clipboard.setData/getData future never completes (the methods ride
+    // SystemChannels.platform here), so the group installs an in-memory
+    // handler.
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    String? clipText;
+
+    setUp(() {
+      clipText = null;
+      messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+        switch (call.method) {
+          case 'Clipboard.setData':
+            clipText = (call.arguments as Map)['text'] as String?;
+            return null;
+          case 'Clipboard.getData':
+            return <String, Object?>{'text': clipText};
+        }
+        return null;
+      });
+    });
+    tearDown(() {
+      messenger.setMockMethodCallHandler(SystemChannels.platform, null);
+    });
+
+    testWidgets('short single-line text pastes inline at the cursor', (
+      tester,
+    ) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(
+        tester,
+        service,
+        clipboardReader: () async => const [],
+      );
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await Clipboard.setData(const ClipboardData(text: 'short snippet'));
+      await _pressPaste(tester);
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.controller!.text, 'short snippet');
+      // No attachment chip, nothing sent.
+      expect(find.textContaining('pasted-'), findsNothing);
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+    });
+
+    testWidgets('long multi-line text becomes a staged .txt chip instead of '
+        'flooding the field', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(
+        tester,
+        service,
+        clipboardReader: () async => const [],
+      );
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      final longText = List.generate(50, (i) => 'log line $i').join('\n');
+      await Clipboard.setData(ClipboardData(text: longText));
+      await _pressPaste(tester);
+
+      // The field stays clean; the text landed in a staged uploads/ chip.
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.controller!.text, isEmpty);
+      expect(find.textContaining('pasted-'), findsOneWidget);
+      expect(find.textContaining('.txt'), findsOneWidget);
+      // Staged under uploads/ in the sandbox env.
+      final staged = await env.listDir('uploads');
+      expect(staged.valueOrNull, isNotEmpty);
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+    });
+
+    testWidgets('a clipboard image becomes a staged image chip', (
+      tester,
+    ) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(
+        tester,
+        service,
+        clipboardReader: () async => [
+          (
+            name: 'clipboard-shot.png',
+            bytes: Uint8List.fromList(const [1, 2, 3]),
+            mimeType: 'image/png',
+          ),
+        ],
+      );
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await _pressPaste(tester);
+
+      // Image chips render a thumbnail without the name text — assert the
+      // chip via its remove button and the staged uploads/ file.
+      expect(find.byIcon(Icons.close), findsOneWidget);
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.controller!.text, isEmpty);
+      final staged = await env.listDir('uploads');
+      expect(staged.valueOrNull, isNotEmpty);
+    });
+
+    testWidgets('AC2: clipboard holding image AND text stages the chip and '
+        'inserts the text', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(
+        tester,
+        service,
+        clipboardReader: () async => [
+          (
+            name: 'clipboard-shot.png',
+            bytes: Uint8List.fromList(const [1, 2, 3]),
+            mimeType: 'image/png',
+          ),
+        ],
+      );
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await Clipboard.setData(const ClipboardData(text: 'annotated caption'));
+      await _pressPaste(tester);
+
+      expect(find.byIcon(Icons.close), findsOneWidget);
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.controller!.text, 'annotated caption');
+    });
+
+    testWidgets('AC1: the pasted chip sends through the picker upload path '
+        '(uploads/ sandbox file)', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(
+        tester,
+        service,
+        clipboardReader: () async => [
+          (
+            name: 'clipboard-shot.png',
+            bytes: Uint8List.fromList(const [1, 2, 3]),
+            mimeType: 'image/png',
+          ),
+        ],
+      );
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await _pressPaste(tester);
+      expect(find.byIcon(Icons.close), findsOneWidget);
+
+      await tester.runAsync(() async {
+        await _typeAndSend(tester, 'here is the shot');
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      await tester.pump();
+
+      final staged = await env.listDir('uploads');
+      expect(
+        staged.valueOrNull!.any((f) => f.name.contains('clipboard-shot')),
+        isTrue,
+      );
+      expect(service.messages.where((m) => m.role == 'user'), isNotEmpty);
+    });
+
+    testWidgets('AC4: a platform reporting no image clipboard support '
+        'no-ops to plain text paste', (tester) async {
+      final env = MemoryExecutionEnv();
+      final service = _fakeService(env, _singleTextResponse('ok'));
+      addTearDown(service.dispose);
+      await service.initialize();
+      // No clipboardReader override: the app adapter probes the real
+      // clipboard through the native readers; with no plugin registered in
+      // the test frame the probe fails and the composer falls back to the
+      // plain text paste.
+      await _pumpComposer(tester, service);
+
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await Clipboard.setData(const ClipboardData(text: 'just text'));
+      await _pressPaste(tester);
+
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.controller!.text, 'just text');
+      expect(find.byIcon(Icons.close), findsNothing);
+      // Nothing staged: the uploads dir may not even exist yet.
+      final uploads = await env.listDir('uploads');
+      expect(uploads.valueOrNull ?? const <FileInfo>[], isEmpty);
+    });
+  });
+
+  group('DAP enrollment interception', () {
+    const channel =
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+    const paste =
+        "fa dap import 'wss://hub.fa1.dev/ws?channel=$channel' && "
+        'DAP_HUB_URL=wss://hub.fa1.dev/ws '
+        "DAP_CLIENT_SECRET='test-only-enrollment-credential' "
+        'DAP_AGENT_NAME=app-agent fa';
+
+    testWidgets('DAP paste clears the draft, joins, and never calls sendText', (
+      tester,
+    ) async {
+      final service = _fakeService(
+        MemoryExecutionEnv(),
+        _singleTextResponse('must not run'),
+      );
+      addTearDown(service.dispose);
+      await service.initialize();
+      var joins = 0;
+      await _pumpComposer(
+        tester,
+        service,
+        onSubmit: (context, text) => interceptDapEnrollmentSubmit(
+          context,
+          text,
+          supported: true,
+          join: (_) async => joins++,
+        ),
+      );
+
+      await _typeAndSend(tester, paste);
+      await tester.pumpAndSettle();
+
+      expect(joins, 1);
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        isEmpty,
+      );
+      expect(
+        find.textContaining('Joined DAP channel #$channel'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('non-Keychain join discloses unencrypted enrollment storage', (
+      tester,
+    ) async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.linux;
+      // Restore via tearDown, not an end-of-test reset: a failure or
+      // throw before pumpAndSettle would otherwise leak the override
+      // into every later test in the process (gh-1895 review).
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final service = _fakeService(
+        MemoryExecutionEnv(),
+        _singleTextResponse('must not run'),
+      );
+      addTearDown(service.dispose);
+      await service.initialize();
+      await _pumpComposer(
+        tester,
+        service,
+        onSubmit: (context, text) => interceptDapEnrollmentSubmit(
+          context,
+          text,
+          supported: true,
+          join: (_) async {},
+          plaintextStorage: () async => true,
+        ),
+      );
+
+      await _typeAndSend(tester, paste);
+      await tester.pumpAndSettle();
+      // In-body reset: flutter_test verifies all foundation debug vars
+      // are unset at the end of the test body. The addTearDown above is
+      // the failure-path net when this line is never reached (gh-1895
+      // review).
+      debugDefaultTargetPlatformOverride = null;
+
+      expect(
+        find.text(
+          'Joined DAP channel #$channel. Channel mail now reaches this agent. '
+          'Storage warning: the invite private key and hub credential are '
+          "stored UNENCRYPTED (plaintext) in this app's sandbox "
+          '(IndexedDB on web).',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('plain text mentioning DAP still reaches the model', (
+      tester,
+    ) async {
+      final service = _fakeService(
+        MemoryExecutionEnv(),
+        _singleTextResponse('answer'),
+      );
+      addTearDown(service.dispose);
+      await service.initialize();
+      var joins = 0;
+      await _pumpComposer(
+        tester,
+        service,
+        onSubmit: (context, text) => interceptDapEnrollmentSubmit(
+          context,
+          text,
+          supported: true,
+          join: (_) async => joins++,
+        ),
+      );
+
+      await tester.runAsync(() async {
+        await _typeAndSend(tester, 'What does DAP_CLIENT_SECRET do?');
+        for (
+          var i = 0;
+          i < 100 && service.messages.where((m) => m.role == 'user').isEmpty;
+          i++
+        ) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+        }
+      });
+
+      expect(joins, 0);
+      final users = service.messages.where((m) => m.role == 'user').toList();
+      expect(users.single.content, 'What does DAP_CLIENT_SECRET do?');
+    });
+
+    testWidgets('web join failure consumes the secret and shows status', (
+      tester,
+    ) async {
+      final service = _fakeService(
+        MemoryExecutionEnv(),
+        _singleTextResponse('must not run'),
+      );
+      addTearDown(service.dispose);
+      await service.initialize();
+      var joins = 0;
+      await _pumpComposer(
+        tester,
+        service,
+        onSubmit: (context, text) => interceptDapEnrollmentSubmit(
+          context,
+          text,
+          supported: true,
+          join: (_) async {
+            joins++;
+            throw StateError('test-only transport failure');
+          },
+        ),
+      );
+
+      await _typeAndSend(tester, paste);
+      await tester.pumpAndSettle();
+
+      expect(joins, 1);
+      expect(service.messages.where((m) => m.role == 'user'), isEmpty);
+      expect(
+        tester.widget<TextField>(find.byType(TextField)).controller!.text,
+        isEmpty,
+      );
+      expect(
+        find.text(
+          "Couldn't join DAP channel #$channel. Check the invite and hub "
+          'connection, then try again.',
+        ),
+        findsOneWidget,
+      );
+    });
+  });
+}

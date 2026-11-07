@@ -1,0 +1,926 @@
+/// The `task` tool: parallel subagents with schema-validated results.
+///
+/// Ported (reduced) from oh-my-pi `packages/coding-agent/src/task/index.ts`
+/// (see `docs/tools/task.md`). The batch wire shape `{context, tasks[]}` is
+/// omp's `task.batch=on` form — v1 has no flat single-spawn shape and no
+/// `isolated` item field (workspace isolation is a follow-up).
+///
+/// Execution model (omp, reduced):
+///
+/// - **Blocking** (default): the call fans out under the session
+///   [Semaphore] and the tool result carries every per-item output (previews
+///   capped at [taskOutputPreviewChars]; full outputs stay addressable as
+///   `agent://<id>`).
+/// - **Background** (`background: true`, or [TaskToolConfig.defaultBackground]):
+///   ids are allocated up front, one [TaskJob] per item is registered in the
+///   session [TaskJobManager], and the call returns immediately. omp delivers
+///   completions as async-result injections into the parent conversation; v1
+///   exposes [TaskJobManager.completions] (plus per-job [TaskJob.settled] and
+///   status polling) for the host to wire that injection — see AGENTS.md.
+///
+/// omp gates background execution on the global `async.enabled` setting; the
+/// card's per-call `background` parameter (over [TaskToolConfig.defaultBackground])
+/// is the host-neutral equivalent.
+library;
+
+import 'dart:async';
+
+import '../agent/agent_loop.dart';
+import '../agent/agent_tool.dart';
+import '../approval/approval.dart';
+import '../compaction/compaction_engine.dart';
+import '../compaction/context_window_registry.dart';
+import '../a2a/a2a_manager.dart';
+import '../cancel_token.dart';
+import '../model.dart';
+import '../model_roles/model_resolver.dart';
+import '../session/session_tree.dart';
+import '../prompts/prompts.g.dart';
+import 'agent_registry.dart';
+import 'child_session_io.dart';
+import 'output_manager.dart';
+import 'parallel.dart';
+import 'subagent.dart';
+import 'subagent_manager.dart';
+import 'task_executor.dart';
+import 'task_types.dart';
+
+/// Background job states (omp's async job states, reduced).
+enum TaskJobStatus { queued, running, completed, failed, aborted }
+
+/// One background subagent job (omp's `type: "task"` async job, reduced).
+/// The job id IS the allocated agent id (omp semantics), so a settling job's
+/// result stays addressable as `agent://<id>`.
+final class TaskJob {
+  TaskJob._({
+    required this.id,
+    required this.index,
+    required this.agent,
+    required this.task,
+  });
+
+  /// The job id (== the agent id).
+  final String id;
+
+  /// Position of this item in its batch call.
+  final int index;
+
+  /// The agent type running.
+  final String agent;
+
+  /// The assigned task.
+  final String task;
+
+  TaskJobStatus _status = TaskJobStatus.queued;
+  TaskSingleResult? _result;
+  final _cancelSource = CancelTokenSource();
+  final _settled = Completer<void>();
+
+  /// Current state.
+  TaskJobStatus get status => _status;
+
+  /// The per-item result once settled (present for every terminal state —
+  /// a failed child is a failed job carrying its error entry, not a throw).
+  TaskSingleResult? get result => _result;
+
+  /// The token cancelling this job's child run.
+  CancelToken get cancelToken => _cancelSource.token;
+
+  /// Completes when the job reaches a terminal state.
+  Future<void> get settled => _settled.future;
+
+  /// Cancels the job's child run (omp's hub cancel); a queued job cancels
+  /// while waiting on the session semaphore.
+  void cancel() => _cancelSource.cancel();
+}
+
+/// The async-result message re-injected into the parent conversation when
+/// a background job settles (omp's `<system-notice>` + `<task-result>`
+/// envelope, reduced: no artifact spill — the pointer is `agent://<id>`).
+///
+/// Shared by every host that wires [TaskJobManager.completions] (CLI, app):
+/// one envelope, so a settled job reads the same everywhere.
+const int taskAsyncResultPreviewChars = 4000;
+
+String taskAsyncResultNotice(TaskJob job) {
+  final result = job.result;
+  final buffer = StringBuffer()
+    ..writeln('<system-notice>')
+    ..writeln(
+      'Background agent ${job.id} (${job.agent}) finished with status: '
+      '${job.status.name}.',
+    )
+    ..writeln('Task: ${job.task}')
+    ..writeln()
+    ..write(
+      '<task-result id="${job.id}" agent="${job.agent}" '
+      'status="${job.status.name}">',
+    );
+  _renderResultBody(
+    buffer,
+    result,
+    outputPreviewChars: taskAsyncResultPreviewChars,
+    leadWithPointer: true,
+  );
+  _renderDeliverables(buffer, result);
+  final error = result?.error;
+  if (error != null) buffer.write('\nerror: $error');
+  buffer
+    ..write('\n</task-result>')
+    ..write('\n</system-notice>');
+  return buffer.toString();
+}
+
+/// The parent-visible body of one settled child result (gh-1951): the
+/// EXPLICIT reply rides verbatim when present — it is the deliverable,
+/// and a content-free final-message stub never stands in for it (the
+/// incident: a 7909-char reply acked "delivered", the parent saw only the
+/// stub). Over-cap replies arrive as the #1829 envelope (excerpt +
+/// pointer + completeness), which `recordReply` stored on the handle.
+/// With no reply at all, the documented `completed_without_reply` notice
+/// names the bare completion text for what it is.
+///
+/// The reply body is UNTRUSTED child text inside a structured envelope
+/// (review round 2): line-leading envelope markers inside the body are
+/// defused (best-effort — see `_defuseEnvelopeMarkers`) so the body
+/// cannot close the block early or forge verdict/pointer lines.
+///
+/// [leadWithPointer] appends the `agent://` pointer line for the
+/// full final-message output when the body was not already pointer-tailed
+/// (the async envelope only pointers a truncated preview). The blocking
+/// renderer (default `false`) owns its tail pointer — the body never
+/// adds a second one for the same id (review round 2: the contradictory
+/// `[Full output: …]` + `[Truncated output: …]` label pair).
+void _renderResultBody(
+  StringBuffer buffer,
+  TaskSingleResult? result, {
+  required int outputPreviewChars,
+  bool leadWithPointer = false,
+}) {
+  if (result == null) return;
+  var pointerTailed = false;
+  final reply = result.reply;
+  if (reply != null && reply.trim().isNotEmpty) {
+    buffer
+      ..writeln()
+      ..writeln('[explicit reply]')
+      ..write(_defuseEnvelopeMarkers(reply))
+      ..write('\n[explicit reply end]');
+  } else {
+    if (result.completedWithoutReply) {
+      buffer.write(
+        '\n[completed_without_reply — no explicit reply was recorded; the '
+        'text below is the child\'s final message, not a reply]',
+      );
+    }
+    final output = result.output;
+    if (output.isNotEmpty) {
+      if (output.length > outputPreviewChars) {
+        buffer
+          ..writeln()
+          ..writeln(output.substring(0, outputPreviewChars))
+          ..writeln('…');
+        if (leadWithPointer) {
+          // The async envelope owns the pointer (no caller tail follows).
+          buffer.write('[Full output: agent://${result.id}]');
+          pointerTailed = true;
+        }
+        // leadWithPointer == false: the BLOCKING renderer appends its own
+        // (truncation-aware) tail pointer — a body-side pointer would
+        // double it with a contradictory label.
+      } else {
+        buffer
+          ..writeln()
+          ..write(output);
+      }
+    }
+  }
+  if (leadWithPointer && !pointerTailed) {
+    buffer.write('\n[Full output: agent://${result.id}]');
+  }
+}
+
+/// Line-leading envelope markers (review round 2): the reply body is
+/// untrusted child text — a line-leading structural marker could close
+/// the `[explicit reply]` block early or forge deliverable verdict /
+/// output-pointer lines the parent model reads as harness output (the
+/// same synthetic-line-injection class the #1829 id sanitizer
+/// (`_cleanReportId` in deliverables.dart) defuses for child-chosen ids).
+final RegExp _envelopeMarkerLine = RegExp(
+  r'^\s*\[(?:explicit reply(?: end)?|deliverable[ :]|'
+  r'completed_without_reply|Full output:|Truncated output:)',
+);
+
+/// Defuses line-leading envelope markers in untrusted child text: the
+/// brackets of a marker-shaped line are stripped (the same
+/// structural-character strip the #1829 id sanitizer applies to ids) so the
+/// rendered envelope cannot be closed early or acquire forged
+/// verdict/pointer lines. The text content itself is preserved — this is
+/// best-effort sanitizing of model-facing text, not a security boundary
+/// (the child's final message rides the same-trust channel raw).
+String _defuseEnvelopeMarkers(String body) {
+  return body
+      .split('\n')
+      .map((line) {
+        if (!_envelopeMarkerLine.hasMatch(line)) return line;
+        return line.replaceAll('[', '').replaceAll(']', '');
+      })
+      .join('\n');
+}
+
+/// The deliverable pointer block shared by the blocking and background
+/// result renderers (issue #1829): every recorded deliverable with its
+/// harness verdict, plus the tier-2 stub fallback notice when present.
+void _renderDeliverables(StringBuffer buffer, TaskSingleResult? result) {
+  if (result == null) return;
+  for (final record in result.deliverables) {
+    buffer.write('\n[${record.render()}]');
+  }
+  final fallback = result.stubFallback;
+  if (fallback != null) {
+    buffer.write('\n[deliverable fallback: $fallback]');
+  }
+}
+
+/// Session-scoped registry of background `task` jobs (reduced port of omp's
+/// `AsyncJobManager` role for task spawns).
+///
+/// Completion delivery: omp injects an async-result message into the parent
+/// conversation when a job settles. v1 surfaces the same event through
+/// [completions]; hosts inject the message (CLI wiring is a follow-up).
+final class TaskJobManager {
+  final _jobs = <String, TaskJob>{};
+  final _completions = StreamController<TaskJob>.broadcast();
+  final _starts = StreamController<TaskJob>.broadcast();
+
+  /// Every job of the session, in registration order.
+  List<TaskJob> get jobs => List.unmodifiable(_jobs.values);
+
+  /// Looks a job up by id; `null` when unknown.
+  TaskJob? job(String id) => _jobs[id];
+
+  /// Broadcast stream of jobs as they settle (omp's async-result event).
+  Stream<TaskJob> get completions => _completions.stream;
+
+  /// Broadcast stream of jobs as they REGISTER (issue #277 start blocks:
+  /// the visible "spawned" moment, not the queued→running flip).
+  Stream<TaskJob> get starts => _starts.stream;
+
+  /// Resolves when every registered job has settled.
+  Future<void> get settled =>
+      Future.wait([for (final job in _jobs.values) job.settled]);
+
+  /// Closes the completions stream (session teardown).
+  Future<void> close() {
+    unawaited(_starts.close());
+    return _completions.close();
+  }
+
+  TaskJob _register({
+    required String id,
+    required int index,
+    required String agent,
+    required String task,
+  }) {
+    final job = TaskJob._(id: id, index: index, agent: agent, task: task);
+    _jobs[id] = job;
+    _starts.add(job);
+    return job;
+  }
+
+  void _finish(TaskJob job, TaskSingleResult result) {
+    job._result = result;
+    job._status = switch (result.status) {
+      TaskSpawnStatus.completed => TaskJobStatus.completed,
+      TaskSpawnStatus.failed => TaskJobStatus.failed,
+      TaskSpawnStatus.aborted => TaskJobStatus.aborted,
+    };
+    if (!job._settled.isCompleted) job._settled.complete();
+    _completions.add(job);
+  }
+
+  /// Publishes a RESUMED child's settled run (gh-1951 AC3/AC6). Resumes
+  /// execute inline on the executor — no [TaskJob] of their own — so
+  /// their completions are published here, riding the SAME async-result
+  /// envelope through the SAME [completions] stream every host already
+  /// consumes. The job replaces the spawn's settled row under the child
+  /// id (`/tasks` keeps one row per child); no start event fires (this
+  /// run was never queued in this registry), and `settled` resolves
+  /// instantly, so the headless drain never waits on it.
+  void publishResumed(TaskSingleResult result) {
+    final job = TaskJob._(
+      id: result.id,
+      index: 0,
+      agent: result.agent,
+      task: result.task,
+    );
+    _jobs[result.id] = job;
+    _finish(job, result);
+  }
+}
+
+/// Configuration for [taskTool]. One config per session: the [semaphore],
+/// [outputs] store, and [jobManager] are session-scoped through it, so
+/// repeated (and concurrent) `task` calls share the concurrency bound and
+/// the `agent://` id space (omp's session-scoped `TaskTool` instance).
+final class TaskToolConfig {
+  /// Creates a [TaskToolConfig].
+  TaskToolConfig({
+    required this.childTools,
+    required this.streamFunction,
+    required this.model,
+    this.rolesResolver,
+    this.agentTypes = const [],
+    int maxConcurrent = defaultTaskMaxConcurrent,
+    this.defaultBackground = false,
+    AgentOutputStore? outputs,
+    TaskJobManager? jobManager,
+    this.subagentManager,
+    this.childSessionFactory,
+    this.childSessionOpener,
+    this.a2aManager,
+    this.compactionEngine,
+    this.contextWindowRegistry,
+    this.contextWindowCap,
+    this.misuseBreaker = true,
+    this.deliverableRedactor,
+    this.replyAutoSpill,
+    this.deliverableArtifactSink,
+    this.deliverableArtifactSource,
+  }) : semaphore = Semaphore(normalizeConcurrencyLimit(maxConcurrent)),
+       outputs = outputs ?? AgentOutputStore(),
+       jobManager = jobManager ?? TaskJobManager();
+
+  /// The parent tool pool children draw their restricted surface from.
+  /// The `task` tool itself is always excluded from child surfaces (no
+  /// nested task calls in v1).
+  final List<AgentTool> childTools;
+
+  /// The parent's provider adapter, inherited by children without a
+  /// resolvable model role. Resolved at SPAWN time, not at construction:
+  /// a host that re-authenticates or switches provider/model mid-session
+  /// (`/provider`, an SSO refresh) re-points its live adapter, and children
+  /// spawned afterwards must inherit the live credential — a wiring frozen
+  /// at boot would send the stale (or empty) key and 401.
+  final StreamFunction Function() streamFunction;
+
+  /// The parent's model, inherited the same way (resolved per spawn).
+  final Model Function() model;
+
+  /// Optional role resolver; agent types with a
+  /// [TaskAgentDefinition.modelRole] (e.g. the built-in `explore` on `smol`)
+  /// resolve their model + stream through it, falling back to the parent
+  /// wiring when the role is unconfigured.
+  final ModelRolesResolver? rolesResolver;
+
+  /// Host-provided agent types; a name colliding with a built-in replaces it
+  /// (omp's project-over-bundled precedence).
+  final List<TaskAgentDefinition> agentTypes;
+
+  /// The session concurrency bound (omp's `task.maxConcurrency`; `0` means
+  /// unbounded). Sized once — later changes need a new config (omp semantics).
+  final Semaphore semaphore;
+
+  /// Default execution mode when a call omits `background` (omp's
+  /// `async.enabled`, made host-neutral per the card).
+  final bool defaultBackground;
+
+  /// The session output store backing `agent://` resolution.
+  final AgentOutputStore outputs;
+
+  /// The session background job registry.
+  final TaskJobManager jobManager;
+
+  /// Optional retained-subagent registry (Phase 3a). When present, every
+  /// spawn registers a [SubagentHandle] so the child is addressable and
+  /// observable after completion.
+  final SubagentManager? subagentManager;
+
+  /// Optional child-session factory (Phase 3a+): when present, the executor
+  /// creates a real JSONL session for each completed child and writes its
+  /// transcript into it, so `/agents open <id>` can switch into the child
+  /// session afterwards. Created at COMPLETION (not at register) — creating
+  /// a session mid-spawn would lose the completion-delivery steering race.
+  final Future<Session> Function(String parentSessionId, String childId)?
+  childSessionFactory;
+
+  /// Optional child-session opener (issue #222): when present, the shared
+  /// [executor] can resume a failed/idle/completed child IN ITS OWN JSONL
+  /// session (`task_resume` / `task_send`) — same session file, same
+  /// mailbox id, never a `name-2` clone. Null disables the resume path;
+  /// the tools advertise the missing `child-resume` capability.
+  final ChildSessionOpener? childSessionOpener;
+
+  /// Optional A2A remote-agent manager (Phase 5a). When present, the agent
+  /// type `a2a:<name>` runs items against the configured remote agent.
+  final A2aManager? a2aManager;
+
+  /// Compaction engine for proactive child compaction (issue #439): the
+  /// host's config choice rides to children — null resolves to structured.
+  final CompactionEngine? compactionEngine;
+
+  /// The shared per-model context-window registry (gh-1742 invariant 2):
+  /// children resolve their compaction window and loop-guard basis from
+  /// the same registered values the main agent publishes. Null = carried
+  /// `model.contextWindow` (legacy behavior).
+  final ContextWindowRegistry? contextWindowRegistry;
+
+  /// The owner context-window cap (`agent.contextWindowCap`), honored for
+  /// children too (gh-1742).
+  final int? contextWindowCap;
+
+  /// The tool-misuse circuit breaker switch (issue #862, default true):
+  /// every spawned child agent gets a breaker wired into its loop.
+  final bool misuseBreaker;
+
+  /// Pre-persistence redaction gate for deliverable artifacts (issue
+  /// #1829, I3) — the host's redaction pipeline applied to report text
+  /// before it lands in the output store. Null = no pipeline wired.
+  final String Function(String text)? deliverableRedactor;
+
+  /// The auto-spill kill switch (gh-1956, `subagents.replyAutoSpill`):
+  /// live getter; null/true = auto-spill on (default), false = pure-chunk.
+  final bool Function()? replyAutoSpill;
+
+  /// The durable-artifact sink (gh-1956, AC6): one append row per spill.
+  final Future<void> Function(Map<String, dynamic> artifact)?
+  deliverableArtifactSink;
+
+  /// The durable-artifact source backing resume-time restore (gh-1956,
+  /// AC6). Null keeps artifacts session-lifetime only.
+  final Future<List<Map<String, dynamic>>> Function()?
+  deliverableArtifactSource;
+
+  /// The session-shared executor (issue #222): the `task` tool runs
+  /// through it, and hosts pass [TaskExecutor.resumeChild] to
+  /// `subagentMonitoringTools` so `task_resume`/`task_send` continue
+  /// children in their own sessions. Lazy — identical construction to the
+  /// executor `taskTool` used to build per call.
+  late final TaskExecutor executor = TaskExecutor(
+    childTools: childTools,
+    streamFunction: streamFunction,
+    model: model,
+    registry: TaskAgentRegistry(agentTypes),
+    semaphore: semaphore,
+    store: outputs,
+    rolesResolver: rolesResolver,
+    subagentManager: subagentManager,
+    a2aManager: a2aManager,
+    childSessionFactory: childSessionFactory,
+    childSessionOpener: childSessionOpener,
+    compactionEngine: compactionEngine,
+    contextWindowRegistry: contextWindowRegistry,
+    contextWindowCap: contextWindowCap,
+    misuseBreaker: misuseBreaker,
+    deliverableRedactor: deliverableRedactor,
+    // gh-1951 AC3/AC6: resumed-run completions ride the SAME async-result
+    // envelope a background spawn gets — the publisher is wired here, so
+    // every host listening to [TaskJobManager.completions] (CLI, wire
+    // serve, app) surfaces them with zero per-host changes.
+    resultPublisher: (result) => jobManager.publishResumed(result),
+    replyAutoSpill: replyAutoSpill,
+    deliverableArtifactSink: deliverableArtifactSink,
+    deliverableArtifactSource: deliverableArtifactSource,
+  );
+}
+
+/// Creates the `task` tool bound to [config] (omp's `TaskTool`).
+AgentTool taskTool({required TaskToolConfig config}) {
+  final registry = config.executor.registry;
+  final executor = config.executor;
+
+  final a2aNames = [
+    for (final name in config.a2aManager?.servers.keys ?? const <String>[])
+      '### a2a:$name (REMOTE)\n'
+          '${config.a2aManager![name]!.config.url}',
+  ];
+
+  final description = taskToolDescriptionPrompt
+      .replaceAll('{{defaultAgent}}', defaultTaskAgentName)
+      .replaceAll(
+        '{{agents}}',
+        [
+          registry.agents
+              .map(
+                (agent) =>
+                    '### ${agent.name}${agent.readOnly ? ' (READ-ONLY)' : ''}\n'
+                    '${agent.description}',
+              )
+              .join('\n'),
+          if (a2aNames.isNotEmpty) ...a2aNames,
+        ].join('\n'),
+      );
+
+  return AgentTool(
+    name: taskToolName,
+    label: 'task',
+    tier: ApprovalTier.exec,
+    description: description,
+    parameters: const {
+      'type': 'object',
+      'properties': {
+        'context': {
+          'type': 'string',
+          'description':
+              'Shared background (project state, constraints, contracts) '
+              'rendered into every spawned subagent\'s system prompt',
+        },
+        'tasks': {
+          'type': 'array',
+          'description': 'One subagent per item',
+          'items': {
+            'type': 'object',
+            'properties': {
+              'name': {
+                'type': 'string',
+                'description':
+                    'Stable id base ([A-Za-z0-9_-]); uniquified per session',
+              },
+              'agent': {
+                'type': 'string',
+                'description':
+                    'Agent type for this item (see the tool description); '
+                    'omit for the general-purpose worker',
+              },
+              'task': {
+                'type': 'string',
+                'description':
+                    'Complete, self-contained instructions for the subagent',
+              },
+              'outputSchema': {
+                'description':
+                    'JSON Schema the subagent\'s final output must satisfy; '
+                    'invalid output gets one fix retry, then the item fails',
+              },
+            },
+            'required': ['task'],
+          },
+        },
+        'background': {
+          'type': 'boolean',
+          'description':
+              'Run items as background jobs and return job ids immediately '
+              '(default: host configuration)',
+        },
+      },
+      'required': ['context', 'tasks'],
+    },
+    execute: (arguments, cancelToken, onUpdate) async {
+      final items = _parseItems(arguments, registry);
+      final context = (arguments['context'] as String).trim();
+      final background =
+          (arguments['background'] as bool?) ?? config.defaultBackground;
+      return background
+          ? _spawnBackground(config, executor, items, context, cancelToken)
+          : _runBlocking(
+              config,
+              executor,
+              items,
+              context,
+              cancelToken,
+              onUpdate,
+            );
+    },
+  );
+}
+
+/// Validates the raw call arguments into [TaskItem]s (omp's batch
+/// validation, reduced). Failures throw — the agent loop converts them into
+/// an error tool result the model can fix and retry.
+List<TaskItem> _parseItems(
+  Map<String, dynamic> arguments,
+  TaskAgentRegistry registry,
+) {
+  final context = (arguments['context'] as String?)?.trim() ?? '';
+  if (context.isEmpty) {
+    throw ArgumentError(
+      'context must not be empty — it carries the shared background for '
+      'every item in the batch.',
+    );
+  }
+  final rawTasks = arguments['tasks'] as List? ?? const [];
+  if (rawTasks.isEmpty) {
+    throw ArgumentError('tasks must contain at least one item.');
+  }
+  final items = <TaskItem>[];
+  final seenNames = <String>{};
+  for (var i = 0; i < rawTasks.length; i++) {
+    final raw = (rawTasks[i] as Map).cast<String, dynamic>();
+    items.add(_parseItem(raw, i, registry, seenNames));
+  }
+  return items;
+}
+
+/// Validates one raw `tasks[]` entry into a [TaskItem].
+TaskItem _parseItem(
+  Map<String, dynamic> raw,
+  int index,
+  TaskAgentRegistry registry,
+  Set<String> seenNames,
+) {
+  final taskText = (raw['task'] as String?)?.trim() ?? '';
+  if (taskText.isEmpty) {
+    throw ArgumentError('tasks[$index].task must not be empty.');
+  }
+  final name = (raw['name'] as String?)?.trim();
+  _checkDuplicateName(name, seenNames);
+  final agent = (raw['agent'] as String?)?.trim();
+  _checkAgentKnown(agent, registry);
+  return TaskItem(
+    task: taskText,
+    name: name,
+    agent: agent,
+    outputSchema: raw['outputSchema'],
+  );
+}
+
+/// Rejects a non-empty [name] already used in this call (names are
+/// case-insensitive within a call).
+void _checkDuplicateName(String? name, Set<String> seenNames) {
+  if (name != null && name.isNotEmpty && !seenNames.add(name.toLowerCase())) {
+    throw ArgumentError(
+      'duplicate task name "$name" (names are case-insensitive within a call).',
+    );
+  }
+}
+
+/// Rejects a non-empty [agent] naming an unknown agent type, listing the
+/// available ones. `a2a:<name>` types bypass the local registry — they are
+/// validated against the A2A manager's configured servers instead (an
+/// unknown remote server fails at spawn time with its own message).
+void _checkAgentKnown(String? agent, TaskAgentRegistry registry) {
+  if (agent != null && agent.isNotEmpty && registry.resolve(agent) == null) {
+    if (agent.startsWith('a2a:')) return;
+    throw ArgumentError(
+      'Unknown agent type "$agent" — available: '
+      '${registry.agents.map((a) => a.name).join(', ')}',
+    );
+  }
+}
+
+/// Blocking execution: fan out under the session semaphore, stream progress
+/// through [onUpdate], and return every per-item output (omp's settled
+/// response, reduced to the text block — our `ToolExecutionResult` has no
+/// `details` side channel).
+///
+/// Yield-aware: when the loop's soft-yield token fires (a user steering
+/// message arrived mid-wait), the STILL-RUNNING children are converted into
+/// background jobs untouched — never aborted — and the tool call answers
+/// with their job ids, so the user message is delivered at the next step
+/// boundary. Settled items report inline as usual.
+Future<ToolExecutionResult> _runBlocking(
+  TaskToolConfig config,
+  TaskExecutor executor,
+  List<TaskItem> items,
+  String context,
+  CancelToken? cancelToken,
+  ToolUpdateCallback? onUpdate,
+) async {
+  final stopwatch = Stopwatch()..start();
+  final phases = List<TaskSpawnPhase?>.filled(items.length, null);
+  final ids = <int, String>{};
+  // Ids are allocated up front (omp's async path does the same) so a yield
+  // conversion can register jobs for children still queued on the semaphore.
+  final preallocatedIds = [
+    for (final item in items) config.outputs.allocateId(taskItemNameBase(item)),
+  ];
+  var returned = false;
+  void emitProgress() {
+    if (returned) return;
+    onUpdate?.call(
+      ToolExecutionResult.text(_renderProgress(items, phases, ids)),
+    );
+  }
+
+  final results = List<TaskSingleResult?>.filled(items.length, null);
+  final futures = [
+    for (var i = 0; i < items.length; i++)
+      executor.runSpawn(
+        item: items[i],
+        index: i,
+        context: context,
+        preallocatedId: preallocatedIds[i],
+        cancelToken: cancelToken,
+        onProgress: (index, id, phase) {
+          ids[index] = id;
+          phases[index] = phase;
+          emitProgress();
+        },
+      ),
+  ];
+  final indexed = [
+    for (var i = 0; i < items.length; i++)
+      futures[i].then((result) => results[i] = result),
+  ];
+  final allSettled = Future.wait(indexed);
+
+  final yieldToken = currentYieldToken();
+  if (yieldToken == null) {
+    await allSettled;
+    stopwatch.stop();
+    returned = true;
+    return ToolExecutionResult.text(
+      _renderResults(results.cast(), stopwatch.elapsed),
+    );
+  }
+
+  await Future.any([allSettled, yieldToken.onCancel]);
+  returned = true;
+  stopwatch.stop();
+  if (results.every((result) => result != null)) {
+    await allSettled;
+    return ToolExecutionResult.text(
+      _renderResults(results.cast(), stopwatch.elapsed),
+    );
+  }
+
+  // Yielded: move the unfinished children into the session job registry
+  // untouched; their completions arrive via the async-result flow.
+  final moved = <String>[];
+  for (var i = 0; i < items.length; i++) {
+    if (results[i] != null) continue;
+    final job = config.jobManager._register(
+      id: preallocatedIds[i],
+      index: i,
+      agent: taskItemAgentName(items[i]),
+      task: items[i].task,
+    );
+    job._status = phases[i] == TaskSpawnPhase.running
+        ? TaskJobStatus.running
+        : TaskJobStatus.queued;
+    unawaited(
+      futures[i].then((result) => config.jobManager._finish(job, result)),
+    );
+    moved.add(preallocatedIds[i]);
+  }
+  final finished = results.whereType<TaskSingleResult>().toList();
+  final buffer = StringBuffer(
+    'Moved ${moved.length} still-running '
+    '${moved.length == 1 ? 'agent' : 'agents'} to background jobs (they were '
+    'NOT aborted) because a steering message arrived, which follows next:\n',
+  );
+  for (final id in moved) {
+    buffer.writeln('- `$id` (result arrives as agent://$id)');
+  }
+  buffer.write(
+    '\nEach result is delivered when its job settles; use task_status / '
+    'task_send / task_observe to follow up.',
+  );
+  if (finished.isNotEmpty) {
+    buffer.write('\n\nAlready finished before the yield:');
+    for (final result in finished) {
+      _renderResult(buffer, result);
+    }
+  }
+  return ToolExecutionResult.text(buffer.toString());
+}
+
+/// Background execution: allocate ids up front, register one job per item,
+/// and return immediately (omp's async response). Job bodies run detached
+/// under the same session semaphore; the parent cancel token cancels every
+/// job of the call (omp's parent-abort cancel).
+ToolExecutionResult _spawnBackground(
+  TaskToolConfig config,
+  TaskExecutor executor,
+  List<TaskItem> items,
+  String context,
+  CancelToken? cancelToken,
+) {
+  final types = <String>{};
+  final lines = <String>[];
+  for (var i = 0; i < items.length; i++) {
+    final item = items[i];
+    final agentName = taskItemAgentName(item);
+    final id = config.outputs.allocateId(taskItemNameBase(item));
+    final job = config.jobManager._register(
+      id: id,
+      index: i,
+      agent: agentName,
+      task: item.task,
+    );
+    types.add(agentName);
+    lines.add('- `$id` ($agentName, job `$id`)');
+    if (cancelToken != null) {
+      unawaited(cancelToken.onCancel.then((_) => job.cancel()));
+    }
+    unawaited(
+      executor
+          .runSpawn(
+            item: item,
+            index: i,
+            context: context,
+            preallocatedId: id,
+            cancelToken: job.cancelToken,
+            onProgress: (index, id, phase) {
+              if (phase == TaskSpawnPhase.running &&
+                  job._status == TaskJobStatus.queued) {
+                job._status = TaskJobStatus.running;
+              }
+            },
+          )
+          .then((result) => config.jobManager._finish(job, result)),
+    );
+  }
+  return ToolExecutionResult.text(
+    'Spawned ${items.length} background '
+    '${items.length == 1 ? 'agent' : 'agents'} using ${types.join(', ')}.\n'
+    '${lines.join('\n')}\n\n'
+    'Each result is delivered when its job settles and stays addressable as '
+    'agent://<id>.',
+  );
+}
+
+/// Whether a spawn phase is settled — the job reached a terminal state.
+bool _isSettledPhase(TaskSpawnPhase? phase) =>
+    phase == TaskSpawnPhase.completed ||
+    phase == TaskSpawnPhase.failed ||
+    phase == TaskSpawnPhase.aborted;
+
+String _progressMarker(TaskSpawnPhase? phase) => switch (phase) {
+  TaskSpawnPhase.completed => '✓',
+  TaskSpawnPhase.failed || TaskSpawnPhase.aborted => '✗',
+  TaskSpawnPhase.running => '…',
+  null => '·',
+};
+
+String _progressLabel(TaskSpawnPhase? phase) => switch (phase) {
+  TaskSpawnPhase.completed => 'done',
+  TaskSpawnPhase.failed => 'failed',
+  TaskSpawnPhase.aborted => 'aborted',
+  TaskSpawnPhase.running => 'running',
+  null => 'waiting',
+};
+
+String _renderProgress(
+  List<TaskItem> items,
+  List<TaskSpawnPhase?> phases,
+  Map<int, String> ids,
+) {
+  final settled = phases.where(_isSettledPhase).length;
+  final lines = StringBuffer('task: $settled/${items.length} settled');
+  for (var i = 0; i < items.length; i++) {
+    final phase = phases[i];
+    final id = ids[i] ?? taskItemNameBase(items[i]);
+    final agent = taskItemAgentName(items[i]);
+    lines.write(
+      '\n  ${_progressMarker(phase)} $id ($agent) — ${_progressLabel(phase)}',
+    );
+  }
+  return lines.toString();
+}
+
+String _renderResults(List<TaskSingleResult> results, Duration total) {
+  final failed = results
+      .where((result) => result.status != TaskSpawnStatus.completed)
+      .length;
+  final seconds = (total.inMilliseconds / 1000).toStringAsFixed(1);
+  final buffer = StringBuffer(
+    '${results.length} '
+    '${results.length == 1 ? 'subagent' : 'subagents'} finished in '
+    '${seconds}s${failed == 0 ? '' : ' — $failed failed'}.',
+  );
+  for (final result in results) {
+    _renderResult(buffer, result);
+  }
+  return buffer.toString();
+}
+
+/// Renders one per-item block of the settled batch response: header with
+/// status (and schema verdict when validated), the error line, the gh-1951
+/// deliverable body (explicit reply verbatim — or the completion notice +
+/// final-text preview when none was recorded), and the `agent://` pointer.
+void _renderResult(StringBuffer buffer, TaskSingleResult result) {
+  buffer.write(
+    '\n\n## ${result.id} (${result.agent}) — ${_spawnStatusLabel(result.status)}',
+  );
+  final structured = result.structuredOutput;
+  if (structured != null) {
+    buffer.write(' [schema: ${_schemaStatusLabel(structured.status)}]');
+  }
+  final error = result.error;
+  if (error != null) {
+    buffer.write('\nerror: $error');
+  }
+  _renderResultBody(buffer, result, outputPreviewChars: taskOutputPreviewChars);
+  buffer.write(
+    '\n[${result.truncated ? 'Truncated output' : 'Full output'}: '
+    'agent://${result.id}]',
+  );
+  _renderDeliverables(buffer, result);
+}
+
+String _spawnStatusLabel(TaskSpawnStatus status) {
+  return switch (status) {
+    TaskSpawnStatus.completed => 'ok',
+    TaskSpawnStatus.failed => 'failed',
+    TaskSpawnStatus.aborted => 'aborted',
+  };
+}
+
+String _schemaStatusLabel(StructuredValidationStatus status) {
+  return switch (status) {
+    StructuredValidationStatus.valid => 'valid',
+    StructuredValidationStatus.invalid => 'invalid',
+    StructuredValidationStatus.unavailable => 'unvalidated',
+  };
+}

@@ -1,0 +1,812 @@
+/// Image generation tool (`generate_image`) for [AgentCli].
+///
+/// A pure-Dart image-generation client that saves the PNG into the sandbox
+/// `generated/` dir. Dialects:
+/// - OpenRouter `POST {base}/images` (`input_references` for reference
+///   images, `data[].b64_json` + `media_type`) — detected by the
+///   `openrouter.ai` host (gh-1844).
+/// - OpenAI-compatible `POST {base}/images/generations` (`size`,
+///   `data[0].b64_json`/`url`) — the default for every other endpoint.
+/// - DIAL `POST {base}/openai/deployments/{model}/chat/completions`.
+/// - MiniMax `POST {base}/image_generation` (`aspect_ratio`, `image-01`,
+///   `response_format: base64`, `data.image_base64[]`).
+///
+/// The image bytes never enter the main chat context — the saved path and a
+/// base64-staged [ImageContent] are returned. Web-safe.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:http/http.dart' as http;
+
+import '../agent/agent_loop.dart' show ToolExecutionResult;
+import '../agent/agent_tool.dart';
+import '../approval/approval.dart';
+import '../cancel_token.dart' show CancelToken, cancellable;
+import '../env/execution_env.dart';
+import '../model_roles/media_model_slots.dart';
+import '../model_roles/models_config.dart';
+import '../types.dart';
+import 'media_reference_images.dart';
+
+final Random _mediaNameRandom = Random.secure();
+
+/// The `generate_image` tool name.
+const generateImageToolName = 'generate_image';
+
+/// Directory (relative to the env root) where generated files land.
+const generatedMediaDir = 'generated';
+
+/// Failure from a media generation call.
+final class MediaException implements Exception {
+  /// Creates a [MediaException].
+  MediaException(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// Resolves a named secret (the slot override's `apiKeyName`) to its value;
+/// returns null when the name is unknown.
+typedef MediaKeyResolver = Future<String?> Function(String name);
+
+/// The resolved endpoint for a media slot, ready for a request.
+final class MediaEndpoint {
+  /// Creates an endpoint descriptor.
+  const MediaEndpoint({
+    required this.baseUrl,
+    required this.modelId,
+    required this.apiKey,
+  });
+
+  /// Base URL the per-modality path is appended to.
+  final String baseUrl;
+
+  /// Model id sent in the request body.
+  final String modelId;
+
+  /// The resolved API key (empty = no usable credential).
+  final String apiKey;
+}
+
+/// Resolves the `imageGeneration` slot endpoint for the CLI.
+///
+/// Mirrors the app's `MediaModelsStore.resolve` (gh-1844): a
+/// `models.slots.imageGeneration` override wins; WITHOUT one the slot is
+/// UNCONFIGURED (null) — the main connection is never an implicit
+/// fallback (sending the chat model id to a media API was the worst
+/// case). The main connection serves the slot only through the EXPLICIT
+/// per-slot opt-in (`useMainConnection: true`). The slot's `apiKeyName`
+/// (or the main key, same-host only) is resolved via [resolveKey].
+Future<MediaEndpoint?> resolveImageGenerationEndpoint(
+  ModelsConfig? modelsConfig, {
+  required String mainBaseUrl,
+  required String mainModelId,
+  required String mainApiKey,
+  MediaKeyResolver? resolveKey,
+}) async {
+  final override = modelsConfig?.slots['imageGeneration'];
+  if (override == null) return null;
+  if (override.useMainConnection) {
+    if (mainBaseUrl.isEmpty || mainModelId.isEmpty) return null;
+    return MediaEndpoint(
+      baseUrl: mainBaseUrl,
+      modelId: mainModelId,
+      apiKey: mainApiKey,
+    );
+  }
+  final key = await resolveMediaSlotKey(
+    override,
+    mainBaseUrl: mainBaseUrl,
+    mainApiKey: mainApiKey,
+    resolveKey: resolveKey,
+  );
+  if (key.isEmpty) {
+    final keyName = override.apiKeyName;
+    final named = (keyName == null || keyName.isEmpty)
+        ? ''
+        : ' (named "$keyName")';
+    throw MediaException(
+      'the imageGeneration slot has no resolvable API key$named '
+      '— a slot override never uses the main provider key across hosts; '
+      'set models.slots.imageGeneration.apiKeyName to a stored key name '
+      '(/key set <name>) or an environment variable',
+    );
+  }
+  return MediaEndpoint(
+    baseUrl: override.baseUrl,
+    modelId: override.modelId,
+    apiKey: key,
+  );
+}
+
+/// Resolves a slot override's API key: the named key ([resolveKey]) wins;
+/// otherwise the MAIN connection's key is reused when the override's
+/// endpoint is on the SAME HOST only (gh-1844 review: shared by the
+/// image and video resolvers — one rule, both CLI tools). Returns ''
+/// when nothing resolves (the callers throw the actionable
+/// "no resolvable API key" error).
+Future<String> resolveMediaSlotKey(
+  MediaSlotModelConfig override, {
+  required String mainBaseUrl,
+  required String mainApiKey,
+  MediaKeyResolver? resolveKey,
+}) async {
+  final keyName = override.apiKeyName;
+  if (keyName != null && keyName.isNotEmpty) {
+    return (await resolveKey?.call(keyName)) ?? '';
+  }
+  if (_isSameHost(override.baseUrl, mainBaseUrl)) {
+    return mainApiKey;
+  }
+  return '';
+}
+
+bool _isSameHost(String a, String b) {
+  final hostA = Uri.tryParse(a)?.host.toLowerCase();
+  final hostB = Uri.tryParse(b)?.host.toLowerCase();
+  return hostA != null && hostA.isNotEmpty && hostA == hostB;
+}
+
+/// One image-generation dialect (its own URL shape, body schema, and
+/// response parsing). Adding a provider = one new class + one entry in
+/// [imageGenerationDialects]; the dispatcher below never changes.
+abstract final class ImageDialect {
+  /// Whether this dialect handles [endpoint].
+  bool matches(MediaEndpoint endpoint);
+
+  /// Whether this dialect can carry [images] (reference images) — only
+  /// the OpenRouter dialect does (gh-1844); every other dialect rejects
+  /// them before any network call.
+  bool get supportsReferenceImages => false;
+
+  /// Generates an image on the given endpoint.
+  Future<({String path, Uint8List bytes, String detail})> generate({
+    required ExecutionEnv env,
+    required MediaEndpoint endpoint,
+    required String prompt,
+    String? size,
+    String? quality,
+    List<ResolvedMediaImage> images = const [],
+    required http.Client client,
+  });
+}
+
+/// Registered image dialects, in precedence order — the MOST SPECIFIC
+/// matcher first (OpenRouter before the OpenAI-compatible fallback, which
+/// matches everything).
+final List<ImageDialect> imageGenerationDialects = [
+  DialImageDialect(),
+  MiniMaxImageDialect(),
+  OpenRouterImageDialect(),
+  OpenAiImageDialect(), // default fallback — must stay last
+];
+
+/// OpenRouter dedicated Image API (gh-1844):
+/// `POST {base}/images` with `{model, prompt, size?, quality?,
+/// input_references?}`, answering `{data: [{b64_json, media_type?}],
+/// usage?}` — detected by the `openrouter.ai` host. Reference images ride
+/// `input_references` (`image_url` entries: http(s) URLs or base64 data
+/// URLs), per the official Image API docs. Wire format pinned from
+/// https://openrouter.ai/docs/guides/overview/multimodal/image-generation.
+final class OpenRouterImageDialect extends ImageDialect {
+  @override
+  bool matches(MediaEndpoint endpoint) => isOpenRouterBaseUrl(endpoint.baseUrl);
+
+  @override
+  bool get supportsReferenceImages => true;
+
+  @override
+  Future<({String path, Uint8List bytes, String detail})> generate({
+    required ExecutionEnv env,
+    required MediaEndpoint endpoint,
+    required String prompt,
+    String? size,
+    String? quality,
+    List<ResolvedMediaImage> images = const [],
+    required http.Client client,
+  }) async {
+    final response = await client.post(
+      Uri.parse('${_trimSlash(endpoint.baseUrl)}/images'),
+      headers: {
+        'Content-Type': 'application/json',
+        if (endpoint.apiKey.isNotEmpty)
+          'Authorization': 'Bearer ${endpoint.apiKey}',
+      },
+      body: jsonEncode({
+        'model': endpoint.modelId,
+        'prompt': prompt,
+        if (size != null && size.isNotEmpty) 'size': size,
+        if (quality != null && quality.isNotEmpty) 'quality': quality,
+        if (images.isNotEmpty)
+          'input_references': [
+            for (final image in images) image.toOpenRouterJson(),
+          ],
+      }),
+    );
+    if (response.statusCode != 200) {
+      throw MediaException(
+        'image generation failed: HTTP ${response.statusCode}: '
+        '${response.body}',
+      );
+    }
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final decoded = await _decodeImageResult(data, client);
+    final path = await _save(env, 'images', decoded.ext, decoded.bytes);
+    return (path: path, bytes: decoded.bytes, detail: 'saved to $path');
+  }
+
+  /// The decoded image bytes + saved file extension from an OpenRouter
+  /// `{data: [...]}` response body: `b64_json` inline bytes, or a `url`
+  /// download (extracted from [generate] to keep its complexity in the
+  /// CRAP budget — gh-1844).
+  Future<({String ext, Uint8List bytes})> _decodeImageResult(
+    Map<String, dynamic> data,
+    http.Client client,
+  ) async {
+    final first = data['data'] is List && (data['data'] as List).isNotEmpty
+        ? (data['data'] as List).first
+        : null;
+    if (first is! Map<String, dynamic>) {
+      throw MediaException('image generation: no image in OpenRouter response');
+    }
+    final ext = _extensionForMediaType(first['media_type']?.toString());
+    final b64 = first['b64_json'];
+    if (b64 is String && b64.isNotEmpty) {
+      return (ext: ext, bytes: base64Decode(b64));
+    }
+    final url = first['url'];
+    if (url is String && url.isNotEmpty) {
+      return (ext: ext, bytes: await _download(url, client));
+    }
+    throw MediaException('image generation: no image in OpenRouter response');
+  }
+
+  /// The saved file extension for an OpenRouter `media_type`: structured
+  /// types map to their clean subtype (`image/svg+xml` → `svg` — the raw
+  /// subtype would put a `+` in the filename), known types keep their
+  /// subtype, anything else falls back to `png` (review, gh-1844).
+  String _extensionForMediaType(String? mediaType) {
+    if (mediaType == null || !mediaType.startsWith('image/')) return 'png';
+    var subtype = mediaType.substring('image/'.length);
+    // Structured types: the file extension is the clean base subtype
+    // (`svg+xml` → `svg`), never the raw `+`-carrying parameter.
+    final plus = subtype.indexOf('+');
+    if (plus >= 0) subtype = subtype.substring(0, plus);
+    return switch (subtype) {
+      'png' || 'jpeg' || 'webp' || 'svg' => subtype,
+      _ => 'png',
+    };
+  }
+
+  String _trimSlash(String url) =>
+      url.endsWith('/') ? url.substring(0, url.length - 1) : url;
+}
+
+/// DIAL image generation (`POST {base}/openai/deployments/{model}/chat/completions`,
+/// `Api-Key: {key}`, reading `custom_content.attachments[0].url`,
+/// downloaded from `{base}/v1/{url}`).
+final class DialImageDialect extends ImageDialect {
+  @override
+  bool matches(MediaEndpoint endpoint) {
+    final host = Uri.tryParse(endpoint.baseUrl)?.host.toLowerCase() ?? '';
+    return host.contains('ai-proxy') ||
+        host.contains('dial') ||
+        host.endsWith('.epam.com');
+  }
+
+  @override
+  Future<({String path, Uint8List bytes, String detail})> generate({
+    required ExecutionEnv env,
+    required MediaEndpoint endpoint,
+    required String prompt,
+    String? size,
+    String? quality,
+    List<ResolvedMediaImage> images = const [],
+    required http.Client client,
+  }) async {
+    final base = endpoint.baseUrl.endsWith('/')
+        ? endpoint.baseUrl.substring(0, endpoint.baseUrl.length - 1)
+        : endpoint.baseUrl;
+    final response = await client.post(
+      Uri.parse(
+        '$base/openai/deployments/${endpoint.modelId}/chat/completions',
+      ),
+      headers: {
+        'Content-Type': 'application/json',
+        if (endpoint.apiKey.isNotEmpty) 'Api-Key': endpoint.apiKey,
+      },
+      body: jsonEncode({
+        'messages': [
+          {'role': 'user', 'content': prompt},
+        ],
+      }),
+    );
+    if (response.statusCode != 200) {
+      throw MediaException(
+        'image generation failed: HTTP ${response.statusCode}: '
+        '${response.body}',
+      );
+    }
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final attachment = _extractDialAttachment(data);
+    if (attachment == null) {
+      throw MediaException('image generation: no image in DIAL response');
+    }
+    final bytes = await _downloadDialAttachment(
+      attachment,
+      base: base,
+      apiKey: endpoint.apiKey,
+      client: client,
+    );
+    final path = await _save(env, 'images', 'png', bytes);
+    return (path: path, bytes: bytes, detail: 'saved to $path');
+  }
+
+  Map<String, dynamic>? _extractDialAttachment(Map<String, dynamic> data) {
+    final choices = data['choices'];
+    if (choices is! List || choices.isEmpty) return null;
+    final first = choices.first;
+    if (first is! Map<String, dynamic>) return null;
+    final msg = first['message'];
+    if (msg is! Map<String, dynamic>) return null;
+    final customContent = msg['custom_content'];
+    if (customContent is! Map<String, dynamic>) return null;
+    final attachments = customContent['attachments'];
+    if (attachments is! List || attachments.isEmpty) return null;
+    final att = attachments.first;
+    return att is Map<String, dynamic> ? att : null;
+  }
+
+  /// Inline base64 image payload (`b64_json`/`data`), `null` when the
+  /// attachment carries none.
+  Uint8List? _dialInlineImage(Map<String, dynamic> att) {
+    final b64 = att['b64_json'] ?? att['data'];
+    if (b64 is String && b64.isNotEmpty) {
+      return base64Decode(b64);
+    }
+    return null;
+  }
+
+  /// Absolute `http(s)://` URLs pass through; DIAL-relative URLs resolve
+  /// against `$base/v1/`.
+  String _dialDownloadUrl(String relUrl, String base) {
+    if (relUrl.startsWith('http://') || relUrl.startsWith('https://')) {
+      return relUrl;
+    }
+    return '$base/v1/${relUrl.startsWith('/') ? relUrl.substring(1) : relUrl}';
+  }
+
+  Future<Uint8List> _downloadDialAttachment(
+    Map<String, dynamic> att, {
+    required String base,
+    required String apiKey,
+    required http.Client client,
+  }) async {
+    final inline = _dialInlineImage(att);
+    if (inline != null) {
+      return inline;
+    }
+    final relUrl = att['url'] as String?;
+    if (relUrl == null || relUrl.isEmpty) {
+      throw MediaException('image generation: no image in DIAL response');
+    }
+    final imgResp = await client.get(
+      Uri.parse(_dialDownloadUrl(relUrl, base)),
+      headers: {if (apiKey.isNotEmpty) 'Api-Key': apiKey},
+    );
+    if (imgResp.statusCode != 200) {
+      throw MediaException(
+        'failed to download image from DIAL: HTTP ${imgResp.statusCode}: '
+        '${imgResp.body}',
+      );
+    }
+    return imgResp.bodyBytes;
+  }
+}
+
+/// OpenAI-compatible image generation (`POST {base}/images/generations`,
+/// `size`, `data[0].b64_json`/`url`).
+final class OpenAiImageDialect extends ImageDialect {
+  @override
+  bool matches(MediaEndpoint endpoint) => true; // fallback
+
+  @override
+  Future<({String path, Uint8List bytes, String detail})> generate({
+    required ExecutionEnv env,
+    required MediaEndpoint endpoint,
+    required String prompt,
+    String? size,
+    String? quality,
+    List<ResolvedMediaImage> images = const [],
+    required http.Client client,
+  }) async {
+    final response = await client.post(
+      Uri.parse('${endpoint.baseUrl}/images/generations'),
+      headers: {
+        'Content-Type': 'application/json',
+        if (endpoint.apiKey.isNotEmpty)
+          'Authorization': 'Bearer ${endpoint.apiKey}',
+      },
+      body: jsonEncode({
+        'model': endpoint.modelId,
+        'prompt': prompt,
+        'size': ?size,
+        'quality': ?quality,
+      }),
+    );
+    if (response.statusCode != 200) {
+      throw MediaException(
+        'image generation failed: HTTP ${response.statusCode}: '
+        '${response.body}',
+      );
+    }
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    final b64 = data['data']?[0]?['b64_json'];
+    if (b64 is String) {
+      final bytes = base64Decode(b64);
+      final path = await _save(env, 'images', 'png', bytes);
+      return (path: path, bytes: bytes, detail: 'saved to $path');
+    }
+    final url = data['data']?[0]?['url'];
+    if (url is String) {
+      final bytes = await _download(url, client);
+      final path = await _save(env, 'images', 'png', bytes);
+      return (path: path, bytes: bytes, detail: 'saved to $path');
+    }
+    throw MediaException('image generation: no image in response');
+  }
+}
+
+/// MiniMax image generation (`POST {base}/image_generation`,
+/// `model: image-01`, `aspect_ratio`, `response_format: base64`).
+final class MiniMaxImageDialect extends ImageDialect {
+  @override
+  bool matches(MediaEndpoint endpoint) => endpoint.baseUrl.contains('minimax');
+
+  /// Maps an OpenAI-style `size` ("1024x1024") to a MiniMax `aspect_ratio`
+  /// ("1:1"). Falls back to `1:1` for unknown sizes.
+  String _aspectRatio(String? size) {
+    if (size == null) return '1:1';
+    final parts = size.toLowerCase().split('x');
+    if (parts.length == 2) {
+      final w = int.tryParse(parts[0]);
+      final h = int.tryParse(parts[1]);
+      if (w != null && h != null) {
+        final gcd = _gcd(w, h);
+        return '${w ~/ gcd}:${h ~/ gcd}';
+      }
+    }
+    return '1:1';
+  }
+
+  @override
+  Future<({String path, Uint8List bytes, String detail})> generate({
+    required ExecutionEnv env,
+    required MediaEndpoint endpoint,
+    required String prompt,
+    String? size,
+    String? quality,
+    List<ResolvedMediaImage> images = const [],
+    required http.Client client,
+  }) async {
+    final base = endpoint.baseUrl.endsWith('/')
+        ? endpoint.baseUrl.substring(0, endpoint.baseUrl.length - 1)
+        : endpoint.baseUrl;
+    final response = await client.post(
+      Uri.parse('$base/image_generation'),
+      headers: {
+        'Content-Type': 'application/json',
+        if (endpoint.apiKey.isNotEmpty)
+          'Authorization': 'Bearer ${endpoint.apiKey}',
+      },
+      body: jsonEncode({
+        'model': 'image-01',
+        'prompt': prompt,
+        'aspect_ratio': _aspectRatio(size),
+        'response_format': 'base64',
+      }),
+    );
+    if (response.statusCode != 200) {
+      throw MediaException(
+        'image generation failed: HTTP ${response.statusCode}: '
+        '${response.body}',
+      );
+    }
+    final data = jsonDecode(response.body) as Map<String, dynamic>;
+    _throwOnMiniMaxError(data);
+    final images = data['data']?['image_base64'];
+    if (images is List && images.isNotEmpty && images.first is String) {
+      final bytes = base64Decode(images.first as String);
+      final path = await _save(env, 'images', 'png', bytes);
+      return (path: path, bytes: bytes, detail: 'saved to $path');
+    }
+    throw MediaException('image generation: no image in MiniMax response');
+  }
+
+  /// MiniMax reports failures INSIDE HTTP 200 responses as
+  /// `{"base_resp":{"status_code":1004,"status_msg":"login fail: ..."}}` —
+  /// without this check the dialect reports a misleading
+  /// "no image in MiniMax response" instead of the auth/config problem.
+  void _throwOnMiniMaxError(Map<String, dynamic> data) {
+    final baseResp = data['base_resp'];
+    if (baseResp is! Map<String, dynamic>) return;
+    final code = baseResp['status_code'];
+    if (code is num && code != 0) {
+      final msg = baseResp['status_msg'];
+      throw MediaException(
+        'MiniMax image_generation failed: base_resp $code'
+        '${msg is String && msg.isNotEmpty ? ': $msg' : ''} '
+        '(MiniMax hides errors inside HTTP 200; the imageGeneration slot '
+        'likely needs its own MiniMax key — set '
+        'models.slots.imageGeneration.apiKeyName)',
+      );
+    }
+  }
+}
+
+int _gcd(int a, int b) {
+  var x = a;
+  var y = b;
+  while (y != 0) {
+    final t = x % y;
+    x = y;
+    y = t;
+  }
+  return x;
+}
+
+/// Generates an image on the `imageGeneration` endpoint and saves the PNG
+/// into [generatedMediaDir]. Returns the saved path, bytes, and detail.
+///
+/// [images] are reference images (gh-1844): they are validated against
+/// the endpoint's CAPABILITIES (declared on the slot or discovered from
+/// OpenRouter model metadata — never model-name checks) BEFORE the
+/// generation call, so an endpoint that does not accept images fails with
+/// an actionable error instead of a provider 400. Only the OpenRouter
+/// dialect can carry them; other dialects refuse them up front.
+///
+/// [cancelToken] honors cancellation checkpoints (issue #1923 AC2): a
+/// token cancelled before the call rejects up front with no HTTP at all;
+/// after that each unbounded HTTP await races [CancelToken.onCancel] and
+/// rejects with [CancelledException] when it fires — the request itself
+/// is not aborted (the provider keeps the paid work; only the wait
+/// rejects). The soft-yield token is deliberately NOT consulted: a
+/// mid-POST abort would lose paid API work.
+///
+/// Dispatches to the first dialect in [imageGenerationDialects] whose
+/// `matches(endpoint)` returns true.
+Future<({String path, Uint8List bytes, String detail})> generateImageBytes({
+  required ExecutionEnv env,
+  required MediaEndpoint endpoint,
+  required String prompt,
+  String? size,
+  String? quality,
+  List<MediaImageInput> images = const [],
+  List<String> declaredInputModalities = const [],
+  http.Client? httpClient,
+  CancelToken? cancelToken,
+}) async {
+  cancelToken?.throwIfCancelled();
+  final client = httpClient ?? http.Client();
+  // Finish-or-detach (r1 blocker): a cancel rejects the WAIT below while
+  // the paid POST is still on the wire — closing the client in `finally`
+  // at that moment ABORTS the in-flight request, and aborting saves
+  // nothing (the money is spent). `inFlight` therefore chains the close
+  // to the newest work's own settlement; the cancelled wait's result is
+  // discarded, never its wire work.
+  Future<void>? inFlight;
+  Future<T> track<T>(Future<T> work) {
+    inFlight = work.then((_) {}, onError: (Object _, StackTrace _) {});
+    return work;
+  }
+
+  try {
+    final dialect = imageGenerationDialects
+        .where((d) => d.matches(endpoint))
+        .firstOrNull;
+    if (dialect == null) {
+      throw MediaException('image generation: no matching dialect');
+    }
+    final resolvedImages = images.isEmpty
+        ? const <ResolvedMediaImage>[]
+        : await resolveMediaImageInputs(env, images);
+    if (resolvedImages.isNotEmpty) {
+      if (!dialect.supportsReferenceImages) {
+        throw MediaException(
+          'reference images are only supported by the OpenRouter image '
+          'dialect — point the imageGeneration slot at an OpenRouter '
+          'endpoint (or drop the images argument)',
+        );
+      }
+      ensureImageInputSupported(
+        slot: 'imageGeneration',
+        modelId: endpoint.modelId,
+        inputModalities: await cancellable(
+          cancelToken,
+          () => track(
+            resolveInputModalities(
+              baseUrl: endpoint.baseUrl,
+              apiKey: endpoint.apiKey,
+              modelId: endpoint.modelId,
+              declared: declaredInputModalities,
+              client: client,
+            ),
+          ),
+        ),
+      );
+    }
+    return await cancellable(
+      cancelToken,
+      () => track(
+        dialect.generate(
+          env: env,
+          endpoint: endpoint,
+          prompt: prompt,
+          size: size,
+          quality: quality,
+          images: resolvedImages,
+          client: client,
+        ),
+      ),
+    );
+  } finally {
+    final pending = inFlight;
+    if (pending == null) {
+      client.close();
+    } else {
+      // Detach, never abort: close only once the wire work settles.
+      unawaited(pending.then((_) => client.close()));
+    }
+  }
+}
+
+Future<String> _save(
+  ExecutionEnv env,
+  String prefix,
+  String ext,
+  Uint8List bytes,
+) async {
+  final dir = generatedMediaDir;
+  final created = await env.createDir(dir, recursive: true);
+  if (created.isErr) {
+    throw MediaException('failed to create $dir: ${created.errorOrNull}');
+  }
+  // Milliseconds alone collide when two calls land in the same batch (or
+  // two fa processes generate at once) — one would overwrite the other.
+  // dart2js: shifts are 32-bit — `1 << 32` == 0, so nextInt(0) would throw
+  // on web (issue #1074). Spell the bound literally.
+  final unique =
+      DateTime.now().microsecondsSinceEpoch.toRadixString(36) +
+      _mediaNameRandom.nextInt(0xFFFFFFFF).toRadixString(36);
+  final name =
+      '${prefix}_${DateTime.now().millisecondsSinceEpoch}_$unique.$ext';
+  final rel = '$dir/$name';
+  final written = await env.writeBinaryFile(rel, bytes);
+  if (written.isErr) {
+    throw MediaException('failed to write $rel: ${written.errorOrNull}');
+  }
+  return rel;
+}
+
+Future<Uint8List> _download(String url, http.Client client) async {
+  final response = await client.get(Uri.parse(url));
+  if (response.statusCode != 200) {
+    throw MediaException('failed to download image: ${response.statusCode}');
+  }
+  return response.bodyBytes;
+}
+
+/// Builds the `generate_image` [AgentTool] for the CLI. The endpoint is
+/// resolved lazily per call so a `/models set imageGeneration ...` switch is
+/// picked up without a restart.
+///
+/// gh-1844: without a `models.slots.imageGeneration` override (or the
+/// explicit `useMainConnection: true` opt-in) the tool fails with an
+/// actionable "configure the slot" error — the main connection is never
+/// an implicit fallback. The optional `images` argument carries reference
+/// images (sandbox paths, http(s) URLs, or base64) for multimodal
+/// endpoints.
+AgentTool generateImageTool({
+  required ExecutionEnv env,
+  required ModelsConfig? modelsConfig,
+  required String Function() mainBaseUrl,
+  required String Function() mainModelId,
+  required String Function() mainApiKey,
+  MediaKeyResolver? resolveKey,
+  http.Client? httpClient,
+}) {
+  return AgentTool(
+    name: generateImageToolName,
+    label: generateImageToolName,
+    tier: ApprovalTier.write,
+    description:
+        'Generates an image from a text prompt. Requires the '
+        'imageGeneration slot to be configured (models.slots.'
+        'imageGeneration in ~/.fah/config.yaml, or useMainConnection: '
+        'true to opt into the main connection explicitly). Returns a path '
+        'to the saved image file. Arguments: prompt (required), size '
+        '(optional, e.g. "1024x1024"), quality (optional), images '
+        '(optional, list of reference images: sandbox paths, http(s) URLs, '
+        'or base64 — supported by OpenRouter image endpoints that accept '
+        'image input).',
+    parameters: const {
+      'type': 'object',
+      'properties': {
+        'prompt': {
+          'type': 'string',
+          'description': 'text prompt describing the image to generate',
+        },
+        'size': {'type': 'string', 'description': 'image size, e.g. 1024x1024'},
+        'quality': {
+          'type': 'string',
+          'description': 'image quality, e.g. standard or high',
+        },
+        'images': {
+          'type': 'array',
+          'items': {'type': 'string'},
+          'description':
+              'optional reference images (sandbox path, http(s) URL, or '
+              'base64) for endpoints that accept image input',
+        },
+      },
+      'required': ['prompt'],
+    },
+    execute: (arguments, cancelToken, onUpdate) async {
+      cancelToken?.throwIfCancelled();
+      final prompt = arguments['prompt'] as String? ?? '';
+      final size = arguments['size'] as String?;
+      final quality = arguments['quality'] as String?;
+      if (prompt.trim().isEmpty) {
+        throw MediaException('prompt is required');
+      }
+      final override = modelsConfig?.slots['imageGeneration'];
+      final endpoint = await resolveImageGenerationEndpoint(
+        modelsConfig,
+        mainBaseUrl: mainBaseUrl(),
+        mainModelId: mainModelId(),
+        mainApiKey: mainApiKey(),
+        resolveKey: resolveKey,
+      );
+      cancelToken?.throwIfCancelled();
+      if (endpoint == null) {
+        throw MediaException(
+          'no endpoint configured for slot imageGeneration; set one in '
+          'models.slots.imageGeneration (~/.fah/config.yaml), e.g. via '
+          '/models set imageGeneration <model> <baseUrl>. To serve the '
+          'slot from the main connection explicitly, set '
+          'models.slots.imageGeneration.useMainConnection: true.',
+        );
+      }
+      final imageArgs = arguments['images'];
+      final images = <MediaImageInput>[
+        if (imageArgs is List)
+          for (final entry in imageArgs)
+            if (entry != null) parseMediaImageInput(entry.toString()),
+      ];
+      final file = await generateImageBytes(
+        env: env,
+        endpoint: endpoint,
+        prompt: prompt,
+        size: size,
+        quality: quality,
+        images: images,
+        declaredInputModalities: override?.inputModalities ?? const [],
+        httpClient: httpClient,
+        cancelToken: cancelToken,
+      );
+      cancelToken?.throwIfCancelled();
+      return ToolExecutionResult(
+        content: [
+          TextContent(text: 'saved image to ${file.path} (${file.detail})'),
+          ImageContent(data: base64Encode(file.bytes), mimeType: 'image/png'),
+        ],
+      );
+    },
+  );
+}

@@ -1,0 +1,214 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_agent_harness/io.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+
+import 'package:fa/services/app_log.dart';
+import 'package:fa/services/backup_exclusion.dart';
+import 'package:fa/services/dap_home.dart';
+import 'package:fa/services/project_folder_channel.dart';
+import 'package:fa/services/project_mount_env.dart';
+import 'package:fa/services/project_mount_store.dart';
+import 'package:fa/sandbox/fs_persistence_stub.dart'
+    if (dart.library.html) 'fs_persistence_web.dart';
+import 'package:fa/sandbox/memory_shell.dart';
+import 'package:fa/sandbox/persistent_web_env.dart';
+import 'package:fa/sandbox/sandbox_host_paths.dart';
+import 'package:fa/sandbox/wasm_shell.dart';
+
+/// Creates the execution environment for the current platform.
+///
+/// Desktop keeps the existing [LocalExecutionEnv] with the host shell. Mobile
+/// uses a sandboxed host directory and a WasiSandboxShell backed by
+/// MIT-licensed uutils/ripgrep WASM binaries so the agent has a working shell
+/// on iOS and Android.
+/// The user's home directory on desktop (for user-level skill roots like
+/// `~/.claude/skills`, `~/.copilot/skills`); null on mobile/web where those
+/// directories do not exist.
+///
+/// gh-1276 review: the CLI's `homeDirectory()` (`lib/src/cli/cli_config.dart`)
+/// falls back to `USERPROFILE` on Windows, where `HOME` is typically unset —
+/// the app mirrors that fallback (and `bin/fah.dart`'s `HOME ?? USERPROFILE`
+/// order elsewhere) so a Windows desktop build shares the CLI's user store
+/// (`%USERPROFILE%/.fah/memory`) instead of silently falling back to a
+/// disjoint sandbox-local one. [environment] is injectable for tests.
+String? desktopHomeDir([Map<String, String>? environment]) {
+  if (kIsWeb || Platform.isAndroid || Platform.isIOS) return null;
+  final env = environment ?? Platform.environment;
+  if (Platform.isWindows) return env['USERPROFILE'] ?? env['HOME'];
+  return env['HOME'] ?? env['USERPROFILE'];
+}
+
+Future<ExecutionEnv> createPlatformEnv({http.Client? httpClient}) async {
+  if (kIsWeb) {
+    // Fallback for the unlikely case this file is compiled for web; the stub
+    // implementation is preferred via conditional import.
+    return MemoryExecutionEnv(cwd: '/');
+  }
+
+  if (_isMobilePlatform()) {
+    return createMobileSandboxEnv(httpClient: httpClient);
+  }
+  return createDesktopEnv();
+}
+
+/// Only reached off-web (the caller's web branch returns first) — safe to
+/// touch `Platform`.
+bool _isMobilePlatform() => !kIsWeb && (Platform.isAndroid || Platform.isIOS);
+
+/// The Android/iOS branch of [createPlatformEnv]: a sandboxed host directory
+/// plus the WASI shell backed by MIT-licensed uutils/ripgrep WASM binaries
+/// so the agent has a working shell on mobile.
+///
+/// Issue #640: if the WASM runtime fails (e.g. a Rust PanicException while
+/// JIT-compiling python.wasm inside the Android `untrusted_app` VM limits),
+/// the failure used to kill boot before the first frame — a black screen.
+/// It now logs a warning and falls back to the pure-Dart [MemoryShell] over
+/// a [MemoryExecutionEnv] + [PersistentWebExecutionEnv] (the web shell
+/// stack), so the app always boots to the UI.
+Future<ExecutionEnv> createMobileSandboxEnv({
+  http.Client? httpClient,
+  @visibleForTesting Future<WasiSandboxShell> Function()? loadShell,
+}) async {
+  final appDir = await getApplicationDocumentsDirectory();
+  final sandbox = Directory('${appDir.path}/fah_sandbox');
+  await sandbox.create(recursive: true);
+  // Android/iOS have no HOME and a read-only `/`: keep the `~/.dap` hub
+  // config inside the sandbox so Settings → Agent network survives restarts.
+  dapHomeOverride = sandbox.path;
+  // gh-1730 review: `.dap` holds the hub clientSecret (usable directly as a
+  // credential) plus the identity/channel keys — on iOS Documents/ rides the
+  // default iCloud backup. Create the hub tree eagerly and mark it excluded
+  // BEFORE the hub client can write a credential into it (issue #329 E4
+  // precedent: key material never leaves the device). Only `.dap` is
+  // excluded — sessions and the rest of the sandbox stay restorable.
+  final dapDir = Directory('${sandbox.path}/.dap');
+  await dapDir.create(recursive: true);
+  await excludePathFromBackup(dapDir.path);
+
+  // Both Android and iOS run the WASI sandbox shell; on iOS the wasm_run
+  // library is statically linked into the app binary (see setUpWasmRuntime).
+  try {
+    final shell =
+        await (loadShell ??
+            () => WasiSandboxShell.load(
+              workingDirectory: '/',
+              sandboxHostPath: sandbox.path,
+              httpClient: httpClient,
+            ))();
+    return SandboxedExecutionEnv(
+      LocalExecutionEnv(cwd: sandbox.path, shell: shell),
+      sandbox.path,
+    );
+  } on Object catch (e) {
+    final note = 'WASM shell unavailable, falling back to MemoryShell: $e';
+    debugPrint('[env_factory] $note');
+    AppLog.i('sandbox', note);
+    final shell = MemoryShell(httpClient: httpClient);
+    final env = MemoryExecutionEnv(cwd: '/', shell: shell);
+    shell.attach(env);
+    return PersistentWebExecutionEnv.restore(env, createFsSnapshotStore());
+  }
+}
+
+/// The desktop branch of [createPlatformEnv]: the application-support
+/// directory as the container cwd so settings/stores live inside the app
+/// sandbox and do not trigger a permission prompt on macOS. macOS
+/// additionally layers the optional project-folder mount on top via
+/// [mountedDesktopEnv].
+Future<ExecutionEnv> createDesktopEnv() async {
+  final appDir = await getApplicationSupportDirectory();
+  final baseEnv = LocalExecutionEnv(cwd: appDir.path);
+  if (!Platform.isMacOS) return baseEnv;
+  return mountedDesktopEnv(baseEnv);
+}
+
+/// macOS project-folder mount layer over [baseEnv]: restores the persisted
+/// mount (bookmark access re-granted → [ProjectMountEnv.mountedRoot], or the
+/// stale-mount note when access is refused).
+Future<ExecutionEnv> mountedDesktopEnv(LocalExecutionEnv baseEnv) async {
+  final mountEnv = ProjectMountEnv(baseEnv);
+  final stored = await ProjectMountStore.load(baseEnv);
+  if (stored == null) return mountEnv;
+  applyStoredMount(
+    mountEnv,
+    stored,
+    granted: await ProjectFolderChannelOps().startAccessing(stored.bookmark),
+  );
+  return mountEnv;
+}
+
+/// Applies a restored mount to [mountEnv]: a granted bookmark exposes the
+/// project folder as the mounted root; a refused one surfaces the
+/// stale-mount note (public so both branches are table-tested).
+void applyStoredMount(
+  ProjectMountEnv mountEnv,
+  ProjectMountStore stored, {
+  required bool granted,
+}) {
+  if (granted) {
+    mountEnv.mountedRoot = stored.path;
+  } else {
+    mountEnv.mountUnavailable = stored.path;
+  }
+}
+
+/// `true` when running on a mobile OS that needs the WASM shell sandbox.
+bool get isMobile => Platform.isAndroid || Platform.isIOS;
+
+/// `true` when running on Android (the WASM shell sandbox works there).
+bool get isAndroidPlatform => Platform.isAndroid;
+
+/// `true` when running on iOS (the WASM shell sandbox works there via the
+/// statically linked wasm_run library).
+bool get isIosPlatform => Platform.isIOS;
+
+/// `true` when running on the web.
+bool get isWebPlatform => false;
+
+/// Maps sandbox-absolute paths (`/foo`) into the sandbox host directory for
+/// the file tools, so `read`/`write`/`ls`/`edit` agree with the WASM shell's
+/// view of `/` as the sandbox root.
+///
+/// The mapping is idempotent: paths already inside the sandbox host directory
+/// pass through unchanged. That matters because this env reports the *host*
+/// path as [cwd], so any path derived from values the env itself hands out —
+/// `'${env.cwd}/sessions'`, [absolutePath]/[joinPath] results, or
+/// [FileInfo.path] from [listDir] — must remain valid input. Without the
+/// pass-through, `JsonlSessionRepo(fs: env, sessionsRoot: '${env.cwd}/
+/// sessions')` resolved and wrote sessions into a nested
+/// `<sandbox>/<sandbox-host-path>/sessions` directory.
+///
+/// A sandbox-virtual absolute path that textually begins with the host root
+/// is indistinguishable from an already-mapped host path and is treated as
+/// the latter; both readings stay inside the sandbox, so the sandbox
+/// boundary is preserved either way.
+final class SandboxedExecutionEnv extends ForwardingFs
+    with
+        ForwardingBackgroundShell,
+        ForwardingRangedReadFs,
+        ForwardingRenamableFs {
+  /// Creates an env mapping sandbox-absolute paths onto [_sandboxRoot],
+  /// delegating everything else (relative paths, [exec]) to the delegate.
+  SandboxedExecutionEnv(super.delegate, this._sandboxRoot);
+
+  final String _sandboxRoot;
+
+  /// Lazily-built matcher sharing the "inside the sandbox host dir"
+  /// convention with the WASM shell (gh-1274 review) so the two mappings
+  /// cannot drift apart.
+  SandboxHostRoot? _hostRoot;
+
+  @override
+  String mapPath(String path) {
+    final root = _sandboxRoot;
+    if (root.isEmpty) return path;
+    final hostRoot = _hostRoot ??= SandboxHostRoot(root);
+    if (hostRoot.contains(path)) return path;
+    if (path.startsWith('/')) return '$root$path';
+    return path;
+  }
+}

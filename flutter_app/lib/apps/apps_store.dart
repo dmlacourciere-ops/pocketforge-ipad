@@ -1,0 +1,1597 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+import 'package:fa/apps/app_storage.dart';
+import 'package:fa/apps/catalog_service.dart';
+import 'package:fa/apps/manifest_i18n.dart';
+import 'package:fa/services/app_log.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+
+/// Stable manifest/platform identifier for the current Flutter host.
+String get currentFaPlatform {
+  if (kIsWeb) return 'web';
+  return switch (defaultTargetPlatform) {
+    TargetPlatform.android => 'android',
+    TargetPlatform.iOS => 'ios',
+    TargetPlatform.macOS => 'macos',
+    TargetPlatform.windows => 'windows',
+    TargetPlatform.linux => 'linux',
+    TargetPlatform.fuchsia => 'fuchsia',
+  };
+}
+
+/// Removes platform-tagged Markdown that does not apply to [platform].
+///
+/// Whole blocks use `<!-- fa-platforms: ios,macos -->` and
+/// `<!-- /fa-platforms -->`. A single table/list line can carry only the
+/// opening marker; the marker is stripped when the line is retained.
+String filterPlatformInstructions(String source, {required String platform}) {
+  final block = RegExp(
+    r'<!-- fa-platforms:\s*([^>]+?)\s*-->(.*?)<!-- /fa-platforms -->',
+    dotAll: true,
+  );
+  var filtered = source.replaceAllMapped(block, (match) {
+    return _platformList(match.group(1)).contains(platform)
+        ? match.group(2)!
+        : '';
+  });
+  final taggedLine = RegExp(
+    r'^.*<!-- fa-platforms:\s*([^>]+?)\s*-->.*$',
+    multiLine: true,
+  );
+  filtered = filtered.replaceAllMapped(taggedLine, (match) {
+    if (!_platformList(match.group(1)).contains(platform)) return '';
+    return match
+        .group(0)!
+        .replaceFirst(RegExp(r'\s*<!-- fa-platforms:\s*[^>]+?\s*-->'), '');
+  });
+  return filtered.replaceAll('{{FA_PLATFORM}}', platform);
+}
+
+Set<String> _platformList(Object? value) => {
+  for (final item in switch (value) {
+    List<Object?> values => values,
+    String text => text.split(','),
+    _ => const <Object?>[],
+  })
+    if (item.toString().trim().isNotEmpty) item.toString().trim().toLowerCase(),
+};
+
+/// Declared capabilities of a JS app, parsed from its `manifest.json`.
+///
+/// Mirrors YoLoIT's widget manifest (`network`, `allowedCommands`) and adds
+/// the Fa bridge surface (`llm`, `homekit`, `health`, `contacts`,
+/// `microphone`, `notifications`, `media`, `keys`). Every capability
+/// defaults to denied; the user can grant/deny per app at runtime (see
+/// [AppPermissionsStore]).
+class AppPermissions {
+  const AppPermissions({
+    this.network = false,
+    this.allowedCommands = const [],
+    this.llm = false,
+    this.homekit = false,
+    this.health = false,
+    this.contacts = false,
+    this.calendar = false,
+    this.microphone = false,
+    this.notifications = false,
+    this.media = false,
+    this.keys = false,
+    this.theme = false,
+  });
+
+  factory AppPermissions.fromJson(Map<String, Object?> json) {
+    return AppPermissions(
+      network: json['network'] == true,
+      allowedCommands: [
+        for (final c in (json['allowedCommands'] as List?) ?? const [])
+          c.toString(),
+      ],
+      llm: json['llm'] == true,
+      homekit: json['homekit'] == true,
+      health: json['health'] == true,
+      contacts: json['contacts'] == true,
+      calendar: json['calendar'] == true,
+      microphone: json['microphone'] == true,
+      notifications: json['notifications'] == true,
+      media: json['media'] == true,
+      keys: json['keys'] == true,
+      theme: json['theme'] == true,
+    );
+  }
+
+  /// Network access (`jsr.fetchJson`).
+  final bool network;
+
+  /// Shell commands the app may run through `jsr.exec`.
+  final List<String> allowedCommands;
+
+  /// Access to the host LLM via the `jsr.fa.llm(...)` bridge call.
+  final bool llm;
+
+  /// HomeKit bridge (stub — pending platform implementation).
+  final bool homekit;
+
+  /// Health data bridge (stub).
+  final bool health;
+
+  /// Contacts bridge (stub).
+  final bool contacts;
+
+  /// System-calendar bridge (`jsr.fa.calendar` — events, create, update,
+  /// delete).
+  final bool calendar;
+
+  /// Microphone bridge (`jsr.fa.asr`) — record audio and transcribe speech.
+  final bool microphone;
+
+  /// Local-notifications bridge (`jsr.fa.notify`) — schedule/cancel local
+  /// system notifications.
+  final bool notifications;
+
+  /// Media bridge (`jsr.fa.media`) — image / TTS / music generation and
+  /// video reading on the configured media endpoints.
+  final bool media;
+
+  /// Host-keys bridge (`jsr.fa.keys`) — list/read the user's saved API keys
+  /// and request new ones through the host's secret prompt.
+  final bool keys;
+
+  /// Theme-pack bridge (`jsr.fa.theme`) — list installed packs, read the
+  /// active one, apply one WITH user consent per call (issue #169).
+  final bool theme;
+
+  AppPermissions copyWith({
+    bool? network,
+    bool? llm,
+    bool? homekit,
+    bool? health,
+    bool? contacts,
+    bool? calendar,
+    bool? microphone,
+    bool? notifications,
+    bool? media,
+    bool? keys,
+    bool? theme,
+  }) {
+    return AppPermissions(
+      network: network ?? this.network,
+      allowedCommands: allowedCommands,
+      llm: llm ?? this.llm,
+      homekit: homekit ?? this.homekit,
+      health: health ?? this.health,
+      contacts: contacts ?? this.contacts,
+      calendar: calendar ?? this.calendar,
+      microphone: microphone ?? this.microphone,
+      notifications: notifications ?? this.notifications,
+      media: media ?? this.media,
+      keys: keys ?? this.keys,
+      theme: theme ?? this.theme,
+    );
+  }
+
+  Map<String, Object?> toJson() => {
+    'network': network,
+    'allowedCommands': allowedCommands,
+    'llm': llm,
+    'homekit': homekit,
+    'health': health,
+    'contacts': contacts,
+    'calendar': calendar,
+    'microphone': microphone,
+    'notifications': notifications,
+    'media': media,
+    'keys': keys,
+    'theme': theme,
+  };
+}
+
+/// Live-tile widget declaration of a JS app, parsed from the optional
+/// `"widget"` section of its `manifest.json`:
+///
+/// ```json
+/// "widget": { "entry": "widget_tile.js", "size": "4x2", "refreshSeconds": 900 }
+/// ```
+///
+/// An app with a tile renders its own mini UI inside the launcher home grid
+/// (see `app_tile_host.dart`) instead of the static icon + label, spanning
+/// the declared WxH block of icon slots. Unknown or invalid values fall back
+/// to the defaults (like `chrome` does).
+class JsTileWidgetInfo {
+  const JsTileWidgetInfo({
+    this.entry = defaultEntry,
+    this.widthCells = defaultWidthCells,
+    this.heightCells = defaultHeightCells,
+    this.refreshSeconds,
+    this.interactive = false,
+  });
+
+  factory JsTileWidgetInfo.fromJson(Map<String, Object?> json) {
+    final entry = (json['entry'] ?? defaultEntry).toString();
+    // "size": "<W>x<H>" in icon-slot cells (e.g. "2x2", "4x2"); anything
+    // unparsable falls back to the small-widget default 2x2, numbers clamp
+    // to the supported range.
+    var widthCells = defaultWidthCells;
+    var heightCells = defaultHeightCells;
+    final match = RegExp(
+      r'^(\d+)x(\d+)$',
+    ).firstMatch(json['size']?.toString() ?? '');
+    if (match != null) {
+      final declaredW = int.tryParse(match.group(1)!) ?? defaultWidthCells;
+      final declaredH = int.tryParse(match.group(2)!) ?? defaultHeightCells;
+      widthCells = declaredW.clamp(minWidthCells, maxWidthCells);
+      heightCells = declaredH.clamp(minHeightCells, maxHeightCells);
+      // An out-of-range span (0x0, 9x9, …) clamps with a note, never a
+      // crash (issue #166, E2).
+      if (declaredW != widthCells || declaredH != heightCells) {
+        AppLog.i(
+          'apps',
+          'widget size ${declaredW}x$declaredH clamped to '
+              '${widthCells}x$heightCells',
+        );
+      }
+    }
+    final refresh = json['refreshSeconds'];
+    return JsTileWidgetInfo(
+      entry: entry.isEmpty ? defaultEntry : entry,
+      widthCells: widthCells,
+      heightCells: heightCells,
+      refreshSeconds: refresh is num && refresh > 0 ? refresh.toInt() : null,
+      interactive: json['interactive'] == true,
+    );
+  }
+
+  /// Default tile entry file inside the app folder.
+  static const String defaultEntry = 'widget_tile.js';
+
+  /// Default horizontal span in icon-slot cells (the iOS "small" widget).
+  static const int defaultWidthCells = 2;
+
+  /// Default vertical span in icon-slot cells.
+  static const int defaultHeightCells = 2;
+
+  /// Minimum/maximum horizontal span of a tile, in icon-slot cells.
+  /// Width 1 declares an icon-only tile: the launcher shows the plain
+  /// icon block and never boots a tile engine for it.
+  static const int minWidthCells = 1;
+  static const int maxWidthCells = 4;
+
+  /// Minimum/maximum vertical span of a tile, in icon-slot cells.
+  static const int minHeightCells = 1;
+  static const int maxHeightCells = 4;
+
+  /// Tile JS entry file inside `apps/<id>/`.
+  final String entry;
+
+  /// When true, UI events from the tile tree (button taps) are routed to
+  /// the tile engine's `jsr.onEvent` instead of opening the full app —
+  /// the widget is interactive right on the launcher board. Opening the
+  /// app stays available via the tile menu (long-press / right-click).
+  final bool interactive;
+
+  /// Horizontal tile span in icon-slot cells
+  /// ([minWidthCells]..[maxWidthCells]); unknown manifest values fall back
+  /// to [defaultWidthCells].
+  final int widthCells;
+
+  /// Vertical tile span in icon-slot cells
+  /// ([minHeightCells]..[maxHeightCells]); unknown manifest values fall back
+  /// to [defaultHeightCells].
+  final int heightCells;
+
+  /// The declared tile size as a `'WxH'` cell string (e.g. `'4x2'`).
+  String get size => '${widthCells}x$heightCells';
+
+  /// Optional host-side refresh cadence: the tile host calls the tile's
+  /// `tile.refresh` event every this many seconds (the tile JS can also just
+  /// use its own `setInterval` instead).
+  final int? refreshSeconds;
+}
+
+/// A JS app discovered in the env's `apps/` folder.
+class JsAppInfo {
+  const JsAppInfo({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.icon,
+    required this.declaredPermissions,
+    this.nameText,
+    this.descriptionText,
+    this.version = '1.0.0',
+    this.chrome = chromeHeader,
+    this.tileWidget,
+    this.bundled = false,
+    this.platforms,
+    this.dirOverride,
+    this.error,
+    this.installSource,
+  });
+
+  factory JsAppInfo.fromManifest(
+    Map<String, Object?> json, {
+    required bool bundled,
+    required String fallbackId,
+  }) {
+    final widget = json['widget'];
+    // Localization lives ONLY in the additive nameI18n/descriptionI18n
+    // keys (locale -> string | {"file": ...}) — see manifest_i18n.dart.
+    // The legacy name/description keys stay scalar strings (JSR strict
+    // casts) and carry the default-locale value.
+    final nameText = LocalizedText.parse(json['name'], json['nameI18n']);
+    final descriptionText = LocalizedText.parse(
+      json['description'],
+      json['descriptionI18n'],
+    );
+    final name = nameText.resolve(null);
+    // gh-1614 I1: the STORAGE DIR NAME is the namespace identity. A
+    // manifest declaring a divergent or hostile id (`{"id": "../evil"}`,
+    // or an id that simply does not match the folder) must not steer the
+    // tile's reads to another root — that divergence is exactly the
+    // listed-but-unreadable defect. The declared id stays display-only
+    // metadata; the resolver keys on the directory.
+    return JsAppInfo(
+      id: fallbackId,
+      name: name.isEmpty ? fallbackId : name,
+      description: descriptionText.resolve(null),
+      nameText: nameText,
+      descriptionText: descriptionText,
+      icon: (json['icon'] ?? '📦').toString(),
+      version: (json['version'] ?? '1.0.0').toString(),
+      chrome: json['chrome'] == chromeFull ? chromeFull : chromeHeader,
+      tileWidget: widget is Map<String, Object?>
+          ? JsTileWidgetInfo.fromJson(widget)
+          : null,
+      declaredPermissions: AppPermissions.fromJson(json),
+      bundled: bundled,
+      platforms: json.containsKey('platforms')
+          ? _platformList(json['platforms'])
+          : null,
+    );
+  }
+
+  final String id;
+  final String name;
+  final String description;
+
+  /// The parsed localized manifest values behind [name]/[description]
+  /// (null when this instance was built directly with plain strings —
+  /// [displayName]/[displayDescription] then treat the plain strings as
+  /// the scalar fallback). Ref contents are attached by
+  /// [AppsStore.listApps] via [withI18nContents].
+  final LocalizedText? nameText;
+  final LocalizedText? descriptionText;
+
+  /// The manifest name resolved for [locale] (device locale tag like
+  /// `en` or `pt-BR`): exact tag → language → `en` → first declared →
+  /// scalar fallback.
+  String displayName(String? locale) =>
+      (nameText ?? LocalizedText.parse(name)).resolve(locale);
+
+  /// The manifest description resolved for [locale] (see [displayName]).
+  String displayDescription(String? locale) =>
+      (descriptionText ?? LocalizedText.parse(description)).resolve(locale);
+
+  static const _unset = Object();
+
+  /// Field-preserving copy — the ONE hand-written field list (gh-1614
+  /// review): flag setters compose over this instead of duplicating the
+  /// 14 fields, so a future [JsAppInfo] field cannot be silently dropped
+  /// by a missed hand-maintained copy. [installSource] takes the
+  /// [_unset] sentinel (the `widget_publication_store.copyWith`
+  /// convention) because [withInstallSource] must also be able to CLEAR
+  /// the provenance badge, not only overwrite it.
+  JsAppInfo copyWith({
+    LocalizedText? nameText,
+    LocalizedText? descriptionText,
+    String? error,
+    Object? installSource = _unset,
+  }) => JsAppInfo(
+    id: id,
+    name: name,
+    description: description,
+    icon: icon,
+    declaredPermissions: declaredPermissions,
+    nameText: nameText ?? this.nameText,
+    descriptionText: descriptionText ?? this.descriptionText,
+    version: version,
+    chrome: chrome,
+    tileWidget: tileWidget,
+    bundled: bundled,
+    platforms: platforms,
+    dirOverride: dirOverride,
+    error: error ?? this.error,
+    installSource: identical(installSource, _unset)
+        ? this.installSource
+        : installSource as String?,
+  );
+
+  /// Copy with ref file contents (ref path → text) attached, so
+  /// [displayName]/[displayDescription] can resolve `{"file": ...}`
+  /// entries synchronously at display time.
+  JsAppInfo withI18nContents(Map<String, String> contents) => copyWith(
+    nameText: nameText?.withContents(contents),
+    descriptionText: descriptionText?.withContents(contents),
+  );
+
+  /// Copy flagged with a launch-blocking error (see [error]) — every other
+  /// field, localized display values included, carries over. The listing
+  /// uses this for the gh-1614 missing-files state: the tile renders the
+  /// explicit broken-app affordance and taps surface the message instead
+  /// of launching into a `StateError`. The FIRST error wins (an already
+  /// flagged tile keeps its flag).
+  JsAppInfo withError(String message) => copyWith(error: error ?? message);
+
+  /// Copy with the install source (`catalog` | `unpacked` — from
+  /// `apps/.installed.json`) attached; null for apps with no record
+  /// (agent-created). The launcher and the catalog sheet surface it
+  /// (gh-1616 invariant I3).
+  JsAppInfo withInstallSource(String? source) =>
+      installSource == source ? this : copyWith(installSource: source);
+
+  /// Where this app was installed from: `catalog` (the fa_widgets
+  /// gallery), `unpacked` (a local folder load, gh-1616), or null when
+  /// there is no install record (agent-created apps).
+  final String? installSource;
+
+  final String icon;
+  final String version;
+  final AppPermissions declaredPermissions;
+
+  /// Host platforms on which this app is enabled, or null for every platform.
+  ///
+  /// Manifest identifiers are `web`, `android`, `ios`, `macos`, `windows`,
+  /// `linux`, and `fuchsia`.
+  final Set<String>? platforms;
+
+  bool supportsPlatform(String platform) =>
+      platforms == null || platforms!.contains(platform.toLowerCase());
+
+  /// Default display chrome: the app renders under a regular AppBar.
+  static const String chromeHeader = 'header';
+
+  /// Full-bleed display chrome: no AppBar; app controls float over the app.
+  static const String chromeFull = 'full';
+
+  /// Display chrome (NOT a permission): [chromeHeader] (default) or
+  /// [chromeFull]; unknown manifest values fall back to [chromeHeader].
+  final String chrome;
+
+  /// True when the app wants the full-bleed layout (see [chromeFull]).
+  bool get isFullChrome => chrome == chromeFull;
+
+  /// True for demo apps seeded from bundled assets (read-only source).
+  final bool bundled;
+
+  /// Live-tile widget declaration (the manifest's `"widget"` section), or
+  /// null when the app has no launcher tile — it renders the classic static
+  /// icon tile on the home grid.
+  final JsTileWidgetInfo? tileWidget;
+
+  /// Optional redirect of the app directory outside `apps/` — session-scoped
+  /// dynamic-message widgets store their code and `storage.json` under the
+  /// session folder instead of the shared apps folder; null for normal apps.
+  final String? dirOverride;
+
+  /// Non-null when the app's `manifest.json` exists but does not parse
+  /// (an agent edit can break it): the tile renders a visible error
+  /// affordance and taps surface the message instead of launching — never
+  /// a silently stale or missing app (issue #866). Null for healthy apps.
+  final String? error;
+
+  /// Env-relative path of the app directory (`apps/<id>` resolved through
+  /// the shared [AppStorage] namespace — gh-1614 I1 — or the session
+  /// folder override for dynamic-message widgets, see [dirOverride]).
+  ///
+  /// Throws [ArgumentError] for an id that cannot live in the namespace
+  /// (gh-1614 AC4 read-side rejection) — such an app can never be listed
+  /// ([AppsStore.listApps] filters the directory first).
+  String get dir => dirOverride ?? AppStorage.appDir(id);
+  String get widgetPath => '$dir/${AppStorage.defaultEntry}';
+  String get manifestPath => '$dir/${AppStorage.manifestFile}';
+
+  /// Env-relative path of the live-tile entry file (see [tileWidget]).
+  String get tileWidgetPath =>
+      '$dir/${tileWidget?.entry ?? JsTileWidgetInfo.defaultEntry}';
+}
+
+/// Effective permission state for one app: the manifest's declared set with
+/// the user's runtime overrides applied (stored in `apps_permissions.json`).
+class EffectiveAppPermissions {
+  const EffectiveAppPermissions(this.declared, this.overrides);
+
+  final AppPermissions declared;
+  final AppPermissions? overrides;
+
+  bool get network => overrides?.network ?? declared.network;
+  bool get llm => overrides?.llm ?? declared.llm;
+  bool get homekit => overrides?.homekit ?? declared.homekit;
+  bool get health => overrides?.health ?? declared.health;
+  bool get contacts => overrides?.contacts ?? declared.contacts;
+  bool get calendar => overrides?.calendar ?? declared.calendar;
+  bool get microphone => overrides?.microphone ?? declared.microphone;
+  bool get notifications => overrides?.notifications ?? declared.notifications;
+  bool get media => overrides?.media ?? declared.media;
+  bool get keys => overrides?.keys ?? declared.keys;
+  List<String> get allowedCommands => declared.allowedCommands;
+
+  AppPermissions effective() => AppPermissions(
+    network: network,
+    allowedCommands: allowedCommands,
+    llm: llm,
+    homekit: homekit,
+    health: health,
+    contacts: contacts,
+    calendar: calendar,
+    microphone: microphone,
+    notifications: notifications,
+    media: media,
+    keys: keys,
+  );
+}
+
+/// User-granted permission overrides per app, persisted as
+/// `apps_permissions.json` through the shared [ExecutionEnv] (same pattern
+/// as `ProviderRegistry` / `LastConnectionStore`).
+class AppPermissionsStore {
+  AppPermissionsStore(this._env, this._overrides);
+
+  static const String _fileName = 'apps_permissions.json';
+
+  final ExecutionEnv _env;
+  final Map<String, AppPermissions> _overrides;
+
+  static Future<AppPermissionsStore> load(ExecutionEnv env) async {
+    final overrides = <String, AppPermissions>{};
+    final raw = await env.readTextFile(_fileName);
+    final text = raw.valueOrNull;
+    if (text != null) {
+      try {
+        final decoded = jsonDecode(text);
+        if (decoded is Map<String, Object?>) {
+          for (final entry in decoded.entries) {
+            final value = entry.value;
+            if (value is Map<String, Object?>) {
+              overrides[entry.key] = AppPermissions.fromJson(value);
+            }
+          }
+        }
+      } on FormatException {
+        // Corrupt file — start empty.
+      }
+    }
+    return AppPermissionsStore(env, overrides);
+  }
+
+  EffectiveAppPermissions forApp(JsAppInfo app) =>
+      EffectiveAppPermissions(app.declaredPermissions, _overrides[app.id]);
+
+  Future<void> setOverride(String appId, AppPermissions permissions) async {
+    _overrides[appId] = permissions;
+    await _save();
+  }
+
+  Future<void> clearOverride(String appId) async {
+    _overrides.remove(appId);
+    await _save();
+  }
+
+  Future<void> _save() async {
+    final json = {
+      for (final entry in _overrides.entries) entry.key: entry.value.toJson(),
+    };
+    await _env.writeFile(
+      _fileName,
+      const JsonEncoder.withIndent('  ').convert(json),
+    );
+  }
+}
+
+/// Discovers JS apps in the env's `apps/` folder and seeds the bundled demo
+/// apps from Flutter assets on first run.
+///
+/// The folder layout is `<env.cwd>/apps/<id>/{manifest.json,widget.js}`.
+/// Because it lives in the shared env, the Fa agent can create and edit apps
+/// with its regular file tools — that is how "Fa, make me an app" works.
+class AppsStore {
+  /// Creates a store over [env]; [readAsset] defaults to `rootBundle`.
+  /// [seedDemoIds] lists the bundled apps seeded on first run.
+  AppsStore(
+    this._env, {
+    Future<String> Function(String path)? readAsset,
+    this.seedDemoIds = demoAppIds,
+    String? platform,
+  }) : platform = platform ?? currentFaPlatform,
+       _readAsset = readAsset ?? rootBundle.loadString;
+
+  /// Asset root that USED TO hold the bundled demo apps (see pubspec.yaml).
+  /// Kept for API compatibility — nothing is bundled anymore.
+  static const String bundledAssetRoot = 'assets/apps';
+
+  /// The bundled demo apps seeded on first run — EMPTY: every widget moved
+  /// to the widget catalog (Get widgets), so a fresh install starts with a
+  /// clean grid and nothing is seeded. Kept (empty) for API compatibility:
+  /// `isDemo` checks and the demo-restore flow simply never match.
+  static const List<String> demoAppIds = [];
+
+  /// The demo apps this store seeds (see [seedBundledApps]).
+  final List<String> seedDemoIds;
+
+  final ExecutionEnv _env;
+  final String platform;
+
+  /// Asset reader — reads bundled demo app sources; injectable for tests.
+  final Future<String> Function(String path) _readAsset;
+
+  /// Last scan's parsed state per app id: manifest content hash → parsed
+  /// model (with i18n contents attached). [listApps] re-parses ONLY apps
+  /// whose manifest changed (the hash-diff gate, issue #866).
+  final Map<String, String> _manifestHashes = {};
+  final Map<String, JsAppInfo> _parsedApps = {};
+
+  /// Per-app digests of the i18n ref files embedded in the cached model
+  /// (`apps/<id>`-relative path → sha256) — see [_i18nRefsUnchanged].
+  final Map<String, Map<String, String>> _refHashes = {};
+
+  /// Lists all apps found in `apps/`, sorted by name.
+  ///
+  /// Incremental (issue #866): every manifest.json is hashed against the
+  /// last scan; only changed manifests are re-parsed, so panel opens and
+  /// post-agent-write reloads cost one small read per unchanged app and
+  /// zero re-parses. Honesty rules from #866: a manifest that no longer
+  /// parses yields a visible error entry ([JsAppInfo.error]) instead of
+  /// silently dropping the app, and `.installed.json` records whose app
+  /// directory has vanished (agent `rm -rf`) are pruned.
+  Future<List<JsAppInfo>> listApps() async {
+    final apps = <JsAppInfo>[];
+    final seen = <String>{};
+    final listing = await _env.listDir(AppStorage.root);
+    final entries = listing.valueOrNull;
+    if (entries == null) {
+      return _cachedAppsFallback();
+    }
+    for (final entry in entries) {
+      if (!_isListableDir(entry)) continue;
+      final id = entry.name;
+      seen.add(id);
+      final listed = await _listAppDir(id);
+      if (listed != null && listed.supportsPlatform(platform)) {
+        apps.add(listed);
+      }
+    }
+    await _pruneVanishedApps(seen);
+    return _attachInstallProvenance(apps);
+  }
+
+  /// A failed listing is NOT an empty workspace (issue #866 review):
+  /// serving the last-known models keeps the panel truthful through a
+  /// transient IO error, and the install-record prune must never run on an
+  /// empty `seen` — that would wipe `.installed.json`.
+  Future<List<JsAppInfo>> _cachedAppsFallback() async {
+    final sources = await installSources();
+    final cachedApps =
+        _parsedApps.values
+            .where((app) => app.supportsPlatform(platform))
+            .map((app) => app.withInstallSource(sources[app.id]))
+            .toList()
+          ..sort((a, b) => a.name.compareTo(b.name));
+    return cachedApps;
+  }
+
+  /// The three list-side skips: non-directories, dot-entries, and names
+  /// that cannot resolve inside the shared namespace. gh-1614 AC4 (list
+  /// side): an unresolvable directory could never boot through the
+  /// resolver anyway — logged so the leftover stays discoverable.
+  bool _isListableDir(FileInfo entry) {
+    if (entry.kind != FileKind.directory) return false;
+    final id = entry.name;
+    if (id.startsWith('.')) return false;
+    if (!AppStorage.isResolvableId(id)) {
+      AppLog.i(
+        'apps',
+        'skipping non-resolvable app dir "$id" — an app id must be a '
+            'single plain segment (no "..", no "/", no absolute form)',
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /// One app directory of a scan: returns the listed model (healthy or
+  /// error-flagged), or null when there is nothing to list (missing
+  /// manifest — half-created folder, the healer's domain). Cache-hit
+  /// (unchanged manifest + i18n refs + bootable surfaces) returns the
+  /// cached model with zero re-parses (issue #866 AC3).
+  Future<JsAppInfo?> _listAppDir(String id) async {
+    final raw = (await _env.readTextFile(
+      AppStorage.manifestPath(id),
+    )).valueOrNull;
+    if (raw == null) return null; // half-created folder — healer's domain
+    final hash = _digest(raw);
+    // gh-1614 I2 (listed ⇒ bootable): probe the exact files the boot
+    // paths check (WidgetManifest.fromStorage's exists probe through the
+    // same resolver; the tile surface through AppTileHost's
+    // tileWidgetPath read). A missing entry renders the explicit
+    // missing-files state naming the root, instead of a tile that dies
+    // with a raw StateError on tap.
+    final missingEntry = await _missingBootEntry(id);
+    final cached = _parsedApps[id];
+    if (cached != null &&
+        await _cachedParseFresh(cached, id, hash, missingEntry)) {
+      // The cached model carries the tile declaration: probe the tile
+      // entry too (gh-1614 I2 — every listed launch surface is
+      // bootability-checked, the cache-hit path included).
+      final tileMissing = await _missingBootEntry(
+        id,
+        tileEntry: cached.tileWidget?.entry,
+      );
+      if (tileMissing == null) {
+        // Unchanged manifest (and i18n ref files) — zero rescans (AC3):
+        // the cached model (i18n contents included) is still the truth.
+        return cached;
+      }
+      // Torn tile entry: fall through to the fresh parse below, which
+      // re-flags the listed copy (the healthy parse stays cached).
+    }
+    final app = await _parseManifestEntry(raw, id);
+    // Cache the HEALTHY parse; the missing-files state attaches to the
+    // listed copy only, so a later scan (entry restored) heals the tile
+    // without a re-parse.
+    _manifestHashes[id] = hash;
+    _parsedApps[id] = app;
+    // The tile declaration only exists once the manifest parsed — probe
+    // the tile surface against the parsed model (gh-1614 I2). A parse
+    // failure already carries its own error; the tile probe is skipped.
+    final tileMissing = app.tileWidget == null
+        ? null
+        : await _missingBootEntry(id, tileEntry: app.tileWidget!.entry);
+    final listedError = missingEntry ?? tileMissing;
+    return listedError == null ? app : app.withError(listedError);
+  }
+
+  /// The cache gate: manifest content hash unchanged, no boot-surface
+  /// already missing, and the i18n ref files byte-identical to the cached
+  /// digests.
+  Future<bool> _cachedParseFresh(
+    JsAppInfo cached,
+    String id,
+    String hash,
+    String? missingEntry,
+  ) async {
+    return _manifestHashes[id] == hash &&
+        missingEntry == null &&
+        await _i18nRefsUnchanged(cached, id);
+  }
+
+  /// Parses one manifest: a healthy model with i18n contents attached, or
+  /// (the agent edited the manifest into garbage) a flagged error entry
+  /// that keeps the app discoverable — never a silent stale/missing row.
+  /// Both failure shapes land in the catch: FormatException (JSON syntax /
+  /// not an object) and strict-cast TypeErrors ("allowedCommands": 5) —
+  /// one flagged entry, one construction site (issue #866 review r2).
+  Future<JsAppInfo> _parseManifestEntry(String raw, String id) async {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, Object?>) {
+        throw const FormatException('manifest must be a JSON object');
+      }
+      return await _withI18nContents(
+        JsAppInfo.fromManifest(decoded, bundled: false, fallbackId: id),
+        id,
+      );
+    } on Object catch (e) {
+      _refHashes.remove(id);
+      return JsAppInfo(
+        id: id,
+        name: id,
+        description: '',
+        icon: '📦',
+        declaredPermissions: const AppPermissions(),
+        error: e is FormatException
+            ? 'manifest.json does not parse: ${e.message}'
+            : 'manifest.json is invalid: $e',
+      );
+    }
+  }
+
+  /// Directories that vanished since the last scan: forget their cached
+  /// parses and prune the stale `.installed.json` records (issue #866 —
+  /// no zombie installs after an agent deletes an app dir).
+  Future<void> _pruneVanishedApps(Set<String> seen) async {
+    final gone = _manifestHashes.keys
+        .where((id) => !seen.contains(id))
+        .toList();
+    if (gone.isEmpty) return;
+    final installed = await _readInstalled();
+    var pruned = false;
+    for (final id in gone) {
+      _manifestHashes.remove(id);
+      _parsedApps.remove(id);
+      _refHashes.remove(id);
+      if (installed.remove(id) != null) pruned = true;
+    }
+    if (pruned) await _writeInstalled(installed);
+  }
+
+  /// Provenance (gh-1616 I3): attached AFTER the cache gate — a re-install
+  /// flips the recorded origin without touching the manifest, and the
+  /// badge must follow the record, not the cached parse.
+  Future<List<JsAppInfo>> _attachInstallProvenance(List<JsAppInfo> apps) async {
+    final sources = await installSources();
+    final withSource = [
+      for (final app in apps) app.withInstallSource(sources[app.id]),
+    ]..sort((a, b) => a.name.compareTo(b.name));
+    return withSource;
+  }
+
+  /// Reads the `{"file": ...}` i18n ref files declared by [app]'s manifest
+  /// name/description and returns the app with their contents attached, so
+  /// display sites resolve localized strings synchronously. Missing or
+  /// unreadable ref files are skipped (resolution falls through to the
+  /// next locale candidate). Records each ref file's content digest under
+  /// [dirId] — the apps/ directory name every per-app cache uses, NOT the
+  /// manifest's declared id (the two may differ) — so the [listApps] cache
+  /// gate notices agent edits to the ref files too; the manifest itself
+  /// never changes in that workflow (issue #866).
+  Future<JsAppInfo> _withI18nContents(JsAppInfo app, String dirId) async {
+    final paths = {
+      ...?app.nameText?.refPaths,
+      ...?app.descriptionText?.refPaths,
+    };
+    if (paths.isEmpty) {
+      _refHashes.remove(dirId);
+      return app;
+    }
+    final contents = <String, String>{};
+    final digests = <String, String>{};
+    for (final path in paths) {
+      // gh-1614 AC4: a ref path arriving from user storage cannot point
+      // outside the app namespace — a non-conforming ref is skipped like a
+      // missing one (resolution falls through to the next locale).
+      if (!AppStorage.isValidRelativePath(path)) {
+        AppLog.i('apps', 'i18n ref ${app.dir}/$path refused — skipped');
+        continue;
+      }
+      final content = (await _env.readTextFile('${app.dir}/$path')).valueOrNull;
+      if (content != null) {
+        contents[path] = content;
+        digests[path] = _digest(content);
+      } else {
+        AppLog.i('apps', 'i18n ref ${app.dir}/$path missing — skipped');
+      }
+    }
+    _refHashes[dirId] = digests;
+    return app.withI18nContents(contents);
+  }
+
+  /// True when every i18n ref file recorded under [dirId] still matches the
+  /// digest recorded at parse time. One small read per ref file per scan —
+  /// apps without refs cost nothing (issue #866 review: an agent editing
+  /// `apps/<id>/i18n/*.json` must invalidate the cache like any write).
+  Future<bool> _i18nRefsUnchanged(JsAppInfo app, String dirId) async {
+    final recorded = _refHashes[dirId];
+    if (recorded == null) return true;
+    return _allI18nRefsUnchanged(app, recorded);
+  }
+
+  /// Whether every ref file recorded under [dirId] still matches its
+  /// parse-time digest; the FIRST changed (or missing) file decides.
+  Future<bool> _allI18nRefsUnchanged(
+    JsAppInfo app,
+    Map<String, String> recorded,
+  ) async {
+    for (final entry in recorded.entries) {
+      if (!await _i18nRefUnchanged(app, entry)) return false;
+    }
+    return true;
+  }
+
+  /// Whether one ref file still matches the digest recorded at parse
+  /// time (a missing file counts as changed).
+  Future<bool> _i18nRefUnchanged(
+    JsAppInfo app,
+    MapEntry<String, String> entry,
+  ) async {
+    final current = (await _env.readTextFile(
+      '${app.dir}/${entry.key}',
+    )).valueOrNull;
+    return current != null && _digest(current) == entry.value;
+  }
+
+  /// Reads the JS source of [app].
+  Future<String> readWidgetSource(JsAppInfo app) async =>
+      (await _env.readTextFile(app.widgetPath)).getOrThrow();
+
+  /// File (under the env's `apps/`) recording the content hashes of
+  /// demo-app files AS LAST SEEDED by us. Seeding compares each on-disk
+  /// file against its recorded hash: a mismatch means the user (or the
+  /// agent) took ownership of the file, and the refresh leaves it alone —
+  /// bundled demos update only where nothing was customized. A file whose
+  /// recorded hash is missing (pre-feature installs) and whose content
+  /// differs from the bundle is conservatively treated as user-owned.
+  static const String demoSeedsFile = 'apps/.demo_seeds.json';
+
+  /// Force-restores a demo app's bundled code files (manifest, widget.js,
+  /// tile entry, svg icon) and re-records their seed hashes, so future
+  /// refreshes flow again — the escape hatch for a demo app the user (or
+  /// an agent) customized and wants back to the reference version.
+  /// `storage.json` (the app's user data) is NOT touched. Returns false
+  /// for unknown demo ids.
+  Future<bool> resetDemoApp(String appId) async {
+    if (!seedDemoIds.contains(appId)) return false;
+    await _seedDemoApp(appId, force: true);
+    return true;
+  }
+
+  /// Copies bundled demo apps (see [seedDemoIds]) into `apps/`, refreshing
+  /// files ONLY when the user did not customize them (see [demoSeedsFile]
+  /// for the ownership rule). A manifest whose `icon` points at an `.svg`
+  /// file gets that file copied alongside, and a manifest with a
+  /// `"widget"` section gets its tile entry file copied when the asset
+  /// exists.
+  Future<void> seedBundledApps([List<String>? demoIds]) async {
+    final hashes = await _readSeedHashes();
+    var hashesChanged = false;
+    for (final id in demoIds ?? seedDemoIds) {
+      try {
+        hashesChanged = await _seedDemoApp(id, hashes: hashes) || hashesChanged;
+      } on Object catch (e) {
+        // One broken demo (missing/corrupt asset) must never kill the
+        // seeding of the rest — it lands in [failedSeeds] and gets an
+        // error badge on its launcher tile instead; tapping the tile shows
+        // the stored error text so it can be handed to Fa for a fix.
+        AppLog.i('apps', 'demo seed failed: $id — $e');
+        failedSeeds.value = {...failedSeeds.value, id: e.toString()};
+        continue;
+      }
+      failedSeeds.value = {...failedSeeds.value}..remove(id);
+    }
+    if (hashesChanged) {
+      await _env.writeFile(demoSeedsFile, jsonEncode(hashes));
+    }
+  }
+
+  /// Demo app ids whose last seed attempt failed, mapped to the error text
+  /// (missing/corrupt asset). The launcher badges those tiles instead of
+  /// letting one broken app take down the whole grid (TestFlight 1.0.0
+  /// regression: a demo id shipped without its assets and killed the entire
+  /// seeding) and shows this text on tap.
+  final ValueNotifier<Map<String, String>> failedSeeds = ValueNotifier({});
+
+  /// Seeds one demo app; returns true when the hash records changed.
+  /// [hashes] is the shared store mutated in place (omit with [force] to
+  /// persist immediately).
+  Future<bool> _seedDemoApp(
+    String id, {
+    Map<String, Map<String, String>>? hashes,
+    bool force = false,
+  }) async {
+    final ownStore = hashes == null;
+    final store = hashes ?? await _readSeedHashes();
+    final files = await _readBundledDemoFiles(id);
+    final appHashes = store.putIfAbsent(id, () => {});
+    // A broken skeleton is not user content: when the on-disk manifest is
+    // present but unparseable (a half-written agent file), ownership
+    // protection would otherwise skip every file forever and brick the
+    // tile (listApps skips the folder, the launcher shows a dead
+    // placeholder). Re-seed the whole app instead.
+    final currentManifest = (await _env.readTextFile(
+      AppStorage.manifestPath(id),
+    )).valueOrNull;
+    final skeletonBroken = await _isBrokenDemoSkeleton(id, currentManifest);
+    final changed = await _syncDemoFiles(
+      id,
+      files,
+      appHashes,
+      skeletonBroken: skeletonBroken,
+      force: force,
+    );
+    if (ownStore && changed) {
+      await _env.writeFile(demoSeedsFile, jsonEncode(store));
+    }
+    return changed;
+  }
+
+  /// Reads the demo app's bundled files: the manifest/widget pair plus any
+  /// extra asset the manifest declares (svg icon, tile entry). A manifest
+  /// that does not parse still seeds the base pair.
+  Future<Map<String, String>> _readBundledDemoFiles(String id) async {
+    final manifest = await _readAsset('$bundledAssetRoot/$id/manifest.json');
+    final files = <String, String>{
+      'manifest.json': manifest,
+      'widget.js': await _readAsset('$bundledAssetRoot/$id/widget.js'),
+    };
+    await _addDeclaredDemoAssets(id, manifest, files);
+    return files;
+  }
+
+  /// Adds the files the parsed manifest declares (an `.svg` icon asset, a
+  /// tile entry asset) to [files].
+  Future<void> _addDeclaredDemoAssets(
+    String id,
+    String manifest,
+    Map<String, String> files,
+  ) async {
+    try {
+      final decoded = jsonDecode(manifest);
+      if (decoded is Map<String, Object?>) {
+        await _addDemoIconAsset(id, decoded, files);
+        await _addDemoTileAsset(id, decoded, files);
+      }
+    } on FormatException {
+      // Keep the app even if its manifest doesn't parse.
+    }
+  }
+
+  Future<void> _addDemoIconAsset(
+    String id,
+    Map<String, Object?> decoded,
+    Map<String, String> files,
+  ) async {
+    final icon = decoded['icon']?.toString() ?? '';
+    if (icon.toLowerCase().endsWith('.svg')) {
+      files[icon] = await _readAsset('$bundledAssetRoot/$id/$icon');
+    }
+  }
+
+  Future<void> _addDemoTileAsset(
+    String id,
+    Map<String, Object?> decoded,
+    Map<String, String> files,
+  ) async {
+    final tile = decoded['widget'];
+    if (tile is! Map<String, Object?>) return;
+    final entry = JsTileWidgetInfo.fromJson(tile).entry;
+    try {
+      files[entry] = await _readAsset('$bundledAssetRoot/$id/$entry');
+    } on Object {
+      // The manifest declares a tile but no asset ships it — the
+      // tile host will surface the missing file at render time.
+    }
+  }
+
+  /// Whether the stored manifest is present but unparseable (a
+  /// half-written agent file) — the signal to re-seed the whole app.
+  Future<bool> _isBrokenDemoSkeleton(String id, String? currentManifest) async {
+    if (currentManifest == null) return false;
+    try {
+      jsonDecode(currentManifest);
+    } on FormatException {
+      AppLog.i('apps', 'demo app $id has a broken manifest — re-seeding');
+      return true;
+    }
+    return false;
+  }
+
+  /// Copies every bundled file into app storage, honoring ownership;
+  /// returns true when the recorded hashes changed.
+  Future<bool> _syncDemoFiles(
+    String id,
+    Map<String, String> files,
+    Map<String, String> appHashes, {
+    required bool skeletonBroken,
+    required bool force,
+  }) async {
+    var changed = false;
+    for (final file in files.entries) {
+      if (await _syncDemoFile(
+        id,
+        file,
+        appHashes,
+        skeletonBroken: skeletonBroken,
+        force: force,
+      )) {
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  /// Syncs one bundled file. Already-current files only refresh the
+  /// recorded hash; a diverged stored copy is user content and is never
+  /// overwritten ([force] overrides). Returns true when the recorded
+  /// hashes changed.
+  Future<bool> _syncDemoFile(
+    String id,
+    MapEntry<String, String> file,
+    Map<String, String> appHashes, {
+    required bool skeletonBroken,
+    required bool force,
+  }) async {
+    final path = AppStorage.appFile(id, file.key);
+    final bundled = file.value;
+    final newHash = _digest(bundled);
+    final recorded = appHashes[file.key];
+    final current = (await _env.readTextFile(path)).valueOrNull;
+    if (current == bundled) {
+      // Already current — just make sure the hash is recorded.
+      if (recorded != newHash) {
+        appHashes[file.key] = newHash;
+        return true;
+      }
+      return false;
+    }
+    if (_userModifiedDemoFile(current, recorded, skeletonBroken) && !force) {
+      // The user (or the agent) owns this file now — never overwrite.
+      return false;
+    }
+    await _env.writeFile(path, bundled);
+    if (recorded != newHash) {
+      appHashes[file.key] = newHash;
+      return true;
+    }
+    return false;
+  }
+
+  /// True when the stored copy diverges from the last-seeded hash — the
+  /// user or the agent owns the file now.
+  bool _userModifiedDemoFile(
+    String? current,
+    String? recorded,
+    bool skeletonBroken,
+  ) {
+    return !skeletonBroken &&
+        current != null &&
+        (recorded == null || _digest(current) != recorded);
+  }
+
+  Future<Map<String, Map<String, String>>> _readSeedHashes() async {
+    final text = (await _env.readTextFile(demoSeedsFile)).valueOrNull;
+    if (text == null) return {};
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is! Map<String, Object?>) return {};
+      return {
+        for (final app in decoded.entries)
+          if (app.value is Map<String, Object?>)
+            app.key: {
+              for (final file in (app.value! as Map<String, Object?>).entries)
+                file.key: file.value.toString(),
+            },
+      };
+    } on Object {
+      return {};
+    }
+  }
+
+  static String _digest(String content) =>
+      sha256.convert(utf8.encode(content)).toString();
+
+  /// The gh-1614 missing-files state text (I3): names the storage root and
+  /// the exact missing path, and says what to do about it — the tile shows
+  /// this instead of launching into a `StateError`.
+  static String _missingEntryMessage(
+    String id, {
+    String entry = AppStorage.defaultEntry,
+  }) =>
+      'stored files missing under ${AppStorage.root}/$id/ — the app '
+      'cannot start: ${AppStorage.entryPath(id, entry)} is missing or '
+      'unreadable. Reinstall the app from the widgets catalog, or ask Fa '
+      'to recreate it.';
+
+  /// Bootability probe for EVERY launch surface of `apps/<id>/` (gh-1614
+  /// I2): the full-app entry ([AppStorage.entryPath]) and — when the
+  /// manifest declares a live-tile widget — the tile entry
+  /// ([JsAppInfo.tileWidgetPath], the exact path `AppTileHost` boots).
+  /// Returns null when every surface resolves; otherwise the missing-files
+  /// message naming the first missing path.
+  Future<String?> _missingBootEntry(String id, {String? tileEntry}) async {
+    if (!((await _env.exists(AppStorage.entryPath(id))).valueOrNull ?? false)) {
+      return _missingEntryMessage(id);
+    }
+    if (tileEntry == null) return null;
+    // A manifest can declare an entry that cannot resolve in the
+    // namespace (`../x`, absolute): that tile can never boot, so flag it
+    // instead of letting the resolver ArgumentError crash the listing.
+    if (!AppStorage.isValidRelativePath(tileEntry)) {
+      return '${AppStorage.root}/$id/ cannot start: the manifest declares a '
+          'live-tile entry "$tileEntry" that is not a valid in-namespace '
+          'path (no "..", no absolute form). Fix the manifest '
+          '"widget"."entry" or reinstall the app.';
+    }
+    if (!((await _env.exists(
+          AppStorage.entryPath(id, tileEntry),
+        )).valueOrNull ??
+        false)) {
+      return _missingEntryMessage(id, entry: tileEntry);
+    }
+    return null;
+  }
+
+  // ── Widget-catalog lifecycle (install / update / remove) ────────────────
+
+  /// Env-relative record of catalog-installed widgets:
+  /// `{id: {origin, version, installedAt, files:{rel: sha256}}}`. Lives
+  /// next to the app code under `apps/` so both the CLI and the app (and
+  /// the agent) can read it as data.
+  static const String installedMetaFile = 'apps/.installed.json';
+
+  /// Installs (or updates) one widget from the catalog's unpacked archive.
+  /// Ownership-aware per file, same contract as bundled-demo seeding: a
+  /// file the user or agent changed since OUR last write is never
+  /// clobbered. `storage.json` is user data and is always skipped. The new
+  /// version is recorded even when individual files were protected.
+  ///
+  /// [origin] records the install source in `.installed.json`
+  /// (`catalog` — the default — or `unpacked` for gh-1616's local-folder
+  /// loader). The unpacked loader reuses this exact write path so boot,
+  /// updates and the Apps grid need zero special cases (invariant I1);
+  /// only the recorded provenance differs.
+  ///
+  /// When the manifest localizes name/description via `{"file": ...}`
+  /// refs, every referenced file must exist — in the archive itself or
+  /// (for updates) already on disk — otherwise the install fails BEFORE
+  /// anything is written, same all-or-nothing contract as the
+  /// write-verify below.
+  Future<void> installWidget({
+    required String id,
+    required String version,
+    required Map<String, Uint8List> files,
+    String origin = 'catalog',
+  }) async {
+    await _validateI18nRefs(id, files);
+    final meta = await _readInstalled();
+    final entry = meta.putIfAbsent(
+      id,
+      () => {'origin': origin, 'version': version},
+    )..['version'] = version;
+    entry['origin'] = origin;
+    entry['installedAt'] = DateTime.now().toUtc().toIso8601String();
+    final hashes = Map<String, String>.from(
+      (entry['files'] as Map?)?.cast<String, String>() ?? const {},
+    );
+    for (final file in files.entries) {
+      if (file.key == 'storage.json') continue; // user data, not ours
+      // gh-1614 I1: archive names resolve through the shared namespace
+      // helper — a hostile entry name cannot write outside the app dir
+      // (ArgumentError = install failure, never a misplaced write).
+      final path = AppStorage.appFile(id, file.key);
+      final bytes = file.value;
+      final digest = sha256.convert(bytes).toString();
+      final recorded = hashes[file.key];
+      if (recorded != null) {
+        final current = await _env.readBinaryFile(path);
+        if (current.valueOrNull != null &&
+            sha256.convert(current.valueOrNull!).toString() != recorded) {
+          AppLog.i('apps', 'catalog update keeps user-modified $path');
+          continue;
+        }
+      }
+      await _env.writeBinaryFile(path, bytes);
+      // Write-verify (issue #201, fix direction 4): a write that does not
+      // read back byte-identical must surface as an install FAILURE, not
+      // as a broken tile on the grid (manifest present, entry file bad).
+      final written = (await _env.readBinaryFile(path)).valueOrNull;
+      if (written == null || sha256.convert(written).toString() != digest) {
+        throw StateError(
+          'install of $id failed verification: $path did not read back '
+          'byte-identical',
+        );
+      }
+      hashes[file.key] = digest;
+    }
+    entry['files'] = hashes;
+    await _writeInstalled(meta);
+  }
+
+  /// Install-time existence check for manifest i18n ref files
+  /// (`{"file": "./i18n/..."}` under name/description): every referenced
+  /// path must ship in [files] or already exist under `apps/<id>/`
+  /// (an update archive may omit a file the previous install wrote).
+  /// Throws [StateError] before any byte is written when a ref dangles.
+  /// A manifest that does not parse is NOT rejected here — that stays
+  /// the launcher's broken-tile call, as before.
+  Future<void> _validateI18nRefs(
+    String id,
+    Map<String, Uint8List> files,
+  ) async {
+    final manifestBytes = files['manifest.json'];
+    if (manifestBytes == null) return;
+    Object? decoded;
+    try {
+      decoded = jsonDecode(utf8.decode(manifestBytes));
+    } on Object {
+      return;
+    }
+    if (decoded is! Map<String, Object?>) return;
+    final refs = {
+      ...LocalizedText.parse(decoded['name'], decoded['nameI18n']).refs.values,
+      ...LocalizedText.parse(
+        decoded['description'],
+        decoded['descriptionI18n'],
+      ).refs.values,
+    };
+    for (final ref in refs) {
+      if (files.containsKey(ref)) continue;
+      // gh-1614 rework (review): a ref that cannot resolve inside the app
+      // namespace fails the install with the SAME honest i18n message
+      // shape as a dangling one — not the raw resolver ArgumentError. The
+      // read side skips such refs like missing files, so the install-time
+      // rejection must say WHY, naming the ref.
+      if (!AppStorage.isValidRelativePath(ref)) {
+        throw StateError(
+          'install of $id rejected: manifest i18n ref "$ref" is not a '
+          'valid in-namespace path',
+        );
+      }
+      final onDisk =
+          (await _env.exists(AppStorage.appFile(id, ref))).valueOrNull ?? false;
+      if (!onDisk) {
+        throw StateError(
+          'install of $id rejected: manifest i18n ref "$ref" is missing '
+          'from the widget package',
+        );
+      }
+    }
+  }
+
+  /// Removes a catalog-installed widget's CODE files (`apps/<id>/` minus
+  /// `storage.json`) and drops its meta record. Returns false when there is
+  /// nothing installed under that id. With [force] the meta check is
+  /// skipped — used by the launcher's long-press Remove for agent-created
+  /// apps that were never catalog-installed (same storage.json keep).
+  Future<bool> removeWidget(String appId, {bool force = false}) async {
+    // gh-1614 rework 2 (I1): the id arrives from user storage (the agent's
+    // `widgets_catalog remove <id>`) — resolve it through the namespace
+    // BEFORE any IO, so a traversal id fails closed instead of steering
+    // the listing and the recursive remove outside `apps/`
+    // (`apps/../vault` normalizes to `vault/` on every host).
+    final dir = AppStorage.appDir(appId);
+    final meta = await _readInstalled();
+    if (!force && !meta.containsKey(appId)) return false;
+    final entries = (await _env.listDir(dir)).valueOrNull ?? const <FileInfo>[];
+    for (final item in entries) {
+      if (item.name == 'storage.json') continue;
+      // A directory-listing name is always a single segment, so the join
+      // cannot leave the (already validated) dir — the strict
+      // [AppStorage.appFile] pattern would wrongly refuse user files with
+      // spaces or unicode names here.
+      await _env.remove('$dir/${item.name}', recursive: true);
+    }
+    meta.remove(appId);
+    await _writeInstalled(meta);
+    return true;
+  }
+
+  /// Factory reset of the whole apps workspace: deletes EVERY app
+  /// directory — catalog downloads, agent-created apps, demos — WITH
+  /// their `storage.json` user data (unlike [removeWidget], nothing is
+  /// preserved), plus the install metadata, the demo-seed tracking file
+  /// and the catalog cache, then re-seeds the bundled demos from the
+  /// reference assets. Returns how many app directories were removed.
+  Future<int> resetToFactory() async {
+    final entries =
+        (await _env.listDir(AppStorage.root)).valueOrNull ?? const <FileInfo>[];
+    var removed = 0;
+    for (final item in entries) {
+      await _env.remove('apps/${item.name}', recursive: true);
+      if (item.kind == FileKind.directory) removed++;
+    }
+    // Dotfiles may not be listed by every env — remove the known ones
+    // explicitly (missing files are fine).
+    for (final metaFile in const [
+      installedMetaFile,
+      demoSeedsFile,
+      'apps/.catalog_cache_v2.json',
+    ]) {
+      try {
+        await _env.remove(metaFile, recursive: true);
+      } on Object {
+        // Absent or read-only — nothing to reset there.
+      }
+    }
+    return removed;
+  }
+
+  /// Compares [entries] against installed versions: returns candidates with
+  /// a strictly newer semver AND an existing `apps/<id>/` directory
+  /// (not-installed ids are fresh installs, not updates).
+  Future<List<WidgetUpdate>> availableUpdates(
+    List<CatalogEntry> entries,
+  ) async {
+    final meta = await _readInstalled();
+    final updates = <WidgetUpdate>[];
+    for (final entry in entries) {
+      // gh-1614 rework 2: a catalog id that cannot live in the namespace is
+      // never installable (installWidget's resolver rejects it) — skip the
+      // probe instead of resolving it outside `apps/`.
+      if (!AppStorage.isResolvableId(entry.id)) continue;
+      final dirExists =
+          (await _env.exists(AppStorage.manifestPath(entry.id))).valueOrNull ??
+          false;
+      if (!dirExists) continue;
+      final installedVersion = meta[entry.id]?['version'] ?? '';
+      if (semverNewer(installedVersion, entry.version)) {
+        updates.add(
+          WidgetUpdate(entry: entry, installedVersion: installedVersion),
+        );
+      }
+    }
+    return updates;
+  }
+
+  Future<Map<String, Map<String, dynamic>>> _readInstalled() async {
+    final text = (await _env.readTextFile(installedMetaFile)).valueOrNull;
+    if (text == null) return {};
+    try {
+      final decoded = jsonDecode(text);
+      if (decoded is! Map) return {};
+      return {
+        for (final entry in decoded.entries)
+          if (entry.value is Map)
+            entry.key as String: Map<String, dynamic>.from(entry.value as Map),
+      };
+    } on FormatException {
+      return {};
+    }
+  }
+
+  /// Whether [appId] was installed from the widget catalog (recorded in
+  /// `apps/.installed.json` with origin `catalog`). Unpacked installs
+  /// (origin `unpacked`, gh-1616) are user-owned local code: the publish
+  /// eligibility gate and the catalog auto-update treat them exactly like
+  /// agent-created apps.
+  Future<bool> isCatalogInstalled(String appId) async =>
+      (await _readInstalled())[appId]?['origin'] == 'catalog';
+
+  /// The recorded install source per app id (`catalog` | `unpacked`) —
+  /// ids absent from the map have no record (agent-created apps).
+  Future<Map<String, String>> installSources() async {
+    final meta = await _readInstalled();
+    return {
+      for (final entry in meta.entries)
+        if (entry.value['origin'] is String)
+          entry.key: entry.value['origin'] as String,
+    };
+  }
+
+  /// Ids of every directory under `apps/` — including broken
+  /// half-installed ones that [listApps] skips (no manifest). The
+  /// auto-update healer scans these.
+  Future<List<String>> listAppDirIds() async {
+    final entries =
+        (await _env.listDir(AppStorage.root)).valueOrNull ?? const [];
+    return [
+      for (final entry in entries)
+        if (entry.kind == FileKind.directory && !entry.name.startsWith('.'))
+          entry.name,
+    ];
+  }
+
+  /// Whether `apps/<id>/` contains no entries at all — the residue of a
+  /// failed install (wipe-then-redownload that never landed). A Remove
+  /// keeps `storage.json`, so an empty dir is NEVER a removed widget.
+  Future<bool> isEmptyAppDir(String id) async {
+    // gh-1614 rework 2: an id that cannot resolve in the namespace has no
+    // app dir — nothing to heal (and no listing outside `apps/`).
+    final dir = AppStorage.tryAppDir(id);
+    if (dir == null) return false;
+    final entries = (await _env.listDir(dir)).valueOrNull;
+    return entries != null && entries.isEmpty;
+  }
+
+  /// Installed CATALOG widgets as `{id: version}` (origin == 'catalog').
+  Future<Map<String, String>> installedCatalogVersions() async {
+    final meta = await _readInstalled();
+    return {
+      for (final entry in meta.entries)
+        if (entry.value['origin'] == 'catalog')
+          entry.key: entry.value['version']?.toString() ?? '',
+    };
+  }
+
+  /// True when the install is exactly what we wrote: every recorded file
+  /// is byte-identical on disk and the user added no code files of their
+  /// own (`storage.json` is user data and ignored). Used by the silent
+  /// auto-update — a modified widget stays on the manual Update path so
+  /// user work is never moved underfoot.
+  Future<bool> isCleanInstall(String id) async {
+    // gh-1614 rework 2: a record whose id cannot resolve in the namespace
+    // is tampered or corrupt — never clean, and never walked outside
+    // `apps/`.
+    if (!AppStorage.isResolvableId(id)) return false;
+    final meta = await _readInstalled();
+    final entry = meta[id];
+    if (entry == null) return false;
+    final files = entry['files'];
+    if (files is! Map) return false;
+    final recorded = files.cast<String, String>();
+    final onDisk = <String>[];
+    Future<void> walk(String dir, String prefix) async {
+      final entries = (await _env.listDir(dir)).valueOrNull ?? const [];
+      for (final item in entries) {
+        final rel = prefix.isEmpty ? item.name : '$prefix/${item.name}';
+        if (item.kind == FileKind.directory) {
+          await walk('$dir/${item.name}', rel);
+        } else {
+          onDisk.add(rel);
+        }
+      }
+    }
+
+    await walk(AppStorage.appDir(id), '');
+    for (final name in onDisk) {
+      if (name == 'storage.json') continue;
+      if (!recorded.containsKey(name)) return false; // user-added
+    }
+    for (final file in recorded.entries) {
+      // A recorded name that cannot resolve in the namespace never named a
+      // real install file — tampered record, not a clean install.
+      if (!AppStorage.isValidRelativePath(file.key)) return false;
+      final current = (await _env.readBinaryFile(
+        AppStorage.appFile(id, file.key),
+      )).valueOrNull;
+      if (current == null) return false; // user-deleted
+      if (sha256.convert(current).toString() != file.value) return false;
+    }
+    return true;
+  }
+
+  /// Recorded files of a catalog install (per `apps/.installed.json`
+  /// hashes) that are MISSING on disk — the fingerprint of a torn
+  /// filesystem snapshot replaying only part of an install (issue #201:
+  /// manifest restored, widget.js lost, tile renders but launch dies with
+  /// FileError notFound). Empty when the install is intact or [id] is not
+  /// catalog-installed.
+  Future<List<String>> missingInstalledFiles(String id) async {
+    // gh-1614 rework 2: a record whose id cannot resolve in the namespace
+    // is tampered or corrupt — nothing verifiable to check.
+    if (!AppStorage.isResolvableId(id)) return const [];
+    final meta = await _readInstalled();
+    final files = meta[id]?['files'];
+    if (files is! Map) return const [];
+    final missing = <String>[];
+    for (final key in files.keys) {
+      final rel = key.toString();
+      // A recorded name that cannot resolve in the namespace never named a
+      // real install file (the installer validates every write through the
+      // resolver): report it MISSING so the healer reinstalls instead of
+      // probing outside `apps/`.
+      if (!AppStorage.isValidRelativePath(rel)) {
+        missing.add(rel);
+        continue;
+      }
+      final path = AppStorage.appFile(id, rel);
+      if (!((await _env.exists(path)).valueOrNull ?? false)) {
+        missing.add(rel);
+      }
+    }
+    return missing;
+  }
+
+  Future<void> _writeInstalled(Map<String, Map<String, dynamic>> meta) async {
+    await _env.writeFile(installedMetaFile, jsonEncode(meta));
+  }
+}
+
+/// Numeric `major.minor.patch` comparison: true when [installed] is STRICTLY
+/// older than [candidate]. Absent/broken installed versions always upgrade.
+bool semverNewer(String installed, String candidate) {
+  List<int> parts(String value) => value
+      .split('.')
+      .map((part) => int.tryParse(part) ?? -1)
+      .toList(growable: false);
+  final a = parts(installed);
+  final b = parts(candidate);
+  if (a.length != 3 || a.any((part) => part < 0)) return true;
+  if (b.length != 3) return false;
+  for (var i = 0; i < 3; i++) {
+    if (b[i] > a[i]) return true;
+    if (b[i] < a[i]) return false;
+  }
+  return false;
+}
+
+/// A catalog entry whose remote version beats the locally installed one.
+class WidgetUpdate {
+  const WidgetUpdate({required this.entry, required this.installedVersion});
+
+  final CatalogEntry entry;
+  final String installedVersion;
+}

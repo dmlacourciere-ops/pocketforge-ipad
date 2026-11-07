@@ -1,0 +1,653 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+/// The app boot module (issue #483): `main()` delegates here.
+///
+/// The boot pipeline is a sequence of named stages — window → services →
+/// storage → telemetry → routes — each a small, separately testable unit
+/// (≤ CC 10). The storage stage accepts an injected [ExecutionEnv] so unit
+/// tests exercise it without plugin channels; the routes stage is injected
+/// by `main.dart` (it mounts the app UI, which the boot module must not
+/// depend on). Stage order mirrors the historical inline `main()` exactly —
+/// boot is semantics-preserving.
+library;
+
+import 'dart:async';
+import 'dart:ui' show PlatformDispatcher;
+
+import 'package:fa/boot/boot_watchdog.dart';
+import 'package:fa/firebase_options.dart';
+import 'package:fa/l10n/app_localizations.dart';
+import 'package:fa/network/key_wallet.dart';
+import 'package:fa/network/network_mode.dart';
+import 'package:fa/network/network_session_manager.dart';
+import 'package:fa/sandbox/env_factory.dart';
+import 'package:fa/sandbox/wasm_setup_stub.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/services/analytics.dart';
+import 'package:fa/services/app_log.dart';
+import 'package:fa/services/copilot_cli_identity.dart';
+import 'package:fa/services/flutter_session_manager.dart';
+import 'package:fa/services/leftover_model_cleanup.dart';
+import 'package:fa/services/relay_agent_service.dart';
+import 'package:fa/services/sessions_root.dart';
+import 'package:fa/services/image_preview_store.dart';
+import 'package:fa/services/keychain_store.dart';
+import 'package:fa/services/project_mount_env.dart';
+import 'package:fa/services/last_connection.dart';
+import 'package:fa/services/media_models_store.dart';
+import 'package:fa/services/onboarding_store.dart';
+import 'package:fa/services/ondevice_config_store.dart';
+import 'package:fa/services/platform_http_client.dart';
+import 'package:fa/services/provider_registry.dart';
+import 'package:fa/services/quota_store.dart';
+import 'package:fa/services/session_keys_store.dart';
+import 'package:fa/services/settings_env.dart';
+import 'package:fa/services/skills_access_store.dart';
+import 'package:fa/services/task_models_store.dart';
+import 'package:fa/services/theme_controller.dart';
+import 'package:fa/services/theme_pack_store.dart';
+import 'package:fa/services/web/sandbox_url_strategy.dart';
+import 'package:fa/services/office/office_boot.dart';
+import 'package:fa/services/office/office_fetch_bridge.dart';
+import 'package:fa_ui/fa_ui.dart';
+import 'package:firebase_analytics/firebase_analytics.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:intl/date_symbol_data_local.dart';
+
+/// The stores and per-surface services the storage stage loads, consumed by
+/// the routes stage (`MyApp`). Every field is final — loaded once at boot.
+final class BootStores {
+  const BootStores({
+    required this.env,
+    required this.sessionKeys,
+    required this.registry,
+    required this.lastConnection,
+    required this.themeController,
+    required this.themePacks,
+    required this.onboarding,
+    required this.skillsAccess,
+    required this.mediaModels,
+    required this.taskModels,
+    required this.onDeviceConfig,
+    required this.imagePreviews,
+    required this.networkWallet,
+    required this.networkMode,
+    required this.networkSessions,
+    required this.quotas,
+  });
+
+  /// The shared execution env (also on [BootStores] so the routes stage
+  /// hands the same instance to the app).
+  final ExecutionEnv env;
+
+  /// The saved-keys store (`SessionKeysScope` + connection form prefill).
+  final SessionKeysStore sessionKeys;
+
+  /// The custom-provider registry (Providers screen, key resolution).
+  final ProviderRegistry registry;
+
+  /// The persisted last connection (boot auto-connect + form prefill).
+  final LastConnectionStore lastConnection;
+
+  /// The persisted appearance choice.
+  final ThemeController themeController;
+
+  /// The installed theme packs.
+  final ThemePackStore themePacks;
+
+  /// The first-launch onboarding flag.
+  final OnboardingStore onboarding;
+
+  /// The third-party skills consent store.
+  final SkillsAccessStore skillsAccess;
+
+  /// The media-model overrides.
+  final MediaModelsStore mediaModels;
+
+  /// The task-model overrides.
+  final TaskModelsStore taskModels;
+
+  /// The on-device engine configuration.
+  final OnDeviceConfigStore onDeviceConfig;
+
+  /// The image-preview preference store.
+  final ImagePreviewStore imagePreviews;
+
+  /// The fa_network device key wallet (issue #955).
+  final KeyWallet networkWallet;
+
+  /// The local ↔ network mode navigation state machine (issue #955).
+  final NetworkModeController networkMode;
+
+  /// The fa_network session owner (join/resume/leave, issue #955).
+  final NetworkSessionManager networkSessions;
+
+  /// The provider quota view (issue #823): meters in the providers list
+  /// and the chat header's remaining badge.
+  final QuotaStore quotas;
+}
+
+/// The process-wide boot watchdog (gh-1507): one instance, installed once
+/// — [BootWatchdog.install] is idempotent. The first frame cancels the
+/// pre-frame phase; the restore phase ([BootWatchdog.beginRestore] →
+/// [BootWatchdog.restoreDone]) covers the post-frame restore chain.
+final BootWatchdog kBootWatchdog = BootWatchdog();
+
+/// The boot pipeline. `main()` constructs it with the app's routes stage
+/// and calls [run] — zero logic in `main()` itself.
+final class FaAppBoot {
+  const FaAppBoot({
+    required this.routes,
+    Future<ExecutionEnv> Function()? createEnv,
+  }) : createEnv = createEnv ?? createPlatformEnv;
+
+  /// The routes stage: mounts the app UI (`runApp`) and attaches the
+  /// boot-time OAuth listeners. Injected so this module stays UI-free.
+  final Future<void> Function(BootStores stores, FirebaseAnalytics? analytics)
+  routes;
+
+  /// Overridable for tests; production resolves the real platform env.
+  final Future<ExecutionEnv> Function() createEnv;
+
+  /// Runs the boot stages in the historical `main()` order:
+  /// window → services → storage → telemetry → routes.
+  ///
+  /// Issue #544: the platform env is created AFTER the window+services
+  /// stages — `createPlatformEnv()` needs the binding (path_provider
+  /// channels) and the registered wasm_run runtime (`WasiSandboxShell.load`
+  /// compiles modules through the FFI bindings), both established by
+  /// `bootWindow`/`bootServices`. Creating the env first killed iOS and
+  /// Android release boots before the first frame (white screen —
+  /// TestFlight build 160); unit tests inject the env via [runWithEnv] and
+  /// never saw it.
+  Future<void> run() async {
+    bootWindow();
+    // gh-1507: the first-frame watchdog goes up right after the window
+    // stage (the binding exists now) so a pre-frame wedge is breadcrumbed
+    // with the last completed boot step.
+    kBootWatchdog.install();
+    BootSteps.mark('window');
+    await bootServices();
+    BootSteps.mark('services');
+    return _runStages(await createEnv());
+  }
+
+  /// The same pipeline over a caller-provided [ExecutionEnv] — the seam
+  /// unit tests (and future integrations) use to boot without plugin
+  /// channels. Unlike [run] this entry runs the window+services stages
+  /// itself; production [run] has already run them and enters at
+  /// [_runStages], so no stage executes twice.
+  Future<void> runWithEnv(ExecutionEnv env) async {
+    bootWindow();
+    kBootWatchdog.install();
+    BootSteps.mark('window');
+    await bootServices();
+    BootSteps.mark('services');
+    return _runStages(env);
+  }
+
+  Future<void> _runStages(ExecutionEnv env) async {
+    debugPrint(
+      '[fah] platform env created: ${env.runtimeType}, cwd=${env.cwd}',
+    );
+    // From here the in-app log also persists to logs/app.log in the sandbox.
+    AppLog.attach(env);
+    BootSteps.mark('env');
+    final stores = await loadBootStores(env);
+    BootSteps.mark('storage');
+    final analytics = await bootTelemetry();
+    BootSteps.mark('telemetry');
+    await routes(stores, analytics);
+    BootSteps.mark('routes-mounted');
+  }
+}
+
+/// The window stage: binding, embedded-pane handshake, sandbox-safe URL
+/// strategy, the platform HTTP transport, the Copilot CLI identity (the
+/// app is a second first-class PAT surface — gh-1606 review), and the
+/// debug-print tee. All synchronous, all before any async service work.
+void bootWindow() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // The PAT-mode user-agent carries the app version + host OS
+  // (`copilot/<version> (<os>) term/unknown`) — without this install
+  // app-side PAT requests present the keep-working default
+  // `copilot/fa (unknown)` (gh-1606 review).
+  installHostCopilotCliIdentity();
+  // Office.onReady FIRST (issue #202): the pane's handshake starts before
+  // any later boot step can die on a sandboxed host.
+  bootOfficeApi();
+  // The OWA iframe sandbox strips history.replaceState — the web engine's
+  // default deep-link URL sync crashes on it mid-boot ("q.replaceState is
+  // not a function"), graying the pane before the first frame. Probe the
+  // History API and fall back to a no-op strategy in stripped frames
+  // (issue #202); working hosts keep the default strategy.
+  installSandboxSafeUrlStrategy();
+  // Use NSURLSession on iOS/macOS instead of dart:io HttpClient; this fixes
+  // "Failed host lookup" failures on networks where the system resolver is
+  // required (DNS-over-HTTPS, content filters, per-app VPNs).
+  // Issue #470: the embedded office pane routes provider HTTP through the
+  // extension's SW fetch bridge (CORS); everywhere else this is null and the
+  // direct platform transport stays.
+  providerHttpClientFactory =
+      installOfficeHttpBridge() ?? createPlatformHttpClient;
+  // The inter-agent inbox watcher (opt-in: never in tests).
+  AgentService.enableInboxWatcher = true;
+  _teeDebugPrintIntoAppLog();
+}
+
+/// The services stage: Firebase app, the WASM runtime, and the `.env`
+/// provider filter — the plugin-touching setup that must precede storage.
+Future<void> bootServices() async {
+  await _initFirebaseApp();
+  await _setUpWasmRuntimeBestEffort();
+  providerFilterEnvOverride = await _loadProviderFilterOverride();
+}
+
+/// The storage stage: every persisted store the app boots with, loaded over
+/// the (injected) platform env. Unit tests pass a fake [env] — no plugin
+/// channels involved.
+Future<BootStores> loadBootStores(ExecutionEnv env) async {
+  // iOS/macOS persist API keys in the platform Keychain (see
+  // [KeychainStore]); other platforms fall back to file/session storage.
+  const keychain = KeychainStore();
+  BootSteps.begin('storage:sessionKeys');
+  final sessionKeys = await SessionKeysStore.load(env, keychain: keychain);
+  BootSteps.mark('storage:sessionKeys');
+  BootSteps.begin('storage:registry');
+  final registry = await ProviderRegistry.load(
+    env,
+    keychain: keychain,
+    // Copilot deletes must reach the entry-scoped token's fallback home.
+    sessionKeys: sessionKeys,
+  );
+  BootSteps.mark('storage:registry');
+  debugPrint('[fah] provider registry loaded');
+  BootSteps.begin('storage:lastConnection');
+  final lastConnection = await LastConnectionStore.load(env);
+  BootSteps.mark('storage:lastConnection');
+  debugPrint('[fah] last connection loaded');
+  BootSteps.begin('storage:theme');
+  final themeController = await ThemeController.load(env);
+  BootSteps.mark('storage:theme');
+  BootSteps.begin('storage:onboarding');
+  final onboardingStore = await OnboardingStore.load(env);
+  BootSteps.mark('storage:onboarding');
+  BootSteps.begin('storage:themePacks');
+  final themePacks = await ThemePackStore.load(env);
+  BootSteps.mark('storage:themePacks');
+  final skillsAccessStore = SkillsAccessStore(env);
+  BootSteps.begin('storage:mediaModels');
+  final mediaModels = await MediaModelsStore.load(env);
+  BootSteps.mark('storage:mediaModels');
+  BootSteps.begin('storage:taskModels');
+  final taskModels = await TaskModelsStore.load(env);
+  BootSteps.mark('storage:taskModels');
+  BootSteps.begin('storage:onDeviceConfig');
+  final onDeviceConfig = await OnDeviceConfigStore.load(env);
+  BootSteps.mark('storage:onDeviceConfig');
+  // gh-2004: drop the removed on-device stack's cached model artifacts on
+  // boot — best-effort, non-fatal, logged once. Idempotent: a sandbox
+  // with nothing cached scans and deletes nothing.
+  unawaitedLeftoverModelCleanup(env);
+  final imagePreviews = ImagePreviewStore(env);
+  BootSteps.begin('storage:imagePreviews');
+  await imagePreviews.load();
+  BootSteps.mark('storage:imagePreviews');
+  // fa_ui's provider UI resolves named keys through the app's chain
+  // (dart-defines → saved keys → .env), exactly like the connection form.
+  FaUiHost.keyResolver = (name) => settingsKeyEnv(name, sessionKeys);
+  // Network mode (issue #955): the device wallet (keychain-first, file
+  // fallback), the persisted mode picker state, and the session manager.
+  BootSteps.begin('storage:networkWallet');
+  final networkWallet = await _loadNetworkWallet(env);
+  BootSteps.mark('storage:networkWallet');
+  BootSteps.begin('storage:networkMode');
+  final networkMode = NetworkModeController(await NetworkModeStore.load(env));
+  BootSteps.mark('storage:networkMode');
+  final networkSessions = NetworkSessionManager(
+    baseUrl: Uri.parse(faNetworkBaseUrl),
+    authBaseUrl: Uri.parse(faAuthBaseUrl),
+    wallet: networkWallet,
+  );
+  // Restore the persisted ai-native account (issue #955 iteration 3):
+  // an unexpired token becomes the JWT, an expired one is refreshed
+  // silently. Fire-and-forget — boot never blocks on the network.
+  unawaited(networkSessions.restoreAccount());
+  // Provider quota (issue #823): the shared store reads keys through the
+  // persisted registry; the changes stream drives the app surfaces.
+  QuotaStore.instance.attachRegistry(registry);
+  return BootStores(
+    env: env,
+    sessionKeys: sessionKeys,
+    registry: registry,
+    lastConnection: lastConnection,
+    themeController: themeController,
+    themePacks: themePacks,
+    onboarding: onboardingStore,
+    skillsAccess: skillsAccessStore,
+    mediaModels: mediaModels,
+    taskModels: taskModels,
+    onDeviceConfig: onDeviceConfig,
+    imagePreviews: imagePreviews,
+    networkWallet: networkWallet,
+    networkMode: networkMode,
+    networkSessions: networkSessions,
+    quotas: QuotaStore.instance,
+  );
+}
+
+/// The fa_network REST base URL; overridable with
+/// `--dart-define=FA_NETWORK_URL=…` (staging, self-hosted hubs).
+const faNetworkBaseUrl = String.fromEnvironment(
+  'FA_NETWORK_URL',
+  defaultValue: 'https://network.fa1.dev',
+);
+
+/// The ai-native auth service base URL (`/api/auth/*` + `/api/oauth-proxy/*`
+/// live there — the fa_network relay does NOT proxy them). Overridable with
+/// `--dart-define=FA_AUTH_URL=…` (staging, local auth deploys).
+const faAuthBaseUrl = String.fromEnvironment(
+  'FA_AUTH_URL',
+  defaultValue: 'https://ai-native.cloud',
+);
+
+/// Loads the fa_network device wallet (issue #955): the platform keychain
+/// when supported, the sandbox file otherwise. A broken backend or corrupt
+/// wallet JSON falls back (keychain → file → in-memory) — boot must never
+/// crash on wallet I/O, and the corrupt file is never overwritten (the
+/// in-memory fallback has no backend attached, so nothing persists over it).
+Future<KeyWallet> _loadNetworkWallet(ExecutionEnv env) async {
+  if (KeychainStore.isSupported) {
+    try {
+      return await KeyWallet.load(KeychainWalletBackend());
+    } on Object catch (e) {
+      debugPrint('[fah] network wallet keychain load failed: $e');
+    }
+  }
+  try {
+    return await KeyWallet.load(FileWalletBackend(env));
+  } on Object catch (e) {
+    debugPrint('[fah] network wallet file load failed: $e');
+    return KeyWallet.load(MemoryWalletBackend());
+  }
+}
+
+/// The telemetry stage: analytics (strictly optional), the fa_ui chat-event
+/// routing, Crashlytics breadcrumbs, and intl date symbols. Returns the
+/// analytics instance for the routes stage (`MyApp`'s navigator observer).
+Future<FirebaseAnalytics?> bootTelemetry() async {
+  final analytics = _initAnalytics();
+  AppAnalytics.installFirebase(analytics);
+  AppAnalytics.instance.appStart(analyticsAvailable: analytics != null);
+  // The fa_ui chat widgets report through FaChatHost.track — route those
+  // events into the app's analytics facade.
+  FaChatHost.analytics = routeFaChatAnalytics;
+  _wireCrashlyticsBreadcrumbs();
+  // intl date symbols for the app locales — DateFormat (derived session
+  // titles) only ships en_US data compiled in; the rest must be loaded.
+  await _loadIntlDateSymbols();
+  return analytics;
+}
+
+/// Tees debug output into the in-app log (settings → copy debug logs); the
+/// original debugPrint still runs, so console output is unchanged.
+void _teeDebugPrintIntoAppLog() {
+  final originalDebugPrint = debugPrint;
+  debugPrint = (message, {wrapWidth}) {
+    originalDebugPrint(message, wrapWidth: wrapWidth);
+    if (message != null) AppLog.i('debug', message);
+  };
+}
+
+/// Initializes Firebase unless running inside the browser-extension panel
+/// or with placeholder CI options. The extension panel runs the same web
+/// build under chrome-extension://, whose MV3 CSP blocks the inline-script
+/// bootstrap firebase_core_web uses to load the JS SDK — initializing
+/// there ends in an uncaught error, and the panel does not need Firebase.
+///
+/// The native Firebase SDK auto-configures the [DEFAULT] app from
+/// GoogleService-Info.plist when the plugins register — a second
+/// initializeApp throws [core/duplicate-app] and, unhandled, kills boot
+/// before the first frame (black screen on macOS/iOS). Reuse the natively
+/// configured app in that case.
+Future<void> _initFirebaseApp() async {
+  final options = DefaultFirebaseOptions.currentPlatform;
+  final inExtension = Uri.base.scheme == 'chrome-extension';
+  if (inExtension || options.apiKey.startsWith('YOUR_')) return;
+  try {
+    await Firebase.initializeApp(options: options);
+  } on FirebaseException catch (error) {
+    if (error.code != 'duplicate-app') rethrow;
+    debugPrint(
+      '[fa] Firebase [DEFAULT] already configured natively — reusing it',
+    );
+  }
+}
+
+/// Wasm runtime setup is best-effort. If the native bindings are
+/// unavailable the app should still start so the chat UI and other
+/// providers remain usable.
+Future<void> _setUpWasmRuntimeBestEffort() async {
+  try {
+    await setUpWasmRuntime();
+    debugPrint('[fah] WASM runtime setup succeeded');
+  } on Object catch (error) {
+    debugPrint('[fah] WASM runtime setup failed: $error');
+  }
+}
+
+/// Loads `.env` (intentionally not committed; values can be supplied via
+/// --dart-define instead) and returns its runtime FA_PROVIDERS override —
+/// the --dart-define wins in the core, so this is `null` unless `.env`
+/// carried the variable. Filtered-out providers never appear in the
+/// pickers, the add-provider list, or onboarding.
+Future<String?> _loadProviderFilterOverride() async {
+  try {
+    await dotenv.load(fileName: '.env');
+  } on Object {
+    return null;
+  }
+  final faProviders = dotenv.isInitialized ? dotenv.env['FA_PROVIDERS'] : null;
+  if (faProviders == null || faProviders.trim().isEmpty) return null;
+  return faProviders;
+}
+
+/// Analytics is strictly optional. On web with placeholder options
+/// (`YOUR_*` — what CI builds) initializeApp is skipped, and just reading
+/// Firebase.apps can throw (no JS SDK loaded — seen on Safari, where it
+/// killed startup before runApp); content blockers break it too.
+FirebaseAnalytics? _initAnalytics() {
+  try {
+    if (Firebase.apps.isNotEmpty) return FirebaseAnalytics.instance;
+  } on Object catch (error) {
+    debugPrint('[fah] analytics unavailable, continuing without: $error');
+  }
+  return null;
+}
+
+/// The fa_ui chat-event route table (the `_faCall` handler-map pattern,
+/// PR #436): event name → analytics facade call. Unknown events are
+/// ignored — same as the switch this replaced.
+final Map<String, void Function(Map<String, Object> params)>
+_faChatAnalyticsRoutes = {
+  'approval_mode_changed': (params) =>
+      AppAnalytics.instance.approvalModeChanged(params['mode'] as String),
+  'secret_request': (params) =>
+      AppAnalytics.instance.secretRequest(params['result'] as String),
+  'message_sent': (params) => AppAnalytics.instance.messageSent(
+    hasAttachments: params['has_attachments'] as bool,
+    textLength: params['text_length'] as int,
+  ),
+  'upload_added': (params) =>
+      AppAnalytics.instance.uploadAdded(params['count'] as int),
+  'voice_input_used': (_) => AppAnalytics.instance.voiceInputUsed(),
+  'screen_opened': (params) =>
+      AppAnalytics.instance.screenOpened(params['screen_name'] as String),
+  'files_opened': (params) =>
+      AppAnalytics.instance.filesOpened(params['source'] as String),
+  'settings_opened': (_) => AppAnalytics.instance.settingsOpened(),
+};
+
+/// Routes fa_ui chat-widget track events into the app's analytics facade.
+/// Public so the boot assignment can tear it off and tests can drive it.
+void routeFaChatAnalytics(
+  String event, [
+  Map<String, Object> params = const {},
+]) {
+  _faChatAnalyticsRoutes[event]?.call(params);
+}
+
+/// Crashlytics: fatal Flutter errors + uncaught async errors flow into the
+/// Firebase console (no web support — the guard skips the web platform
+/// entirely, and any Firebase setup error keeps boot going without it).
+/// Breadcrumbs: the debugPrint tee (already feeding AppLog) also leaves a
+/// trail in the crash report.
+void _wireCrashlyticsBreadcrumbs() {
+  if (kIsWeb) return;
+  try {
+    _wireCrashlytics();
+  } on Object catch (error) {
+    debugPrint('[fah] crashlytics unavailable, continuing without: $error');
+  }
+}
+
+/// Assumes a non-web platform; any Firebase setup error propagates to the
+/// caller's catch (boot continues without crashlytics).
+void _wireCrashlytics() {
+  if (Firebase.apps.isEmpty) return;
+  final crashlytics = FirebaseCrashlytics.instance;
+  FlutterError.onError = crashlytics.recordFlutterFatalError;
+  PlatformDispatcher.instance.onError = (error, stack) {
+    crashlytics.recordError(error, stack, fatal: true);
+    return true;
+  };
+  _teeDebugPrintToCrashlytics(crashlytics);
+  debugPrint('[fah] crashlytics wired');
+}
+
+/// The debugPrint tee (already feeding AppLog) also leaves a trail in the
+/// crash report.
+void _teeDebugPrintToCrashlytics(FirebaseCrashlytics crashlytics) {
+  final baseDebugPrint = debugPrint;
+  debugPrint = (message, {wrapWidth}) {
+    baseDebugPrint(message, wrapWidth: wrapWidth);
+    if (message != null) crashlytics.log(message);
+  };
+}
+
+/// Loads intl date symbols for every supported app locale.
+Future<void> _loadIntlDateSymbols() async {
+  for (final locale in AppLocalizations.supportedLocales) {
+    await initializeDateFormatting(locale.languageCode);
+  }
+}
+
+/// The extension-panel relay boot (issue #34, decomposed by #483): builds
+/// the session manager, attaches the SW relay, wires the live-session
+/// adoption contract, seeds the persisted registry from the SW's active
+/// provider, and hands the result to [onHome]. The widget layer (caller)
+/// owns navigation and `mounted` checks; every failure path funnels into
+/// [onError] — including a null [createRelay] result (not hosted) and a
+/// throwing one.
+Future<void> bootExtensionRelay({
+  /// The panel env; `null` builds the platform one (real boots).
+  ExecutionEnv? env,
+
+  /// Overridable for tests; production tears off [RelayAgentService.create].
+  Future<RelayAgentService?> Function()? createRelay,
+  required Future<void> Function(
+    FlutterSessionManager manager,
+    ProviderRegistry registry,
+  )
+  onHome,
+  required void Function(String message) onError,
+}) async {
+  final resolvedEnv = env ?? await createPlatformEnv();
+  final manager = FlutterSessionManager(
+    env: resolvedEnv,
+    sessionsRoot: defaultSessionsRoot(resolvedEnv.sessionCwd),
+  );
+  try {
+    final relay = await (createRelay ?? RelayAgentService.create)();
+    if (relay == null) {
+      debugPrint('[fah] relay create returned null (not hosted?)');
+      onError('extension service worker not reachable');
+      return;
+    }
+    manager.addSession(
+      relay.relaySessionId.isEmpty ? 'relay' : relay.relaySessionId,
+      relay,
+    );
+    // The SAME adoption contract as the desktop hosted boot (the
+    // createRelayServiceIfHosted caller): a session_new/session_open from
+    // ANY surface arrives as an attach broadcast — re-key the slot and the
+    // selection source. Without this the panel kept its BOOT session id
+    // forever: the drawer's live row pinned the stale dot, the real live
+    // session rendered nowhere, and the archived twin of the stale slot
+    // duplicated the row.
+    relay.onLiveSessionIdChanged = (newId) {
+      manager.hostedLiveId.value = newId;
+      manager.rekeyActiveSession(newId);
+    };
+    // The hello/attach handshake may have completed BEFORE the callback
+    // was assigned (RelayAgentService.create awaits it) — converge once
+    // so hostedLiveId is authoritative from the first frame.
+    final liveAtBoot = relay.liveSessionId;
+    if (liveAtBoot != null && liveAtBoot.isNotEmpty) {
+      manager.hostedLiveId.value = liveAtBoot;
+      manager.rekeyActiveSession(liveAtBoot);
+    }
+    // The models/provider screens read this registry; in relay mode the
+    // truth lives in the SW's chrome.storage, so seed one entry from the
+    // attach-time settings snapshot. The key stays session-only
+    // (rememberKey) — re-saving the form round-trips it via settings_put
+    // instead of losing it. The persisted registry (providers.json) — the
+    // Providers screen's adds live here across reloads. NEVER swap it for
+    // a session-only in-memory instance: the Default-chat-model picker
+    // shares this instance, and an empty one makes the picker show nothing
+    // while the Providers screen (its own null-fallback registry) looks
+    // fine.
+    final registry = await ProviderRegistry.load(resolvedEnv);
+    // Issue #327: the guard needs the registry rows to judge a
+    // settings_put against (review MINOR - the relay path skipped it).
+    relay.providerRegistry = registry;
+    final sw = relay.swProvider;
+    debugPrint(
+      '[fah] relay boot: session=${relay.relaySessionId} '
+      'swProvider=${sw == null ? 'none' : '${sw['baseUrl']} / ${sw['model']}'} '
+      'registry=${registry.providers.length}',
+    );
+    await seedRelaySwProvider(registry, sw);
+    await onHome(manager, registry);
+  } on Object catch (e) {
+    debugPrint('[fah] relay boot failed: $e');
+    onError('$e');
+  }
+}
+
+/// Makes sure the SW's active provider exists as a picker tile (the key
+/// stays session-only; the apply flow round-trips it via settings_put).
+/// A no-op when the SW has no active provider or the registry already
+/// knows its base URL.
+Future<void> seedRelaySwProvider(
+  ProviderRegistry registry,
+  Map<String, String>? sw,
+) async {
+  if (sw == null || sw['baseUrl']!.isEmpty) return;
+  final known = registry.providers.any((p) => p.baseUrl == sw['baseUrl']);
+  if (known) return;
+  final base = Uri.tryParse(sw['baseUrl']!);
+  final provider = await registry.add(
+    name: base?.host ?? sw['baseUrl']!,
+    baseUrl: sw['baseUrl']!,
+    modelId: sw['model'] ?? '',
+  );
+  registry.rememberKey(provider.id, sw['apiKey'] ?? '');
+}

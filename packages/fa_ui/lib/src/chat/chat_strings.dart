@@ -1,0 +1,604 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:flutter/widgets.dart';
+
+import 'upload_utils.dart';
+
+/// The chat UI strings (composer, message tiles, approval/ask/secret sheets,
+/// media player). Same resolution pattern as [FaUiStrings]: built-in
+/// English/Russian defaults, host override via [FaChatStringsScope].
+abstract class FaChatStrings {
+  /// Creates chat strings.
+  const FaChatStrings();
+
+  /// Resolves the strings for [context].
+  static FaChatStrings of(BuildContext context) {
+    final scoped = context
+        .dependOnInheritedWidgetOfExactType<FaChatStringsScope>()
+        ?.strings;
+    if (scoped != null) return scoped;
+    final locale = Localizations.maybeLocaleOf(context);
+    return forLocale(locale ?? const Locale('en'));
+  }
+
+  /// The built-in defaults for [locale] (Russian or English).
+  static FaChatStrings forLocale(Locale locale) => locale.languageCode == 'ru'
+      ? const FaChatStringsRu()
+      : const FaChatStringsEn();
+
+  String get appTitle;
+  String get chatAbortTooltip;
+  String get chatMoreTooltip;
+  String get chatFilesTooltip;
+  String get chatCopySessionTooltip;
+  String get chatSettingsTooltip;
+  String get chatModelPicker;
+  String get chatTrajectoryTooltip;
+  String get chatCopiedToClipboard;
+  String get chatCopyMessageTooltip;
+  String get chatMessageCopiedToClipboard;
+  String get errorCopyTooltip;
+  String get errorCopiedToClipboard;
+  String get errorCopyFailedTooltip;
+  String get chatInputHint;
+  String get chatTyping;
+
+  /// The single run-status row (issues #865, #1042): the phase labels.
+  String get chatStatusThinking;
+  String chatStatusRunningTool(String tool);
+  String get chatSendTooltip;
+  String get chatSteerTooltip;
+  String get chatAttachTooltip;
+  String get chatGallery;
+  String get chatCamera;
+  String get chatAttachFile;
+  String get chatRemoveAttachment;
+  String get chatMicTooltip;
+  String get chatMicStopTooltip;
+  String get chatMicDenied;
+  String chatMicError(String error);
+  String chatAttachNoName(String name);
+  String chatAttachError(String error, String name);
+  String chatSendError(String error);
+  String chatUploadFailed(String error);
+  String uploadTooLarge(String max, String total);
+  String get chatLoadEarlier;
+  String chatAttachmentCap(int skipped);
+  String chatDropFolderRejected(String name);
+  String get chatClipboardUnsupported;
+  String get chatCollapse;
+  String chatLoadEarlierCount(String count);
+  String get chatLoadEarlierFailed;
+  String chatBeginningOfSession(String count);
+
+  /// The bottom quick-action chip label (issue #379).
+  String get chatOpenWidgetAsApp;
+
+  /// The chip dismiss tooltip (issue #379).
+  String get chatOpenWidgetAsAppDismiss;
+  String get chatLoadNewer;
+  String chatLoadNewerCount(String count);
+
+  /// The follow-mode jump pill (gh-1439): the semantic label and the
+  /// live-updating `⌄ N new` counter shown while the user is held away
+  /// from the live tail.
+  String get chatJumpToLive;
+  String chatFollowNewCount(String count);
+
+  /// The `+N lines` hint on a collapsed tool-output card (issue #458).
+  String chatClampHint(int lines);
+  String get chatShowMore;
+  String get chatShowLess;
+
+  /// Stub body for a tool result with no output — no clamp UI.
+  String get chatNoOutput;
+  String approvalAllowToolTitle(String tool);
+  String approvalTierLabel(String tier);
+  String get approvalDeny;
+  String get approvalAllowOnce;
+  String get approvalAlwaysAllow;
+  String get approvalYoloAllowEverything;
+  String get approvalModeTitle;
+  String get approvalModeAlwaysAsk;
+  String get approvalModeWrite;
+  String get approvalModeYolo;
+  String get approvalModeAlwaysAskHint;
+  String get approvalModeWriteHint;
+  String get approvalModeYoloHint;
+  String get askQuestionTitle;
+  String askQuestionProgress(String current, String total);
+  String get askCancel;
+  String get askBack;
+  String get askNext;
+  String get askAnswerAction;
+  String get askOtherLabel;
+  String get askYourAnswerLabel;
+  String get askRecommended;
+  String get secretRequestTitle;
+  String get secretRequestNameLabel;
+  String get secretRequestValueLabel;
+  String get secretRequestInvalidName;
+  String get secretRequestSave;
+  String get secretRequestNotNow;
+  String get passwordPromptLabel;
+  String get passwordPromptSubmit;
+  String get passwordPromptCancel;
+  String get mediaPlayTooltip;
+  String get mediaPauseTooltip;
+  String get mediaMuteTooltip;
+  String get mediaUnmuteTooltip;
+  String get mediaFileMissing;
+  String get mediaVideoUnsupportedWeb;
+
+  /// The labeled placeholder for a user attachment whose image bytes are
+  /// gone from the message record (registry cap/drop, on-device path-only
+  /// sends) — never a silent gap (issue #461).
+  String get chatImageUnavailable;
+
+  /// The overflow tile label when a bubble shows fewer thumbs than the
+  /// message carries: `+N more` opens the gallery at the first hidden one.
+  String chatMoreAttachments(int count);
+
+  /// The auth-expired banner title (issue #692: the chat's error banner
+  /// replaces the raw provider error — CLI hint + marker — with this).
+  String get chatAuthExpiredBannerTitle;
+
+  /// The auth-expired banner body; [provider] is the expired provider's
+  /// id (from the `[[auth-expired:…]]` marker).
+  String chatAuthExpiredBannerBody(String provider);
+
+  /// The auth-expired banner's re-authorize button label.
+  String get chatAuthExpiredBannerAction;
+}
+
+/// Built-in English chat strings.
+class FaChatStringsEn extends FaChatStrings {
+  /// Creates English chat strings.
+  const FaChatStringsEn();
+  @override
+  String get appTitle => 'Fa';
+  @override
+  String get chatAbortTooltip => 'Abort';
+  @override
+  String get chatMoreTooltip => 'More actions';
+  @override
+  String get chatFilesTooltip => 'Files';
+  @override
+  String get chatCopySessionTooltip => 'Copy session';
+  @override
+  String get chatTrajectoryTooltip => 'Trajectory';
+  @override
+  String get chatSettingsTooltip => 'Connection settings';
+  @override
+  String get chatModelPicker => 'Model';
+  @override
+  String get chatCopiedToClipboard => 'Session copied to clipboard';
+  @override
+  String get chatCopyMessageTooltip => 'Copy raw message';
+  @override
+  String get errorCopyTooltip => 'Copy error details';
+  @override
+  String get errorCopiedToClipboard => 'Copied error to clipboard';
+  @override
+  String get errorCopyFailedTooltip => "Couldn't copy";
+  @override
+  String get chatMessageCopiedToClipboard => 'Message copied to clipboard';
+  @override
+  String get chatInputHint => 'Type a message';
+  @override
+  String get chatTyping => 'Fa is typing...';
+  @override
+  String get chatStatusThinking => 'Thinking...';
+  @override
+  String chatStatusRunningTool(String tool) => 'Running $tool';
+  @override
+  String get chatSendTooltip => 'Send';
+  @override
+  String get chatSteerTooltip => 'Send now (interrupt)';
+  @override
+  String get chatAttachTooltip => 'Attach';
+  @override
+  String get chatGallery => 'Gallery';
+  @override
+  String get chatCamera => 'Camera';
+  @override
+  String get chatAttachFile => 'Attach file';
+  @override
+  String get chatRemoveAttachment => 'Remove attachment';
+  @override
+  String get chatMicTooltip => 'Voice input';
+  @override
+  String get chatMicStopTooltip => 'Stop recording';
+  @override
+  String get chatMicDenied =>
+      'Microphone access was denied. Enable it in the system privacy settings (Privacy & Security → Microphone), then try again.';
+  @override
+  String chatMicError(String error) => 'Voice input failed: $error';
+  @override
+  String chatAttachNoName(String name) =>
+      'Could not attach "$name": no usable file name.';
+  @override
+  String chatAttachError(String error, String name) =>
+      'Could not attach $name: $error';
+  @override
+  String chatSendError(String error) => 'Could not send: $error';
+  @override
+  String chatUploadFailed(String error) => 'Upload failed: $error';
+  @override
+  String uploadTooLarge(String max, String total) =>
+      'Upload is too large: $total exceeds the $max per-batch limit.';
+  @override
+  String chatClampHint(int lines) => lines == 1 ? '+1 line' : '+$lines lines';
+  @override
+  String chatAttachmentCap(int skipped) =>
+      'Attachment limit is $kMaxPendingAttachments — skipped $skipped.';
+  @override
+  String chatDropFolderRejected(String name) =>
+      'Folders cannot be attached — "$name" skipped.';
+  @override
+  String get chatClipboardUnsupported =>
+      'Clipboard holds content this platform cannot attach.';
+  @override
+  String get chatCollapse => 'Collapse';
+  @override
+  String get chatShowMore => 'Show more';
+  @override
+  String get chatShowLess => 'Show less';
+  @override
+  String get chatNoOutput => '(no output)';
+  @override
+  String get chatLoadEarlier => 'Load earlier';
+  @override
+  String chatLoadEarlierCount(String count) => 'Load earlier ($count more)';
+  @override
+  String get chatLoadEarlierFailed =>
+      "Couldn't load earlier messages - tap to retry";
+  @override
+  String chatBeginningOfSession(String count) =>
+      'Beginning of session (1 of $count)';
+  @override
+  String get chatOpenWidgetAsApp => '✦ Open widget as app';
+  @override
+  String get chatOpenWidgetAsAppDismiss => 'Dismiss';
+  @override
+  String get chatLoadNewer => 'Load newer';
+  @override
+  String chatLoadNewerCount(String count) => 'Load newer ($count more)';
+  @override
+  String get chatJumpToLive => 'Jump to live';
+  @override
+  String chatFollowNewCount(String count) => '⌄ $count new';
+  @override
+  String approvalAllowToolTitle(String tool) => 'Allow $tool?';
+  @override
+  String approvalTierLabel(String tier) => 'Tier: $tier';
+  @override
+  String get approvalDeny => 'Deny';
+  @override
+  String get approvalAllowOnce => 'Allow once';
+  @override
+  String get approvalAlwaysAllow => 'Always allow';
+  @override
+  String get approvalYoloAllowEverything => 'YOLO mode — allow everything';
+  @override
+  String get approvalModeTitle => 'Tool approvals';
+  @override
+  String get approvalModeAlwaysAsk => 'Always ask';
+  @override
+  String get approvalModeWrite => 'Write';
+  @override
+  String get approvalModeYolo => 'YOLO';
+  @override
+  String get approvalModeAlwaysAskHint => 'Every tool call asks for approval.';
+  @override
+  String get approvalModeWriteHint =>
+      'File reads run freely; writes, edits and shell commands ask for approval.';
+  @override
+  String get approvalModeYoloHint =>
+      'All tools run without asking (destructive shell commands still ask).';
+  @override
+  String get askQuestionTitle => 'Question';
+  @override
+  String askQuestionProgress(String current, String total) =>
+      'Question $current of $total';
+  @override
+  String get askCancel => 'Cancel';
+  @override
+  String get askBack => 'Back';
+  @override
+  String get askNext => 'Next';
+  @override
+  String get askAnswerAction => 'Answer';
+  @override
+  String get askOtherLabel => 'Other (type your own)';
+  @override
+  String get askYourAnswerLabel => 'Your answer';
+  @override
+  String get askRecommended => 'Recommended';
+  @override
+  String get secretRequestTitle => 'Fa needs a key';
+  @override
+  String get secretRequestNameLabel => 'Key name';
+  @override
+  String get secretRequestValueLabel => 'Key value';
+  @override
+  String get secretRequestInvalidName =>
+      'Use UPPER_SNAKE: A–Z, 0–9, _, starting with a letter';
+  @override
+  String get secretRequestSave => 'Save';
+  @override
+  String get secretRequestNotNow => 'Not now';
+  @override
+  String get passwordPromptLabel => 'Password';
+  @override
+  String get passwordPromptSubmit => 'Submit';
+  @override
+  String get passwordPromptCancel => 'Cancel';
+  @override
+  String get mediaPlayTooltip => 'Play';
+  @override
+  String get mediaPauseTooltip => 'Pause';
+  @override
+  String get mediaMuteTooltip => 'Mute';
+  @override
+  String get mediaUnmuteTooltip => 'Unmute';
+  @override
+  String get mediaFileMissing => 'Media file not found';
+  @override
+  String get mediaVideoUnsupportedWeb =>
+      'Video playback is not supported in the web build';
+  @override
+  String get chatImageUnavailable => '[image unavailable]';
+  @override
+  String chatMoreAttachments(int count) => '+$count more';
+  @override
+  String get chatAuthExpiredBannerTitle => 'Session expired';
+  @override
+  String chatAuthExpiredBannerBody(String provider) =>
+      'Your $provider session has expired. Sign in again, then resend '
+      'your message.';
+  @override
+  String get chatAuthExpiredBannerAction => 'Authorize';
+}
+
+/// Built-in Russian chat strings.
+class FaChatStringsRu extends FaChatStrings {
+  /// Creates Russian chat strings.
+  const FaChatStringsRu();
+  @override
+  String get appTitle => 'Fa';
+  @override
+  String get chatAbortTooltip => 'Прервать';
+  @override
+  String get chatMoreTooltip => 'Ещё действия';
+  @override
+  String get chatFilesTooltip => 'Файлы';
+  @override
+  String get chatCopySessionTooltip => 'Копировать сессию';
+  @override
+  String get chatTrajectoryTooltip => 'Траектория';
+  @override
+  String get chatSettingsTooltip => 'Настройки подключения';
+  @override
+  String get chatModelPicker => 'Модель';
+  @override
+  String get chatCopiedToClipboard => 'Сессия скопирована в буфер обмена';
+  @override
+  String get chatCopyMessageTooltip => 'Копировать сообщение целиком';
+  @override
+  String get errorCopyTooltip => 'Скопировать текст ошибки';
+  @override
+  String get errorCopiedToClipboard => 'Ошибка скопирована в буфер обмена';
+  @override
+  String get errorCopyFailedTooltip => 'Не удалось скопировать';
+  @override
+  String get chatMessageCopiedToClipboard =>
+      'Сообщение скопировано в буфер обмена';
+  @override
+  String get chatInputHint => 'Введите сообщение';
+  @override
+  String get chatTyping => 'Fa печатает...';
+  @override
+  String get chatStatusThinking => 'Думает...';
+  @override
+  String chatStatusRunningTool(String tool) => 'Запускает $tool';
+  @override
+  String get chatSendTooltip => 'Отправить';
+  @override
+  String get chatSteerTooltip => 'Отправить сейчас (прервать)';
+  @override
+  String get chatAttachTooltip => 'Прикрепить';
+  @override
+  String get chatGallery => 'Галерея';
+  @override
+  String get chatCamera => 'Камера';
+  @override
+  String get chatAttachFile => 'Прикрепить файл';
+  @override
+  String get chatRemoveAttachment => 'Удалить вложение';
+  @override
+  String get chatMicTooltip => 'Голосовой ввод';
+  @override
+  String get chatMicStopTooltip => 'Остановить запись';
+  @override
+  String get chatMicDenied =>
+      'Доступ к микрофону запрещён. Разрешите его в системных настройках конфиденциальности (Конфиденциальность и безопасность → Микрофон) и попробуйте снова.';
+  @override
+  String chatMicError(String error) => 'Ошибка голосового ввода: $error';
+  @override
+  String chatAttachNoName(String name) =>
+      'Не удалось прикрепить «$name»: нет подходящего имени файла.';
+  @override
+  String chatAttachError(String error, String name) =>
+      'Не удалось прикрепить $name: $error';
+  @override
+  String chatSendError(String error) => 'Не удалось отправить: $error';
+  @override
+  String chatUploadFailed(String error) => 'Ошибка загрузки: $error';
+  @override
+  String uploadTooLarge(String max, String total) =>
+      'Загрузка слишком большая: $total превышает лимит $max на один пакет.';
+  @override
+  String chatClampHint(int lines) {
+    final mod10 = lines % 10;
+    final mod100 = lines % 100;
+    final word = mod10 == 1 && mod100 != 11
+        ? 'строка'
+        : (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14))
+        ? 'строки'
+        : 'строк';
+    return '+$lines $word';
+  }
+
+  @override
+  String chatAttachmentCap(int skipped) =>
+      'Лимит вложений — $kMaxPendingAttachments, пропущено $skipped.';
+  @override
+  String chatDropFolderRejected(String name) =>
+      'Папки прикрепить нельзя — «$name» пропущена.';
+  @override
+  String get chatClipboardUnsupported =>
+      'В буфере обмена содержимое, которое здесь нельзя прикрепить.';
+  @override
+  String get chatCollapse => 'Свернуть';
+  @override
+  String get chatShowMore => 'Развернуть';
+  @override
+  String get chatShowLess => 'Свернуть';
+  @override
+  String get chatNoOutput => '(нет вывода)';
+  @override
+  String get chatLoadEarlier => 'Загрузить более ранние';
+  @override
+  String chatLoadEarlierCount(String count) =>
+      'Загрузить более ранние (ещё $count)';
+  @override
+  String get chatLoadEarlierFailed =>
+      'Не удалось загрузить более ранние — нажмите, чтобы повторить';
+  @override
+  String chatBeginningOfSession(String count) => 'Начало сессии (1 из $count)';
+  @override
+  String get chatOpenWidgetAsApp => '✦ Открыть виджет как приложение';
+  @override
+  String get chatOpenWidgetAsAppDismiss => 'Скрыть';
+  @override
+  String get chatLoadNewer => 'Загрузить более новые';
+  @override
+  String chatLoadNewerCount(String count) =>
+      'Загрузить более новые (ещё $count)';
+  @override
+  String get chatJumpToLive => 'К живому концу переписки';
+  @override
+  String chatFollowNewCount(String count) => '⌄ ещё $count';
+  @override
+  String approvalAllowToolTitle(String tool) => 'Разрешить $tool?';
+  @override
+  String approvalTierLabel(String tier) => 'Уровень: $tier';
+  @override
+  String get approvalDeny => 'Запретить';
+  @override
+  String get approvalAllowOnce => 'Разрешить один раз';
+  @override
+  String get approvalAlwaysAllow => 'Всегда разрешать';
+  @override
+  String get approvalYoloAllowEverything => 'YOLO — разрешать всё';
+  @override
+  String get approvalModeTitle => 'Разрешения инструментов';
+  @override
+  String get approvalModeAlwaysAsk => 'Всегда спрашивать';
+  @override
+  String get approvalModeWrite => 'Запись';
+  @override
+  String get approvalModeYolo => 'YOLO';
+  @override
+  String get approvalModeAlwaysAskHint =>
+      'Каждый вызов инструмента требует разрешения.';
+  @override
+  String get approvalModeWriteHint =>
+      'Чтение файлов выполняется свободно; запись, правки и команды оболочки требуют разрешения.';
+  @override
+  String get approvalModeYoloHint =>
+      'Все инструменты запускаются без запроса (разрушительные команды оболочки всё равно спрашивают).';
+  @override
+  String get askQuestionTitle => 'Вопрос';
+  @override
+  String askQuestionProgress(String current, String total) =>
+      'Вопрос $current из $total';
+  @override
+  String get askCancel => 'Отмена';
+  @override
+  String get askBack => 'Назад';
+  @override
+  String get askNext => 'Далее';
+  @override
+  String get askAnswerAction => 'Ответить';
+  @override
+  String get askOtherLabel => 'Другое (введите свой вариант)';
+  @override
+  String get askYourAnswerLabel => 'Ваш ответ';
+  @override
+  String get askRecommended => 'Рекомендуется';
+  @override
+  String get secretRequestTitle => 'Fa нужен ключ';
+  @override
+  String get secretRequestNameLabel => 'Имя ключа';
+  @override
+  String get secretRequestValueLabel => 'Значение ключа';
+  @override
+  String get secretRequestInvalidName =>
+      'Только UPPER_SNAKE: A–Z, 0–9, _, начиная с буквы';
+  @override
+  String get secretRequestSave => 'Сохранить';
+  @override
+  String get secretRequestNotNow => 'Не сейчас';
+  @override
+  String get passwordPromptLabel => 'Пароль';
+  @override
+  String get passwordPromptSubmit => 'Отправить';
+  @override
+  String get passwordPromptCancel => 'Отмена';
+  @override
+  String get mediaPlayTooltip => 'Воспроизвести';
+  @override
+  String get mediaPauseTooltip => 'Пауза';
+  @override
+  String get mediaMuteTooltip => 'Выключить звук';
+  @override
+  String get mediaUnmuteTooltip => 'Включить звук';
+  @override
+  String get mediaFileMissing => 'Медиафайл не найден';
+  @override
+  String get mediaVideoUnsupportedWeb =>
+      'Воспроизведение видео не поддерживается в веб-сборке';
+  @override
+  String get chatImageUnavailable => '[изображение недоступно]';
+  @override
+  String chatMoreAttachments(int count) => '+$count ещё';
+  @override
+  String get chatAuthExpiredBannerTitle => 'Сессия истекла';
+  @override
+  String chatAuthExpiredBannerBody(String provider) =>
+      'Сессия $provider истекла. Войдите заново и отправьте сообщение '
+      'ещё раз.';
+  @override
+  String get chatAuthExpiredBannerAction => 'Авторизоваться';
+}
+
+/// Installs a custom [FaChatStrings] implementation above the chat.
+class FaChatStringsScope extends InheritedWidget {
+  /// Creates a scope.
+  const FaChatStringsScope({
+    required this.strings,
+    required super.child,
+    super.key,
+  });
+
+  /// The strings visible below this scope.
+  final FaChatStrings strings;
+
+  @override
+  bool updateShouldNotify(FaChatStringsScope oldWidget) =>
+      strings != oldWidget.strings;
+}

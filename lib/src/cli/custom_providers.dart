@@ -1,0 +1,652 @@
+/// The custom-provider registry: user-saved providers (api type + endpoint
+/// + optional key reference + last-used model) persisted in the
+/// `customProviders:` section of `~/.fah/config.yaml`.
+///
+/// A registry entry is what the `/provider` picker lists above the catalog
+/// presets and what the `/provider custom` wizard appends to; switching to
+/// an entry restores its last-used model, and `/model` while an entry is
+/// active writes the new model id back (per-provider model memory).
+///
+/// Entries may declare per-provider watchdog tuning (issue #1398):
+/// `connectTimeoutMs`/`streamIdleTimeoutMs` — positive milliseconds,
+/// resolution order entry > the global `providerTimeouts:` section >
+/// the 180 s / 300 s defaults. Recipe: `streamIdleTimeoutMs ≈ 2× p95` of
+/// the model's measured inter-chunk gap; the boot log prints one
+/// `[tuning]`-style line per seeded entry.
+library;
+
+import '../exceptions.dart';
+import '../model.dart';
+import '../model_roles/provider_catalog.dart';
+import '../providers/codemie_sso.dart' show codeMieProjectHeader;
+import '../providers/provider_tuning.dart' show parseProviderTimeoutMs;
+
+/// The api types a custom provider can take (the adapter dialect), mapping
+/// one-to-one to catalog specs. Includes OAuth/SSO-backed catalog providers
+/// (openrouter, codemie) — their connect flows save registry entries so
+/// connected providers show in the `/provider` picker — and `kimi`, whose
+/// `/provider kimi` key flow saves a named entry per account.
+const customProviderApiTypes = [
+  'openai',
+  'anthropic',
+  'google',
+  'dial',
+  'openrouter',
+  'minimax',
+  'zai',
+  'aiin',
+  'kimi',
+  'chatgpt',
+  'copilot',
+];
+
+/// How a saved custom provider authenticates. Distinguishes regular API-key
+/// entries from SSO/JWT-backed ones (e.g. CodeMie) so the CLI can pick the
+/// right auth path when switching to a saved entry.
+enum CustomProviderAuthMethod {
+  /// Regular API-key or env-resolved auth (default).
+  apiKey,
+
+  /// Browser-based SSO (CodeMie cookie auth).
+  sso,
+
+  /// JWT Bearer token (CodeMie headless auth).
+  jwt,
+}
+
+/// One saved custom provider.
+final class CustomProviderEntry {
+  /// Creates an entry. [keyName] is the secure-store/env name holding the
+  /// API key (null = keyless); [modelId] is the last-used model.
+  /// [authMethod] selects the auth path for SSO/JWT providers. [authHeader]
+  /// names the auth header (issue #964): `x-api-key` sends
+  /// `x-api-key: <key>` instead of `Authorization: Bearer <key>`.
+  /// [project] is the CodeMie project picked at connect time (issue #1809):
+  /// sent as the `x-codemie-project` header on the entry's API requests.
+  CustomProviderEntry({
+    required this.name,
+    required this.apiType,
+    required this.baseUrl,
+    required this.modelId,
+    this.keyName,
+    this.authMethod = CustomProviderAuthMethod.apiKey,
+    this.authHeader,
+    this.connectTimeout,
+    this.streamIdleTimeout,
+    this.keyNotPersisted = false,
+    this.project,
+  });
+
+  /// Parses one yaml map from the `customProviders:` list. Throws
+  /// [ConfigException] on bad shapes (bad config must surface, never
+  /// silently vanish).
+  factory CustomProviderEntry.fromYaml(Object? node) {
+    if (node is! Map) {
+      throw ConfigException('customProviders entries must be maps, got: $node');
+    }
+    String requireString(String field) {
+      final value = node[field];
+      if (value is! String || value.isEmpty) {
+        throw ConfigException(
+          'customProviders entry needs a non-empty "$field"',
+        );
+      }
+      return value;
+    }
+
+    final apiType = requireString('apiType');
+    if (!customProviderApiTypes.contains(apiType)) {
+      throw ConfigException(
+        'customProviders entry "$apiType" is not a supported apiType '
+        '(${customProviderApiTypes.join(', ')})',
+      );
+    }
+    final keyName = node['keyName'];
+    final authMethod = _parseAuthMethod(node['authMethod']);
+    final name = requireString('name');
+    final authHeader = parseAuthHeaderName(
+      node['authHeader'],
+      'customProviders entry "$name"',
+    );
+    validateAuthHeaderDialect(
+      authHeader,
+      catalogProvider(apiType),
+      'customProviders entry "$name"',
+    );
+    return CustomProviderEntry(
+      name: name,
+      apiType: apiType,
+      baseUrl: requireString('baseUrl'),
+      modelId: requireString('modelId'),
+      keyName: keyName is String && keyName.isNotEmpty ? keyName : null,
+      authMethod: authMethod,
+      // Named error (issue #964 AC5): the entry owns the bad value, so the
+      // message names the entry.
+      authHeader: authHeader,
+      // Per-provider stall-recovery tuning (issue #1398): the watchdog
+      // knobs ride the registry entry, same place baseUrl/keys live.
+      connectTimeout: parseProviderTimeoutMs(
+        node['connectTimeoutMs'],
+        'connectTimeoutMs',
+        'customProviders entry "$name"',
+      ),
+      streamIdleTimeout: parseProviderTimeoutMs(
+        node['streamIdleTimeoutMs'],
+        'streamIdleTimeoutMs',
+        'customProviders entry "$name"',
+      ),
+      // gh-1679: an entry recorded while its key write degraded to
+      // session-only keeps the marker so the next boot can surface the
+      // degradation while the slot stays empty.
+      keyNotPersisted: node['keyNotPersisted'] == true,
+      // Issue #1809: the CodeMie project picked at connect time (null for
+      // non-CodeMie entries and entries connected before the field existed).
+      project:
+          node['project'] is String && (node['project'] as String).isNotEmpty
+          ? node['project'] as String
+          : null,
+    );
+  }
+
+  static CustomProviderAuthMethod _parseAuthMethod(Object? value) {
+    if (value is! String) return CustomProviderAuthMethod.apiKey;
+    switch (value) {
+      case 'sso':
+        return CustomProviderAuthMethod.sso;
+      case 'jwt':
+        return CustomProviderAuthMethod.jwt;
+      default:
+        return CustomProviderAuthMethod.apiKey;
+    }
+  }
+
+  /// Display/lookup name (derived from the endpoint host at creation).
+  final String name;
+
+  /// The adapter dialect: `openai`, `anthropic`, or `google` (catalog spec
+  /// names, see [providerCatalog]).
+  final String apiType;
+
+  /// The endpoint base URL.
+  final String baseUrl;
+
+  /// The secure-store/env name holding the API key, or null when keyless.
+  String? keyName;
+
+  /// How this entry authenticates. Used to pick the right path when switching
+  /// to saved SSO/JWT providers.
+  CustomProviderAuthMethod authMethod;
+
+  /// Auth header name (issue #964): `x-api-key` sends `x-api-key: <key>`
+  /// instead of `Authorization: Bearer <key>` when this entry is active.
+  /// Null keeps the Bearer default.
+  String? authHeader;
+
+  /// Per-provider connect/first-headers watchdog override
+  /// (`connectTimeoutMs` on the entry, issue #1398). Null keeps the
+  /// global `providerTimeouts:` value, then the 180 s default.
+  Duration? connectTimeout;
+
+  /// Per-provider stream-idle watchdog override (`streamIdleTimeoutMs`,
+  /// issue #1398). Null keeps the global value, then the 300 s default.
+  Duration? streamIdleTimeout;
+
+  /// True when the wizard recorded this entry while its key write degraded
+  /// to session-only (gh-1679): the entry carries a visible "key not
+  /// persisted" marker so the next boot surfaces the degradation while the
+  /// slot stays empty. Cleared by a later successful save of [keyName] and
+  /// never written to yaml when false (existing configs stay
+  /// byte-identical).
+  bool keyNotPersisted;
+
+  /// The CodeMie project picked at connect time (issue #1809), sent as the
+  /// `x-codemie-project` header on this entry's API requests. Null for
+  /// non-CodeMie entries and pre-#1809 connects (never written to yaml —
+  /// existing configs stay byte-identical).
+  String? project;
+
+  /// The last-used model id (rewritten on `/model` switches while active).
+  String modelId;
+
+  /// Serializes to the yaml section's map shape.
+  Map<String, Object?> toYaml() {
+    return {
+      'name': name,
+      'apiType': apiType,
+      'baseUrl': baseUrl,
+      'keyName': ?keyName,
+      'authMethod': authMethod.name,
+      'authHeader': ?authHeader,
+      'connectTimeoutMs': ?connectTimeout?.inMilliseconds,
+      'streamIdleTimeoutMs': ?streamIdleTimeout?.inMilliseconds,
+      'keyNotPersisted': ?(keyNotPersisted ? true : null),
+      'project': ?project,
+      'modelId': modelId,
+    };
+  }
+
+  /// The catalog spec backing this entry's adapter dialect — via
+  /// [resolveCliProviderSpec] so a kind-shaped `apiType` (`chatgpt-codex`,
+  /// issue #772) resolves like the name-shaped convention.
+  ProviderSpec get spec => resolveCliProviderSpec(apiType)!;
+}
+
+/// Whether [name] is reserved for a built-in catalog provider
+/// (case-insensitive): an entry named `openai`/`anthropic`/… shadows
+/// `/provider <name>` routing — issue #221's ghost "openai". Reserved
+/// names are rejected at [CustomProviderRegistry.add], dropped at config
+/// load, and filtered out of every merged write.
+bool isReservedCustomProviderName(String name) =>
+    providerCatalog.containsKey(name.toLowerCase());
+
+/// Auth-domain aliases (#706): several spellings can name the SAME
+/// provider account — the ChatGPT OAuth flow derives `chatgpt.com` from
+/// the endpoint host while the catalog provider is `chatgpt`, so one
+/// auth domain ended up with two picker identities, both marked current.
+/// The map folds an alias spelling onto its canonical id; entries keep
+/// their registry name (switching, key slots), identities canonicalize.
+const Map<String, String> providerNameAliases = {'chatgpt.com': 'chatgpt'};
+
+/// The canonical provider identity of [name]: alias spellings fold onto
+/// their canonical id (case-insensitive); unknown names map to
+/// themselves (lowercased). One auth domain — one identity, across the
+/// registry, the picker rows, and the current marker.
+String canonicalProviderName(String name) {
+  final lower = name.trim().toLowerCase();
+  return providerNameAliases[lower] ?? lower;
+}
+
+/// The pattern a typed saved-provider name must match: starts with a
+/// letter or digit, then letters/digits/`. _ + -`. Anything else either
+/// breaks `/provider <name>` argument routing (spaces, slashes) or is a
+/// yaml indicator that corrupts the bare `name:` scalar in config.yaml
+/// (issue #555: a name of `?` made the next config load throw). `@` and
+/// `:` stay legal — the aiin connect names entries by account email and
+/// [CustomProviderRegistry.deriveName] appends `:port` to non-default
+/// ports; the yaml quoting writer is the backstop for both.
+final _usableProviderNamePattern = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._+:@-]*$');
+
+/// Whether [name] is a usable saved-provider name; the name prompts
+/// re-prompt otherwise. Empty answers never reach this — they take the
+/// flow's default name.
+bool isUsableCustomProviderName(String name) =>
+    _usableProviderNamePattern.hasMatch(name);
+
+/// The merge-before-write union for the `customProviders:` section (issue
+/// #221): [caller] is the saving process's intended list, [onDisk] the
+/// freshly re-read list. Caller's entries win per name (case-insensitive)
+/// — an in-flight edit lands — while on-disk entries the caller never
+/// loaded survive (no stale-snapshot clobber). Reserved (catalog-named)
+/// entries are dropped from the result so a ghost can never persist.
+List<CustomProviderEntry> mergeCustomProviderEntries(
+  List<CustomProviderEntry> caller,
+  List<CustomProviderEntry> onDisk,
+) {
+  final callerNames = {for (final e in caller) e.name.toLowerCase()};
+  return [
+    for (final e in caller)
+      if (!isReservedCustomProviderName(e.name)) e,
+    for (final e in onDisk)
+      if (!callerNames.contains(e.name.toLowerCase()) &&
+          !isReservedCustomProviderName(e.name))
+        e,
+  ];
+}
+
+/// Endpoint equality ignoring ONE trailing slash (saved entries, resolved
+/// endpoints, and catalog defaults disagree on it routinely) — the ONE
+/// rule for "is this endpoint that endpoint": saved-entry matches
+/// (key_status), catalog-default classification (key_status, the roles
+/// resolver's endpoint-slot probe, startup's preload set) share it, so a
+/// trailing-slash spelling can never be custom in one helper and default
+/// in another (round-3 review).
+bool sameEndpoint(String a, String b) {
+  String norm(String u) => u.endsWith('/') ? u.substring(0, u.length - 1) : u;
+  return norm(a) == norm(b);
+}
+
+/// Carries the hand-configured fields from [existing] onto [updated]
+/// (review r2): the `/provider` edit wizard rebuilds the entry from the
+/// wizard answers and would otherwise silently drop the fields it does
+/// not ask about — `authMethod` (the SSO/JWT routing signal), `authHeader`
+/// (issue #964), and the tuning keys `connectTimeoutMs`/`streamIdleTimeoutMs`
+/// (issue #1398). `project` (issue #1809) is endpoint-scoped, so it only
+/// carries when the wizard kept the endpoint. The wizard-owned identity
+/// fields (name, apiType, baseUrl, modelId, keyName) stay whatever the
+/// wizard produced.
+CustomProviderEntry mergeEditedCustomProviderEntry({
+  required CustomProviderEntry existing,
+  required CustomProviderEntry updated,
+}) {
+  return updated
+    ..authMethod = existing.authMethod
+    ..authHeader = existing.authHeader
+    ..connectTimeout = existing.connectTimeout
+    ..streamIdleTimeout = existing.streamIdleTimeout
+    // The project is ENDPOINT-scoped (a project of org A means nothing to
+    // org B) — it survives the merge only when the entry keeps serving the
+    // same endpoint; a baseUrl edit drops it (issue #1809 review r2).
+    ..project = sameEndpoint(existing.baseUrl, updated.baseUrl)
+        ? existing.project
+        : null;
+}
+
+/// The `authHeader` of the saved entry serving [baseUrl], for the
+/// folder-model-state restores (boot in `bin/fah.dart` and session
+/// re-apply in `agent_cli.dart` — issue #964 review): a restored gateway
+/// endpoint without its header 401s. Null when [baseUrl] is null (catalog
+/// default) or no saved entry matches it.
+String? authHeaderForBaseUrl(
+  List<CustomProviderEntry> entries,
+  String? baseUrl,
+) {
+  if (baseUrl == null) return null;
+  for (final entry in entries) {
+    if (sameEndpoint(entry.baseUrl, baseUrl)) return entry.authHeader;
+  }
+  return null;
+}
+
+/// The CodeMie project of the saved entry serving [baseUrl] — the ONE
+/// resolver every project-header rebuild goes through (issue #1941): boot
+/// restore, session re-apply, and the generic switch all ask the registry
+/// here instead of re-deriving the value per site. Null when [baseUrl] is
+/// null (catalog default), no saved entry matches it, or the match predates
+/// issue #1809 (no project recorded).
+String? projectHeaderForBaseUrl(
+  List<CustomProviderEntry> entries,
+  String? baseUrl,
+) {
+  if (baseUrl == null) return null;
+  for (final entry in entries) {
+    if (sameEndpoint(entry.baseUrl, baseUrl)) return entry.project;
+  }
+  return null;
+}
+
+/// The CodeMie project this live model bills (null when the model carries
+/// no project header — non-CodeMie models and pre-#1809 connects). The
+/// source for roles-chain pins: the chain serves from the ModelRef entry,
+/// so the live model's header must be COPIED onto the pin (issue #1941).
+extension CodeMieProjectOnModel on Model {
+  String? get codeMieProject => headers?[codeMieProjectHeader];
+}
+
+/// The live list of saved custom providers (shared by the CLI, which
+/// mutates it, and the executable, which persists it).
+final class CustomProviderRegistry {
+  /// Creates a registry over [entries] (a live, mutable list). Same-auth-
+  /// domain records (alias spellings of one canonical id, #706 — e.g. a
+  /// hand-edited `chatgpt` ghost next to the OAuth-minted `chatgpt.com`)
+  /// merge onto ONE record: fields the survivor lacks are inherited from
+  /// the twin (union — nothing dropped), conflicts keep the survivor's
+  /// value, and a note lands in [mergeNotes]. A reserved-named ghost
+  /// (e.g. `chatgpt`, which would shadow `/provider` routing) never
+  /// survives — the non-reserved twin wins even when it came later.
+  CustomProviderRegistry(List<CustomProviderEntry> entries)
+    : this._loaded(_mergeOnLoad(entries));
+
+  CustomProviderRegistry._loaded(
+    ({List<CustomProviderEntry> entries, List<String> notes}) loaded,
+  ) : entries = loaded.entries,
+      mergeNotes = loaded.notes;
+
+  /// All saved entries, in insertion order.
+  final List<CustomProviderEntry> entries;
+
+  /// Human-readable notes from the load-time same-domain merge (#706).
+  /// Each note names the record that was folded and the record that
+  /// actually survived (a ghost-first load swaps both — see
+  /// [_mergeOnLoad]).
+  final List<String> mergeNotes;
+
+  /// Non-destructive migration notes for key slots an older build
+  /// generated with the pre-gh-1226 doubling rule — an entry named
+  /// `z.ai` on host `api.z.ai` persisted `FA_KEY_API_Z_AI_Z_AI` where the
+  /// canonical slot is `FA_KEY_API_Z_AI` (gh-1226 AC3). Resolution still
+  /// probes each entry's OWN stored keyName first, so an existing doubled
+  /// slot keeps working; the note tells the user the canonical name to
+  /// move the value to AND to delete the doubled slot afterwards —
+  /// otherwise the pinned slot keeps winning and the note reprints on
+  /// every boot (review thread). Only the doubling class nags: an
+  /// intentional non-canonical keyName (e.g. a slot shared on purpose
+  /// across entries) is a user choice, not a defect.
+  List<String> get keyNameMigrationNotes {
+    final notes = <String>[];
+    for (final entry in entries) {
+      final stored = entry.keyName;
+      if (stored == null) continue;
+      final canonical = keyNameFor(entry.baseUrl, providerName: entry.name);
+      if (stored == canonical) continue;
+      if (!stored.startsWith('${canonical}_')) continue;
+      final twin = entries.any(
+        (other) =>
+            other != entry &&
+            other.baseUrl == entry.baseUrl &&
+            other.keyName == canonical,
+      );
+      notes.add(
+        'saved key slot for "${entry.name}" is "$stored"; the canonical '
+        'slot is "$canonical"'
+        '${twin ? ' — a same-endpoint entry already uses "$canonical"' : ' — move the value with /key set $canonical <value>'}'
+        '; then /key delete $stored (the pinned slot keeps winning '
+        'while it holds a value)',
+      );
+    }
+    return notes;
+  }
+
+  /// The load-time merge result: one record per identity (canonical
+  /// provider name; for the chatgpt-codex backend the auth DOMAIN itself
+  /// — issue #1706); a reserved-named ghost (e.g. `chatgpt`, which would
+  /// shadow `/provider` routing) yields to a non-reserved twin of the
+  /// same domain even when the ghost came first. The merge and its notes
+  /// are ONE pass over the source, so every note names the record that
+  /// actually survives — a ghost-first load keeps `chatgpt.com` and the
+  /// note must say so, not the ghost it displaced.
+  static ({List<CustomProviderEntry> entries, List<String> notes}) _mergeOnLoad(
+    List<CustomProviderEntry> source,
+  ) {
+    final survivors = <String, CustomProviderEntry>{};
+    final order = <String>[];
+    final notes = <String>[];
+    for (final entry in source) {
+      final id = _recordIdentity(entry);
+      final existing = survivors[id];
+      if (existing == null) {
+        survivors[id] = entry;
+        order.add(id);
+        continue;
+      }
+      // Ghost-first takeover: a reserved-named survivor can never
+      // receive logins (name prompts and `add` reject it) nor survive a
+      // merged write, so the non-reserved twin becomes the survivor.
+      final ghostFirst =
+          isReservedCustomProviderName(existing.name) &&
+          !isReservedCustomProviderName(entry.name);
+      final survivor = ghostFirst ? entry : existing;
+      final twin = ghostFirst ? existing : entry;
+      _unionOnto(survivor, twin);
+      survivors[id] = survivor;
+      notes.add(
+        'merged duplicate provider record "${twin.name}" onto '
+        '"${survivor.name}" (same auth domain)',
+      );
+    }
+    return (entries: [for (final id in order) survivors[id]!], notes: notes);
+  }
+
+  /// The load-merge identity of one record: the canonical provider name —
+  /// except the chatgpt-codex backend (issue #1706), where the AUTH
+  /// DOMAIN is the identity. One ChatGPT account is one `/provider` row:
+  /// a record saved under a custom name and the derived `chatgpt.com`
+  /// spelling are the same account, so they fold onto a single entry at
+  /// load instead of listing twice. Every other provider keeps
+  /// name-based identities (kimi/dial legitimately host several
+  /// same-endpoint accounts).
+  static String _recordIdentity(CustomProviderEntry entry) {
+    final kind = resolveCliProviderSpec(entry.apiType)?.kind;
+    return kind == 'chatgpt-codex'
+        ? 'chatgpt-codex:${entry.baseUrl.replaceAll(RegExp(r'/+$'), '')}'
+        : canonicalProviderName(entry.name);
+  }
+
+  /// Folds [twin]'s missing fields into [survivor] (union; survivor's
+  /// own values win conflicts). Returns [survivor].
+  static CustomProviderEntry _unionOnto(
+    CustomProviderEntry survivor,
+    CustomProviderEntry twin,
+  ) {
+    if (survivor.keyName == null && twin.keyName != null) {
+      survivor.keyName = twin.keyName;
+    }
+    if (survivor.authHeader == null && twin.authHeader != null) {
+      survivor.authHeader = twin.authHeader;
+    }
+    return survivor;
+  }
+
+  /// Finds an entry by [name] (case-insensitive), or null. Alias
+  /// spellings resolve onto the canonical record: `find('chatgpt.com')`
+  /// and `find('chatgpt')` both land on the one same-domain entry.
+  CustomProviderEntry? find(String name) {
+    final lower = name.toLowerCase();
+    for (final entry in entries) {
+      if (entry.name.toLowerCase() == lower) return entry;
+    }
+    final canonical = canonicalProviderName(name);
+    for (final entry in entries) {
+      if (canonicalProviderName(entry.name) == canonical) return entry;
+    }
+    return null;
+  }
+
+  /// Adds (or replaces, on name clash) [entry]. Throws [ConfigException]
+  /// when the entry is named after a built-in catalog provider — such an
+  /// entry shadows `/provider <name>` routing and is exactly the ghost
+  /// "openai" of issue #221; the interactive name prompts reject these
+  /// names already, this is the last line of defense for flows that
+  /// construct entries directly.
+  void add(CustomProviderEntry entry) {
+    if (isReservedCustomProviderName(entry.name)) {
+      throw ConfigException(
+        '"${entry.name}" is a built-in provider name — a saved custom '
+        'entry with that name shadows /provider ${entry.name} routing; '
+        'pick another name',
+      );
+    }
+    final existing = find(entry.name);
+    if (existing != null) entries.remove(existing);
+    entries.add(entry);
+  }
+
+  /// Records the last-used model for the entry named [name] (no-op when
+  /// absent).
+  void updateModel(String name, String modelId) {
+    find(name)?.modelId = modelId;
+  }
+
+  /// Derives a unique display name from [baseUrl]'s host (and non-default
+  /// port), avoiding catalog provider names and existing entries:
+  /// `localhost:11434`, `api.acme.com`, `api.acme.com-2`, ...
+  String deriveName(String baseUrl) {
+    final uri = Uri.tryParse(baseUrl);
+    var host = uri?.host ?? baseUrl;
+    if (host.isEmpty) host = 'custom';
+    final port = uri?.port;
+    final defaultPort = uri?.scheme == 'https' ? 443 : 80;
+    final candidate = port != null && port != defaultPort
+        ? '$host:$port'
+        : host;
+    return _dedupe(candidate);
+  }
+
+  String _dedupe(String candidate) {
+    final reserved = <String>{'custom', ...providerCatalog.keys};
+    var name = candidate;
+    var suffix = 2;
+    while (reserved.contains(name) || find(name) != null) {
+      name = '$candidate-${suffix++}';
+    }
+    return name;
+  }
+
+  /// The secure-store key name backing [baseUrl]'s key:
+  /// `FA_KEY_LOCALHOST_11434`, `FA_KEY_API_ACME_COM` (the store accepts
+  /// `[A-Za-z0-9_]+` only). With [providerName] (a saved entry's name) the
+  /// name is appended — `FA_KEY_API_KIMI_COM_WORK` — so several accounts on
+  /// the same endpoint keep separate keys instead of overwriting one
+  /// host-scoped entry.
+  static String keyNameFor(String baseUrl, {String? providerName}) {
+    final uri = Uri.tryParse(baseUrl);
+    final sanitized = _sanitizeKeyHost(_hostWithPort(uri, baseUrl));
+    final base = 'FA_KEY_${sanitized.isEmpty ? 'CUSTOM' : sanitized}';
+    final name = providerName == null ? null : _sanitizeKeyHost(providerName);
+    // A provider named after its host (the default derived name) — or
+    // already a suffix of the host slug, e.g. an entry named 'z.ai' on
+    // api.z.ai (gh-1226 AC3) — must not double the suffix:
+    // FA_KEY_API_AIIN_BY / FA_KEY_API_Z_AI, not ..._API_AIIN_BY /
+    // ..._Z_AI_Z_AI.
+    return name == null ||
+            name.isEmpty ||
+            name == sanitized ||
+            sanitized.endsWith('_$name')
+        ? base
+        : '${base}_$name';
+  }
+
+  /// Every key-slot name the SAME endpoint ever derived, canonical first —
+  /// the cross-version stability contract (gh-1570 incident REG). A slot
+  /// name is a persistent contract: a key stored by an older build under
+  /// THAT build's spelling of the derivation must keep resolving after an
+  /// update changes the spelling, so resolution probes the whole set and
+  /// the boot migrates a stranded value forward (gh-1570 review).
+  ///
+  /// Today the drift class is the record scoping: a record-scoped slot
+  /// (`keyNameFor(url, providerName: 'kimi-ira')` →
+  /// `FA_KEY_API_KIMI_COM_KIMI_IRA`) sits next to the host-scoped shape
+  /// (`FA_KEY_API_KIMI_COM`) the same endpoint wrote before the record
+  /// rule (or via the /provider flow) — exactly the 1.0.556 → 1.0.564
+  /// lockout pair. Canonical first; never empty; both entries derive from
+  /// the endpoint's host slug only (a scheme-less spelling has no URI
+  /// authority and never produced a host slug in any version).
+  static List<String> keySlotCandidates(
+    String baseUrl, {
+    String? providerName,
+  }) {
+    final candidates = <String>[
+      keyNameFor(baseUrl, providerName: providerName),
+    ];
+    final hostScoped = keyNameFor(baseUrl);
+    if (!candidates.contains(hostScoped)) candidates.add(hostScoped);
+    return candidates;
+  }
+
+  /// The secure-store/env key name backing a connected Copilot account:
+  /// `FA_KEY_COPILOT_<SANITIZED_ENTRY_NAME>` (goal/copilot_provider.md).
+  /// Scoped to the ENTRY (not the host) so several accounts — possibly on
+  /// different plans, hence different hosts — keep separate key slots, and
+  /// so CI can supply `FA_KEY_COPILOT_<NAME>` (+ `_2`…) without a store.
+  static String copilotEntryKeyName(String entryName) =>
+      'FA_KEY_COPILOT_${_sanitizeKeyHost(entryName)}';
+
+  /// The host part of [uri] (falling back to [baseUrl]), with a non-default
+  /// port appended.
+  static String _hostWithPort(Uri? uri, String baseUrl) {
+    var host = uri?.host ?? baseUrl;
+    if (host.isEmpty) host = 'custom';
+    final port = uri?.port;
+    final defaultPort = uri?.scheme == 'https' ? 443 : 80;
+    if (port != null && port != defaultPort) host = '${host}_$port';
+    return host;
+  }
+
+  /// Uppercased, non-alphanumerics collapsed to `_`, edge underscores
+  /// trimmed.
+  static String _sanitizeKeyHost(String value) {
+    return value
+        .toUpperCase()
+        .replaceAll(RegExp('[^A-Z0-9]+'), '_')
+        .replaceAll(RegExp('^_+|_+\$'), '');
+  }
+}

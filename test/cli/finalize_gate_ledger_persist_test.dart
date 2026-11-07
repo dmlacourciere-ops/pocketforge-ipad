@@ -1,0 +1,145 @@
+@TestOn('vm')
+library;
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+import 'agent_cli_test_support.dart';
+
+/// gh-1412 review (rounds 1+2): the hidden `task_ledger` record is an
+/// audit surface three times over — session JSONL, `task_ledger` wire
+/// frame, bench trial sync (`agent-logs/fah-sessions`) — and its
+/// free-text fields (`requirement`/`command`/`expected`/`actual`) quote
+/// agent-authored verification commands and observed output. The
+/// FinalizeGate contract + the unattended `credentialHuntNudge` actively
+/// steer the agent toward credential material (`~/.aws/`, `~/.ssh/`,
+/// env), so the record must pass through the host's redaction pipeline
+/// before `appendCustomEntry` — the same convention the sibling
+/// liveness/stuck records already follow (gh-1054 review).
+void main() {
+  const secret = 'sk-live-topsecret-credential-42';
+
+  final ledgerAnswer =
+      '''
+Task complete.
+```task-ledger
+- requirement: key $secret rotated
+  command: echo "$secret"
+  expected: empty output
+  actual: $secret
+  status: pass
+```
+''';
+
+  Future<List<SessionRecord>> runAndAllRecords({
+    RedactionPipeline? pipeline,
+  }) async {
+    final env = MemoryExecutionEnv(cwd: '/work');
+    await env.writeFile('/work/.fah/memory/.last_maintenance', '');
+    await env.writeFile('/work/key.txt', 'rotated');
+    final io = FakeCliIO();
+    final cli = AgentCli(
+      config: AgentCliConfig(
+        model: testModel,
+        apiKey: 'test-key',
+        env: env,
+        sessionRoot: '/sessions',
+        providerKind: 'openai-completions',
+        approvalMode: ApprovalMode.unattended,
+        headlessRun: true,
+        redactionPipeline: pipeline,
+      ),
+      io: io,
+      // gh-1516: the gate skips trivial turns — the run must produce
+      // state (a tool call) for the ledger record to persist.
+      streamFunction: FakeStreamFunction([
+        toolTurn([
+          ToolCall(
+            id: 'c1',
+            name: 'read',
+            arguments: const {'path': 'key.txt'},
+          ),
+        ]),
+        textTurn(ledgerAnswer),
+      ]).call,
+    );
+    final exitCode = await cli.runHeadless('rotate the key');
+    expect(exitCode, 0);
+    final repo = JsonlSessionRepo(fs: env, sessionsRoot: '/sessions');
+    final sessions = await repo.list(cwd: '/work');
+    final session = await repo.open(sessions.first);
+    return session.getEntries();
+  }
+
+  Future<List<CustomRecord>> runAndRecords({
+    RedactionPipeline? pipeline,
+  }) async {
+    final records = await runAndAllRecords(pipeline: pipeline);
+    return [
+      for (final record in records)
+        if (record is CustomRecord && record.customType == 'task_ledger')
+          record,
+    ];
+  }
+
+  /// gh-1516 review (blocking thread): the hidden `task_ledger` custom
+  /// record may exist, but the persisted ASSISTANT message record must
+  /// never carry the ledger — resume, `fa trajectory`, and the bench
+  /// `agent-logs/fah-sessions` sync all render from the session JSONL,
+  /// which is written on `MessageEndEvent` BEFORE the end-of-run fold
+  /// ever ran. This test reads the persisted record back and fails on
+  /// the pre-fix ordering.
+  test(
+    'the persisted final assistant record contains no task-ledger block',
+    () async {
+      final records = await runAndAllRecords();
+      final assistantRecords = [
+        for (final record in records)
+          if (record is MessageRecord && record.message is AssistantMessage)
+            record,
+      ];
+      expect(assistantRecords, isNotEmpty);
+      final last = assistantRecords.last.message as AssistantMessage;
+      final text = last.content.whereType<TextContent>().map((block) {
+        return block.text;
+      }).join();
+      expect(text, isNot(contains('task-ledger')));
+      expect(text, isNot(contains('```')));
+      expect(text, contains('Task complete.'));
+    },
+  );
+
+  test('ledger free-text is redacted through the host pipeline', () async {
+    final ledgers = await runAndRecords(
+      pipeline: RedactionPipeline(registeredSecrets: [secret]),
+    );
+    expect(ledgers, hasLength(1), reason: 'the run persisted its ledger');
+    final raw = ledgers.map((r) => r.data.toString()).join('\n');
+    expect(raw, isNot(contains(secret)), reason: 'no raw secret in the record');
+    expect(raw, contains('[REDACTED:'), reason: 'masked, not dropped');
+  });
+
+  test('structured fields survive the redaction pass intact', () async {
+    final ledgers = await runAndRecords(
+      pipeline: RedactionPipeline(registeredSecrets: [secret]),
+    );
+    final data = ledgers.single.data;
+    expect(data, isA<Map>());
+    final items = (data as Map)['items'] as List;
+    expect(items, hasLength(1));
+    final item = items.first as Map;
+    expect(item['status'], 'pass');
+    expect(item['requirement'], contains('[REDACTED:'));
+    expect(item['actual'], contains('[REDACTED:'));
+  });
+
+  test(
+    'no pipeline: the record persists verbatim (byte-identical legacy)',
+    () async {
+      final ledgers = await runAndRecords();
+      expect(ledgers, hasLength(1));
+      final raw = ledgers.single.data.toString();
+      expect(raw, contains(secret));
+    },
+  );
+}

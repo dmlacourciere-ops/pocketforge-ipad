@@ -1,0 +1,934 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+/// The `FA_PROVIDER_*` env preconfig parser. Env values arrive via an
+/// injected reader, so every case wires a map-backed closure; no
+/// `dart:io` is involved on either side.
+///
+/// The declaration is machine-written and self-contained: `baseUrl` and
+/// `model` are required, `apiKeyEnvVar` is optional-but-strict (declared →
+/// the named var MUST resolve; absent → keyless, no env-name probing),
+/// every text input has a `_BASE64` twin, and nothing falls back to the
+/// catalog spec values.
+void main() {
+  String? Function(String) envFrom(Map<String, String> vars) =>
+      (name) => vars[name];
+
+  String b64(String value) => base64.encode(utf8.encode(value));
+
+  EnvProviderPreconfig? parse({
+    String? providerType,
+    String? providerName,
+    String? providerConfig,
+    String? providerConfigBase64,
+    Map<String, String> vars = const {},
+    Iterable<String> takenNames = const [],
+  }) => parseEnvProviderPreconfig(
+    providerType: providerType,
+    providerName: providerName,
+    providerConfig: providerConfig,
+    providerConfigBase64: providerConfigBase64,
+    envVarValue: envFrom(vars),
+    takenNames: takenNames,
+  );
+
+  /// A minimal declaration for [type] (required keys only).
+  String config(String type) => switch (type) {
+    'zai' =>
+      '{"baseUrl":"https://api.z.ai/api/coding/paas/v4","model":"glm-5.3"}',
+    _ => '{"baseUrl":"https://relay.internal/v1","model":"test-model"}',
+  };
+
+  final throwsConfig = isA<ConfigException>();
+
+  group('feature off', () {
+    test('null / blank type returns null', () {
+      expect(parse(), isNull);
+      expect(parse(providerType: ''), isNull);
+      expect(parse(providerType: '   '), isNull);
+    });
+  });
+
+  group('required fields', () {
+    test('a missing config with a set type is an error', () {
+      expect(
+        () => parse(providerType: 'zai'),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('FA_PROVIDER_CONFIG'),
+          ),
+        ),
+      );
+    });
+
+    test('an empty config with a set type is an error', () {
+      expect(
+        () => parse(providerType: 'zai', providerConfig: '  '),
+        throwsA(throwsConfig),
+      );
+    });
+
+    test('a missing baseUrl is named, not defaulted', () {
+      expect(
+        () => parse(providerType: 'zai', providerConfig: '{"model":"glm-5.3"}'),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('baseUrl')),
+        ),
+      );
+    });
+
+    test('a missing model is named, not defaulted', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig: '{"baseUrl":"https://api.z.ai/api/coding/paas/v4"}',
+        ),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('model')),
+        ),
+      );
+    });
+  });
+
+  group('apiKeyEnvVar: optional but strict', () {
+    test('a declared, set key ref is applied', () {
+      final pre = parse(
+        providerType: 'zai',
+        providerConfig:
+            '{"baseUrl":"https://relay.internal/v1","model":"glm-5.3",'
+            '"apiKeyEnvVar":"ZAI_API_KEY"}',
+        vars: {'ZAI_API_KEY': 'zk'},
+      )!;
+      expect(pre.apiKeyEnvVar, 'ZAI_API_KEY');
+      expect(pre.apiKey, 'zk');
+    });
+
+    test('a declared but missing key ref fails loud, naming the var', () {
+      expect(
+        () => parse(
+          providerType: 'minimax',
+          providerConfig:
+              '{"baseUrl":"https://api.minimax.io/v1","model":"MiniMax-M3",'
+              '"apiKeyEnvVar":"MISSING_KEY_VAR"}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('MISSING_KEY_VAR'),
+          ),
+        ),
+      );
+    });
+
+    test('a declared but empty key ref fails loud too', () {
+      expect(
+        () => parse(
+          providerType: 'minimax',
+          providerConfig:
+              '{"baseUrl":"https://api.minimax.io/v1","model":"MiniMax-M3",'
+              '"apiKeyEnvVar":"EMPTY_KEY_VAR"}',
+          vars: {'EMPTY_KEY_VAR': ''},
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('EMPTY_KEY_VAR'),
+          ),
+        ),
+      );
+    });
+
+    test('no key ref boots keyless — spec env names are NOT probed', () {
+      // MINIMAX_API_KEY is in the environment, but the declaration does
+      // not name it: absent means absent, the boot stays keyless instead
+      // of silently picking up whatever key happened to be around.
+      final pre = parse(
+        providerType: 'minimax',
+        providerConfig: config('minimax'),
+        vars: {'MINIMAX_API_KEY': 'mm-key'},
+      )!;
+      expect(pre.apiKeyEnvVar, isNull);
+      expect(pre.apiKey, '');
+    });
+  });
+
+  group('apiKeyEnvVar genericity: any catalog type', () {
+    test('anthropic boots end-to-end from env with a custom key var', () {
+      final pre = parse(
+        providerType: 'anthropic',
+        providerConfig:
+            '{"baseUrl":"https://api.anthropic.com","model":"claude-sonnet-4-5",'
+            '"apiKeyEnvVar":"MY_ANTHROPIC_KEY"}',
+        vars: {'MY_ANTHROPIC_KEY': 'sk-ant'},
+      )!;
+      expect(pre.spec.name, 'anthropic');
+      expect(pre.baseUrl, 'https://api.anthropic.com');
+      expect(pre.modelId, 'claude-sonnet-4-5');
+      expect(pre.apiKeyEnvVar, 'MY_ANTHROPIC_KEY');
+      expect(pre.apiKey, 'sk-ant');
+    });
+
+    test('openai boots end-to-end from env the same way', () {
+      final pre = parse(
+        providerType: 'openai',
+        providerConfig:
+            '{"baseUrl":"https://api.openai.com/v1","model":"gpt-5.2",'
+            '"apiKeyEnvVar":"MY_OPENAI_KEY"}',
+        vars: {'MY_OPENAI_KEY': 'sk-oai'},
+      )!;
+      expect(pre.spec.name, 'openai');
+      expect(pre.apiKey, 'sk-oai');
+    });
+  });
+
+  group('base64 twins: config blob', () {
+    test('the _BASE64 twin is used when the plain var is unset', () {
+      final pre = parse(
+        providerType: 'zai',
+        providerConfigBase64: b64(config('zai')),
+      )!;
+      expect(pre.baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+      expect(pre.modelId, 'glm-5.3');
+    });
+
+    test('the plain var wins when both carry the same value', () {
+      final pre = parse(
+        providerType: 'zai',
+        providerConfig: config('zai'),
+        providerConfigBase64: b64(config('zai')),
+      )!;
+      expect(pre.modelId, 'glm-5.3');
+    });
+
+    test('both set with different values is ambiguous — error', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig: config('zai'),
+          providerConfigBase64: b64(config('minimax')),
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('ambiguous'), contains('FA_PROVIDER_CONFIG')),
+          ),
+        ),
+      );
+    });
+
+    test('malformed base64 is an error naming the twin var', () {
+      expect(
+        () => parse(providerType: 'zai', providerConfigBase64: 'not-base64!!!'),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('FA_PROVIDER_CONFIG_BASE64'), contains('base64')),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('base64 twins: key var', () {
+    final zaiWithKeyRef =
+        '{"baseUrl":"https://api.z.ai/api/coding/paas/v4","model":"glm-5.3",'
+        '"apiKeyEnvVar":"ZAI_API_KEY"}';
+
+    test('the _BASE64 twin is used when the plain var is unset', () {
+      final pre = parse(
+        providerType: 'zai',
+        providerConfig: zaiWithKeyRef,
+        vars: {'ZAI_API_KEY_BASE64': b64('sk-zai')},
+      )!;
+      expect(pre.apiKey, 'sk-zai');
+    });
+
+    test('the plain var wins when both carry the same value', () {
+      final pre = parse(
+        providerType: 'zai',
+        providerConfig: zaiWithKeyRef,
+        vars: {'ZAI_API_KEY': 'sk-zai', 'ZAI_API_KEY_BASE64': b64('sk-zai')},
+      )!;
+      expect(pre.apiKey, 'sk-zai');
+    });
+
+    test('both set with different values is ambiguous — error', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig: zaiWithKeyRef,
+          vars: {
+            'ZAI_API_KEY': 'sk-plain',
+            'ZAI_API_KEY_BASE64': b64('sk-twin'),
+          },
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('ambiguous'), contains('ZAI_API_KEY_BASE64')),
+          ),
+        ),
+      );
+    });
+
+    test('malformed base64 is an error naming the twin var', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig: zaiWithKeyRef,
+          vars: {'ZAI_API_KEY_BASE64': '@@not base64@@'},
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('ZAI_API_KEY_BASE64'),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('no-fallback regressions (catalog values never fill gaps)', () {
+    test(
+      'a catalog-backed type with no baseUrl throws instead of guessing',
+      () {
+        // zai HAS a spec default endpoint; the preconfig must not use it.
+        expect(
+          () => parse(providerType: 'zai', providerConfig: '{"model":"x"}'),
+          throwsA(
+            throwsConfig.having(
+              (e) => e.message,
+              'message',
+              contains('baseUrl'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test('a catalog-backed type with no model throws instead of guessing', () {
+      // glm-5.3 is the catalog default; the preconfig must not pick it.
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig: '{"baseUrl":"https://api.z.ai/api/coding/paas/v4"}',
+        ),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('model')),
+        ),
+      );
+    });
+  });
+
+  group('config strictness', () {
+    test('unknown key names the key and the supported set', () {
+      expect(
+        () => parse(
+          providerType: 'minimax',
+          providerConfig: '{"foo":"bar","baseUrl":"https://x","model":"m"}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('foo'), contains('apiKeyEnvVar')),
+          ),
+        ),
+      );
+    });
+
+    test('non-string value is rejected', () {
+      expect(
+        () => parse(
+          providerType: 'minimax',
+          providerConfig: '{"baseUrl":"https://x","model":42}',
+        ),
+        throwsA(throwsConfig),
+      );
+    });
+
+    test('malformed JSON quotes the problem', () {
+      expect(
+        () => parse(providerType: 'minimax', providerConfig: '{oops'),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('not valid JSON'),
+          ),
+        ),
+      );
+    });
+
+    test('non-object JSON is rejected', () {
+      expect(
+        () => parse(providerType: 'minimax', providerConfig: '["m"]'),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('must be a JSON object'),
+          ),
+        ),
+      );
+    });
+
+    test('blank required values are treated as absent — error', () {
+      expect(
+        () => parse(
+          providerType: 'minimax',
+          providerConfig: '{"baseUrl":"https://x","model":"  "}',
+        ),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('model')),
+        ),
+      );
+    });
+  });
+
+  group('name auto-resolve', () {
+    test('taken default name gets -2, then -3', () {
+      expect(
+        parse(
+          providerType: 'minimax',
+          providerConfig: config('minimax'),
+          takenNames: ['minimax'],
+        )!.name,
+        'minimax-2',
+      );
+      expect(
+        parse(
+          providerType: 'minimax',
+          providerConfig: config('minimax'),
+          takenNames: ['minimax', 'minimax-2'],
+        )!.name,
+        'minimax-3',
+      );
+    });
+
+    test('a non-colliding explicit name is kept verbatim', () {
+      expect(
+        parse(
+          providerType: 'minimax',
+          providerConfig: config('minimax'),
+          providerName: 'my-relay',
+        )!.name,
+        'my-relay',
+      );
+    });
+
+    test('an explicit name colliding with a saved entry gets -2', () {
+      expect(
+        parse(
+          providerType: 'anthropic',
+          providerConfig: config('anthropic'),
+          providerName: 'my-relay',
+          takenNames: ['my-relay'],
+        )!.name,
+        'my-relay-2',
+      );
+    });
+
+    test('a name colliding with a catalog provider gets -2', () {
+      expect(
+        parse(
+          providerType: 'minimax',
+          providerConfig: config('minimax'),
+          providerName: 'anthropic',
+        )!.name,
+        'anthropic-2',
+      );
+    });
+  });
+
+  group('FA_PROVIDERS filter interplay', () {
+    tearDown(() => providerFilterEnvOverride = null);
+
+    test('a filtered-out type no longer resolves', () {
+      providerFilterEnvOverride = 'minimax';
+      expect(
+        () => parse(
+          providerType: 'anthropic',
+          providerConfig: config('anthropic'),
+        ),
+        throwsA(throwsConfig),
+      );
+      expect(
+        parse(providerType: 'minimax', providerConfig: config('minimax')),
+        isNotNull,
+      );
+    });
+
+    test('uniquify still avoids names filtered out of resolution', () {
+      providerFilterEnvOverride = 'minimax';
+      expect(
+        parse(
+          providerType: 'minimax',
+          providerConfig: config('minimax'),
+          providerName: 'dial',
+        )!.name,
+        'dial-2',
+      );
+    });
+  });
+
+  group('input modalities (issue #638 AC2)', () {
+    test('input: ["text","image"] parses onto the preconfig', () {
+      final pre = parse(
+        providerType: 'zai',
+        providerConfig:
+            '{"baseUrl":"https://api.z.ai/api/coding/paas/v4",'
+            '"model":"glm-5.3-flash","input":["text","image"]}',
+      )!;
+      expect(pre.input, ['text', 'image']);
+    });
+
+    test('input parses identically through the BASE64 twin', () {
+      final declared =
+          '{"baseUrl":"https://relay.internal/v1","model":"test-model",'
+          '"input":["image"]}';
+      final pre = parse(
+        providerType: 'openai-completions',
+        providerConfigBase64: b64(declared),
+      )!;
+      expect(pre.input, ['image']);
+    });
+
+    test('absent input leaves the preconfig input null (catalog stands)', () {
+      expect(
+        parse(providerType: 'zai', providerConfig: config('zai'))!.input,
+        isNull,
+      );
+    });
+
+    test('an unknown input entry is named, not coerced', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig:
+              '{"baseUrl":"https://api.z.ai/api/coding/paas/v4",'
+              '"model":"glm-5.3","input":["text","video"]}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('input'), contains('video')),
+          ),
+        ),
+      );
+    });
+
+    test('a non-list input is named', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig:
+              '{"baseUrl":"https://api.z.ai/api/coding/paas/v4",'
+              '"model":"glm-5.3","input":"text"}',
+        ),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('input')),
+        ),
+      );
+    });
+
+    test('an empty input list is named', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig:
+              '{"baseUrl":"https://api.z.ai/api/coding/paas/v4",'
+              '"model":"glm-5.3","input":[]}',
+        ),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('input')),
+        ),
+      );
+    });
+
+    test('a non-string input entry is named', () {
+      expect(
+        () => parse(
+          providerType: 'zai',
+          providerConfig:
+              '{"baseUrl":"https://api.z.ai/api/coding/paas/v4",'
+              '"model":"glm-5.3","input":["text",true]}',
+        ),
+        throwsA(
+          throwsConfig.having((e) => e.message, 'message', contains('input')),
+        ),
+      );
+    });
+  });
+
+  group('thinkingLevel (issue #734)', () {
+    test('a declared rung parses onto the preconfig', () {
+      final pre = parse(
+        providerType: 'anthropic',
+        providerConfig:
+            '{"baseUrl":"https://api.anthropic.com","model":"claude-x",'
+            '"thinkingLevel":"low"}',
+      )!;
+      expect(pre.thinkingLevel, 'low');
+    });
+
+    test('absent thinkingLevel leaves the field null (legacy boot)', () {
+      expect(
+        parse(
+          providerType: 'zai',
+          providerConfig: config('zai'),
+        )!.thinkingLevel,
+        isNull,
+      );
+    });
+
+    test('xhigh and max are accepted and normalize to high', () {
+      expect(
+        parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.anthropic.com","model":"claude-x",'
+              '"thinkingLevel":"max"}',
+        )!.thinkingLevel,
+        'high',
+      );
+      expect(
+        parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.anthropic.com","model":"claude-x",'
+              '"thinkingLevel":"xhigh"}',
+        )!.thinkingLevel,
+        'high',
+      );
+    });
+
+    test('an off-ladder value fails loud naming the ladder', () {
+      expect(
+        () => parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.anthropic.com","model":"claude-x",'
+              '"thinkingLevel":"ultra"}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('thinkingLevel'),
+              contains('ultra'),
+              contains('minimal, low, medium, high, xhigh, max'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('a non-string thinkingLevel is named', () {
+      expect(
+        () => parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.anthropic.com","model":"claude-x",'
+              '"thinkingLevel":5}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('thinkingLevel'), contains('5')),
+          ),
+        ),
+      );
+    });
+
+    test('thinkingLevel parses identically through the BASE64 twin', () {
+      final declared =
+          '{"baseUrl":"https://api.anthropic.com","model":"claude-x",'
+          '"thinkingLevel":"max"}';
+      expect(
+        parse(
+          providerType: 'anthropic',
+          providerConfigBase64: b64(declared),
+        )!.thinkingLevel,
+        'high',
+      );
+    });
+  });
+
+  group('capability fields (gh-1471 D4)', () {
+    // The bench workflow's kimi mapping declares contextWindow/maxTokens
+    // in FA_PROVIDER_CONFIG so a catalog drift can never silently
+    // truncate; a zai run declares nothing and stays byte-identical.
+    const kimiConfig =
+        '{"baseUrl":"https://api.kimi.com/coding/v1","model":"k3-256k",'
+        '"apiKeyEnvVar":"FA_KEY_API_KIMI_COM_BENCH",'
+        '"contextWindow":200000,"maxTokens":16384}';
+
+    test('contextWindow/maxTokens parse as the declared ints', () {
+      final preconfig = parse(
+        providerType: 'kimi',
+        providerConfig: kimiConfig,
+        vars: {'FA_KEY_API_KIMI_COM_BENCH': 'test-key'},
+      )!;
+      expect(preconfig.contextWindow, 200000);
+      expect(preconfig.maxTokens, 16384);
+      expect(preconfig.baseUrl, 'https://api.kimi.com/coding/v1');
+      expect(preconfig.modelId, 'k3-256k');
+    });
+
+    test('absent capability fields stay null (byte-identical legacy)', () {
+      // The exact 3-field zai config bench.yml produced before gh-1471.
+      final preconfig = parse(
+        providerType: 'zai',
+        providerConfig:
+            '{"baseUrl":"https://api.z.ai/api/coding/paas/v4",'
+            '"model":"glm-5.3-flash","apiKeyEnvVar":"FA_KEY_API_Z_AI_Z_AI"}',
+        vars: {'FA_KEY_API_Z_AI_Z_AI': 'test-key'},
+      )!;
+      expect(preconfig.contextWindow, isNull);
+      expect(preconfig.maxTokens, isNull);
+    });
+
+    test('capability fields parse identically through the BASE64 twin', () {
+      final preconfig = parse(
+        providerType: 'kimi',
+        providerConfigBase64: b64(kimiConfig),
+        vars: {'FA_KEY_API_KIMI_COM_BENCH': 'test-key'},
+      )!;
+      expect(preconfig.contextWindow, 200000);
+      expect(preconfig.maxTokens, 16384);
+    });
+
+    test('a non-integer capability field fails loud naming the key', () {
+      expect(
+        () => parse(
+          providerType: 'kimi',
+          providerConfig:
+              '{"baseUrl":"https://api.kimi.com/coding/v1",'
+              '"model":"k3-256k","contextWindow":"200000"}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('contextWindow'), contains('200000')),
+          ),
+        ),
+      );
+      expect(
+        () => parse(
+          providerType: 'kimi',
+          providerConfig:
+              '{"baseUrl":"https://api.kimi.com/coding/v1",'
+              '"model":"k3-256k","maxTokens":16384.5}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('maxTokens'), contains('16384.5')),
+          ),
+        ),
+      );
+    });
+
+    test('a below-floor capability field fails loud naming the floor', () {
+      expect(
+        () => parse(
+          providerType: 'kimi',
+          providerConfig:
+              '{"baseUrl":"https://api.kimi.com/coding/v1",'
+              '"model":"k3-256k","contextWindow":8192}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('contextWindow'), contains('16384')),
+          ),
+        ),
+      );
+    });
+
+    test('a blank capability field is absent, not an error', () {
+      final preconfig = parse(
+        providerType: 'kimi',
+        providerConfig:
+            '{"baseUrl":"https://api.kimi.com/coding/v1",'
+            '"model":"k3-256k","contextWindow":""}',
+      )!;
+      expect(preconfig.contextWindow, isNull);
+    });
+  });
+
+  group('cross-layer: bench workflow custom resolve output (gh-1471)', () {
+    // The workflow's custom arm emits FA_PROVIDER_CONFIG with "type"
+    // STRIPPED (it rides the dedicated FA_PROVIDER_TYPE output/env —
+    // this parser's config whitelist has no "type" key). The workflow
+    // side is pinned by ProviderResolveStepTest in
+    // bench/terminal_bench/test_bench_workflow.py (which executes the
+    // actual resolve step from bench.yml and asserts the emitted keys
+    // stay inside this parser's whitelist); this test pins the consumer
+    // side: the exact emitted JSON for the documented dispatch example
+    // must boot. A drift between the two sides — the "type" clash the
+    // gh-1471 re-review caught — fails here or there, never at a
+    // trial's container boot.
+    const emittedForDocumentedExample =
+        '{"baseUrl":"https://api.example.com/v1","model":"m-1",'
+        '"contextWindow":128000,"maxTokens":8192,'
+        '"apiKeyEnvVar":"FA_KEY_BENCH_CUSTOM"}';
+
+    test('the documented custom example output boots end to end', () {
+      final preconfig = parse(
+        providerType: 'openai',
+        providerConfig: emittedForDocumentedExample,
+        vars: {'FA_KEY_BENCH_CUSTOM': 'custom-test-key'},
+      )!;
+      expect(preconfig.baseUrl, 'https://api.example.com/v1');
+      expect(preconfig.modelId, 'm-1');
+      expect(preconfig.contextWindow, 128000);
+      expect(preconfig.maxTokens, 8192);
+      expect(preconfig.apiKeyEnvVar, 'FA_KEY_BENCH_CUSTOM');
+      expect(preconfig.apiKey, 'custom-test-key');
+    });
+
+    test('the preflight whitelist admits every key the workflow can emit', () {
+      // The workflow preflight mirrors this parser's whitelist (plus
+      // "type", stripped before emission) — a workflow-side addition
+      // without a parser-side one must trip THIS parser, and the Python
+      // pin trips the other direction.
+      final preconfig = parse(
+        providerType: 'openai',
+        providerConfig:
+            '{"baseUrl":"https://api.example.com/v1","model":"m-1",'
+            '"input":["text","image"],"thinkingLevel":"high",'
+            '"apiKeyEnvVar":"FA_KEY_BENCH_CUSTOM"}',
+        vars: {'FA_KEY_BENCH_CUSTOM': 'custom-test-key'},
+      )!;
+      expect(preconfig.input, ['text', 'image']);
+      expect(preconfig.thinkingLevel, 'high');
+    });
+  });
+
+  group('wire ⇄ endpoint validation (gh-1570 AC2)', () {
+    test('the bifrost incident configuration boots with a binding warning '
+        '(gh-1624 AC1 — was exit 64)', () {
+      // gh-1624: the 1.0.576 preflight killed the factory's translating
+      // proxy binding (bifrost /anthropic path serving zai/glm ids) at
+      // parse time. On an UNKNOWN/private endpoint the vendor prefix is a
+      // routing key, not a dialect verdict — the parse now succeeds and
+      // carries the mismatch as a warning for the boot notice.
+      final pre = parse(
+        providerType: 'anthropic',
+        providerConfig:
+            '{"baseUrl":"http://192.168.1.10:8080/v1",'
+            '"model":"zai/glm-5.3-flashx","apiKeyEnvVar":"KEY"}',
+        vars: {'KEY': 'k'},
+      )!;
+      expect(pre.binding.providerKind, 'anthropic');
+      expect(pre.modelId, 'zai/glm-5.3-flashx');
+      expect(pre.binding.warnings, hasLength(1));
+      expect(
+        pre.binding.warnings.single,
+        allOf(
+          contains('zai/glm-5.3-flashx'),
+          contains('http://192.168.1.10:8080/v1'),
+          contains('routing key'),
+        ),
+      );
+    });
+
+    test('a vendor-prefix mismatch on a KNOWN vendor endpoint still dies '
+        'at parse time (gh-1624 AC2)', () {
+      expect(
+        () => parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.anthropic.com",'
+              '"model":"zai/glm-5.3-flashx"}',
+        ),
+        throwsA(throwsConfig),
+      );
+    });
+
+    test('a known endpoint of another dialect is rejected', () {
+      expect(
+        () => parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.openai.com/v1",'
+              '"model":"claude-sonnet-4-5"}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            allOf(contains('api.openai.com'), contains('anthropic')),
+          ),
+        ),
+      );
+    });
+
+    test('an explicit wire: override passes and is echoed (E6)', () {
+      final pre = parse(
+        providerType: 'anthropic',
+        providerConfig:
+            '{"baseUrl":"http://192.168.1.10:8080/v1",'
+            '"model":"zai/glm-5.3-flashx","wire":"openai-completions"}',
+      )!;
+      expect(pre.binding.providerKind, 'openai-completions');
+      expect(pre.binding.wireOverride, isTrue);
+      expect(pre.binding.echo(), contains('wire override'));
+      expect(pre.baseUrl, 'http://192.168.1.10:8080/v1');
+    });
+
+    test('an unknown wire: value is rejected', () {
+      expect(
+        () => parse(
+          providerType: 'anthropic',
+          providerConfig:
+              '{"baseUrl":"https://api.anthropic.com",'
+              '"model":"claude-sonnet-4-5","wire":"smoke-signals"}',
+        ),
+        throwsA(
+          throwsConfig.having(
+            (e) => e.message,
+            'message',
+            contains('smoke-signals'),
+          ),
+        ),
+      );
+    });
+
+    test('a consistent declaration resolves its binding', () {
+      final pre = parse(
+        providerType: 'anthropic',
+        providerConfig:
+            '{"baseUrl":"https://api.anthropic.com",'
+            '"model":"claude-sonnet-4-5","apiKeyEnvVar":"MY_ANTHROPIC_KEY"}',
+        vars: {'MY_ANTHROPIC_KEY': 'sk-ant'},
+      )!;
+      expect(pre.binding.providerKind, 'anthropic');
+      expect(pre.binding.modelId, 'claude-sonnet-4-5');
+      expect(pre.binding.keyEnvRef, 'MY_ANTHROPIC_KEY');
+      expect(pre.binding.wireOverride, isFalse);
+    });
+  });
+}

@@ -1,0 +1,990 @@
+/// Golden (screenshot) tests for `lib/ui/screens/settings.dart` and the
+/// providers-first settings pages (`provider_editor_page.dart`,
+/// `providers_section.dart`, `media_slot_picker_page.dart`) — plus the BYOK
+/// connection form (`AgentSettingsForm`) shared by the setup screen and the
+/// on-device route of the default-chat-model flow. Fakes and pump patterns
+/// mirror `test/settings_test.dart` (in-memory `ProviderRegistry`, no
+/// engines needed: no test connects, so no network/file/JS backends are
+/// touched).
+///
+/// Every shot pumps the form inside a realistic app frame — a `Scaffold`
+/// with the settings `AppBar`, the form centered in a max-width column —
+/// like `SettingsScreen` does, so the snapshots double as marketing
+/// material.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:fa/l10n/app_localizations.dart';
+import 'package:fa/l10n/l10n_ext.dart';
+import 'package:fa/services/agent_network_controller.dart';
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/services/media_models_store.dart';
+import 'package:fa/services/provider_registry.dart';
+import 'package:fa/services/session_keys_store.dart';
+import 'package:fa/services/theme_controller.dart';
+import 'package:fa/services/theme_pack_store.dart';
+import 'package:archive/archive.dart';
+import 'package:fa/ui/widgets/fah_wallpaper.dart';
+import 'package:fa/ui/screens/media_slot_picker_page.dart';
+import 'package:fa/ui/screens/models_settings_page.dart';
+import 'package:fa/ui/screens/provider_editor_page.dart';
+import 'package:fa/ui/screens/dap_settings_page.dart';
+import 'package:fa/services/dap_service.dart';
+import 'package:fa/ui/screens/providers_section.dart';
+import 'package:fa/ui/screens/settings.dart';
+import 'package:fa/ui/screens/skills_toggles_section.dart';
+import 'package:fa/ui/screens/redaction_section.dart';
+import 'package:fa/services/task_models_store.dart';
+import 'package:fa/ui/app_theme.dart';
+import 'package:fa/ui/screens/tools_availability_section.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'golden_test_helper.dart';
+
+/// The editor page's `/models` fetch: image, TTS and vision ids so the
+/// capability chips render.
+Future<ModelsEndpointInfo> _editorModels(
+  String baseUrl, {
+  required String apiKey,
+}) async => (
+  const ['gpt-image-1', 'dall-e-3', 'tts-1', 'gpt-4o'],
+  const <String, int>{},
+  const <String, int>{},
+);
+
+/// Loads the MaterialIcons font from the local Flutter SDK so icon glyphs
+/// (dropdown chevrons, add/lock/info icons) render instead of tofu boxes.
+/// No-ops when the SDK font cannot be located.
+Future<void> _ensureMaterialIcons() async {
+  final root = Platform.environment['FLUTTER_ROOT'];
+  if (root == null) return;
+  final file = File(
+    '$root/bin/cache/artifacts/material_fonts/MaterialIcons-Regular.otf',
+  );
+  if (!file.existsSync()) return;
+  final bytes = file.readAsBytesSync();
+  final loader = FontLoader('MaterialIcons')
+    ..addFont(Future.value(ByteData.sublistView(bytes)));
+  await loader.load();
+}
+
+/// Pumps [child] (the settings form by default) in the same frame
+/// `SettingsScreen` uses (app bar + padded scroll view), centered in a
+/// readable max-width column so the content fills wide frames instead of
+/// getting lost at the edge.
+///
+/// The theme's `filledButtonTheme.textStyle` carries no `fontFamily` (the
+/// `styleFrom` textStyle replaces `labelLarge`), which falls back to the
+/// platform font on device but renders tofu in tests — so the frame pins it
+/// to Inter, matching the app's one-typeface intent.
+Future<void> _pumpSettingsFrame(
+  WidgetTester tester, {
+  ProviderRegistry? registry,
+  Size size = goldenSizeDesktop,
+  ThemeData? theme,
+  Widget? child,
+  bool? isWeb,
+}) {
+  return pumpGolden(
+    tester,
+    child ??
+        AgentSettingsForm(
+          registry: registry,
+          connectLabel: 'Apply',
+          onConnect: (_) async {},
+          isWeb: isWeb,
+        ),
+    size: size,
+    theme: theme,
+    wrap: (child) => Builder(
+      builder: (context) {
+        final theme = Theme.of(context);
+        return Theme(
+          data: theme.copyWith(
+            filledButtonTheme: FilledButtonThemeData(
+              style: theme.filledButtonTheme.style?.copyWith(
+                textStyle: const WidgetStatePropertyAll(
+                  TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.w600),
+                ),
+              ),
+            ),
+          ),
+          child: Scaffold(
+            appBar: AppBar(title: Text(context.l10n.settingsTitle)),
+            body: SafeArea(
+              child: Center(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.all(24),
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 560),
+                    child: child,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    ),
+  );
+}
+
+/// A minimal [AgentService] for the sections that show the active
+/// connection (never connected: no network/file/JS backends are touched).
+AgentService _fakeService({
+  String baseUrl = 'https://openrouter.ai/api/v1',
+  String provider = 'openai-completions',
+  String modelId = 'z-ai/glm-5.2',
+}) {
+  return AgentService(
+    agent: Agent(
+      model: Model(
+        id: modelId,
+        api: 'test-api',
+        provider: provider,
+        baseUrl: baseUrl,
+        contextWindow: 100000,
+        maxTokens: 4096,
+      ),
+      systemPrompt: 'You are Fa.',
+      streamFunction: (model, context, {cancelToken}) =>
+          AssistantMessageEventStream()..end(),
+      toolRegistry: ToolRegistry(const []),
+    ),
+    env: MemoryExecutionEnv(),
+    sessionsRoot: '/sessions',
+  );
+}
+
+/// Wraps a full-screen page with the FilledButton font pinned to Inter (see
+/// [_pumpSettingsFrame]).
+Widget _wrapPage(Widget child) => Builder(
+  builder: (context) {
+    final theme = Theme.of(context);
+    return Theme(
+      data: theme.copyWith(
+        filledButtonTheme: FilledButtonThemeData(
+          style: theme.filledButtonTheme.style?.copyWith(
+            textStyle: const WidgetStatePropertyAll(
+              TextStyle(fontFamily: 'Inter', fontWeight: FontWeight.w600),
+            ),
+          ),
+        ),
+      ),
+      child: child,
+    );
+  },
+);
+
+/// Selects the provider row labelled [label] from the list-based picker
+/// (replaces the old dropdown-tap flow). The provider-first flow hides the
+/// config fields until a provider is tapped.
+Future<void> _selectProvider(WidgetTester tester, String label) async {
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  group('provider queue section (issue #418)', _queueGoldenSection);
+  setUpAll(() async {
+    await ensureGoldenFonts();
+    await _ensureMaterialIcons();
+  });
+
+  group('settings goldens', () {
+    testWidgets('hosted provider form (OpenRouter)', (tester) async {
+      await _pumpSettingsFrame(tester);
+      await _selectProvider(tester, 'OpenRouter');
+      await tester.enterText(
+        find.widgetWithText(TextField, 'API key'),
+        'sk-or-test-key',
+      );
+      await tester.pumpAndSettle();
+
+      // Key/model/url fields, the vision checkbox (UNchecked: the default
+      // OpenRouter model id z-ai/glm-5.2 is text-only — issue #42), and the
+      // hosted key note.
+      await expectGolden(tester, 'settings_hosted');
+    });
+
+    testWidgets('hosted provider form on a portrait frame', (tester) async {
+      await _pumpSettingsFrame(tester, size: goldenSizeTall);
+      await _selectProvider(tester, 'OpenRouter');
+      await tester.enterText(
+        find.widgetWithText(TextField, 'API key'),
+        'sk-or-test-key',
+      );
+      await tester.pumpAndSettle();
+
+      await expectGolden(tester, 'settings_hosted_tall');
+    });
+
+    testWidgets('custom preset form with editable base URL', (tester) async {
+      await _pumpSettingsFrame(tester);
+      await _selectProvider(tester, 'Custom');
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Base URL'),
+        'http://localhost:8080/v1',
+      );
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'llama3',
+      );
+      await tester.pumpAndSettle();
+
+      // Optional key + helper, editable URL, and the CORS note.
+      await expectGolden(tester, 'settings_custom');
+    });
+
+    testWidgets('saved custom provider shows edit/delete actions', (
+      tester,
+    ) async {
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      await _pumpSettingsFrame(tester, registry: registry);
+      await _selectProvider(tester, 'Acme');
+
+      // Edit/Delete buttons and the "definition is saved" key note.
+      await expectGolden(tester, 'settings_custom_saved');
+    });
+
+    testWidgets('on-device WebLLM form', (tester) async {
+      // WebLLM is hidden on host platforms, so exercise the web provider
+      // picker even though the test surface is a desktop frame.
+      await _pumpSettingsFrame(tester, isWeb: true);
+      await _selectProvider(tester, 'On-device (WebLLM)');
+
+      // The key/model/URL fields are replaced by the model picker with the
+      // prompt-tools badge plus the offline/WebGPU notes.
+      await expectGolden(tester, 'settings_webllm');
+    });
+
+    testWidgets('hosted apply without a key shows the validation error', (
+      tester,
+    ) async {
+      await _pumpSettingsFrame(tester);
+
+      await tester.ensureVisible(find.text('Apply'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Apply'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('API key is required'), findsOneWidget);
+      await expectGolden(tester, 'settings_validation');
+    });
+
+    testWidgets('hosted provider form — light theme', (tester) async {
+      await _pumpSettingsFrame(tester, theme: buildFahThemeLight());
+      await _selectProvider(tester, 'OpenRouter');
+      await tester.enterText(
+        find.widgetWithText(TextField, 'API key'),
+        'sk-or-test-key',
+      );
+      await tester.pumpAndSettle();
+
+      // The light palette: white inputs on the gray page, darkened
+      // indigo/teal accents, dark text.
+      await expectGolden(tester, 'settings_hosted_light');
+    });
+
+    testWidgets('media models section', (tester) async {
+      final store = MediaModelsStore.inMemory();
+      await store.setOverride(
+        MediaSlot.imageGeneration,
+        const MediaSlotOverride(
+          providerKind: 'openai-completions',
+          baseUrl: 'https://openrouter.ai/api/v1',
+          modelId: 'gpt-image-1',
+        ),
+      );
+      await _pumpSettingsFrame(tester, child: MediaModelsSection(store: store));
+
+      // One row per slot: the overridden image slot shows
+      // `model · provider name`, the rest fall back to the main connection.
+      await expectGolden(tester, 'settings_media_models');
+    });
+
+    testWidgets('tools availability section', (tester) async {
+      // A REAL service so the rows mirror the app's actual wiring. The
+      // service's periodic watchers keep scheduling frames, so pump with
+      // bounded pumps instead of pumpGolden's pumpAndSettle.
+      late final AgentService service;
+      await tester.runAsync(() async {
+        service = await AgentService.create(
+          config: AgentConfig(
+            providerKind: 'openai-completions',
+            modelId: 'z-ai/glm-5.2',
+            baseUrl: 'https://openrouter.ai/api/v1',
+            apiKey: 'sk-or-test-key',
+          ),
+          env: MemoryExecutionEnv(),
+        );
+      });
+      addTearDown(service.dispose);
+
+      tester.view.physicalSize = goldenSizeDesktop;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          debugShowCheckedModeBanner: false,
+          theme: buildFahTheme(),
+          locale: const Locale('en'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Builder(
+            builder: (context) => Scaffold(
+              appBar: AppBar(title: Text(context.l10n.settingsTitle)),
+              body: SafeArea(
+                child: Center(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(24),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 560),
+                      child: ToolsAvailabilitySection(service: service),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+
+      // Wired tools toggle live; absent capabilities show their reason.
+      await expectGolden(tester, 'settings_tools_availability');
+    });
+
+    testWidgets('providers-first settings list', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      final service = _fakeService();
+      await _pumpSettingsFrame(
+        tester,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ProvidersSection(registry: registry),
+            const SizedBox(height: 24),
+            const Divider(),
+            const SizedBox(height: 16),
+            DefaultChatModelSection(service: service, registry: registry),
+          ],
+        ),
+      );
+
+      // The Providers section on top (brand-marked rows, no current check,
+      // the add row) and the Default chat model row.
+      await expectGolden(tester, 'settings_providers');
+    });
+
+    testWidgets('provider editor page', (tester) async {
+      const provider = CustomProvider(
+        id: 'p1',
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        const ProviderEditorPage(
+          title: 'Edit provider',
+          initial: provider,
+          hasSavedKey: true,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Full-screen editor: prefilled fields, the write-only key field with
+      // the keep-key note, and the Delete/Save actions.
+      await expectGolden(tester, 'settings_provider_editor');
+    });
+
+    testWidgets('models settings page', (tester) async {
+      final service = _fakeService();
+      final mediaStore = MediaModelsStore.inMemory();
+      await mediaStore.setOverride(
+        MediaSlot.imageGeneration,
+        const MediaSlotOverride(
+          providerKind: 'openai-completions',
+          baseUrl: 'https://openrouter.ai/api/v1',
+          modelId: 'gpt-image-1',
+        ),
+      );
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        MediaModelsScope(
+          store: mediaStore,
+          child: ModelsSettingsPage(
+            service: service,
+            registry: ProviderRegistry.inMemory(),
+            taskModelsStore: TaskModelsStore.inMemory(),
+            // The provider-queue editor (issue #693) with deterministic
+            // fakes — the real resolver would read the host's config.
+            queueSection: ProviderQueueSection(
+              projectDir: '/tmp/proj',
+              resolve: ({projectDir, homeDir}) => ProviderQueueResolution(
+                scope: ProviderQueueScope.project,
+                entries: _queueFixtureEntries,
+                notices: const [],
+              ),
+              write: (entries, {required layer, projectDir, homeDir}) async =>
+                  '/tmp/proj/.fah/config.yaml',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // The dedicated Models page: presets carousel, the default chat
+      // model row, the task-role rows, the provider-queue chain and the
+      // media slots (image slot overridden).
+      await expectGolden(tester, 'settings_models_page');
+    });
+
+    testWidgets('media slot provider picker page', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        MediaSlotProviderPickerPage(
+          slot: MediaSlot.imageGeneration,
+          title: 'Edit Image generation',
+          mainBaseUrl: 'https://openrouter.ai/api/v1',
+          initial: const MediaSlotOverride(
+            providerKind: 'openai-completions',
+            baseUrl: 'https://openrouter.ai/api/v1',
+            modelId: 'gpt-image-1',
+          ),
+          registry: registry,
+          modelsFetcher: _editorModels,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // The provider list: the main connection row, the hosted presets (the
+      // override's OpenRouter checked), the saved provider, the add row.
+      await expectGolden(tester, 'settings_media_provider_picker');
+    });
+
+    testWidgets('media slot model page', (tester) async {
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.openrouter,
+          initialModel: 'gemini-2.5-flash-preview-tts',
+          initialVoice: 'Kore',
+          modelsFetcher: _editorModels,
+        ),
+      );
+      // The post-frame /models fetch feeds the chips and the quick select.
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pumpAndSettle();
+
+      // The provider header, the model list picker (search field + the
+      // fetched list), the voice preset picker (Gemini voices, with the
+      // sample preview button), the Save action, and the capability chips
+      // derived from the endpoint's /models list.
+      await expectGolden(tester, 'settings_media_model_page');
+    });
+
+    testWidgets('theme and keys sections', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      final provider = await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      registry.rememberKey(provider.id, 'acme-secret');
+      final store = SessionKeysStore.inMemory({
+        'OPENROUTER_API_KEY': 'sk-or-saved',
+      });
+      await _pumpSettingsFrame(
+        tester,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ThemeModeSection(
+              controller: ThemeController.inMemory(FahThemeMode.dark),
+            ),
+            const SizedBox(height: 24),
+            const Divider(),
+            const SizedBox(height: 16),
+            KeysSection(store: store, registry: registry),
+          ],
+        ),
+      );
+
+      // The theme dropdown plus the key rows with their sources (saved /
+      // not set / provider session) — values are never shown.
+      await expectGolden(tester, 'settings_keys_theme');
+    });
+
+    testWidgets('theme and keys sections — light theme', (tester) async {
+      final store = SessionKeysStore.inMemory({
+        'OPENROUTER_API_KEY': 'sk-or-saved',
+      });
+      await _pumpSettingsFrame(
+        tester,
+        theme: buildFahThemeLight(),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ThemeModeSection(
+              controller: ThemeController.inMemory(FahThemeMode.light),
+            ),
+            const SizedBox(height: 24),
+            const Divider(),
+            const SizedBox(height: 16),
+            KeysSection(store: store),
+          ],
+        ),
+      );
+
+      await expectGolden(tester, 'settings_keys_theme_light');
+    });
+
+    testWidgets('skills access section', (tester) async {
+      final service = _fakeService();
+      await _pumpSettingsFrame(
+        tester,
+        child: SkillsAccessSection(service: service),
+      );
+
+      // Icon + title + hint, dropdown at the default (granted = Allowed).
+      await expectGolden(tester, 'settings_skills_access');
+    });
+
+    testWidgets('skills toggles section', (tester) async {
+      final service = _fakeService();
+      await _pumpSettingsFrame(
+        tester,
+        child: SkillsTogglesSection(service: service),
+      );
+
+      // One default-on switch per package builtin (create-goal,
+      // self-settings), each with a one-line description.
+      await expectGolden(tester, 'settings_skills_toggles');
+    });
+
+    testWidgets('redaction section', (tester) async {
+      final service = _fakeService();
+      await _pumpSettingsFrame(
+        tester,
+        child: RedactionSection(service: service),
+      );
+
+      // Icon + title + hint, the switch at the core default (on).
+      await expectGolden(tester, 'settings_redaction');
+    });
+  });
+
+  group('dap hub goldens', () {
+    // Other golden files stub AgentService.maybeCurrent and leak it into
+    // this suite (statics share one VM); the plain dap frames render the
+    // "no network on this platform" path, which requires the service to be
+    // absent — reset the leak before each frame.
+    setUp(() => AgentService.maybeCurrent = null);
+    final connected = DapHubSnapshot(
+      supported: true,
+      url: 'ws://hub.example.com/ws',
+      name: 'fa-desktop',
+      agentId: 'a1b2c3d4e5f60718',
+      channels: const ['general', 'project-x'],
+    );
+
+    testWidgets('dap hub page (desktop)', (tester) async {
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        DapHubPage(service: _FakeDapHubService(connected)),
+      );
+      await tester.pumpAndSettle();
+
+      // Hub URL + status chip, the probe button, agent name/agentId and
+      // the channel chips.
+      await expectGolden(tester, 'settings_dap_hub_page');
+    });
+
+    testWidgets('dap hub page (phone)', (tester) async {
+      await pumpGolden(
+        tester,
+        size: goldenSizePhone,
+        wrap: _wrapPage,
+        DapHubPage(service: _FakeDapHubService(connected)),
+      );
+      await tester.pumpAndSettle();
+
+      await expectGolden(tester, 'settings_dap_hub_page_phone');
+    });
+
+    testWidgets('dap hub page with agent network joined (desktop)', (
+      tester,
+    ) async {
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        DapHubPage(
+          service: _FakeDapHubService(connected),
+          agentNetwork: _joinedAgentNetwork(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Arm the DM composer on a peer so the frame covers the reply path.
+      await tester.tap(find.text('fa-cli'));
+      await tester.pumpAndSettle();
+
+      // The membership card: joined switch on, live state + hub address,
+      // the roster with presence, the DM composer armed on a peer.
+      await expectGolden(tester, 'settings_dap_hub_agent_network');
+    });
+
+    testWidgets('dap hub page with agent network joined (phone)', (
+      tester,
+    ) async {
+      await pumpGolden(
+        tester,
+        size: goldenSizePhone,
+        wrap: _wrapPage,
+        DapHubPage(
+          service: _FakeDapHubService(connected),
+          agentNetwork: _joinedAgentNetwork(),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await expectGolden(tester, 'settings_dap_hub_agent_network_phone');
+    });
+
+    testWidgets('dap connection editor', (tester) async {
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        const DapConnectionEditorPage(
+          initialUrl: 'ws://hub.example.com/ws',
+          initialName: 'fa-desktop',
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // URL + name fields prefilled from the saved connection.
+      await expectGolden(tester, 'settings_dap_hub_editor');
+    });
+
+    testWidgets('dap hub unsupported (web stub)', (tester) async {
+      const unsupported = DapHubSnapshot(
+        supported: false,
+        url: 'ws://127.0.0.1:8787/ws',
+        channels: [],
+      );
+      await pumpGolden(
+        tester,
+        size: goldenSizeDesktop,
+        wrap: _wrapPage,
+        DapHubPage(service: _FakeDapHubService(unsupported)),
+      );
+      await tester.pumpAndSettle();
+
+      // The platform-honest note instead of the connection surface.
+      await expectGolden(tester, 'settings_dap_hub_unsupported');
+    });
+
+    testWidgets('theme packs section over its wallpaper', (tester) async {
+      final env = MemoryExecutionEnv();
+      final store = await ThemePackStore.load(env);
+      // 1×1 transparent PNG — decodes for real (the golden rasterizes it).
+      final png = base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhf'
+        'DwAChwGA60e6kgAAAABJRU5ErkJggg==',
+      );
+      final wallpaper = jsonEncode({
+        'name': 'Forest Walk',
+        'version': '1.0.0',
+        'colors': {
+          'dark': {'accent': '#2E7D32'},
+        },
+        'wallpaper': {'asset': 'bg.png', 'fit': 'cover'},
+      });
+      final mono = jsonEncode({
+        'name': 'Mono',
+        'version': '1.0.0',
+        'colors': {
+          'dark': {'accent': '#9E9E9E'},
+        },
+      });
+      final archive = Archive()
+        ..add(ArchiveFile.bytes('theme.json', utf8.encode(wallpaper)))
+        ..add(ArchiveFile.bytes('bg.png', png));
+      final monoArchive = Archive()
+        ..add(ArchiveFile.bytes('theme.json', utf8.encode(mono)));
+      for (final a in [archive, monoArchive]) {
+        final result = await store.installFromZip(
+          Uint8List.fromList(ZipEncoder().encode(a)),
+        );
+        expect(result.spec, isNotNull, reason: result.reasons.join('\n'));
+      }
+      final controller = ThemeController.inMemory();
+      await controller.setPack('forest-walk', hasWallpaper: true);
+
+      await _pumpSettingsFrame(
+        tester,
+        child: ThemePackScope(
+          store: store,
+          child: FahThemeScope(
+            controller: controller,
+            child: SizedBox(
+              width: double.infinity,
+              height: 640,
+              child: Stack(
+                fit: StackFit.expand,
+                children: const [
+                  Positioned.fill(child: FahWallpaper()),
+                  Positioned.fill(child: ThemePacksSection()),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+      await expectGolden(tester, 'settings_theme_packs_section');
+    });
+  });
+}
+
+/// Deterministic [DapHubService] for the DAP goldens: returns the same
+/// snapshot on every load/probe, never touches the network or `~/.dap`.
+FileMessagingRepository _memoryFileLayer() => FileMessagingRepository(
+  env: MemoryExecutionEnv(cwd: '/golden'),
+  root: '/golden/messages',
+  homeDir: null,
+  decodeSessionCwd: decodeSessionCwd,
+);
+
+/// A scripted membership controller for the agent-network goldens: the
+/// joined state with a live roster, no real hub.
+class _ScriptedAgentNetwork extends AgentNetworkController {
+  _ScriptedAgentNetwork()
+    : super(
+        env: MemoryExecutionEnv(cwd: '/golden'),
+        fileLayer: _memoryFileLayer(),
+        fileFabric: SwappableMessagingRepository(_memoryFileLayer()),
+        transport: null,
+        loadIdentity: (_, _) async => null,
+      ) {
+    unawaited(store.setEnabled(true));
+  }
+
+  @override
+  bool get supported => true;
+
+  @override
+  HubLinkState? get state => HubLinkState.connected;
+
+  @override
+  String? get agentId => 'a1b2c3d4e5f60718';
+
+  @override
+  Future<List<MailboxEntry>> peers() async => const [
+    MailboxEntry(
+      id: '9f8e7d6c5b4a3210',
+      name: 'fa-cli',
+      cwd: '/work/repo',
+      presence: AgentPresence.live,
+      source: 'hub',
+    ),
+    MailboxEntry(
+      id: '77aa88bb99cc00dd',
+      name: 'iPad Fa',
+      presence: AgentPresence.busy,
+      source: 'hub',
+    ),
+  ];
+
+  @override
+  Future<void> setEnabled(bool value) async {
+    await store.setEnabled(value);
+  }
+
+  @override
+  Future<void> saveConnection({
+    String? url,
+    String? token,
+    String? name,
+  }) async {
+    await store.setConnection(url: url, token: token, name: name);
+  }
+
+  @override
+  Future<void> sendDm(String to, String text) async {}
+}
+
+AgentNetworkController _joinedAgentNetwork() => _ScriptedAgentNetwork();
+
+class _FakeDapHubService implements DapHubService {
+  _FakeDapHubService(this.snapshot);
+
+  final DapHubSnapshot snapshot;
+
+  @override
+  Future<DapHubSnapshot> load() async => snapshot;
+
+  @override
+  Future<DapHubSnapshot> probe() async => snapshot.withProbe(true);
+
+  @override
+  Future<void> saveConnection({
+    required String url,
+    required String name,
+    String? secret,
+  }) async {}
+
+  @override
+  Future<List<DapBindableSession>> listBindableSessions() async => const [];
+
+  @override
+  Future<void> saveBinding(
+    DapInboundMode mode, {
+    String? sessionId,
+    String? sessionTitle,
+  }) async {}
+}
+
+/// The deterministic queue fixture shared by the section goldens and the
+/// models-page golden (both render the same two entries).
+final List<ProviderQueueEntry> _queueFixtureEntries = [
+  ProviderQueueEntry(
+    providerType: 'openai-completions',
+    model: 'moonshotai/Kimi-K2.6',
+    baseUrl: 'https://gate.test/v1',
+    apiKeyEnv: 'KIMI_API_KEY',
+  ),
+  ProviderQueueEntry(
+    providerType: 'anthropic',
+    model: 'claude-sonnet-4',
+    apiKeyEnv: 'ANTHROPIC_API_KEY',
+  ),
+];
+
+/// Provider-queue section goldens (issue #418, settings_sections.dart): the editable project-scope
+/// queue and the read-only env-wins queue, each in en and ru. Deterministic
+/// fakes — no config file is read or written.
+void _queueGoldenSection() {
+  final queueEntries = _queueFixtureEntries;
+  final editable = ProviderQueueResolution(
+    scope: ProviderQueueScope.project,
+    entries: queueEntries,
+    notices: const [],
+  );
+  final envOwned = ProviderQueueResolution(
+    scope: ProviderQueueScope.env,
+    entries: editable.entries,
+    notices: const [],
+  );
+  ProviderQueueResolution fakeResolve({String? projectDir, String? homeDir}) =>
+      editable;
+
+  Future<void> frame(
+    WidgetTester tester,
+    ProviderQueueResolution Function({String? projectDir, String? homeDir})
+    resolve,
+    Locale locale,
+    String name,
+  ) async {
+    tester.view.physicalSize = const Size(800, 420);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+    await tester.pumpWidget(
+      MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: buildFahTheme(),
+        locale: locale,
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: Scaffold(
+          body: Center(
+            child: SizedBox(
+              width: 620,
+              child: ProviderQueueSection(
+                projectDir: '/tmp/proj',
+                resolve: resolve,
+                write: (entries, {required layer, projectDir, homeDir}) async =>
+                    '/tmp/proj/.fah/config.yaml',
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await expectGolden(tester, name);
+  }
+
+  testWidgets('queue section, editable project scope (en)', (tester) async {
+    await frame(
+      tester,
+      fakeResolve,
+      const Locale('en'),
+      'settings_queue_project_en',
+    );
+  });
+  testWidgets('queue section, editable project scope (ru)', (tester) async {
+    await frame(
+      tester,
+      fakeResolve,
+      const Locale('ru'),
+      'settings_queue_project_ru',
+    );
+  });
+  testWidgets('queue section, env wins read-only (en)', (tester) async {
+    await frame(
+      tester,
+      ({projectDir, homeDir}) => envOwned,
+      const Locale('en'),
+      'settings_queue_env_en',
+    );
+  });
+  testWidgets('queue section, env wins read-only (ru)', (tester) async {
+    await frame(
+      tester,
+      ({projectDir, homeDir}) => envOwned,
+      const Locale('ru'),
+      'settings_queue_env_ru',
+    );
+  });
+}

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  QUALITY GATE — DO NOT LOWER THESE THRESHOLDS WITHOUT TEAM APPROVAL       ║
+# ║  Every commit must pass: file size (crap4dart loc), analyze, tests,       ║
+# ║  coverage ≥ 80%, CRAP ratchet (crap4dart.yaml), duplication < 1%.         ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+#
+# Pre-commit hook for flutter_agent_harness (pure Dart package).
+# Canonical copy: scripts/pre-commit — install with:
+#   cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# To skip (emergency only): git commit --no-verify
+#
+# Issue #177 (AC7): the hook is a THIN WRAPPER over scripts/ci_fast_gate.sh —
+# the exact script CI runs — with the same path filters: a docs-only commit
+# no longer pays for the flutter suite, a lib-only commit skips flutter_app
+# stages. Hook-specific extras that stay here (they make no sense in CI):
+#   1. dart format SELF-HEAL of staged files (reformat + re-stage, blocking
+#      backstop when the formatter can't),
+#   2. the golden-coverage quick check (check_goldens.py --quick) — local
+#      golden hygiene; pixel goldens themselves run inside the gate's
+#      flutter stage.
+# Parity check: both callers print `GATE_STAGE <name> OK|SKIP <reason>`
+# markers; diffing the hook's markers against CI's must be empty.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "🎨 Auto-formatting staged Dart files..."
+# Format is SELF-HEALING with a BLOCKING backstop: reformat exactly the
+# Dart files in the index and re-stage them; anything still unformatted
+# after that (formatter crashed on syntax errors) blocks the commit with a
+# clear message. A whole-tree `--set-exit-if-changed` gate both (a) failed
+# commits over a single unformatted line and (b) rewrote OTHER agents'
+# work-in-progress files mid-edit when run concurrently — scoped auto-fix
+# avoids both.
+STAGED_DART=$(git diff --cached --name-only --diff-filter=ACM | grep '\.dart$' || true)
+if [ -n "$STAGED_DART" ]; then
+  printf '%s\n' "$STAGED_DART" | xargs dart format >/dev/null 2>&1 || true
+  printf '%s\n' "$STAGED_DART" | xargs git add --
+  UNFORMATTED=$(dart format --output=none --set-exit-if-changed $STAGED_DART 2>/dev/null | grep '^Changed' || true)
+  if [ -n "$UNFORMATTED" ]; then
+    echo "❌ dart format could not fix these files (syntax error?):"
+    echo "$UNFORMATTED"
+    exit 1
+  fi
+fi
+
+# THE shared fast gate (same script, same path filters as CI). --hook makes
+# it derive the scope from the STAGED diff. It unsets GIT_* env itself
+# after reading hook mode.
+bash scripts/ci_fast_gate.sh --hook
+
+# Issue #447: crap4dart quality gates over the STAGED core diff
+# (core-only #433 split — the flutter_app gates run in CI's
+# app-crap-gate job). The root crap4dart.yaml enables exactly
+# broken_goldens; `check --staged` no-ops when no Dart file is staged.
+# Equivalent to the managed block `crap4dart install --force` would
+# append — do not stack both. Requires crap4dart >= 0.9 (the gate
+# framework; older pins only knew `analyze`).
+if command -v dart >/dev/null 2>&1; then
+  C4D_VER=$(dart pub global list 2>/dev/null | awk '$1=="crap4dart"{print $2}')
+  case "$C4D_VER" in
+    # gh-1106: floor 0.11.0 — the root crap4dart.yaml duplication block
+    # uses 0.11.0-only keys (ignore_locals/ignorable); the strict config
+    # parser throws ConfigException on unknown keys, so older pins fail
+    # rather than silently run without Type-2 detection.
+    # gh-1738: floor 0.15.0 — the root config now carries the similarity
+    # gate (gates.similarity); 0.11.0-0.14.x parsers ConfigException on
+    # the unknown gate id, bricking every commit.
+    0.1[5-9].*|0.[2-9][0-9].*|[1-9].*)
+      echo "🧪 crap4dart gates (staged core files)..."
+      # gh-1106: --baseline — the Type-2 duplication gate ships with a
+      # committed snapshot of pre-existing findings; hooks must flag only
+      # NEW duplication, same contract as CI.
+      if ! dart pub global run crap4dart check --staged --baseline; then
+        echo "❌ QUALITY GATE FAILED — crap4dart gates" >&2
+        exit 1
+      fi
+      # Issue #1234 rework: the ≤2800 ceiling over test/ + example/ via
+      # the loc-scope companion config (the package config's sources are
+      # [lib, bin]; 0.11.0 has no per-gate sources override). No-ops
+      # unless a staged file lives under test/ or example/.
+      if ! dart pub global run crap4dart check --staged --config crap4dart.loc-scope.yaml --only loc; then
+        echo "❌ QUALITY GATE FAILED — loc scope (test/example)" >&2
+        exit 1
+      fi
+      ;;
+    "")
+      ;; # not activated — skip silently (CI and the fast gate cover it)
+    *)
+      echo "⚠️  crap4dart $C4D_VER is too old for the gates (need >= 0.15.0 — gh-1738 similarity keys);" \
+           "skipping — run: dart pub global activate crap4dart '>=0.15.0 <0.16.0'" >&2
+      ;;
+  esac
+fi
+
+# Golden-coverage quick check — only when the staged diff can affect the
+# flutter_app (the gate's own markers already told us the flutter stage
+# ran or was skipped; recompute cheaply from the staged paths here).
+STAGED=$(git diff --cached --name-only || true)
+if echo "$STAGED" | grep -qE '^(flutter_app/|packages/|lib/|scripts/|\.github/|pubspec\.)' \
+   || ! echo "$STAGED" | grep -qE '\.(md)$|^docs/|^prompts/'; then
+  if command -v flutter >/dev/null 2>&1; then
+    echo "🔍 Checking golden coverage..."
+    if python3 scripts/check_goldens.py --quick; then
+      echo "✅ Golden gate OK"
+    else
+      exit 1
+    fi
+  fi
+fi
+
+# Issue #433 AC1 (cheap, config-only): README CRAP badge must equal the
+# crap4dart.yaml thresholds — runs only when a config or the README is
+# staged, i.e. exactly the files that can drift apart.
+if echo "$STAGED" | grep -qE '(^|/)crap4dart\.yaml$|^README\.md$'; then
+  python3 scripts/check_crap_guards.py
+fi
+
+echo ""
+echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+echo "║  ✅ ALL QUALITY GATES PASSED — COMMIT APPROVED                            ║"
+echo "╚═══════════════════════════════════════════════════════════════════════════╝"

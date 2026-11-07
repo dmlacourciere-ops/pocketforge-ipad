@@ -1,0 +1,643 @@
+import 'dart:async';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+import 'package:flutter_agent_harness/src/compaction/structured/engine.dart';
+
+/// Issue #515: the compaction phase's LLM calls (structured judge and
+/// summarizer, classic summarizer) must die at the provider layer when
+/// their watchdog budget expires — not pend forever, and not survive the
+/// timeout as an abandoned zombie call.
+const _model = Model(
+  id: 'test-model',
+  api: 'test-api',
+  provider: 'test-provider',
+  baseUrl: 'https://example.test',
+  contextWindow: 100000,
+  maxTokens: 4096,
+);
+
+AssistantMessage _message(StopReason reason) => AssistantMessage(
+  content: const [],
+  api: 'test-api',
+  provider: 'test-provider',
+  model: 'test-model',
+  usage: Usage.zero,
+  stopReason: reason,
+  timestamp: DateTime.utc(2026),
+);
+
+final class _CapturingHooks implements AutoCompactorHooks {
+  Object? bothRolesError;
+  final passes = <AutoCompactorPass>[];
+  int doneCount = 0;
+
+  @override
+  void onDelta(String delta) {}
+
+  @override
+  void onAttemptStart(String label, int attempt, Duration budget) {}
+
+  @override
+  void onPass(AutoCompactorPass pass) => passes.add(pass);
+
+  @override
+  void onRetry(int attempt, int maxAttempts, Duration backoff, Object error) {}
+
+  @override
+  void onDone(int passes, int tokens) => doneCount++;
+
+  @override
+  void onBothRolesFailed(Object lastError) => bothRolesError = lastError;
+}
+
+/// A provider stream that never answers — unless the request's cancel
+/// token fires, in which case it settles as aborted, like a real
+/// adapter's abort path.
+AssistantMessageEventStream _neverAnsweringStream(
+  Model m,
+  Context c, {
+  CancelToken? cancelToken,
+  List<CancelToken?>? tokensSeen,
+}) {
+  tokensSeen?.add(cancelToken);
+  final stream = AssistantMessageEventStream();
+  stream.push(StartEvent(partial: _message(StopReason.stop)));
+  if (cancelToken != null) {
+    unawaited(
+      cancelToken.onCancel.then((_) {
+        stream.push(
+          DoneEvent(
+            reason: StopReason.aborted,
+            message: _message(StopReason.aborted),
+          ),
+        );
+        stream.end();
+      }),
+    );
+  }
+  return stream;
+}
+
+/// A summarizer that pends forever until its cancel token fires.
+Future<SummarizationResult> _hangingSummarizer(
+  SummarizationRequest request,
+  List<CancelToken?> tokensSeen,
+) {
+  tokensSeen.add(request.cancelToken);
+  final done = Completer<SummarizationResult>();
+  if (request.cancelToken != null) {
+    unawaited(
+      request.cancelToken!.onCancel.then((_) {
+        done.complete(SummarizationResult.failure('aborted', aborted: true));
+      }),
+    );
+  }
+  return done.future;
+}
+
+void main() {
+  late MemoryFileSystem fs;
+  late JsonlSessionRepo repo;
+
+  setUp(() {
+    fs = MemoryFileSystem();
+    repo = JsonlSessionRepo(fs: fs, sessionsRoot: '/sessions');
+  });
+
+  const settings = CompactionSettings(
+    enabled: true,
+    reserveTokens: 100,
+    keepRecentTokens: 150,
+  );
+
+  test('structured engine: a never-answering judge no longer bricks the '
+      'run — budget kill aborts the call, the deterministic fallback '
+      'compacts, and the session survives', () async {
+    final session = await repo.create(JsonlSessionCreateOptions(cwd: '/w'));
+    // A read pair plus assistant fillers: hideable entries beyond the
+    // protected tail, so both the judge call and the fallback engage.
+    await session.appendMessage(UserMessage.text('fix the login crash'));
+    await session.appendMessage(
+      AssistantMessage(
+        content: [
+          const TextContent(text: 'looking'),
+          ToolCall(id: 'c1', name: 'read', arguments: const {}),
+        ],
+        api: 'test-api',
+        provider: 'test-provider',
+        model: 'test-model',
+        usage: Usage.zero,
+        stopReason: StopReason.stop,
+        timestamp: DateTime.utc(2026),
+      ),
+    );
+    await session.appendMessage(
+      ToolResultMessage(
+        toolCallId: 'c1',
+        toolName: 'read',
+        content: [TextContent(text: 'x' * 16000)],
+        isError: false,
+        timestamp: DateTime.utc(2026),
+      ),
+    );
+    for (var i = 0; i < 11; i++) {
+      await session.appendMessage(
+        AssistantMessage(
+          content: [TextContent(text: 'filler $i')],
+          api: 'test-api',
+          provider: 'test-provider',
+          model: 'test-model',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+    }
+    final state = AgentState(
+      model: _model,
+      messages: await session.buildContextMessages(),
+    );
+    final tokensSeen = <CancelToken?>[];
+    final hooks = _CapturingHooks();
+    final sw = Stopwatch()..start();
+
+    final ok = await AutoCompactorFactory(
+      session: session,
+      state: state,
+      window: 1000,
+      settings: settings,
+      sources: AutoCompactorSources(
+        smolStream: null,
+        smolModel: null,
+        mainStream: (m, c, {cancelToken}) => _neverAnsweringStream(
+          m,
+          c,
+          cancelToken: cancelToken,
+          tokensSeen: tokensSeen,
+        ),
+        mainModel: _model,
+      ),
+      hooks: hooks,
+      attemptBudget: const Duration(milliseconds: 150),
+      totalBudget: const Duration(seconds: 2),
+    ).run();
+    sw.stop();
+
+    // #541: a dead judge no longer fails the run — the deterministic
+    // fallback closed the window instead.
+    expect(ok, isTrue);
+    expect(sw.elapsed, lessThan(const Duration(seconds: 10)));
+    // The budget reached the provider call AND killed it (#515 kept).
+    expect(tokensSeen, isNotEmpty);
+    expect(
+      tokensSeen.every((t) => t != null && t.isCancelled),
+      isTrue,
+      reason: 'budget expiry must cancel the in-flight provider call',
+    );
+    // The failure surfaced through the hooks as a named pass report,
+    // then the fallback hide reported its own receipt.
+    expect(
+      hooks.passes.any(
+        (p) => !p.ok && p.error.toString().contains('issue #515'),
+      ),
+      isTrue,
+      reason: 'the judge timeout surfaces as a named failed pass',
+    );
+    expect(
+      hooks.passes.any((p) => p.ok && p.fallback == 'structured·hide-fallback'),
+      isTrue,
+      reason: 'the deterministic fallback reports its own receipt',
+    );
+    // Wire stays safe; the read pair did not split.
+    expect(validateToolPairing(state.messages), isEmpty);
+  });
+
+  test('classic engine: budget expiry cancels the wedged summarizer call '
+      'instead of abandoning it', () async {
+    // Usage-anchored messages put the estimate at 5000 tokens, well over
+    // the 900-token trigger, so the classic loop reaches the summarizer.
+    final session = await repo.create(JsonlSessionCreateOptions(cwd: '/w'));
+    for (var i = 0; i < 2; i++) {
+      await session.appendMessage(UserMessage.text('u$i${'a' * 400}'));
+      await session.appendMessage(
+        AssistantMessage(
+          content: [TextContent(text: 'b$i')],
+          api: 'test-api',
+          provider: 'test-provider',
+          model: 'test-model',
+          usage: const Usage(
+            input: 5000,
+            output: 10,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 5010,
+            cost: UsageCost(
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            ),
+          ),
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+    }
+    final state = AgentState(
+      model: _model,
+      messages: await session.buildContextMessages(),
+    );
+    final tokensSeen = <CancelToken?>[];
+    final hooks = _CapturingHooks();
+
+    final ok = await AutoCompactor(
+      session: session,
+      state: state,
+      window: 1000,
+      settings: settings,
+      summary: (r) => _hangingSummarizer(r, tokensSeen),
+      mainSummary: (r) => _hangingSummarizer(r, tokensSeen),
+      smolModel: null,
+      hooks: hooks,
+      // force: true goes straight at the summarizer (the incident's
+      // over-window context) instead of gating on the trigger estimate.
+      force: true,
+      attemptBudget: const Duration(milliseconds: 150),
+      totalBudget: const Duration(seconds: 2),
+    ).run();
+
+    // The run ends (local trim rescues the turn), and — the regression —
+    // the wedged call was CANCELLED, not left running with no token.
+    expect(ok, isTrue);
+    expect(tokensSeen, isNotEmpty);
+    expect(tokensSeen.every((t) => t != null), isTrue);
+    expect(
+      tokensSeen.every((t) => t!.isCancelled),
+      isTrue,
+      reason: 'budget expiry must cancel the in-flight summarizer call',
+    );
+  });
+
+  test('structured engine, direct: the hide judge budget kill is a counted '
+      'failure — the token still aborts the call, and the deterministic '
+      'fallback compacts instead of bricking', () async {
+    final session = await repo.create(JsonlSessionCreateOptions(cwd: '/w'));
+    // A read pair plus filler turns puts the ledger past protect-last-8,
+    // so the hide pass actually reaches the judge call — and the
+    // fallback has something pair-safe to hide afterwards.
+    await session.appendMessage(UserMessage.text('fix the login crash'));
+    await session.appendMessage(
+      AssistantMessage(
+        content: [
+          const TextContent(text: 'looking'),
+          ToolCall(id: 'c1', name: 'read', arguments: const {}),
+        ],
+        api: 'test-api',
+        provider: 'test-provider',
+        model: 'test-model',
+        usage: Usage.zero,
+        stopReason: StopReason.stop,
+        timestamp: DateTime.utc(2026),
+      ),
+    );
+    await session.appendMessage(
+      ToolResultMessage(
+        toolCallId: 'c1',
+        toolName: 'read',
+        content: [TextContent(text: 'x' * 16000)],
+        isError: false,
+        timestamp: DateTime.utc(2026),
+      ),
+    );
+    for (var i = 0; i < 7; i++) {
+      await session.appendMessage(
+        AssistantMessage(
+          content: [TextContent(text: 'filler $i')],
+          api: 'test-api',
+          provider: 'test-provider',
+          model: 'test-model',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+    }
+    final state = AgentState(
+      model: _model,
+      messages: await session.buildContextMessages(),
+    );
+    final budgetSource = CancelTokenSource();
+    final compactor = StructuredCompactor(
+      session: session,
+      state: state,
+      window: 1000,
+      settings: settings,
+      judge: (ledger) => Completer<String?>().future,
+      summarize: (request) async => SummarizationResult.failure('unused'),
+      attemptBudget: const Duration(milliseconds: 150),
+      protectLastN: 3,
+      checkpointPrompt: 'P',
+      budgetSource: budgetSource,
+    );
+
+    final ok = await compactor.run();
+    // #541: the timeout no longer bricks the run — the fallback hid
+    // past the recency floor and the window closed.
+    expect(ok, isTrue);
+    // The engine killed the in-flight call at the token, not just the
+    // await: the provider layer sees the abort (#515 semantics kept).
+    expect(budgetSource.token.isCancelled, isTrue);
+    // The fallback hid deterministically, whole pairs, oldest-first.
+    final records = await session.getEntries();
+    final hidden = records.whereType<HiddenRangeRecord>().toList();
+    expect(hidden, hasLength(1));
+    // The read pair (carrier + result) hid whole.
+    expect(hidden.single.recordIds, hasLength(2));
+    expect(validateToolPairing(state.messages), isEmpty);
+  });
+
+  test('structured engine, direct: the checkpoint summarizer budget kill '
+      'propagates as a named error instead of a null summary', () async {
+    final session = await repo.create(JsonlSessionCreateOptions(cwd: '/w'));
+    for (var i = 0; i < 10; i++) {
+      await session.appendMessage(UserMessage.text('a' * 1600));
+    }
+    final state = AgentState(
+      model: _model,
+      messages: await session.buildContextMessages(),
+    );
+    final budgetSource = CancelTokenSource();
+    final compactor = StructuredCompactor(
+      session: session,
+      state: state,
+      window: 1000,
+      settings: settings,
+      // Judge declines ('[]', F1 no-op): straight to pass 2, where the
+      // summarizer wedges past the attempt budget.
+      judge: (ledger) async => '[]',
+      summarize: (request) => Completer<SummarizationResult>().future,
+      checkpointPrompt: 'P',
+      budgetSource: budgetSource,
+      attemptBudget: const Duration(milliseconds: 150),
+    );
+
+    await expectLater(
+      compactor.run(),
+      throwsA(
+        isA<TimeoutException>()
+            .having(
+              (e) => e.message,
+              'message',
+              contains('checkpoint summarizer'),
+            )
+            .having((e) => e.message, 'issue tag', contains('issue #515')),
+      ),
+    );
+    expect(budgetSource.token.isCancelled, isTrue);
+    // The kill must NOT dissolve into the failure-safety empty summary:
+    // no checkpoint was appended on the way out.
+    final records = await session.getEntries();
+    expect(records.whereType<CompactCheckpointRecord>(), isEmpty);
+  });
+
+  /// gh-1743: a transcript over the window with a droppable read pair —
+  /// the shape the local trim can rescue.
+  Future<(Session, AgentState)> overWindowSessionWithDroppableTail() async {
+    final session = await repo.create(JsonlSessionCreateOptions(cwd: '/w'));
+    await session.appendMessage(UserMessage.text('fix the login crash'));
+    await session.appendMessage(
+      AssistantMessage(
+        content: [
+          const TextContent(text: 'looking'),
+          ToolCall(id: 'c1', name: 'read', arguments: const {}),
+        ],
+        api: 'test-api',
+        provider: 'test-provider',
+        model: 'test-model',
+        usage: Usage.zero,
+        stopReason: StopReason.stop,
+        timestamp: DateTime.utc(2026),
+      ),
+    );
+    await session.appendMessage(
+      ToolResultMessage(
+        toolCallId: 'c1',
+        toolName: 'read',
+        content: [TextContent(text: 'x' * 16000)],
+        isError: false,
+        timestamp: DateTime.utc(2026),
+      ),
+    );
+    for (var i = 0; i < 11; i++) {
+      await session.appendMessage(
+        AssistantMessage(
+          content: [TextContent(text: 'filler $i')],
+          api: 'test-api',
+          provider: 'test-provider',
+          model: 'test-model',
+          usage: Usage.zero,
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+    }
+    final state = AgentState(
+      model: _model,
+      messages: await session.buildContextMessages(),
+    );
+    return (session, state);
+  }
+
+  test('gh-1743: a factory-level budget timeout (wedged judge past the '
+      'total budget) falls back to the local trim instead of aborting '
+      'the session', () async {
+    final (session, state) = await overWindowSessionWithDroppableTail();
+    final tokensBefore = estimateRequestTokens(
+      state.messages,
+      systemPrompt: state.systemPrompt,
+      tools: state.tools,
+    );
+    final tokensSeen = <CancelToken?>[];
+    final hooks = _CapturingHooks();
+
+    final ok = await AutoCompactorFactory(
+      session: session,
+      state: state,
+      window: 1000,
+      settings: settings,
+      sources: AutoCompactorSources(
+        smolStream: null,
+        smolModel: null,
+        // A judge stream that NEVER settles — not even on cancel — so
+        // the engine cannot recover within its own per-call ladder and
+        // the factory's totalBudget watchdog is what fires.
+        mainStream: (m, c, {cancelToken}) {
+          tokensSeen.add(cancelToken);
+          final stream = AssistantMessageEventStream();
+          stream.push(StartEvent(partial: _message(StopReason.stop)));
+          return stream;
+        },
+        mainModel: _model,
+      ),
+      hooks: hooks,
+      // Per-call budget outlives the run budget: the factory-level
+      // TimeoutException is the outcome under test (gh-1743), not the
+      // engine's internal #515 recovery.
+      attemptBudget: const Duration(seconds: 30),
+      totalBudget: const Duration(milliseconds: 300),
+    ).run();
+
+    // The trim rescues the run — the session is NOT aborted.
+    expect(ok, isTrue, reason: 'the local-trim fallback must rescue the run');
+    expect(
+      hooks.bothRolesError,
+      isNull,
+      reason: 'a rescued run never reports both roles failed',
+    );
+    // The mechanical trim reported its own receipt …
+    final trimReceipt = hooks.passes.singleWhere(
+      (p) => p.ok && p.fallback == 'local-trim',
+    );
+    // … and the receipt explains where the tokens went (issue #673
+    // AC3): the dropped user + tool-call + tool-result read pair, with
+    // every filler kept inside the keepRecent budget.
+    expect(trimReceipt.droppedMessages, 3);
+    // … and the hooks bracket closed exactly once.
+    expect(hooks.doneCount, 1);
+    // The live context actually shrank and starts at the trim marker.
+    final tokensAfter = estimateRequestTokens(
+      state.messages,
+      systemPrompt: state.systemPrompt,
+      tools: state.tools,
+    );
+    expect(tokensAfter, lessThan(tokensBefore));
+    expect(state.messages.first, isA<UserMessage>());
+    final marker = state.messages.first as UserMessage;
+    expect(marker.content as String, contains('[context trimmed locally'));
+    // Wire stays pair-safe; the session file keeps every record.
+    expect(validateToolPairing(state.messages), isEmpty);
+    expect((await session.getEntries()).whereType<MessageRecord>().length, 14);
+  });
+
+  test('gh-1743: when nothing is droppable the budget timeout keeps the '
+      'failure verdict', () async {
+    final session = await repo.create(JsonlSessionCreateOptions(cwd: '/w'));
+    // A single tiny user turn with the trigger at zero (window 100,
+    // reserve 100): the structured checkpoint pass reaches the wedged
+    // summarizer, but the trim valve finds nothing droppable (the kept
+    // region would be empty) — so the honest failure verdict must stay.
+    await session.appendMessage(UserMessage.text('a' * 40));
+    final state = AgentState(
+      model: _model,
+      messages: await session.buildContextMessages(),
+    );
+    final messagesBefore = state.messages;
+    final hooks = _CapturingHooks();
+
+    final ok = await AutoCompactorFactory(
+      session: session,
+      state: state,
+      window: 100,
+      settings: settings,
+      sources: AutoCompactorSources(
+        smolStream: null,
+        smolModel: null,
+        mainStream: (m, c, {cancelToken}) {
+          final stream = AssistantMessageEventStream();
+          stream.push(StartEvent(partial: _message(StopReason.stop)));
+          return stream;
+        },
+        mainModel: _model,
+      ),
+      hooks: hooks,
+      force: true,
+      attemptBudget: const Duration(seconds: 30),
+      totalBudget: const Duration(milliseconds: 300),
+    ).run();
+
+    expect(ok, isFalse);
+    expect(hooks.bothRolesError, isNotNull);
+    expect(
+      hooks.passes.any((p) => p.fallback == 'local-trim'),
+      isFalse,
+      reason: 'nothing was droppable — no trim receipt may be reported',
+    );
+    // The exhaustion path is a terminal path like any other: it reports
+    // its failed-pass receipt AND closes the host onDone bracket (the
+    // CLI's HEP compaction_end frame keys off it — a run that ends here
+    // must not leave the bracket open).
+    expect(
+      hooks.doneCount,
+      1,
+      reason: 'the exhaustion path closes the onDone bracket',
+    );
+    final failedPasses = hooks.passes.where((p) => !p.ok).toList();
+    expect(
+      failedPasses,
+      hasLength(1),
+      reason: 'the exhaustion path reports its failed-pass receipt',
+    );
+    expect(failedPasses.single.fallback, isNull);
+    expect(failedPasses.single.error, same(hooks.bothRolesError));
+    // No trim means no live-context change (AgentState copies on assign,
+    // so compare element identity, not list identity).
+    expect(state.messages.length, messagesBefore.length);
+    expect(identical(state.messages.single, messagesBefore.single), isTrue);
+  });
+
+  test('gh-1743: a cancelled run token surfaces the abort — the rescue '
+      'valve never trims (nor reports success) on a run the user '
+      'stopped', () async {
+    final (session, state) = await overWindowSessionWithDroppableTail();
+    final abort = CancelTokenSource()..cancel('user abort');
+    final hooks = _CapturingHooks();
+
+    // The SAME wedged-judge shape as the rescue test: the totalBudget
+    // watchdog is what fires, so the factory's timed-out branch (and
+    // only it) is the code under test — with an already-cancelled run
+    // token attached.
+    await expectLater(
+      AutoCompactorFactory(
+        session: session,
+        state: state,
+        window: 1000,
+        settings: settings,
+        sources: AutoCompactorSources(
+          smolStream: null,
+          smolModel: null,
+          mainStream: (m, c, {cancelToken}) {
+            final stream = AssistantMessageEventStream();
+            stream.push(StartEvent(partial: _message(StopReason.stop)));
+            return stream;
+          },
+          mainModel: _model,
+        ),
+        hooks: hooks,
+        // Cancel parity (issue #1085): a cancelled compaction is never
+        // a mere failed pass — the valve must surface the cancel, not
+        // rescue a run the user just stopped.
+        runToken: abort.token,
+        attemptBudget: const Duration(seconds: 30),
+        totalBudget: const Duration(milliseconds: 300),
+      ).run(),
+      throwsA(isA<CancelledException>()),
+    );
+    // Nothing reported, nothing trimmed: the aborted run leaves no
+    // receipts, no failure verdict, no bracket — and the live context
+    // untouched.
+    expect(
+      hooks.passes,
+      isEmpty,
+      reason: 'a cancelled run is never a mere failed pass',
+    );
+    expect(hooks.bothRolesError, isNull);
+    expect(hooks.doneCount, 0);
+    expect(state.messages.first, isA<UserMessage>());
+    expect(
+      (state.messages.first as UserMessage).content as String,
+      isNot(contains('[context trimmed locally')),
+    );
+  });
+}

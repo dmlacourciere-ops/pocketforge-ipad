@@ -1,0 +1,389 @@
+name: fa
+description: >-
+  Fa — the Flutter Agent app: a chat UI that runs the agent with a mobile
+  ExecutionEnv backed by path_provider and Process.run.
+publish_to: 'none'
+# gh-1522: static placeholder — store builds stamp the version via
+# `flutter build --build-name/--build-number` from the derived tag version,
+# so this file never churns and pubspec.lock stays stable across releases.
+version: 0.0.0-dev+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  html: ^0.15.7
+  flutter:
+    sdk: flutter
+
+  # The local flutter_agent_harness package (pure Dart core + dart:io env).
+  flutter_agent_harness:
+    path: ../
+
+  # The local fa_ui package: the Fa theme + provider/model settings widgets.
+  fa_ui:
+    path: ../packages/fa_ui
+  # The extension panel's worker-relay transports + protocol (issue #34).
+  # Path dep: fa_browser_agent ships inside the repo's browser_ext/ and is
+  # compiled into the SW separately; the app only shares the wire types.
+  fa_browser_agent:
+    path: ../browser_ext/dart
+
+
+  # The Office add-in bridge (issue #182): the outlook taskpane bundle
+  # (FA_HOST=office) embeds the OfficeHostBridge + outlook.* mail tools
+  # from this package; every other build tree-shakes them out.
+  fa_office_agent:
+    path: ../office_addin/dart
+
+  # The local fa_llm package: the LLM config + Copilot device-flow types
+  # the connect flow wires.
+  fa_llm:
+    path: ../packages/fa_llm
+
+  # The DAP/1 hub client (hosted): powers the settings DAP-hub section —
+  # the machine-shared `~/.dap` config, identity, and the connection probe.
+  # IO-bound (dart:io WebSocket + files); web gets the honest stub.
+  fa_hub_client: ^0.2.10
+
+  # Mobile-friendly filesystem root and image picking.
+  path_provider: ^2.1.6
+  image_picker: ^1.2.3
+  # Clipboard images for the composer's smart paste (Pasteboard.image —
+  # restored per the owner's native-clipboard decision; no Rust, no
+  # super_native_extensions chain). Clipboard FILE reading is our own thin
+  # per-platform code: `fa/clipboard_files` method channel (iOS
+  # UIPasteboard / Android ClipData+ContentResolver / macOS NSPasteboard),
+  # win32 FFI (CF_HDROP), and text/uri-list (Linux) — see
+  # lib/services/clipboard_files.dart.
+  pasteboard: ^0.5.0
+  # Native clipboard file reads on Windows (CF_HDROP via FFI, issue
+  # #1979). Resolves to the same 6.x already required by pty2.
+  win32: ^6.0.0
+  # Any-type multi-select system file picker (issue #1979 AC1): NSOpenPanel
+  # / Windows/Linux dialogs / iOS document picker / Android SAF / web input.
+  file_selector: ^1.1.0
+  # Image decode/encode for the Gemini adapter (PNG → JPEG conversion
+  # strips alpha/EXIF that Gemini's vision encoder rejects).
+  image: ^4.5.4
+
+  # Load API keys and runtime config from .env for local dev/simulator runs.
+  flutter_dotenv: ^6.0.1
+
+  # JS apps platform: runs JavaScript widgets and renders them as native
+  # Flutter UI (QuickJS via flutter_js on VM, web worker on web).
+  # 0.4.154 ships the bridge-side voxel renderer (`voxel.attach`, >=
+  # 0.4.127) that fa-craft 0.2.x probes for — older runtimes fall back to
+  # the legacy scene3d path (slower, and not what fa-craft field testing
+  # exercises) — plus jsr.openUrl + the webView node (gh-1235). 0.4.156
+  # (gh-1341) carries upstream 9d57570: the flutter_js engine derives its
+  # setupBridge channel list from JsWidgetBridge.handledChannels instead of
+  # a hand-maintained copy, so `jsr.hostCall`/`jsr.capture` no longer hang
+  # forever on JSC builds (voxel.attach probes → infinite spinner,
+  # fa-craft → permanent legacy scene3d fallback at ~2 FPS). 0.4.171
+  # (pr-1621 lock bump) adds the typed-array binary lane
+  # (`jsr.hostCallBinary`, (pointer, length) on the QuickJS native
+  # backend — b64 fallback on JSC/web) and the packed voxel binary lane
+  # (`voxel.mesh.bin`/`voxel.blocks.bin`), and raises the quickjs_runtime
+  # floor to ^0.3.6 (pure-Dart, additive symbol-probed FFI), which forced
+  # the transitive quickjs_runtime 0.3.5→0.3.6 bump in flutter_app/pubspec.lock.
+  # gh-1842 (lock bump to 0.4.189): the test-compilation floor is now
+  # 0.4.189 — flutter_app/test/apps/fa_craft_bsp_smoke_test.dart
+  # references VoxelDiagnostics, which does not exist below 0.4.189. The
+  # ^0.4.156 constraint is unchanged; the lock pin keeps the test compiling.
+  js_widget_runtime: ^0.4.156
+
+  # The fa_widgets catalog validator — the SAME rule engine the catalog CI
+  # runs (issue #1045): publish pre-flight imports it so a manifest that
+  # passes on-device passes in CI, with byte-identical error strings.
+  # publish_to: none upstream → git dep, sha-pinned for reproducibility.
+  fa_widgets_tool:
+    git:
+      url: https://github.com/IstiN/fa_widgets.git
+      ref: 3aa82cfd381e9b786fde363d7cde63cf31d1ef7a
+
+  # TileProvider type for injecting offline map tiles (tests, custom hosts).
+  flutter_map: ^8.2.2
+
+  # SVG app icons (inline markup or apps/<id>/*.svg files).
+  flutter_svg: ^2.3.0
+
+  cupertino_icons: ^1.0.9
+  flutter_chat_ui: ^2.11.1
+  flutter_markdown: ^0.7.7+1
+  re_highlight: ^0.0.3
+  http: ^1.6.0
+  cupertino_http: ^2.0.2
+  uuid: ^4.6.0
+  flutter_chat_core: ^2.9.0
+  yaml: ^3.1.3
+  # Sandbox-safe web URL strategy (issue #202): the OWA iframe strips
+  # history.replaceState and the engine's default deep-link sync dies on it.
+  flutter_web_plugins:
+    sdk: flutter
+  # Modern web bindings (package:web) for the history probe — dart:html is
+  # deprecated by the analyzer.
+  web: ^1.1.1
+
+  # UI localization (gen-l10n, lib/l10n/*.arb → AppLocalizations).
+  flutter_localizations:
+    sdk: flutter
+  intl: any
+
+  # Myers diff used by the pure-Dart diff/patch sandbox builtins.
+  diffutil_dart: ^4.0.1
+
+  # Git support for the mobile sandbox: pure-Dart local porcelain (network clone
+  # is implemented as a GitHub tarball fallback; full smart HTTP clone is a TODO).
+  dart_git:
+    git:
+      url: https://github.com/GitJournal/dart-git.git
+      ref: master
+
+  path: ^1.9.0
+
+  # package:file MemoryFileSystem for the web sandbox git store.
+  file: ^7.0.1
+
+  # WASM runtime used to run a uutils/ripgrep shell on iOS/Android/Web.
+  wasm_run_flutter: ^0.1.0
+  wasm_run: ^0.1.0+2
+
+  # Pure-Dart inflate with exact stream-end tracking, used by git_smart_http
+  # to parse packfiles (dart:io zlib cannot report the consumed length).
+  # Its XZ/bzip2 decoders also back the sandbox xz/bzip2 -d builtins.
+  archive: ^4.0.9
+
+  # MD5/SHA digests for the sandbox md5sum/sha*sum builtins.
+  crypto: ^3.0.3
+  dartssh2: ^2.22.2
+
+  # Network mode (issue #955): fa_network REST+WS client and the 'fanet1'
+  # envelope crypto (X25519/HKDF/ChaCha20-Poly1305, DAP/1 recipe).
+  cryptography: ^2.7.0
+  web_socket_channel: ^2.4.0
+  # Argon2id KDF for the passphrase-encrypted KeyWallet export (pure Dart,
+  # web-safe); only the KDF is used, AEAD stays on package:cryptography.
+  pointycastle: ^4.0.0
+
+  # In-app HTML file preview on mobile/desktop (web uses an iframe instead —
+  # see lib/ui/widgets/html_preview_web.dart).
+  webview_flutter: ^4.14.1
+
+  # Embedded web content for JS-app `webView` nodes (issue gh-1235): the
+  # FaWebViewHost implementation over flutter_inappwebview (iOS/Android/
+  # macOS; other platforms fall back to the renderer's placeholder).
+  # 6.2.0-beta.3 is the first line whose Android implementation evaluates
+  # under AGP 9 (1.1.3 calls getDefaultProguardFile('proguard-android.txt'),
+  # which AGP 9 removed — the APK CI leg fails on it); the betas are one
+  # coherent set (platform_interface 1.4.0-beta.3 + matching impls, per
+  # upstream), so the umbrella moves as a whole. Return to ^6.1.x stable
+  # once 6.2.0 stable ships.
+  flutter_inappwebview: ^6.2.0-beta.3
+
+  # Inline playback of sandbox-generated media in the chat (see
+  # lib/ui/widgets/media_player.dart): audio plays from in-memory bytes,
+  # video from a temp file (video is not supported in the web build).
+  audioplayers: ^6.8.1
+  video_player: ^2.13.0
+
+  # Firebase: analytics across iOS, Android, macOS, and web. EXACT pins:
+  # pubspec.lock IS now committed (gh-1265) and CI resolves with
+  # --enforce-lockfile, but the exact pins stay as defense in depth — a
+  # same-day pub release once pulled firebase_crashlytics 5.2.7 whose
+  # firebase-ios-sdk 12.17.0 did not exist on SPM yet — the build died in
+  # 'Could not resolve package dependencies' (build 80). Bump deliberately.
+  firebase_core: 4.12.1
+  firebase_analytics: 12.4.5
+
+  # Opens the privacy policy link (onboarding privacy page) in the browser.
+  url_launcher: ^6.3.1
+  # Deep-link handling for mobile OAuth callbacks (fah://oauth/openrouter).
+  app_links: ^6.4.0
+  firebase_crashlytics: 5.2.6
+  # WS channel abstraction for the fa_network realtime socket.
+  stream_channel: ^2.1.0
+
+dev_dependencies:
+  # Settled-memory probe (flutter_app/test/memory_probe.dart, issue #1850):
+  # connects to the test's own VM service to snapshot the per-class live
+  # set after a forced full GC. Transitive via flutter_test; declared for
+  # the depend_on_referenced_packages lint.
+  vm_service: ^15.3.0
+  # Mock seam for url_launcher in widget/golden tests.
+  url_launcher_platform_interface: ^2.3.2
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.0
+  # LatLng for the hand-built map canvas in the store screenshot goldens.
+  latlong2: ^0.9.1
+  # Fake WebViewPlatform for golden tests of lib/ui/widgets/html_preview_stub.dart.
+  webview_flutter_platform_interface: ^2.15.1
+  test: ^1.31.0
+  # CLI visual tests (test/cli_visual/): real TerminalView rendering of the
+  # Fa CLI running in a PTY — screenshots come from the actual xterm widget,
+  # not a hand-rolled rasterizer.
+  xterm: ^4.0.0
+  pty2: ^0.5.3
+  # omp REG parity legs (issue #810): the capture + fa-side visual tests
+  # drive both CLIs through the same scripted OpenAI-compatible mock.
+  fa_llm_mock:
+    path: ../packages/fa_llm_mock
+
+dependency_overrides:
+  # fa_widgets_tool declares archive ^3.6.1 while the app needs ^4.0.9 (the
+  # wasm/zip sandbox builtins). The override resolves the graph to 4.x; the
+  # client only exercises validateWidgetDirectory, which never touches
+  # archive — the packaging/pin-fetch code paths that do run in CI, not in
+  # the app. ponytail: if a client path ever needs pin_fetcher, revisit.
+  archive: ^4.0.9
+  # (meta override removed with Flutter 3.47.4: the SDK now declares
+  # meta ^1.18.3 and dart_tui 2.x declares ^1.19.0, so meta 1.19.0
+  # resolves for both without an override.)
+  freezed_annotation: ^3.1.0
+  flutter_agent_memory: ^0.2.3
+  fa_llm:
+    path: ../packages/fa_llm
+  # Same as the root pubspec_overrides.yaml: the vendored patched fork is
+  # the renderer the real CLI runs; cli_visual tests compile its sources.
+  # (composer fa_tui needs LineEditor, which the hosted 2.x predates.)
+  dart_tui:
+    path: ../vendor/dart_tui
+  # PR #1785 rework: hosted quickjs_runtime 0.4.2 (pulled in by the
+  # js_widget_runtime 0.4.180 bump) fails its Native Assets build on the
+  # Build Android APK leg (`-lpthread` — the NDK has no libpthread since
+  # r18) and the Lockfile smoke windows leg (the QuickJS 2024-01-13
+  # sources are not MSVC-clean). Consume the patched vendored fork until
+  # upstream publishes the fix; pinned by
+  # ../test/quickjs_runtime_vendor_pin_test.dart (root).
+  quickjs_runtime:
+    path: ../vendor/quickjs_runtime
+  wasm_run:
+    path: ../vendor/wasm_run
+  wasm_run_flutter:
+    path: ../vendor/wasm_run_flutter
+  flutter_js:
+    git:
+      url: https://github.com/IstiN/flutter_js.git
+      # fix-jscore-multi-instance: route sendMessage by executing context +
+      # guard post-dispose evaluate. Stock 0.8.7 dispatches the shared native
+      # sendMessage callback to the LAST created runtime, so coexisting JS
+      # engines (launcher tiles + open apps) convert each other's JSValues
+      # with the wrong JSContext — SIGSEGV in JSC::JSLock::lock once one of
+      # them is disposed (TestFlight feedback-7).
+      ref: 74a11bf6e7ab2721146cdc4a80e225115a8ccfe3
+  # gh-1341: the js_widget_runtime git override (bd1e7c2) is gone —
+  # hosted 0.4.156 (= upstream 9d57570, the flutter_js hostCall/capture
+  # channel fix) is published, and the ^0.4.156 constraint resolves it.
+  # flutter_inappwebview_macos 1.2.0-beta.3 declares a macOS 10.14 floor in
+  # both its Package.swift and podspec, but its Swift marks
+  # presentationAnchor(for:) @available(macOS 10.15, *) — the plugin fails to
+  # compile at 10.14 on both the SwiftPM and CocoaPods paths (upstream bug,
+  # still on master). Vendored verbatim with ONLY the deployment floor raised
+  # to the app's 14.0 (vendor/flutter_inappwebview_macos/VENDORED.md). Drop
+  # the override once upstream fixes the minimum.
+  # gh-1798: the vendored Package.swift is DELETED — its existence is the
+  # SwiftPM opt-in signal, and the 14.0-floored product breaks the build
+  # whenever the tool's silent FlutterGeneratedPluginSwiftPackage floor bump
+  # (12.0 → the project's 14.0) skips. The plugin rides CocoaPods (podspec
+  # 14.0, pinned in macos/Podfile.lock); guarded by
+  # ../test/inappwebview_macos_pods_lane_test.dart.
+  flutter_inappwebview_macos:
+    path: ../vendor/flutter_inappwebview_macos
+  # gh-1265: the umbrella's desktop implementations are pulled into every
+  # native desktop build, but the app never uses the plugin on Linux or
+  # Windows (createFaWebViewHost() in lib/apps/fa_webview_host.dart returns
+  # null there — the renderer shows a placeholder). The real impls broke the
+  # nightly desktop release legs: linux hard-requires the WPE WebKit system
+  # library (absent from Ubuntu 24.04 entirely — libwpewebkit-1.0-dev is
+  # jammy-only) and windows C++17-without-/await sources trip MSVC 14.51's
+  # STL1011 on <experimental/coroutine>. Same-name stub overrides with NO
+  # flutter: plugin: section (vendor/*_stub/VENDORED.md) register no native
+  # code, returning both legs to the native surface they had when last
+  # green. Guarded by test/nightly_desktop_leg_guard_test.dart.
+  flutter_inappwebview_linux:
+    path: ../vendor/flutter_inappwebview_linux_stub
+  flutter_inappwebview_windows:
+    path: ../vendor/flutter_inappwebview_windows_stub
+
+flutter:
+  uses-material-design: true
+  generate: true
+
+  assets:
+    - .env
+    - assets/pocketforge/
+    - assets/wasm/add.wasm
+    - assets/wasm/coreutils.wasm
+    - assets/wasm/rg.wasm
+    - assets/wasm/find.wasm
+    - assets/wasm/sed.wasm
+    - assets/wasm/awk.wasm
+    - assets/wasm/tar.wasm
+    - assets/wasm/gzip.wasm
+    - assets/wasm/zip.wasm
+    - assets/wasm/python.wasm
+    - assets/wasm/python_stdlib.zip
+    - assets/wasm/qjs.wasm
+    - assets/wasm/sqlite3.wasm
+    - assets/wasm/lua.wasm
+    - assets/wasm/wasi_hello.wasm
+    - assets/wasm/LICENSE.coreutils
+    - assets/wasm/LICENSE.rg
+    - assets/wasm/LICENSE.findutils
+    - assets/wasm/LICENSE.sed
+    - assets/wasm/LICENSE.awk
+    - assets/wasm/LICENSE.tar
+    - assets/wasm/LICENSE.gzip
+    - assets/wasm/LICENSE.zip
+    - assets/wasm/LICENSE.python
+    - assets/wasm/LICENSE.quickjs
+    - assets/wasm/LICENSE.lua
+    - assets/wasm/ATTRIBUTION.md
+    - assets/fonts/
+
+  fonts:
+    # Inter (SIL OFL 1.1, assets/fonts/Inter-LICENSE.txt) — the app's UI
+    # typeface on every platform, so the look is consistent and golden
+    # screenshots are host-deterministic.
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Regular.ttf
+        - asset: assets/fonts/Inter-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Inter-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Inter-Bold.ttf
+          weight: 700
+    # JetBrains Mono (SIL OFL 1.1) — code/terminal text.
+    - family: JetBrainsMono
+      fonts:
+        - asset: assets/fonts/JetBrainsMono-Regular.ttf
+        - asset: assets/fonts/JetBrainsMono-Bold.ttf
+          weight: 700
+
+flutter_launcher_icons:
+  # Android icons are NOT generated here: they derive from the iOS release
+  # master via tool/generate_android_adaptive_icons.dart (issue #289) so
+  # both platforms ship the identical icon (safe-zone adaptive foreground
+  # + brand navy background). flutter_launcher_icons cannot express the
+  # safe-zone padding, so android stays off here.
+  android: false
+  image_path: "assets/app_icon_source.png"
+  ios: true
+  remove_alpha_ios: true
+  min_sdk_android: 21
+  adaptive_icon_background: "#0b0f16"
+  adaptive_icon_foreground: "assets/app_icon_source.png"
+  macos:
+    generate: true
+  web:
+    generate: false
+  windows:
+    generate: false
+  linux:
+    generate: false
+

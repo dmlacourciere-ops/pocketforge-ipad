@@ -1,0 +1,656 @@
+/// PTY-based integration test harness for the Fa CLI.
+///
+/// Spawns `dart bin/fah.dart` as a real subprocess attached to a
+/// pseudo-terminal (via package:pty2), feeds every output byte into an xterm
+/// terminal emulator (the vendored package:xterm), and exposes keystroke
+/// sending plus quiescent-poll output capture.
+///
+/// pty2 0.5.3 API notes (this file is the canonical reference):
+/// - `PseudoTerminal.start(executable, args, workingDirectory:, environment:,
+///   raw:)` — no columns/rows parameters; the PTY starts at 80x20 and is
+///   sized with `pty.resize(columns, rows)` immediately after start.
+/// - `pty.out` is a `Stream<String>` (already UTF-8 decoded,
+///   malformed-tolerant) — there is no byte stream.
+/// - `pty.write(String)` — keystrokes go in as Dart strings with escapes
+///   (`'\r'`, `'\x1b[A'`).
+/// - `raw: true` (the default) puts the slave into raw mode from the start
+///   (no canonical line buffering, no kernel echo, no ISIG), so arrow keys
+///   and Ctrl+C reach the CLI as bytes.
+/// - `raw: false` keeps the kernel DEFAULT termios — ICRNL stays on, so the
+///   line discipline rewrites a master-written CR to LF before the child
+///   reads it. This is what real PTY hosts (IDE embedded terminals) do to
+///   the wire; the newline-wire suite must run under it too (issue #77).
+/// - The child environment inherits ONLY TERM/LANG/LOGNAME/USER/DISPLAY/
+///   LC_TYPE/HOME/PATH from the parent plus whatever `environment:` adds —
+///   so `PUB_CACHE` must be passed through explicitly when HOME is
+///   overridden (otherwise `dart run` cannot see the pub cache), and API
+///   keys from the developer's real environment never leak into tests.
+library;
+
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter_agent_harness/src/cli/pty_wait_budget.dart';
+import 'package:pty2/pty2.dart';
+import 'package:xterm/xterm.dart';
+
+/// The secret sheet's frame-closed masked value row on a captured screen
+/// (gh-1244): the line carrying bullets AND closing with the `│` border.
+/// The history's tool row (`• request_secret · …`) is not frame-closed,
+/// so the `│` guard pins the match to the sheet's own row. Null when no
+/// such row is painted (sheet not open, or the row's closing border has
+/// not landed in this frame yet). Top-level (like [frameContentLines])
+/// so the row-anchor rule is unit-testable without a PTY.
+String? maskedValueRow(String screen) => screen
+    .split('\n')
+    .where((l) => l.contains('•') && l.trimRight().endsWith('│'))
+    .firstOrNull;
+
+/// The visible viewport with each line's trailing blank cells stripped —
+/// the CONTENT-faithful view for cross-frame equality (gh-982).
+///
+/// The two dart_tui paint paths disagree about row tails
+/// (vendor/dart_tui/lib/src/renderer.dart): the scroll fast path ends
+/// every painted row with an erase (`_paintRow` → `CSI K`; the emulator's
+/// erased cells become empty and vanish from `BufferLine.getText`), while
+/// the cell-diff path (`_diffAndEmit`) writes only changed cells and never
+/// erases the tail — whatever an earlier full repaint materialized there
+/// (explicit space cells) stays. Which history a logical row carries
+/// depends on the renderer's frame-shift heuristics, i.e. on platform
+/// timing: macOS/fa-m5 and linux produced different histories for the
+/// same scenario and the frozen `· older` board row failed a raw list
+/// equality despite byte-identical counts. Raw [FaCliHarness.viewportLines]
+/// equality is only valid for genuinely full-width rows (the composer
+/// rule); compare content frames for everything else.
+List<String> frameContentLines(List<String> viewport) => [
+  for (final line in viewport) line.trimRight(),
+];
+
+/// A screen [Pattern] for [phrase] that still matches when the renderer's
+/// cell-diff path skipped ONE interior space cell (gh-1372). A pure-ASCII
+/// streamed row (no wide glyph forcing the contiguous repaint) can have a
+/// space cell compared "unchanged" against a grid whose physical cell is
+/// erased/never-written — and the vendored emulator's `BufferLine.getText`
+/// drops those cells, so the extracted screen carries `round-tripcomplete`
+/// where the phrase says `round-trip complete` (nightlies 37880055409 +
+/// 38021029680 timed out on byte-identical screens showing exactly that).
+/// Every single-space gap in [phrase] becomes optional (0 or 1 space);
+/// anything else must still match exactly — shifted spaces, other words,
+/// and unrelated rows are refused (`pty_harness_lost_space_test.dart`
+/// pins the semantics and the red-run wire shape).
+Pattern lostSpaceTolerant(String phrase) =>
+    RegExp(phrase.split(' ').map(RegExp.escape).join(' ?'));
+
+/// A `/skills` row for [skillName] whose `added mid-session` flag tail is
+/// FULLY painted. `_listSkills` renders the flag at the row's end
+/// (`…/SKILL.md (project, fah; added mid-session)`), and the TUI paints a
+/// fresh listing over several PTY writes — so the first screen frame
+/// carrying the bare flag anywhere can be MID-PAINT (gh-1639: the
+/// `latecomer` row complete, the `latecomer2` row truncated at
+/// `…/.fah/skills/` or even `Mid-sessio`; a wait on the bare flag anchored
+/// that partial frame and the flagged-row count asserted 1 ≠ 2). `.` never
+/// crosses a newline and the closing `)` must be on the SAME screen row,
+/// so a match proves the row — and with it the last flagged row of the
+/// listing — is settled. Top-level (like [maskedValueRow]) so the
+/// row-anchor rule is unit-testable without a PTY
+/// (`pty_harness_settled_skill_row_test.dart` pins both red frames).
+Pattern settledMidSessionSkillRow(String skillName) =>
+    RegExp('${RegExp.escape(skillName)}.*; added mid-session\\)');
+
+/// One finished background shell job's settle notice (`[bash] sh-…
+/// exited(code) — log`) as painted into the raw stream by the CLI; exactly
+/// one per job proves the command started AND finished. ANY exit code is
+/// terminal — a failed job is settled too (#1345 review), so the pattern
+/// matches `exited(-?\d+)`, not a pinned zero. A job reported LOST paints
+/// no `[bash]` notice at all (the boot reconcile counts it on the board
+/// only) — lost coverage stays the suite's screen-side `· 0 lost` proof.
+final shellJobSettleNotice = RegExp(r'\[bash\] sh-(\S+) exited\(-?\d+\)');
+
+/// The DISTINCT settled shell-job numbers in [raw] — the start/finish proof
+/// set for background-job suites, regardless of exit status. Matched on the
+/// NUMBER PREFIX, never the
+/// full id: a frame repaint can interleave cursor-move escapes mid-id
+/// (observed under CI load: `sh-10-…xqo<esc>[11;29H5<esc>[11;31H exited(0)`),
+/// and a fragmented re-emit must not inflate the distinct-id set with a
+/// corrupt entry. The number is the first token written, so it survives any
+/// such fragmentation. Top-level (like [maskedValueRow]) so the settle
+/// predicate is unit-testable without a PTY.
+Set<String> settledJobNumbers(String raw) => shellJobSettleNotice
+    .allMatches(raw)
+    .map((m) => m.group(1)!.split('-').first)
+    .toSet();
+
+/// The shared deadline-poll engine behind [FaCliHarness.waitForText] and
+/// [FaCliHarness.waitForScreen]: polls [matched] every [pollInterval] until
+/// it turns true or [timeout] expires, then returns [onHit]() — waitForText
+/// returns the raw buffer, waitForScreen returns the anchored screen
+/// snapshot it matched on (capture, don't re-read — gh-1049). The
+/// TimeoutException diagnostics carry the current [screenText] and
+/// [rawTail].
+///
+/// Top-level with injectable `now`/`delay` so the timing semantics are
+/// unit-provable without a PTY (same convention as [maskedValueRow]).
+Future<String> pollUntil({
+  required bool Function() matched,
+  required String Function() onHit,
+  required String Function() screenText,
+  required String Function() rawTail,
+  required String what,
+  Duration timeout = const Duration(seconds: 10),
+  Duration pollInterval = const Duration(milliseconds: 50),
+  DateTime Function()? now,
+  Future<void> Function(Duration)? delay,
+}) async {
+  final clock = now ?? DateTime.now;
+  final sleep =
+      delay ?? (Future<void>.delayed as Future<void> Function(Duration));
+  final deadline = clock().add(timeout);
+  while (clock().isBefore(deadline)) {
+    if (matched()) return onHit();
+    await sleep(pollInterval);
+  }
+  // A match landing during the FINAL poll sleep must not time out: the
+  // last in-loop check ran up to one interval before the deadline expired.
+  // CI 2026-10-05 (PTY shard 2/3, pr-1255): the fa_cli boot's `[Model]`
+  // banner painted inside the last 50 ms of the 90 s budget and the
+  // TimeoutException's own screen dump contained it — a false negative.
+  // Re-check once before giving up.
+  if (matched()) return onHit();
+  throw TimeoutException(
+    'Timed out waiting for $what.\n--- screen ---\n'
+    '${screenText()}\n--- raw tail ---\n${rawTail()}',
+    timeout,
+  );
+}
+
+/// The resolved Fa CLI command (gh-1300): an explicit [faBin] (a per-spawn
+/// `extraEnv['FA_BIN']` override) wins, then the ambient `FA_BIN`
+/// environment (CI compiles the AOT bundle ONCE per run — the
+/// `fa-aot-build` job — and exports it for the whole test step), else the
+/// JIT [jitPrefix] + [args].
+///
+/// Why the seam exists: every PTY/CLI integration test spawns a fresh
+/// `dart bin/fah.dart` and each spawn paid VM start + CFE kernel compile
+/// of the whole harness before `main()` ran (~30 s per test on loaded
+/// ARM runners; even green mock suites measured 28-32 s end-to-end).
+/// The AOT bundle pays the compile ONCE per shard and a spawn drops to
+/// ~1 s — while per-test isolation is untouched (each spawn is still a
+/// fresh process with the caller's env/cwd), which is the point: gh-1300
+/// ships FA_BIN first because it captures the win with zero isolation
+/// redesign.
+///
+/// [jitPrefix] preserves each call site's exact JIT shape when the seam
+/// is unset (local runs): the PTY harness uses the direct-VM
+/// `dart <abs>/bin/fah.dart` (possibly with VM flags before the script
+/// path), the headless helpers use `dart run bin/fah.dart`.
+///
+/// Pure with injectable inputs — [ambientFaBin]/[useAmbientFaBin] let the
+/// unit test pin both inputs instead of reading the environment (a CI
+/// shard exports FA_BIN for the whole leg, so an environment read would
+/// be order- and host-dependent there).
+List<String> faCliCommand(
+  List<String> args, {
+  String? faBin,
+  bool useAmbientFaBin = true,
+  String? ambientFaBin,
+  List<String> jitPrefix = const ['dart', 'bin/fah.dart'],
+}) {
+  final ambient =
+      ambientFaBin ?? (useAmbientFaBin ? Platform.environment['FA_BIN'] : null);
+  final bin = (faBin != null && faBin.isNotEmpty)
+      ? faBin
+      : (ambient != null && ambient.isNotEmpty ? ambient : null);
+  return bin != null ? [bin, ...args] : [...jitPrefix, ...args];
+}
+
+/// Spawns the Fa CLI as a subprocess with a PTY, feeds output to an xterm
+/// terminal emulator, and provides keystroke sending + output capture.
+///
+/// PER-SPAWN RESET CONTRACT (gh-1300 AC5): isolation between tests is by
+/// process construction — every test spawns a fresh CLI, so state resets
+/// to empty rather than being cleared. The inventory, explicitly:
+///
+/// - session store — fresh (a new process sees no session for its slug);
+/// - config + keys — the caller passes a temp HOME (`extraEnv['HOME']`;
+///   the env whitelist above never forwards the developer's real
+///   environment), so `.fah` config and keys start clean per spawn;
+/// - mailbox/inbox dirs, secrets store, provider-mock state — all live
+///   under that temp HOME / the caller's server; a fresh process starts
+///   with none;
+/// - screen/scrollback + composer state — a fresh [Terminal] per spawn;
+/// - skill/approval turn grants, shell-job registry — in-memory, die with
+///   the process (a killed CLI can leak no background jobs into the next
+///   test);
+/// - hub — always pinned to the dead loopback above (a caller may point
+///   `extraEnv` at its own hub; the dead default means a boot never
+///   dials a foreign hub);
+/// - per-spawn CWD — a UNIQUE git-init'd temp dir per spawn (#948
+///   lesson: no shared mutable dir exists, so no run's teardown can
+///   delete another run's cwd).
+///
+/// What STAYS across tests within a shard job: the compiled binary itself
+/// (immutable for the job — the `FA_BIN` AOT seam), the pub cache
+/// (read-only inputs) and the shell host. Nothing else is shared by
+/// construction. (gh-1300's boot-once + process-reset design is the
+/// follow-up this contract is written for; FA_BIN lands first.)
+final class FaCliHarness {
+  FaCliHarness._(
+    this.pty,
+    this.terminal,
+    this.columns,
+    this.rows,
+    this._ownedCwd,
+  );
+
+  /// The spawn-created default CWD (null when the caller passed
+  /// [spawn]'s `workingDirectory` — then nothing is owned or cleaned).
+  Directory? _ownedCwd;
+
+  /// Short per-spawn CWD used when the caller does not pin [spawn]'s
+  /// workingDirectory. The CLI derives its session slug from the CWD, and on
+  /// CI runners the checkout path is so long that the boot banner
+  /// (`/Users/.../flutter_agent_harness` + the `.fah/sessions/<slug>` block)
+  /// wraps over a dozen rows and floods an 80x24 frame — fa-m5-3's slug
+  /// alone ate 6 rows, hiding the credential sheet and half the job board
+  /// from the assertions. Suites that need a specific CWD pass it
+  /// explicitly; package resolution stays on the repo either way (the
+  /// script path is absolute).
+  ///
+  /// Unique per spawn (issue #931 part 3.1 + issue #943 vector 1): every
+  /// test gets its own root — no in-suite concurrency races two CLIs
+  /// through one shared git-init/config-write directory, and no run's
+  /// teardown deletes a FIXED root (the old `/tmp/fa_pty_cwd`) under
+  /// another run's live ext process. The full session/dir-race program
+  /// landed here via #948.
+  /// The old fixed `/tmp/fa_pty_cwd` was shared by EVERY run of EVERY PR's
+  /// PTY leg: one run's teardown deleted it under another run's live ext
+  /// process (`PathNotFoundException: Getting current working directory
+  /// failed`). A unique `Directory.systemTemp` dir per spawn plus the
+  /// [FaCliHarness]-owned cleanup below kills that race class.
+  static Directory _shortDefaultCwd() {
+    final dir = Directory.systemTemp.createTempSync('fa_pty_cwd_');
+    // Match the checkout's shape: the CLI's git-root discovery (and the
+    // lib/src/cli branches behind it) only runs inside a repository. With a
+    // bare tmp dir those paths go unexercised and the cli coverage ratchet
+    // (baseline only up) regresses (~0.2pp observed on fa-m5). Fail loudly:
+    // a silent bare-dir fallback would quietly degrade every test on the
+    // runner instead of one.
+    final git = Process.runSync('git', ['init', '-q', dir.path]);
+    if (git.exitCode != 0) {
+      throw StateError(
+        'git init failed for harness cwd ${dir.path}: ${git.stderr}',
+      );
+    }
+    return dir;
+  }
+
+  var _closed = false;
+
+  /// Load-aware wait budgets (issue #1391): every [timeout] this harness
+  /// waits by is multiplied by the ambient `FA_PTY_BUDGET_SCALE` (unset →
+  /// 1.0 → exact legacy budgets). The merge-blocking CI legs export 2 —
+  /// SM dispatch waves pack the hosted-arm pool and stretch every spawn /
+  /// round-trip / repaint past the quiet-runner budgets; see
+  /// `lib/src/cli/pty_wait_budget.dart` for the drilled-failure rationale.
+  static double get waitBudgetScale => resolvePtyWaitBudgetScale(
+    envValue: Platform.environment[kPtyWaitBudgetScaleEnv],
+  );
+
+  /// Spawns the Fa CLI with a PTY of fixed size.
+  ///
+  /// [args] are extra CLI arguments (e.g., `['--model', 'test-model']`).
+  /// [extraEnv] overrides env vars (e.g., `{'HOME': tempHome.path}`).
+  ///
+  /// The output listener starts immediately inside spawn (data arriving
+  /// before [startListening] would otherwise be lost on the
+  /// single-subscription stream); calling [startListening] afterwards is a
+  /// harmless no-op kept for readability at call sites.
+  static Future<FaCliHarness> spawn({
+    String? workingDirectory,
+    Map<String, String>? extraEnv,
+    List<String> args = const [],
+    int columns = 80,
+    int rows = 24,
+    int? vmServicePort,
+    bool raw = true,
+  }) async {
+    final env = <String, String>{
+      'TERM': 'xterm-256color',
+      'COLORTERM': 'truecolor',
+      // `dart run` resolves packages from the pub cache, which lives under
+      // the REAL home; pty2 only forwards a fixed env whitelist, so pass it
+      // explicitly. Without this a HOME override breaks package resolution.
+      if (Platform.environment['PUB_CACHE'] != null)
+        'PUB_CACHE': Platform.environment['PUB_CACHE']!,
+      // Hub hygiene (issue #943, vector 2): pin the CLI's hub client and
+      // local-hub URLs to a dead loopback port so a boot NEVER dials — or
+      // auto-starts against — the zero-config 8787, where another run's
+      // orphaned hub would silently adopt this fa instance (foreign tasks
+      // in captured frames). Loopback-refused is instant, so the boot-time
+      // dial fails in microseconds and stays quieter than the old
+      // "not configured" hint. Tests that exercise the hub pass their own
+      // URLs via [extraEnv] (spread after these).
+      'DAP_HUB_URL': 'ws://127.0.0.1:1/ws',
+      'DAP_LOCAL_HUB_URL': 'ws://127.0.0.1:1/ws',
+      ...?extraEnv,
+    };
+    // Own the default CWD when the caller did not pin one, so close()/
+    // hardKill() can remove it (review #963: a fresh git-init'd root per
+    // spawn must not accumulate across runs on persistent hosts).
+    final ownedCwd = workingDirectory == null ? _shortDefaultCwd() : null;
+    final command = faCliCommand(
+      args,
+      faBin: extraEnv?['FA_BIN'],
+      jitPrefix: [
+        'dart',
+        // VM flags go BEFORE the script path (JIT shape only; the AOT
+        // binary has no VM service and ignores vmServicePort).
+        if (vmServicePort != null) ...[
+          '--disable-service-auth-codes',
+          '--observe=$vmServicePort',
+        ],
+        // Absolute script path so a non-default [workingDirectory] still
+        // resolves the repo's binary (folder-scoping tests launch fa in
+        // temp dirs while package resolution stays on the repo).
+        '${Directory.current.path}/bin/fah.dart',
+      ],
+    );
+    final pty = PseudoTerminal.start(
+      command.first,
+      command.sublist(1),
+      workingDirectory: ownedCwd?.path ?? workingDirectory,
+      environment: env,
+      raw: raw,
+    );
+    // The PTY starts at 80x20 (pty2 default); size it to the requested
+    // geometry before the CLI finishes booting.
+    pty.resize(columns, rows);
+    final terminal = Terminal(maxLines: rows * 4);
+    if (columns != 80 || rows != 24) terminal.resize(columns, rows);
+    final harness = FaCliHarness._(pty, terminal, columns, rows, ownedCwd);
+    harness.startListening();
+    // Answer the CLI's terminal queries (device attributes etc.) so it
+    // does not wait out a response timeout on every boot.
+    terminal.onOutput = pty.write;
+    return harness;
+  }
+
+  /// The pseudo-terminal running the CLI process.
+  final PseudoTerminal pty;
+
+  /// The xterm terminal emulator — receives all PTY output.
+  final Terminal terminal;
+
+  /// The PTY width in columns.
+  final int columns;
+
+  /// The PTY height in rows.
+  final int rows;
+
+  /// Accumulated raw output (with ANSI escape sequences).
+  final _rawBuffer = StringBuffer();
+
+  /// All raw bytes written by the CLI so far (ANSI escape sequences
+  /// preserved), exposed for terminal-reset assertions.
+  String get rawOutput => _rawBuffer.toString();
+
+  var _listening = false;
+  StreamSubscription<String>? _outputSub;
+
+  /// Starts listening to PTY output, feeding both [_rawBuffer] and
+  /// [terminal]. Called automatically by [spawn]; idempotent.
+  void startListening() {
+    if (_listening) return;
+    _listening = true;
+    _outputSub = pty.out.listen((text) {
+      _rawBuffer.write(text);
+      terminal.write(text);
+    });
+  }
+
+  /// Sends text (arrives as keystrokes on the raw PTY).
+  void sendText(String text) => pty.write(text);
+
+  /// Sends Enter (CR — dart_tui maps both CR and LF to 'enter').
+  void sendEnter() => pty.write('\r');
+
+  /// Sends Escape.
+  void sendEscape() => pty.write('\x1b');
+
+  /// Sends Ctrl+S — the TUI's steer gesture while busy (steers the
+  /// queued follow-ups into the running agent).
+  void sendCtrlS() => pty.write('\x13');
+
+  /// Sends Backspace.
+  void sendBackspace() => pty.write('\x7f');
+
+  /// Kills the CLI with SIGKILL and reaps it — a real crash (no graceful
+  /// exit, no boundary work). Use when the test needs the exact
+  /// process-death residue (issue #437 phase 2).
+  Future<void> hardKill() async {
+    pty.kill(ProcessSignal.sigkill);
+    await pty.exitCode.timeout(const Duration(seconds: 5), onTimeout: () => -1);
+    await _outputSub?.cancel();
+    _releaseOwnedCwd();
+    _releaseTranscript();
+  }
+
+  /// gh-1789: the group declarer keeps every addTearDown closure — and thus
+  /// its harness — reachable until the whole file's group finishes, so an
+  /// unbounded raw transcript (the whole session's ANSI frames) and the
+  /// emulator's callback into the dead pty retain megabytes per test.
+  /// Release them once the CLI is dead; nothing reads them afterwards
+  /// (mid-test hardKill callers spawn a fresh harness).
+  void _releaseTranscript() {
+    _rawBuffer.clear();
+    terminal.onOutput = null;
+  }
+
+  /// Removes the spawn-created default CWD, if any. Best-effort and
+  /// idempotent: teardown must never break because a file inside stayed
+  /// locked (the CLI or a child agent may still hold an fd); a left-behind
+  /// directory is preferable to masking a real test failure.
+  void _releaseOwnedCwd() {
+    final dir = _ownedCwd;
+    if (dir == null) return;
+    _ownedCwd = null;
+    try {
+      if (dir.existsSync()) dir.deleteSync(recursive: true);
+    } on FileSystemException {
+      // Left behind on purpose.
+    }
+  }
+
+  /// Sends Ctrl+C.
+  void sendCtrlC() => pty.write('\x03');
+
+  /// Sends Arrow Up.
+  void sendArrowUp() => pty.write('\x1b[A');
+
+  /// Sends Arrow Down.
+  void sendArrowDown() => pty.write('\x1b[B');
+
+  /// Waits for the REPL boot to finish: the banner's `[Model]` block is on
+  /// screen and the frame redraws have settled.
+  ///
+  /// NOTE: in TUI mode the input zone renders NO `fa> ` prefix (that prompt
+  /// string is line-mode only) — the banner + status line are the reliable
+  /// boot markers.
+  Future<String> waitForBoot({
+    Duration timeout = const Duration(seconds: 90),
+  }) async {
+    final output = await waitForText('[Model]', timeout: timeout);
+    // The TUI repaints the full frame once more after its terminal
+    // capability queries resolve; let that settle before interacting.
+    await waitForOutput(settleMs: 400, timeout: const Duration(seconds: 15));
+    return output;
+  }
+
+  /// Types [command] and submits it, closing the slash menu first.
+  ///
+  /// In TUI mode, typing a bare slash command opens the slash-completion
+  /// menu, where Enter only ACCEPTS the highlighted item instead of
+  /// submitting. Sending Escape first closes the menu so the Enter that
+  /// follows always submits the typed text. Commands with arguments
+  /// (e.g. `/approval always-ask`) close the menu on their own while
+  /// typing; the extra Escape is a harmless no-op then.
+  Future<void> runSlashCommand(String command) async {
+    sendText(command);
+    // Let the slash menu open between the last keystroke and Escape.
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    sendEscape();
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    sendEnter();
+  }
+
+  /// Reads output until no new data arrives for [settleMs] milliseconds
+  /// twice in a row, or [timeout] expires. Returns the accumulated raw
+  /// output.
+  Future<String> waitForOutput({
+    int settleMs = 200,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final budget = scalePtyWaitBudget(timeout, waitBudgetScale);
+    final deadline = DateTime.now().add(budget);
+    var lastLength = -1;
+    var stableTurns = 0;
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(Duration(milliseconds: settleMs));
+      if (_rawBuffer.length == lastLength) {
+        if (++stableTurns >= 2) break;
+      } else {
+        stableTurns = 0;
+        lastLength = _rawBuffer.length;
+      }
+    }
+    return _rawBuffer.toString();
+  }
+
+  /// Waits for [pattern] to appear in the accumulated raw output OR on the
+  /// current terminal screen, then returns the raw output. The screen check
+  /// catches text whose raw form is interrupted by ANSI styling.
+  Future<String> waitForText(
+    Pattern pattern, {
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    return pollUntil(
+      matched: () {
+        final output = _rawBuffer.toString();
+        return output.contains(pattern) || screenText.contains(pattern);
+      },
+      onHit: _rawBuffer.toString,
+      screenText: () => screenText,
+      rawTail: _rawTail,
+      what: '"$pattern" in output',
+      timeout: scalePtyWaitBudget(timeout, waitBudgetScale),
+    );
+  }
+
+  /// Waits for [pattern] to appear on the CURRENT terminal screen — the
+  /// painted viewport, not the raw stream. `waitForText` also matches raw
+  /// bytes, which races frame painting on loaded CI runners: the echo hits
+  /// the raw buffer first and an immediate `expect(screenText, …)` still
+  /// sees the previous frame (#550/#557 flake family). Use this when the
+  /// assertion contract is the SCREEN.
+  ///
+  /// CAPTURE THE RESULT and assert on it: `final screen = await
+  /// harness.waitForScreen(marker)` — the returned string IS the anchored
+  /// screen. A bare `await waitForScreen(header)` followed by a fresh
+  /// `harness.screenText` read re-samples the screen mid-render: the wait
+  /// returns the first frame containing the header (no settle) while
+  /// pickers/cards paint their remaining rows a frame later, and the read
+  /// loses that race on loaded hosts (gh-1049 flake family). Screens may
+  /// only be re-read after a `waitForOutput(settleMs:)` settle.
+  /// `test/integration/pty_screen_wait_reg_test.dart` greps for the
+  /// anti-pattern and fails the default suite when it regrows.
+  Future<String> waitForScreen(
+    Pattern pattern, {
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    // `hit` anchors the EXACT snapshot [matched] accepted — re-reading
+    // screenText in [onHit] would re-sample mid-render (gh-1049).
+    var hit = '';
+    return pollUntil(
+      matched: () {
+        hit = screenText;
+        return hit.contains(pattern);
+      },
+      onHit: () => hit,
+      screenText: () => screenText,
+      rawTail: _rawTail,
+      what: '"$pattern" on screen',
+      timeout: scalePtyWaitBudget(timeout, waitBudgetScale),
+    );
+  }
+
+  /// Waits until [matched] accepts the accumulated raw output, then
+  /// returns that raw output (capture, don't re-read). The
+  /// predicate-anchored raw-stream wait: [waitForOutput] settles on
+  /// SILENCE — the wrong tool when the payload IS the stream, e.g.
+  /// waiting for N settle notices whose inter-arrival gaps rival the
+  /// settle window (gh-1337: the v1.0.520 countdown capture returned
+  /// mid-drain with the tail jobs unlanded because a stretched
+  /// inter-notice gap satisfied the silence rule). On expiry it throws
+  /// with the screen and raw-tail diagnostics — a settled-or-not answer
+  /// can never silently truncate the capture.
+  Future<String> waitForRaw(
+    bool Function(String raw) matched, {
+    String what = 'raw-output predicate',
+    Duration timeout = const Duration(seconds: 10),
+  }) {
+    return pollUntil(
+      matched: () => matched(_rawBuffer.toString()),
+      onHit: _rawBuffer.toString,
+      screenText: () => screenText,
+      rawTail: _rawTail,
+      what: what,
+      timeout: scalePtyWaitBudget(timeout, waitBudgetScale),
+    );
+  }
+
+  /// The last 2000 characters of raw output, for timeout diagnostics.
+  String get rawTail => _rawTail();
+
+  String _rawTail() {
+    final raw = _rawBuffer.toString();
+    return raw.length <= 2000 ? raw : raw.substring(raw.length - 2000);
+  }
+
+  /// Every line of the visible viewport (blank lines kept, trailing
+  /// whitespace preserved) — the layout-faithful view for screenshots.
+  List<String> get viewportLines {
+    final lines = <String>[];
+    final buf = terminal.buffer;
+    for (var i = buf.scrollBack; i < buf.lines.length; i++) {
+      lines.add(buf.lines[i].getText());
+    }
+    return lines;
+  }
+
+  /// [viewportLines] with each line's trailing blank cells stripped —
+  /// the CONTENT-faithful view for cross-frame equality (gh-982).
+  List<String> get viewportContentLines => frameContentLines(viewportLines);
+
+  /// The terminal screen as text lines (ANSI-stripped, empty lines dropped).
+  List<String> get screenLines => [
+    for (final line in viewportLines)
+      if (line.trim().isNotEmpty) line,
+  ];
+
+  /// The terminal screen as a single string (newline-separated lines).
+  String get screenText => screenLines.join('\n');
+
+  /// Kills the CLI process, cancels the output subscription (otherwise an
+  /// open stream keeps the test runner's event loop alive), and waits for
+  /// the process to exit. Deletes the harness-owned temp CWD only AFTER
+  /// the process is dead — never under a live CLI (issue #936 vector 1).
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    pty.kill();
+    await pty.exitCode.timeout(const Duration(seconds: 5), onTimeout: () => -1);
+    await _outputSub?.cancel();
+    _releaseOwnedCwd();
+    _releaseTranscript();
+  }
+}

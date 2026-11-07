@@ -1,0 +1,1082 @@
+/// Static configuration for an [AgentCli] session — extracted from
+/// `agent_cli.dart` to keep it under the 2800-line gate.
+part of 'agent_cli.dart';
+
+/// One DAP/1 hub snapshot shared with the app (`DapHubSnapshot` in
+/// `src/dap/dap_hub_snapshot.dart`): the live probe outcome (`connected`,
+/// `agentId`) plus the resolved config url and agent name (env >
+/// `.fah/packages.yaml` `hub:` > `~/.dap/config.json` > defaults —
+/// resolved by the host through the hub client package, so lib/ stays
+/// dart:io-free). `connected` false means the hub plugin is not connected
+/// right now.
+
+/// Static configuration for an [AgentCli] session.
+final class AgentCliConfig {
+  /// Creates an [AgentCliConfig]. Not const: [modelRolesResolver] and
+  /// [cubeSettings] are mutable (the settings-hub flows create/rewrite
+  /// them on demand).
+  AgentCliConfig({
+    required this.model,
+    required this.apiKey,
+    required this.env,
+    required this.sessionRoot,
+    this.wakeExecutable,
+    this.folderModelStateApplies = true,
+    this.activeCustomName,
+    // Test-only seam (never set by bin/fah.dart): a restore re-bind or a
+    // live /provider switch rebuilds the stream through
+    // [_catalogStreamFunction]; hosts that injected a scripted stream for
+    // hermetic tests set this so the rebuilt stream stays scripted and
+    // records the model a restored turn would serve (gh-1226 AC1).
+    this.catalogStreamOverride,
+    this.presenceStore,
+    this.leaseStore,
+    this.parseExecutor,
+    this.sessionName,
+    this.steeringStaleAfter = const Duration(minutes: 2),
+    this.providerKind = 'openai-completions',
+    this.envVarIsSet,
+    this.envVarValue,
+    this.herdrEnvLookup,
+    this.herdrSpawn,
+    this.modelsFetcher,
+    this.modelsHttpClient,
+    this.providerNetworks = const {},
+    this.tuiMouseCapture = true,
+    this.tuiSyncOutput,
+    this.tuiClassic = false,
+    this.showCompactionDetails = false,
+    this.statusLine,
+    this.agentLoadMode,
+    this.systemPrompt,
+    this.promptOverrides,
+    this.visionConfig,
+    this.transcribeConfig,
+    this.visionResolver,
+    this.onImageInspectUsage,
+    this.mediaFileReadNotes = false,
+    this.transcribeAvailable,
+    this.webSearchConfig,
+    this.sqliteEngine,
+    this.lspConfig,
+    this.mcpConfig,
+    this.a2aConfig,
+    this.plugins = const [],
+    this.pluginConfig = const {},
+    this.promptTemplateDirs = const [],
+    this.initialMode = 'code',
+    this.approvalMode = ApprovalMode.yolo,
+    this.alwaysAllowTools = const {},
+    this.modelRolesResolver,
+    // Issue #1552 AC4: the roles-drop warning (gh-760 boot boundary) also
+    // surfaces in the notice stream — stderr alone is invisible inside the
+    // TUI's alternate screen. Null = no drop happened.
+    this.rolesDropNotice,
+    // The `sessions:` section (gh-1746): the opt-in retention policy.
+    // Null = the section is absent — boot never sweeps and never notes
+    // (AC1's byte-identical legacy).
+    this.sessionsRetention,
+    this.providersQueueRuntime,
+    this.providerQueueEnv,
+    this.ttsr,
+    this.memoryConfig,
+    this.redactionPipeline,
+    this.jobLogDir,
+    this.spills,
+    this.projectContext,
+    this.modelsConfig,
+    this.onModelsConfigChanged,
+    this.onModelChanged,
+    this.onProviderChanged,
+    this.secureKeys,
+    this.customProviders,
+    this.freshInstallProviderFlow = false,
+    this.onSecretStored,
+    this.onSecretGranted,
+    this.onModeChanged,
+    this.onApprovalChanged,
+    this.skillsAccess = SkillsAccess.granted,
+    this.skillsDisableShellExecution = false,
+    this.skillsLiveRediscovery = true,
+    this.skillToggles = const {},
+    this.onSkillsAccessChanged,
+    this.onSkillTogglesChanged,
+    this.isShiftPressed,
+    this.processId,
+    this.homeDir,
+    this.powerSleepPrevention = PowerAssertionLevel.idle,
+    this.powerSleepPreventionHold = PowerAssertionHold.perRun,
+    this.powerRunner,
+    this.quotaBadge = false,
+    this.quotaTtl,
+    this.quotaHttpClient,
+    this.tuiTheme,
+    this.tuiProgramHooks,
+    this.sttyRunner,
+    this.openRouterOAuthExchangeFn,
+    this.chatGptOAuthExchangeFn,
+    this.aiinConnectFn,
+    this.copilotDeviceFlowFn,
+    this.copilotUserFn,
+    this.clipboardWrite,
+    this.codeMieSsoAuthenticateFn,
+    this.codeMieGuidedSetupFn,
+    this.compactionSettings,
+    this.compactionEngine,
+    this.compactionJudgeBudgetSeconds,
+    this.contextWindowCap,
+    this.stuckTool,
+    this.foregroundCall,
+    // gh-1577: the empty-hiccup retry knobs, threaded next to the loop's
+    // maxEmptyRetries so hosts/tests can tune the budget and pin the
+    // backoff (tests pass Duration.zero). Defaults match the loop's.
+    this.emptyHiccupRetries = 3,
+    this.emptyHiccupBaseDelay = const Duration(milliseconds: 500),
+    this.emptyHiccupMaxBackoff = const Duration(milliseconds: 8000),
+    // gh-1603: the headless empty-reply nudge budget (see
+    // [headlessEmptyReplyNudges]).
+    this.headlessEmptyReplyNudges = 2,
+    this.headlessRun = false,
+    this.subagents = const SubagentsConfig(),
+    this.waiting = const WaitingConfig(),
+    this.jobs = const JobsConfig(),
+    this.headless = const HeadlessConfig(),
+    this.deadline,
+    this.streamThinking = false,
+    this.noStreamThinking = false,
+    this.cubeSpec,
+    this.cubeSource,
+    this.cubeSettings,
+    this.onCubeSettingsChanged,
+    this.onUserConfigFileChanged,
+    this.cubeRegistryClient,
+    this.extRuntimeFactory,
+    this.extBootstrapJs = '$kExtTransportStdioJs\n;\n$kExtBootstrapCoreJs',
+    this.jsExtensionsEnabled = true,
+    this.dapHubState,
+    this.runtimeTools,
+    this.agentMode,
+    this.misuseBreaker = true,
+    this.loadMode = AgentLoadMode.defaultMode,
+    this.onToolsConfigChanged,
+    this.onDapHubConfigChanged,
+    this.osName,
+    this.fsProbe,
+    this.browserBridgeHandle,
+    this.browserController,
+    this.hubFabric,
+    this.dapDisplayNameResolver,
+    this.agentCapabilities = const [],
+    this.machineName,
+    this.persistAbortedPartials = false,
+    this.wireDump = false,
+    this.trajectoryRequestBlobs = true,
+    this.trajectoryRequestBlobMaxMb = 50,
+    this.trajectoryRequestBlobMaxBytes = 50 << 20,
+    this.trajectoryRequestBlobTtlDays = 30,
+    this.updateCommand,
+    this.autoUpdate = AutoUpdateMode.notify,
+  });
+
+  /// The user's home directory, when the host has one (used for user-level
+  /// skill/context discovery: `~/.fah/skills`, `~/.fah/AGENTS.md`). Null on
+  /// sandboxed hosts (web) where only the project FS exists.
+  final String? homeDir;
+
+  /// Persisted TUI theme name (`tui.theme`, issue #279): a built-in key or
+  /// a user theme file stem. `null`/unknown → default theme at boot.
+  final String? tuiTheme;
+
+  /// Backend agent mode (issue #155): persist aborted assistant partials
+  /// so a SIGTERM/SIGINT graceful cancel leaves a resumable JSONL (the
+  /// `cancelled` HEP frame's counterpart on disk). Default false: the
+  /// REPL keeps discarding incomplete streams.
+  final bool persistAbortedPartials;
+
+  /// Opt-in raw wire dumps (issue #385 F5, `trajectory.wireDump` yaml,
+  /// default false): when on, the full outbound request payload is
+  /// captured per request, redacted through the active pipeline, capped,
+  /// and persisted as a `trajectory_wire_dump` session record.
+  final bool wireDump;
+
+  /// gh-1745 request-blob spilling (`trajectory.requestBlobs` yaml,
+  /// default true): the heavy half of every request capture — per-message
+  /// previews/block texts, the raw wire dump — is persisted to
+  /// `.fah/trajectories/<sid>/requests/` instead of the session JSONL,
+  /// whose `model_request_summary` record keeps lightweight metadata plus
+  /// a `spillFile` pointer. `false` restores the legacy inline
+  /// persistence byte-identically.
+  final bool trajectoryRequestBlobs;
+
+  /// `trajectory.requestBlobMaxMb` — the per-session blob-dir byte budget
+  /// (default 50 MB).
+  final int trajectoryRequestBlobMaxMb;
+
+  /// The same budget in bytes ([TrajectorySection.requestBlobMaxBytes]
+  /// threaded through [CliConfig] at boot, gh-1745 rework): the blob
+  /// store consumes this instead of re-shifting MB inline.
+  final int trajectoryRequestBlobMaxBytes;
+
+  /// `trajectory.requestBlobTtlDays` — blob age bound (default 30 days).
+  final int trajectoryRequestBlobTtlDays;
+
+  /// The self-update policy (issue #1377, `auto_update` yaml key), plumbed
+  /// from [CliConfig.autoUpdate] by the host at boot. Mutable: the
+  /// settings-hub flow updates it after a successful persist — the same
+  /// live-override pattern as [liveCompactionEngine].
+  AutoUpdateMode autoUpdate = AutoUpdateMode.notify;
+
+  /// The `/update` slash-command seam (issue #1377): the self-update
+  /// engine lives in the host executable (`bin/self_manage.dart`) and
+  /// lib/src stays dart:io-free, so the host injects a closure that
+  /// checks, applies, spawns the successor and exits(0) on success — and
+  /// prints + stays alive on any failure. [String? sessionId] is the
+  /// LIVE session to resume (resolved by the caller): the successor argv
+  /// gains `--session <id>` when the argv does not already carry one, so
+  /// the running conversation survives the restart. Null (tests,
+  /// embedded hosts): the command reports the surface as unavailable.
+  final Future<void> Function(String? sessionId)? updateCommand;
+
+  /// Override for the compaction thresholds (ratio-based trigger, reserve
+  /// and recent-token budgets). When `null`, `defaultCompactionSettings`
+  /// is used (ratio 0.7, reserve 50000, keep 80000). Hosts plumb their
+  /// `compaction:` yaml section through this field.
+  final CompactionSettings? compactionSettings;
+
+  /// The effective compaction engine (issue #148), resolved by the host
+  /// (global < project < `--compaction-engine` runtime flag). `null` keeps
+  /// the structured engine — the default everywhere since issue #287
+  /// (classic remains the explicit rollback choice).
+  final CompactionEngine? compactionEngine;
+
+  /// Owner-side effective context override (`agent.contextWindowCap`,
+  /// issues #273/#729), threaded into the [Agent] (loop guard) and into
+  /// every consumer of the effective window (compaction thresholds, ctx
+  /// meter/footer). Below the catalog window it clamps down; above it,
+  /// it raises the effective window to the served truth. `null` =
+  /// uncapped.
+  final int? contextWindowCap;
+
+  /// Stuck-call supervision (`agent.stuckTool`, gh-1054): liveness
+  /// heartbeats for long-running tool calls plus the autonomous
+  /// cancel/retry/convert follow-up. `null` = unsupervised (the loop runs
+  /// byte-identically to before).
+  final StuckToolConfig? stuckTool;
+
+  /// Foreground tool-call budget (`agent.foregroundCallBudgetSeconds` +
+  /// `agent.foregroundCallAutoConvert`, issue #1786), a pass-through into
+  /// the [Agent] — defaults live in
+  /// [ForegroundCallBudgetConfig.fromLeaves]/the loop. `null` =
+  /// unconfigured (the loop's defaults apply).
+  final ForegroundCallBudgetConfig? foregroundCall;
+
+  /// gh-1577: empty-hiccup retry budget (see
+  /// [AgentLoopConfig.emptyHiccupRetries]).
+  final int emptyHiccupRetries;
+
+  /// gh-1577: first backoff sleep between empty-hiccup retries.
+  final Duration emptyHiccupBaseDelay;
+
+  /// gh-1577: cap on the exponential empty-hiccup backoff.
+  final Duration emptyHiccupMaxBackoff;
+
+  /// gh-1603: the empty-reply `continue` nudge budget for HEADLESS runs.
+  /// Interactive keeps the issue #1085 M2b one-nudge semantics (a user is
+  /// present to re-ask); an unattended run retries the blank longer — the
+  /// session may end only after `1 + headlessEmptyReplyNudges` consecutive
+  /// unrecoverable empties, and then the exit is the explicit
+  /// `__FA_INCOMPLETE` failure (never a clean 0).
+  final int headlessEmptyReplyNudges;
+
+  /// Whether this process drives a headless run (`fah run "<prompt>"` and
+  /// friends) as opposed to an interactive REPL/TUI session. Set by the
+  /// executable's dispatch. Does NOT select the supervision default:
+  /// since gh-1632 the autonomous default applies in EVERY mode and
+  /// `advisory` is reachable only via explicit `agent.stuckTool:` config
+  /// (the gh-1054 interactive-advisory default branch is gone).
+  final bool headlessRun;
+
+  /// Per-call judge/summarizer budget seconds (`compaction.
+  /// judgeBudgetSeconds`, issue #541), resolved by the host from the
+  /// user config. `null` keeps the 300s default — the knob exists for
+  /// giant marathon sessions whose judge cannot answer within 300s.
+  /// NOTE: the knob scales only the per-attempt budget — the
+  /// whole-run `totalBudget` (default 15 min) is NOT scaled, so values
+  /// above 300s shorten the retry ladder.
+  final int? compactionJudgeBudgetSeconds;
+
+  /// The `subagents:` section (issue #383): heartbeat cadence and stall
+  /// threshold for background-subagent status digests.
+  final SubagentsConfig subagents;
+
+  /// Live compaction-engine override set by the settings-hub Compaction
+  /// flow (session scope, or after a yaml write). Wins over the
+  /// boot-resolved [compactionEngine] for the rest of the session.
+  /// NEVER persisted by the host config save: the session scope promises
+  /// "no file change", and the project/global scopes write their yaml
+  /// through the targeted upsert themselves — the whole-file save keeps
+  /// the on-disk `compaction:` block untouched instead. Mutable by
+  /// design — the same live-override pattern as [modelRolesResolver].
+  CompactionEngine? liveCompactionEngine;
+
+  /// Optional fa_cube sandbox spec applied for the whole session (from the
+  /// `--cube`/`--cube-config` flags or the `cube:` config section). The
+  /// execution env wraps it in a [SandboxedExecutionEnv]: filesystem and
+  /// shell operations clamp to the cube's policies, `/cube` swaps it live.
+  /// Null = no cube — the env passes through untouched.
+  final CubeSpec? cubeSpec;
+
+  /// Where [cubeSpec] came from: an explicit manifest path (contains `/`)
+  /// or a cube name. `/cube reload` re-resolves it; `/cube use` overwrites
+  /// it. Null when no cube was requested.
+  final String? cubeSource;
+
+  /// The host OS name (e.g. `linux`, `macos`), supplied by the executable —
+  /// lib/src stays dart:io-free. `/cube` uses it to describe the OS sandbox
+  /// backend. Null (tests, web) reports a generic passthrough instead.
+  final String? osName;
+
+  /// The symlink probe for the cube fs guard, supplied by the executable
+  /// (`LocalCubeFsProbe` on IO hosts — lib/src stays dart:io-free). Null
+  /// (tests, web) keeps the guard on the lexical traversal check.
+  final CubeFsProbe? fsProbe;
+
+  /// The `package:http` client for the fa1.dev cube registry
+  /// (`/cube templates` / `/cube install`). Tests inject a mock; web hosts
+  /// pass their shared browser-capable client. Null uses a fresh
+  /// `http.Client()`.
+  final http.Client? cubeRegistryClient;
+
+  /// The live `cube:` config section (the saved sandbox startup default).
+  /// The settings-hub Cube sandbox flow rewrites it; the host persists the
+  /// new value after [onCubeSettingsChanged] fires. Mutable like
+  /// [modelRolesResolver] ([CubeSettings] itself is immutable).
+  CubeSettings? cubeSettings;
+
+  /// Called when the saved cube default changes (the settings-hub Cube
+  /// sandbox flow) so the executable can persist it. The flow awaits the
+  /// hook before confirming, so persistence lands with the feedback line.
+  final Future<void> Function()? onCubeSettingsChanged;
+
+  /// Called after a settings-hub flow wrote the USER config file
+  /// directly — every sanctioned write that bypasses the host's
+  /// whole-file save: the surgical validated-yaml upserts (user-scope
+  /// wins), the drop-key / clear-key edits, the ttsr block replace and
+  /// the mcp block replace (the roster lives on
+  /// `SettingsConfigSyncFlow._notifyUserConfigFileChanged`). Hosts
+  /// holding a boot-time snapshot of the user config re-read it here so
+  /// their next whole-file save renders the freshest on-disk truth
+  /// instead of re-rendering the stale boot values OVER the flow's write
+  /// (gh-1572 rework). Null (tests, web) makes the writes one-way.
+  final Future<void> Function()? onUserConfigFileChanged;
+
+  /// Fetches one [DapHubSnapshot] (probe outcome in
+  /// [DapHubSnapshot.connected]): the resolved config url/name plus the
+  /// live connection state. File reads and the plugin status stay on the
+  /// host side (the hub client owns its IO; lib/ stays dart:io-free) —
+  /// null (tests without a fake, web) means no hub wiring exists and the
+  /// DAP / Hub flow reports the state as unavailable.
+  final Future<DapHubSnapshot?> Function()? dapHubState;
+
+  /// Persists a changed hub url / agent name (the settings-hub DAP / Hub
+  /// flow) through the hub client's `~/.dap/config.json` read-modify-write
+  /// — the single authority for that file's format. Null (tests without a
+  /// fake, web) keeps the change session-only.
+  final Future<void> Function({String? url, String? name})?
+  onDapHubConfigChanged;
+
+  /// Optional override for the OpenRouter OAuth code exchange. Tests inject a
+  /// fake here so the `/provider openrouter oauth` flow can run without
+  /// network. Production leaves this null and uses the real exchange endpoint.
+  final Future<OpenRouterOAuthKey> Function({
+    required String code,
+    required String codeVerifier,
+    String? label,
+  })?
+  openRouterOAuthExchangeFn;
+
+  /// Optional override for the ChatGPT OAuth code exchange. Tests inject a
+  /// fake here so the `/provider chatgpt oauth` flow can run without network.
+  /// Production leaves this null and uses the real exchange endpoint.
+  final Future<ChatGptOAuthCredentials> Function({
+    required String code,
+    required String redirectUri,
+    required String verifier,
+  })?
+  chatGptOAuthExchangeFn;
+
+  /// Test seam: overrides [runAiinConnectCliFlow] for `/provider aiin` —
+  /// CLI-level tests inject a canned connect result instead of a real
+  /// browser + loopback server.
+  final Future<AiinConnectResult?> Function({
+    required String provider,
+    void Function(String)? onStatus,
+  })?
+  aiinConnectFn;
+
+  /// Optional override for the whole Copilot device flow (grant + poll),
+  /// returning the GitHub token. Tests inject a fake so `/provider copilot`
+  /// runs without network; production runs the real flow against
+  /// github.com. [clientId] is the FA_COPILOT_CLIENT_ID override (null =
+  /// the pinned VS Code Copilot client id); [onStatus] receives the
+  /// waiting lines.
+  final Future<String> Function({
+    String? clientId,
+    void Function(String status)? onStatus,
+  })?
+  copilotDeviceFlowFn;
+
+  /// Optional override for the GitHub account lookup behind `/provider
+  /// copilot` (GET api.github.com/user → login). Tests inject a fake;
+  /// production calls [fetchGitHubLogin].
+  final Future<String> Function(String githubToken)? copilotUserFn;
+
+  /// Optional override for the platform clipboard write behind `/provider
+  /// export` (gh-1606): copies [text] to the host clipboard; resolves to
+  /// null on success, the failure reason otherwise (the text itself never
+  /// surfaces). Tests inject a fake; production runs
+  /// [writeClipboardText] (pbcopy/xclip/wl-copy/clip).
+  final Future<String?> Function(String text)? clipboardWrite;
+
+  /// Optional override for the CodeMie SSO browser flow
+  /// (`/provider codemie sso`). Tests inject a fake returning canned
+  /// credentials; production runs the localhost-callback browser flow.
+  final Future<CodeMieSsoCredentials?> Function(
+    String codeMieUrl,
+    void Function(String) onStatus,
+  )?
+  codeMieSsoAuthenticateFn;
+
+  /// Optional override for the post-SSO guided project/model selection.
+  /// Tests inject a fake returning a canned model id; production runs the
+  /// real guided flow (fetch projects, fetch models, pickers).
+  final Future<String?> Function(
+    String apiBase,
+    String token,
+    Future<String?> Function(
+      String title,
+      List<(String, String, String)> options,
+    )
+    pickOption,
+    Future<String?> Function(String question, {bool secret}) askLine,
+  )?
+  codeMieGuidedSetupFn;
+
+  /// Directories to scan for `/name` prompt templates (`.md` files).
+  final List<String> promptTemplateDirs;
+
+  /// Initial mode name (`code`, `architect`, `review`).
+  final String initialMode;
+
+  /// Initial approval mode (`/approval` switches it at runtime). Defaults to
+  /// [ApprovalMode.yolo] — pre-approval-model CLI behavior — while critical
+  /// `bash` patterns still prompt (or are denied when non-interactive).
+  /// [ApprovalMode.unattended] additionally skips the critical interceptor:
+  /// the session never blocks, for runs without a user present.
+  final ApprovalMode approvalMode;
+
+  /// Tools always-allowed from previous sessions (`/allow`, "approve always"
+  /// answers), persisted by the embedding executable.
+  final Set<String> alwaysAllowTools;
+
+  /// The RUNTIME `tools:` availability scope — the `--tools` flag value,
+  /// or the parsed `FA_TOOLS` env twin when the flag is absent (deepest of
+  /// the config scopes the wiring stacks: global, project, session,
+  /// runtime, then the builtin capability floor). Null when neither source
+  /// declared intent.
+  final ToolsConfig? runtimeTools;
+
+  /// The resolved harness mode (issue #679, `pi_mode.dart`): `'pi'` or
+  /// null (default). Resolved by the executable — flag > env > config —
+  /// and consumed by the wiring: the pi runtime tools scope pins the
+  /// surface to read/write/edit/bash and the prompt composition strips
+  /// every optional section.
+  final String? agentMode;
+
+  /// The tool-misuse circuit breaker switch (`agent.misuseBreaker`,
+  /// issue #862, default true): wired into the [Agent] and every spawned
+  /// child. `false` disables it everywhere — byte-identical to the
+  /// pre-breaker harness (E5).
+  final bool misuseBreaker;
+
+  /// The tool-load preset for this boot (issue #680): resolves
+  /// `--omp` > `FA_AGENT_MODE` > `agent.mode`. [AgentLoadMode.defaultMode]
+  /// keeps every present tool in the schema (byte-identical behavior).
+  final AgentLoadMode loadMode;
+
+  /// Called when the user changes the GLOBAL `tools:` scope
+  /// (`/tools enable|disable <id> global`) so the executable can persist
+  /// the CLI's live global view (`globalTools`). Null keeps the change
+  /// session-only.
+  final Future<void> Function()? onToolsConfigChanged;
+
+  /// Optional model-roles resolver (roles/fallback chains/key rotation from
+  /// the CLI config). When set and its `default` role resolves, the agent
+  /// runs through the resolver's fallback stream instead of the plain
+  /// [providerKind]/[apiKey] wiring, compaction summarizes through the
+  /// `smol` role, and `/model` renders the roles overview. Mutable: the
+  /// settings-hub agent-models flow creates one on demand when the config
+  /// had no `roles:` section (auxiliary roles resolve lazily; the default
+  /// chain stays untouched).
+  ModelRolesResolver? modelRolesResolver;
+
+  /// The roles-drop warning text (issue #1552 AC4), or null: the gh-760
+  /// boot boundary degraded the whole `roles:` config — the line surfaces
+  /// in the notice stream (line mode + the TUI transcript after the
+  /// banner), never stderr-only.
+  final String? rolesDropNotice;
+
+  /// The `sessions:` section (gh-1746), null when absent. Drives the
+  /// boot retention check: sweep/note only what the user configured.
+  final SessionsConfig? sessionsRetention;
+
+  /// The provider-queue runtime (issue #418): when set, the default role
+  /// resolves through the queue's stream function — sticky cursor, loud
+  /// failover on provider death. Wins over the roles resolver's default
+  /// chain; auxiliary roles (smol/slow/plan) keep resolving independently.
+  /// Mutable for the same live-override reasons as [modelRolesResolver].
+  ProviderQueueRuntime? providersQueueRuntime;
+
+  /// The environment view the provider-queue scope resolves through
+  /// (issue #418 + #675): the queue editor re-resolves the winning scope
+  /// before a write, and it MUST see the same env the boot saw — an
+  /// ambient `FA_PROVIDERS_QUEUE` on the host process (the ai-teammate
+  /// runner exports one) must not decide test/embedder fate after the
+  /// host booted with its own view. Null = the process environment (the
+  /// production boot reads it directly, so behavior is unchanged).
+  final Map<String, String>? providerQueueEnv;
+
+  /// Optional TTSR configuration (stream rules from the CLI config and the
+  /// project rules file). When set and enabled, a [TtsrController] watches
+  /// the agent's streams and drives abort/inject/retry on rule matches.
+  final TtsrConfig? ttsr;
+
+  /// The layered redaction pipeline (issue #24), assembled by the host
+  /// startup from the `redact:` config + this process's secrets. When set,
+  /// the CLI attaches its hooks to the agent (tool-result masking,
+  /// blockMode credential-file denies) and masks user prompt text at the
+  /// entry points; null = redaction hooks stay off (only the legacy
+  /// [SecretRedactor] exact-value masking runs).
+  final RedactionPipeline? redactionPipeline;
+
+  /// Where the bash-job registry writes job logs (issue #1408 AC1); null
+  /// keeps `<cwd>/.fah/bash_jobs`. The bench boot resolves
+  /// `FAH_JOB_LOG_DIR` ([jobLogDirOverride]) so unattended runs keep
+  /// harness artifacts outside the graded task workspace.
+  final String? jobLogDir;
+
+  /// Optional `memory:` section of `~/.fah/config.yaml` — long-term memory
+  /// storage path overrides (git-backed project memory). Null = the
+  /// historical `.fah/memory` layout.
+  final MemoryConfig? memoryConfig;
+
+  /// The resolved `spills:` section (issue #678) — project yaml wins over
+  /// the user one, wholesale. Null or inactive (`enabled: false` /
+  /// `threshold: 0`) = no spill hooks attached, byte-identical legacy.
+  final SpillsConfig? spills;
+
+  /// The resolved `projectContext:` section (issue #1761) — the merged
+  /// project-context budget. Null = the 32KB default; `maxBytes: 0`
+  /// disables the section and skips every file read.
+  final ProjectContextConfig? projectContext;
+
+  /// The live models config (the `models:` section of `~/.fah/config.yaml`),
+  /// shared with the executable: `/models set`/`/models remove` mutate its
+  /// media slot overrides and `/model <name>` resolves its custom model
+  /// definitions; the host persists it after [onModelsConfigChanged]. Null
+  /// (web, tests without one) disables the models-config commands.
+  final ModelsConfig? modelsConfig;
+
+  /// Called when the models config changes (`/models set`,
+  /// `/models remove`) so the executable can persist it.
+  final void Function()? onModelsConfigChanged;
+
+  /// Called when the user switches the active model via `/model`.
+  ///
+  /// Awaiting the callback: the persistence it performs (global config +
+  /// the per-folder model state) must complete before the process can exit
+  /// — a `/model x` + `/exit` one-two would otherwise lose the switch.
+  final Future<void> Function(Model model)? onModelChanged;
+
+  /// Called when the user switches the active provider via `/provider`
+  /// (legacy wiring only; roles mode reports through [onModelChanged]).
+  /// Carries the new provider adapter kind and the resolved API key so the
+  /// executable can redact an explicitly passed token and persist the
+  /// provider/model/baseUrl triple. The key may be empty (keyless custom
+  /// endpoints); it is never persisted by the executable.
+  final Future<void> Function(String providerKind, String apiKey)?
+  onProviderChanged;
+
+  /// The platform secure-storage cache (macOS Keychain / Secret Service /
+  /// Windows Credential Locker), preloaded by the host at startup. Backs the
+  /// `/key` command and lets `/provider ... <token>` persist the token.
+  /// Null (web, tests) disables secure storage: tokens stay session-only.
+  final SecureKeyCache? secureKeys;
+
+  /// The saved custom-provider registry (the `customProviders:` config
+  /// section), shared with the executable: the CLI mutates it (wizard adds,
+  /// per-provider model memory), the host persists it. Null (web, tests
+  /// without one) disables saved providers — the wizard still switches but
+  /// adds nothing to the list.
+  final CustomProviderRegistry? customProviders;
+
+  /// Fresh-install boot (issue #969): the executable computed that NOTHING
+  /// is configured — no saved custom providers, no persisted provider
+  /// switch, and no key resolving anywhere (env or the secure store) — and
+  /// this is an interactive REPL boot. The REPL then opens the guided
+  /// add-provider wizard (the same flow `/provider custom` opens) before
+  /// the first prompt. Never set for headless runs; the CLI re-checks
+  /// `CliIO.isInteractive`, so piped input never sees the wizard either.
+  final bool freshInstallProviderFlow;
+
+  /// Called when the user stores a secret via `/key set`, so the executable
+  /// can redact the value from tool results and session files.
+  final void Function(String name, String value)? onSecretStored;
+
+  /// Called when the agent requests a secret via the `request_secret` tool
+  /// and the user grants it, so the executable can redact the value from
+  /// tool results and inject it into the shell environment.
+  final void Function(String name, String value)? onSecretGranted;
+
+  /// Called when the user switches the active mode via `/mode`, `/code`,
+  /// `/architect`, or `/review`.
+  final void Function(String mode)? onModeChanged;
+
+  /// Called when the approval state changes (`/approval`, `/allow`, or an
+  /// "approve always" prompt answer) so the executable can persist it.
+  final void Function()? onApprovalChanged;
+
+  /// Consent for discovering third-party skill roots (Claude/Copilot/Codex
+  /// directories). [SkillsAccess.granted] is the default (opt-out discovery —
+  /// migrating users keep their existing skills with zero setup);
+  /// [SkillsAccess.ask] makes an interactive host prompt once at startup
+  /// (persisted via [onSkillsAccessChanged]); a headless run treats `ask` as
+  /// denied. Own roots (`.fah/skills`, `.agents/skills`) are always
+  /// discovered.
+  final SkillsAccess skillsAccess;
+
+  /// When true, `!`command`` shell injections inside skill bodies are not
+  /// executed; the placeholder renders as a disabled note instead.
+  final bool skillsDisableShellExecution;
+
+  /// Whether the per-composition skills freshness check runs (gh-1440,
+  /// `skills.liveRediscovery`). On by default — a skill landing on disk
+  /// mid-session joins the index at the next prompt recomposition and
+  /// `/skill:` cold-resolves misses. `false` returns to boot-snapshot
+  /// semantics with the prompt's staleness footer; `/skills reload` and
+  /// cold-resolve stay available either way.
+  final bool skillsLiveRediscovery;
+
+  /// The GLOBAL per-skill on/off toggles (`skills:` section of
+  /// `~/.fah/config.yaml`, issue #1151): skill name → enabled. The CLI
+  /// seeds its live view from this at first resolution;
+  /// `/skills NAME global` mutates the live view and the host persists it
+  /// through [onSkillTogglesChanged].
+  final Map<String, bool> skillToggles;
+
+  /// Called when the skills-access consent changes (startup prompt,
+  /// `/skills access ...`) so the executable can persist it.
+  final void Function(SkillsAccess access)? onSkillsAccessChanged;
+
+  /// Called when a global per-skill toggle changes
+  /// (`/skills NAME global`, the settings-hub Skills flow) so the
+  /// executable can persist the live toggles
+  /// (`AgentCli.globalSkillToggles`).
+  final Future<void> Function()? onSkillTogglesChanged;
+
+  /// Host-provided Shift modifier check (e.g. macOS Core Graphics via FFI).
+  /// When null, Shift+Enter is not specially handled.
+  final bool Function()? isShiftPressed;
+
+  /// The host process id (diagnostics on the presence heartbeat). Null
+  /// where the platform exposes no pid (web).
+  final int? processId;
+
+  /// The effective `power.sleepPrevention` level (issue #325): what the
+  /// held sleep-prevention assertion asks the platform for. Defaults to
+  /// [PowerAssertionLevel.idle] like oh-my-pi.
+  final PowerAssertionLevel powerSleepPrevention;
+
+  /// When the sleep-prevention assertion is held (`power.hold`, #326):
+  /// per-run by default — acquired at run start, released at settle, so
+  /// an idle agent never pins the machine awake;
+  /// [PowerAssertionHold.session] is the explicit hold-the-whole-session
+  /// opt-in.
+  final PowerAssertionHold powerSleepPreventionHold;
+
+  /// The platform sleep-prevention runner (host-injected through
+  /// `lib/io.dart`'s `hostPowerRunner`). Null disables assertions
+  /// entirely — the test runtime and web hosts pass no runner, so no
+  /// unit test ever spawns a real `caffeinate`.
+  final PowerAssertionRunner? powerRunner;
+
+  /// Status-line provider-quota badge (`quota.badge`, issue #823): default
+  /// OFF (OQ2 lean) — the status line stays quiet until the user opts in.
+  final bool quotaBadge;
+
+  /// Quota-cache TTL override (`quota.ttl_minutes`, issue #823). Null keeps
+  /// the service's 15-minute default.
+  final Duration? quotaTtl;
+
+  /// Injectable http client for the quota adapters (issue #823): tests
+  /// inject a MockClient here; production shares the keep-alive provider
+  /// client. Null = shared client, no IO is made until a surface peeks.
+  final http.Client? quotaHttpClient;
+
+  /// Headless TUI test hooks (scripted key bytes, captured frames) handed to
+  /// the TUI controller — null in production, where the dart_tui program
+  /// reads stdin and renders to the real terminal.
+  final TuiProgramHooks? tuiProgramHooks;
+
+  /// Injected `stty` runner (issue #735): routes BOTH the TUI's boot-time
+  /// termios sanitize and the TermiosGuard's post-tool-phase re-asserts
+  /// through a fake — headless tests model the tty with it. Null in
+  /// production (real `stty` subprocesses; the guard no-ops without a
+  /// terminal, so non-TUI hosts are unaffected).
+  final SttyRunner? sttyRunner;
+
+  /// The model to run. `/model <id>` swaps the id at runtime.
+  final Model model;
+
+  /// API key for the provider. Only used when no [StreamFunction] override
+  /// is injected into [AgentCli] and no [modelRolesResolver] covers the
+  /// default role.
+  final String apiKey;
+
+  /// Execution environment backing the built-in tools and session storage.
+  final ExecutionEnv env;
+
+  /// Executable used to WAKE an asleep cross-session mailbox: agent_message
+  /// spawns `nohup <wakeExecutable> --session <name> "<prompt>"` detached in
+  /// the target's cwd so a sleeping agent processes its inbox now (a later
+  /// interactive start resumes the same session). Null falls back to `fa`
+  /// on PATH.
+  final String? wakeExecutable;
+
+  /// Root directory for JSONL sessions (cwd-encoded layout, like pi).
+  final String sessionRoot;
+
+  /// Whether the saved per-folder model memory may override the resolved
+  /// config for session loads (bin/fah.dart computes it from the launch
+  /// pins: --model/--provider/--base-url and the FA_PROVIDER_* preconfig
+  /// disable it). Defaults to true so tests and embedded hosts behave like
+  /// an unpinned launch.
+  final bool folderModelStateApplies;
+
+  /// The saved custom provider entry the boot restored (the folder model
+  /// state's name pin, gh-1000): the CLI starts with that entry marked
+  /// active — its key slot and its name in the status bar. Null when the
+  /// boot restored no named entry.
+  final String? activeCustomName;
+
+  /// Test-only seam: builds the stream a restore re-bind or a live
+  /// /provider switch would serve for [kind]/[key]; null (every
+  /// production boot) keeps the real catalog adapter.
+  final StreamFunction Function(String kind, String key)? catalogStreamOverride;
+
+  /// Live-session presence heartbeats: the running CLI registers its
+  /// session here so the Fa app (sharing the sessions root) can mark the
+  /// session live and attach to it. Null (tests, web) disables presence.
+  final SessionPresenceStore? presenceStore;
+
+  /// Off-isolate session record parsing (issue #503 boot cost): the IO
+  /// host injects `IsolateSessionParseExecutor` (exported from
+  /// `lib/io.dart`) so a marathon resume decodes its multi-hundred-MB
+  /// tail core-wide instead of stalling the UI isolate; null (tests,
+  /// web) keeps the inline batched path.
+  final SessionParseExecutor? parseExecutor;
+
+  /// Session-ownership leases (issue #428): the store this CLI acquires
+  /// its session's `_owner.json` lease through. Null (tests, web)
+  /// disables ownership — today's unenforced multi-writer behavior.
+  final FileSessionLeaseStore? leaseStore;
+
+  /// Optional session name to resume or create on startup.
+  final String? sessionName;
+
+  /// How long a busy run may stream NO agent events before mid-run
+  /// steering panels flip to `dead` (issue #437 E4): honest tool work
+  /// streams events continuously, so only a wedged run (the #355
+  /// mid-thinking family) crosses this threshold. A late delivery from
+  /// `dead` stays possible — dead means "not responding", not "lost".
+  final Duration steeringStaleAfter;
+
+  /// Provider adapter kind: `openai-completions`, `anthropic`, or `google`.
+  final String providerKind;
+
+  /// Reports whether an environment variable is set (non-empty) on the
+  /// host. The startup banner uses it to name the provider key env var in
+  /// play — the name only, never the value. Null (tests, web) behaves as
+  /// "unset", so the banner then warns instead of naming a var.
+  final bool Function(String name)? envVarIsSet;
+
+  /// Reads an environment variable's value on the host (null/empty treated
+  /// as unset). `/provider` uses it to resolve the target provider's API key
+  /// from its catalog env names when no explicit token is passed. Null
+  /// (tests, web) means no key is ever found this way.
+  final String? Function(String name)? envVarValue;
+
+  /// Reads a herdr pane env var on the host (issue #1481): the herdr pane
+  /// reporter's whole gate input (`HERDR_ENV`, `HERDR_PANE_ID`,
+  /// `HERDR_BIN_PATH`, plus the `FA_HERDR=0` kill switch). herdr exports
+  /// the vars to every pane process, so the CLI's own process env is the
+  /// right source. Null (tests, web) = every var unset — the reporter is
+  /// constructed inert and spawns nothing. lib/src stays dart:io-free; the
+  /// executable injects the `Platform.environment` lookup.
+  final String? Function(String name)? herdrEnvLookup;
+
+  /// The herdr pane reporter's transport (issue #1481): one fire-and-forget
+  /// spawn of `$HERDR_BIN_PATH pane …` per report, cut by the reporter's
+  /// short timeout, silent on failure. The executable injects a
+  /// `Process.run`-backed closure (lib/ stays dart:io-free); null (tests
+  /// without a recorder, web) keeps the reporter spawn-free even behind an
+  /// active gate.
+  final Future<void> Function(List<String> argv)? herdrSpawn;
+
+  /// Fetches model ids from an OpenAI-compatible `/models` endpoint (the
+  /// `/models` picker and the custom-provider flow). Null uses the built-in
+  /// HTTP implementation; tests inject a fake.
+  final Future<List<String>> Function(String baseUrl, {required String apiKey})?
+  modelsFetcher;
+
+  /// HTTP client override for the non-OpenAI model-list dialects the
+  /// settings flows dispatch to (DIAL deployments, CodeMie `/llm_models`) —
+  /// [modelsFetcher] only covers the OpenAI shape. Null (production) lets
+  /// the fetchers create their own client; tests inject a `MockClient`.
+  final http.Client? modelsHttpClient;
+
+  /// Per-provider proxy bindings (`providers:` → `network:`, issue #1921),
+  /// carried from the loaded [CliConfig]. Empty = every provider direct.
+  final Map<String, ProviderNetworkConfig> providerNetworks;
+
+  /// Whether the TUI captures the mouse for wheel scrolling. Default true:
+  /// the session renders in the alternate screen, where the terminal has no
+  /// native scrollback — without capture a two-finger scroll does nothing
+  /// and the user cannot reach earlier output. Selection still works via
+  /// the terminal's bypass modifier (Shift in most). `FA_TUI_MOUSE=0` opts
+  /// out for always-on native select-to-copy.
+  final bool tuiMouseCapture;
+
+  /// DEC 2026 synchronized output tri-state for the TUI. Null (default) =
+  /// auto-detect via DECRQM; `FA_TUI_SYNC=1` forces BSU/ESU framing for
+  /// terminals that support ?2026 but not the query; `FA_TUI_SYNC=0` forces
+  /// legacy writes (deterministic fallback path).
+  final bool? tuiSyncOutput;
+
+  /// The classic-chrome kill switch (`tui.classic`, #806): `true` pins
+  /// the legacy TUI composer — the `─` rule, the bare input zone and the
+  /// dim one-line status footer — byte-identically, and disables the
+  /// omp status band (the `images.registry: false` precedent).
+  final bool tuiClassic;
+
+  /// The compaction-report detail opt-in (`tui.showCompactionDetails`,
+  /// gh-1636, default false): an auto-compaction pass prints ONE short
+  /// marker line, the internal checkpoint summary stays out of the
+  /// console, and the headless log face stops streaming the summarizer
+  /// deltas (the gh-1433 E4 stream becomes opt-in — the gh-1430 E3
+  /// `… reasoning` liveness line still covers the window). `true`
+  /// restores the full report block and the live delta stream. Nothing
+  /// is lost by default: the summary stays in the session file and is
+  /// reachable via `compact_expand`. The manual `/compact` report always
+  /// renders details.
+  final bool showCompactionDetails;
+
+  /// The parsed `tui.statusLine` section; [AgentCli] resolves it once
+  /// into the status-line engine the composer's top band renders.
+  final StatusLineConfig? statusLine;
+
+  /// The agent load mode label (`omp`/`pi`/null) for the band's mode
+  /// segment (`default` renders as nothing — see [StatusLineSnapshot]).
+  final String? agentLoadMode;
+
+  /// System prompt override; defaults to [defaultAgentCliSystemPrompt].
+  ///
+  /// Wins over [promptOverrides] and the active mode's prompt (the
+  /// `--system-prompt`/`--system-prompt-file` flags map here). A `/mode`
+  /// switch replaces it with the mode's prompt.
+  final String? systemPrompt;
+
+  /// Prompt overrides from the CLI config `prompts:` section (resolved by
+  /// the executable via `resolvePromptOverrides`). Replaces the mode system
+  /// prompts (`cli/mode_*` names — startup and `/mode` switches) and the
+  /// compaction summarization prompts (`compaction/*` names). Null or empty
+  /// keeps the built-in prompts byte-identical.
+  final PromptOverrides? promptOverrides;
+
+  /// Optional vision model configuration. When provided, the `inspect_image`
+  /// tool is registered and routes image analysis to a dedicated model.
+  ///
+  /// Prefer using the `inspect_image` plugin via [plugins] / [pluginConfig].
+  final InspectImageConfig? visionConfig;
+
+  /// Optional transcription endpoint configuration. When provided, the
+  /// `transcribe_audio` tool is registered and routes audio transcription to
+  /// a Whisper-compatible endpoint.
+  ///
+  /// Prefer using the `transcribe_audio` plugin via [plugins] /
+  /// [pluginConfig].
+  final TranscribeAudioConfig? transcribeConfig;
+
+  /// The live vision-slot resolver (gh-1984 AC5/AC8): invoked per image
+  /// read so the persisted `models.slots.vision` (and a later-arriving
+  /// key) applies without a restart. Null = the boot [visionConfig] is
+  /// the capability.
+  final Future<InspectImageConfig?> Function()? visionResolver;
+
+  /// Receives the read auto-route's vision-model usage (gh-1984 AC2) so
+  /// the executable can surface the spend in /cost. Null = untracked.
+  final void Function(Usage usage)? onImageInspectUsage;
+
+  /// Audio/video read notes (gh-1984 AC10) — the plain CLI + headless opt
+  /// in (their media surface is `transcribe_audio`); hosts with a
+  /// different media surface keep today's read behavior.
+  final bool mediaFileReadNotes;
+
+  /// Whether `transcribe_audio` is registered — steers the audio read
+  /// note between "call the tool" and "configure the slot". Null = the
+  /// [transcribeConfig] presence decides.
+  final bool Function()? transcribeAvailable;
+
+  /// Optional web search configuration. When provided, `web_search` and
+  /// `web_fetch` are registered (see [builtinTools]); keyless DuckDuckGo
+  /// works with all defaults, keyed providers read their API keys from the
+  /// config's [SecretsStore].
+  final WebSearchConfig? webSearchConfig;
+
+  /// Optional SQLite engine enabling `read` targets like `data.db:table`.
+  /// Pass the FFI-backed engine from `lib/io.dart` on native hosts; leave
+  /// null on web (SQLite reads then return a clean "not supported" note).
+  final SqliteEngine? sqliteEngine;
+
+  /// Optional LSP configuration enabling the `lsp` tool (diagnostics /
+  /// definition / references / rename). Pass a config with the process
+  /// transport factory from `lib/io.dart` on native hosts; leave null on
+  /// web (the tool is not registered).
+  final LspToolConfig? lspConfig;
+
+  /// Optional MCP configuration (the `mcp:` config section). Servers
+  /// connect lazily in the background at startup; each advertised tool is
+  /// registered as `mcp__<server>__<tool>` (exec approval tier) and the
+  /// system prompt gains a tiny server-status section. Stdio servers need
+  /// the process transport factory from `lib/io.dart`; remote (HTTP)
+  /// servers work on every host. Null disables MCP.
+  final McpToolConfig? mcpConfig;
+
+  /// Optional A2A remote-agent configuration (the `a2a:` config section,
+  /// Phase 5a). Servers connect lazily; items with the agent type
+  /// `a2a:<name>` run against the remote agent through the `task` tool.
+  /// Null disables A2A.
+  final A2aConfig? a2aConfig;
+
+  /// Plugins to register at startup.
+  final List<FahPlugin> plugins;
+
+  /// Per-plugin configuration from `.fah/packages.yaml` (keyed by plugin name).
+  final Map<String, dynamic> pluginConfig;
+
+  /// The loopback browser-bridge handle (`/browser connect`), implemented
+  /// by the host over the WebSocket bridge server (the io lives in the
+  /// executable; lib/ stays dart:io-free). Null (web hosts, plain tests)
+  /// makes `/browser` answer with a clean unavailable note.
+  final BrowserBridgeHandle? browserBridgeHandle;
+
+  /// The live browser controller (issue #23) backing the `browser_*`
+  /// tools. Null = no browser backend: the family stays capability-off.
+  /// The controller's `attached` flag is the capability floor and its
+  /// `onAvailabilityChanged` hook triggers the live availability rebuild.
+  final BrowserController? browserController;
+
+  /// Creates the JS engine for one stored extension (issue #32). The host
+  /// executable injects the `QjsProcessRuntime` factory from `lib/io.dart`;
+  /// tests inject a `FakeJsrRuntime` factory. Null keeps JS extensions
+  /// disabled regardless of [jsExtensionsEnabled].
+  final JsrRuntime Function(StoredExtension ext)? extRuntimeFactory;
+
+  /// Engine bootstrap source evaluated before each extension's `main.js`
+  /// (transport + core from `ext_bootstrap_js.dart`; the stdio transport
+  /// default matches the qjs-process engine).
+  final String extBootstrapJs;
+
+  /// Master switch for JS extensions. Effective only together with a
+  /// non-null [extRuntimeFactory] — both must be on for extensions to load.
+  final bool jsExtensionsEnabled;
+
+  /// Hub-backed primary for the agent messaging fabric (issue #27 phase 1).
+  /// When set, the fabric routes hub-resolvable recipients through it and
+  /// falls back to the file inboxes (offline queue + forward on reconnect);
+  /// the hub identity's mail merges into the main inbox drain. The
+  /// implementation is IO-bound (DAP WebSocket) and lives bin-side — hosts
+  /// inject it here. Null (default) keeps the pure file fabric.
+  final MessagingRepository? hubFabric;
+
+  /// Live DAP display-name lookup for channel @-mention attribution. The
+  /// IO-bound hub owns the identity; this pure callback keeps that layering
+  /// out of the CLI and follows runtime reconnects/name changes.
+  final String? Function()? dapDisplayNameResolver;
+
+  /// Capabilities this host announces in the fabric directory (issue #27
+  /// phase 2) — from the `fabric.capabilities` config section. Rendered as
+  /// sub-lines of this instance's `agent_directory` entry so peers can
+  /// discover what this agent can do.
+  final List<AgentCapability> agentCapabilities;
+
+  /// The `waiting:` section (issue #450): visible-waiting heartbeat
+  /// cadence, the `--wait-for-jobs` ceiling, and the per-call foreground
+  /// liveness thresholds (gh-1055).
+  final WaitingConfig waiting;
+
+  /// The `jobs:` section (issue #478): boot-maintenance knobs for the
+  /// cross-run shell-job state (manifest age belt + log GC), plus the
+  /// `maxLogBytes` per-log ceiling (issue #919).
+  final JobsConfig jobs;
+
+  /// The `headless:` section (gh-1459): the wall-clock ceiling
+  /// (`shellJobDrainMs`, default 30 min; 0 = off) for the headless
+  /// background-job drain after the final answer.
+  final HeadlessConfig headless;
+
+  /// The session deadline clock (gh-1556): the ONE wall-clock budget
+  /// source this session projects everywhere — the per-turn `time-left:`
+  /// request line ([Agent.budgetLineProvider]), the one-shot wrap-up
+  /// steering notices, the TUI countdown chip, and the
+  /// `FA_DEADLINE_EPOCH_MS` bash env var. Injected so tests drive it with
+  /// a fake clock; null (the default) builds a live `SessionDeadline()`.
+  /// The executable seeds it from `FA_DEADLINE_EPOCH_MS` <
+  /// `--timer`/`--deadline` via `resolveSessionDeadline`; `/timer`
+  /// adjusts it live mid-session.
+  final SessionDeadline? deadline;
+
+  /// The effective gh-1198 thinking-stream setting for the run
+  /// (`--stream-thinking` flag OR the `output.streamThinking` config,
+  /// resolved by the host): line-mode/headless runs print thinking
+  /// deltas dimmed, live, like the TUI. False — the default — keeps the
+  /// byte-identical legacy output and enables the reasoning-phase
+  /// liveness line instead.
+  final bool streamThinking;
+
+  /// The `--no-stream-thinking` hatch (gh-1433): thinking-scoped silence —
+  /// on the log face (headless runs stream thinking by default since
+  /// gh-1433) it restores the legacy thinking silence for the run. The
+  /// arg parser rejects it together with `--stream-thinking`.
+  final bool noStreamThinking;
+
+  /// This host's machine name for `name@machine` addressing (issue #27
+  /// phase 2): a `@machine` suffix matching it is stripped before local
+  /// resolution; other machines are phase-3 A2A territory. Null when the
+  /// hostname is unavailable.
+  final String? machineName;
+
+  /// The effective stuck supervision for THIS host (gh-1054, gated per
+  /// gh-1632 I1): an explicit `agent.stuckTool:` wins everywhere;
+  /// otherwise the autonomous default applies in EVERY mode — interactive
+  /// REPL/TUI sessions included. The implicit interactive-advisory branch
+  /// (gh-1054 review) is what left the gh-1632 incident session hanging 27
+  /// minutes on a dead `git fetch`: the stuck flag fired, no escalation
+  /// ever followed. `advisory` stays reachable ONLY via explicit config
+  /// (`agent.stuckTool.followUp: advisory`).
+  StuckToolConfig effectiveStuckTool() {
+    final configured = stuckTool;
+    if (configured != null) return configured;
+    return const StuckToolConfig();
+  }
+}

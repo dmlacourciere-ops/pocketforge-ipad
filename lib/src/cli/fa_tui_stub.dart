@@ -1,0 +1,218 @@
+/// Web-safe stub for `fa_tui.dart` (the dart_tui-based interactive REPL).
+///
+/// The real TUI needs a raw terminal (`dart:io`, `dart:ffi`), which web
+/// builds lack — `agent_cli.dart` is exported from the web-compiled root
+/// library, so it imports this file conditionally:
+///
+/// ```dart
+/// import 'fa_tui_stub.dart' if (dart.library.io) 'fa_tui.dart';
+/// ```
+///
+/// The stub mirrors the host-facing API ([FaTuiCallbacks],
+/// [FaTuiController]) with no-op behavior; on web `useTui` is always false,
+/// so a controller is never actually run. The model/message classes
+/// (FaTuiModel, OutputMsg, BusyMsg, OpenPickerMsg, DrainQueueMsg) are
+/// VM-only and not part of this surface.
+library;
+
+import 'agent_hub_tui.dart';
+import 'paste_image.dart';
+import 'sigint_action.dart';
+import 'subagent_board.dart';
+import 'termios_guard.dart' show SttyRunner;
+import 'tui_prompt.dart';
+import 'tui_repl.dart' show MenuItem, TuiProgramHooks;
+import 'tui_status_line.dart' show StatusLineSnapshot, TuiStatusLine;
+
+/// A waiting-row timer (due-at epoch ms, one-line preview) — mirrors the
+/// VM fa_tui.dart alias (issue #1997).
+typedef WaitingTimer = ({int dueMs, String preview});
+
+/// Stub mirror of fa_tui.dart's busy forensic sink (never fires here).
+void Function(String line)? faTuiBusyDiagnostics;
+
+/// Host callbacks supplied by [AgentCli] to the dart_tui REPL. See
+/// `fa_tui.dart` for field docs.
+final class FaTuiCallbacks {
+  const FaTuiCallbacks({
+    required this.onSubmit,
+    required this.onModelSelected,
+    required this.buildSlashMenu,
+    required this.buildModelMenu,
+    this.buildImportSessionsMenu,
+    required this.statusLine,
+    required this.prompt,
+    this.onInterrupt,
+    this.onCtrlCExit,
+    this.isShiftPressed,
+    this.opensPicker,
+    this.onPickerSelected,
+    this.onPickerCancelled,
+    this.onSteer,
+    this.onBudgetAccept,
+    this.pathCandidates,
+    this.onHubAction,
+    this.readClipboardImage,
+    this.readClipboardText,
+    this.statusSnapshot,
+    this.statusLineEngine,
+  });
+
+  final Future<void> Function(String line, {List<TuiImageAttachment> images})
+  onSubmit;
+  final Future<void> Function(String modelId) onModelSelected;
+  final List<MenuItem> Function(String prefix) buildSlashMenu;
+  final List<MenuItem> Function(String filter, int width) buildModelMenu;
+
+  /// Rebuilds the `/import` session-search picker (issue #1562). Always
+  /// null here — the TUI never runs on web; mirrors fa_tui.dart so the
+  /// repl_boot call site compiles for BOTH targets.
+  final List<MenuItem> Function(String filter)? buildImportSessionsMenu;
+
+  final String Function() statusLine;
+  final String prompt;
+
+  /// Band composer seam (#806). Always null here — the web stub keeps
+  /// the legacy composer; see fa_tui.dart for the real contract.
+  final StatusLineSnapshot Function()? statusSnapshot;
+  final TuiStatusLine? statusLineEngine;
+  final void Function()? onInterrupt;
+  final void Function()? onCtrlCExit;
+  final bool Function()? isShiftPressed;
+  final bool Function(String key)? opensPicker;
+  final Future<void> Function(String pickerId, String key)? onPickerSelected;
+  final void Function(String pickerId)? onPickerCancelled;
+  final Future<void> Function(List<String> messages)? onSteer;
+
+  /// One-key budget-offer accept (issue #1786). See fa_tui.dart — the
+  /// field mirrors the real callbacks so the repl_boot call site
+  /// compiles for BOTH targets.
+  final bool Function()? onBudgetAccept;
+  final List<String> Function(String fragment)? pathCandidates;
+
+  /// Agents-hub overlay actions (issue #277). See fa_tui.dart.
+  final Future<void> Function(String action, String? key)? onHubAction;
+
+  /// Reads the platform pasteboard image on Ctrl+V. Always null here —
+  /// web builds report the pasteboard as unavailable (edge E1).
+  final Future<PasteboardRead> Function()? readClipboardImage;
+
+  /// Reads the platform pasteboard's text (gh-1575, Ctrl+V fallback).
+  /// Always null here — web builds never fall back to clipboard text.
+  final Future<PasteboardRead> Function()? readClipboardText;
+}
+
+/// No-op stand-in for the real TUI controller (never run on web).
+final class FaTuiController {
+  FaTuiController({
+    required this.callbacks,
+    required this.isExited,
+    // Ignored on web (the TUI never runs there); kept for signature parity
+    // with the dart_tui controller in fa_tui.dart.
+    TuiProgramHooks? programHooks,
+    bool mouseCapture = true,
+    bool? syncOutput,
+    SttyRunner? sttyRunner,
+    SigintPolicy? sigintPolicy,
+  });
+
+  final FaTuiCallbacks callbacks;
+  final bool Function() isExited;
+
+  void sendOutput(String text, {bool newline = false}) {}
+
+  void sendModelsRefresh() {}
+
+  void sendThemeChanged() {}
+  void openModelMenu() {}
+
+  void openPicker(
+    String pickerId,
+    String title,
+    List<MenuItem> items, {
+    String? initialKey,
+  }) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller so agent_cli call sites compile for BOTH targets.
+  void pushHub(FaHubState state, {bool refreshOnly = false}) {}
+
+  /// No-op on web. See [pushHub].
+  void closeHub() {}
+
+  void sendQuit() {}
+
+  void sendInputText(String text) {}
+
+  void setInputHistory(List<String> history) {}
+
+  /// No-op on web: the boot replay anchor is a VM-TUI concern (issue #446
+  /// wave-14); web never runs the controller.
+  void markReplayAnchor() {}
+
+  void sendBusy(bool busy, {String source = 'run'}) {}
+
+  /// No-op on web: the stub controller renders nothing, so silent
+  /// post-answer phase relabels (auto-compaction, memory extraction) have
+  /// no visible row to update. Mirrors the dart_tui controller's method
+  /// so agent_cli call sites compile for BOTH targets (the web build
+  /// broke when only the real controller grew this member).
+  void setBusyPhase(String phase) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller's method so agent_cli call sites compile for BOTH targets
+  /// (issue #115 scheduled-follow-ups indicator).
+  void setScheduled(int count, int? nextDueMs) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller's method so agent_cli call sites compile for BOTH targets
+  /// (issue #429 background-job board live region).
+  void setJobBoard(List<String> lines) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller's method so the subagent status board's push (gh-1415)
+  /// compiles for BOTH targets.
+  void setSubagentBoard(List<SubagentBoardRow> rows) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller's method so the run-stall push (issue #514) compiles for
+  /// BOTH targets.
+  void setRunStalled(bool stalled) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller so the visible-waiting pushes (issue #450) compile for
+  /// BOTH targets.
+  void setWaiting({
+    required List<String> jobs,
+    required List<WaitingTimer> timers,
+    int lostJobs = 0,
+  }) {}
+
+  /// No-op on web (the TUI never runs there). Mirrors the dart_tui
+  /// controller's method so /theme hot swaps compile for BOTH targets.
+  void applyTheme() {}
+
+  Future<TuiPromptAnswer?> openPrompt(TuiPromptSpec spec) async => null;
+
+  /// Constant width on web (the stub never renders). Mirrors the real
+  /// controller's terminal width accessor.
+  int get termWidth => 80;
+
+  /// Frame zero on web (the stub never animates). Mirrors the real
+  /// controller's spinner-frame accessor (gh-1446 AC5).
+  int get spinnerFrame => 0;
+
+  /// Blank on web (the stub never animates). Mirrors the real
+  /// controller's brand-frame accessor (gh-1446 AC5).
+  String get brandFrameGlyph => ' ';
+
+  Future<List<String>> drainQueue() async => const [];
+
+  void clearQueue() {}
+
+  /// No-op on web. Mirrors the dart_tui controller's method so agent_cli
+  /// call sites compile for BOTH targets (issue #830 double-press hint).
+  void armInterruptHint() {}
+
+  Future<void> run() async {}
+}

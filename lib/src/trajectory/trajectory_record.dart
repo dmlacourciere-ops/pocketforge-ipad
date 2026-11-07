@@ -1,0 +1,869 @@
+/// The trajectory ledger record model: one row of the turn-aware event
+/// ledger.
+///
+/// Ported from deepseek-harness `packages/client/ui-trajectory/src/client/
+/// trajectory-record.ts` (`TrajectoryCellKind`, `TrajectoryCellProps`
+/// data subset). A [TrajectoryRecord] is the pure-Dart projection of one
+/// session-tree event; renderers do an exhaustive switch on [TrajectoryCellKind].
+library;
+
+import '../types.dart';
+
+import 'trajectory_blobs.dart';
+
+/// Closed set of trajectory record kinds.
+enum TrajectoryCellKind {
+  /// Model/tool-set/checkpoint context changes.
+  system,
+
+  /// A user message (turn root or steering).
+  user,
+
+  /// Agent instructions, session references, plugin or skill context.
+  context,
+
+  /// A compaction or branch summary.
+  compacted,
+
+  /// A finalized assistant message.
+  message,
+
+  /// A top-level tool call (with its result once it arrives).
+  tool,
+
+  /// A nested tool call ([TrajectoryToolRecord.parentCallId] is set).
+  subtool,
+}
+
+/// Why a [TrajectorySystemRecord] was written.
+enum TrajectorySystemChange {
+  initial,
+  modelChange,
+  toolsChange,
+  thinkingLevelChange,
+  checkpoint,
+  checkpointAutoClosed,
+  contextInject,
+  sessionEnd,
+  turnEnd,
+}
+
+/// One source content block preserved in model order for the details panel.
+final class TrajectorySourceBlock {
+  /// Creates a [TrajectorySourceBlock].
+  const TrajectorySourceBlock({
+    required this.type,
+    required this.content,
+    this.attachmentName,
+    this.callId,
+    this.toolName,
+  });
+
+  /// Block type discriminator (`text`, `thinking`, `toolCall`, `image`).
+  final String type;
+
+  /// Text payload (rendered placeholder for images).
+  final String content;
+
+  /// Attachment reference name for image blocks.
+  final String? attachmentName;
+
+  /// Tool call id for `toolCall` blocks.
+  final String? callId;
+
+  /// Tool name for `toolCall` blocks.
+  final String? toolName;
+}
+
+/// An in-flight streaming content block of a partial assistant message.
+final class TrajectoryPartialBlock {
+  /// Creates a [TrajectoryPartialBlock].
+  const TrajectoryPartialBlock({required this.type, required this.content});
+
+  /// Block type discriminator.
+  final String type;
+
+  /// Accumulated text so far.
+  final String content;
+}
+
+/// Recorded inputs needed to derive assistant TTFT and decode throughput.
+final class AssistantMetricDetail {
+  /// Creates an [AssistantMetricDetail].
+  const AssistantMetricDetail({
+    required this.timingRecorded,
+    this.stepStartTime,
+    this.firstTokenTime,
+    this.completedTime,
+    required this.usageProvided,
+    this.outputTokens,
+  });
+
+  /// Whether any wall-clock timing was recorded for the step.
+  final bool timingRecorded;
+
+  /// When the request was issued.
+  final DateTime? stepStartTime;
+
+  /// Time to first token marker.
+  final DateTime? firstTokenTime;
+
+  /// When the response completed.
+  final DateTime? completedTime;
+
+  /// Whether the provider reported usage for the step.
+  final bool usageProvided;
+
+  /// Output token count, when known.
+  final int? outputTokens;
+}
+
+/// Character bound of a [TrajectoryRequestMessageSummary.preview].
+const int requestPreviewChars = 200;
+
+/// One outbound request message, summarized for the details panel.
+final class TrajectoryRequestMessageSummary {
+  /// Creates a [TrajectoryRequestMessageSummary].
+  const TrajectoryRequestMessageSummary({
+    required this.role,
+    required this.chars,
+    required this.preview,
+    this.blocks = const [],
+  });
+
+  /// Role discriminator (`user`, `assistant`, `toolResult`).
+  final String role;
+
+  /// JSON-serialized length of the message payload.
+  final int chars;
+
+  /// Bounded text preview of the message content.
+  final String preview;
+
+  /// Block structure in model order with bounded full texts and image
+  /// markers (F3). Empty when not captured (old sessions, E6).
+  final List<TrajectoryRequestMessageBlock> blocks;
+
+  /// Serializes to a JSON map.
+  Map<String, dynamic> toJson() => {
+    'role': role,
+    'chars': chars,
+    'preview': preview,
+    if (blocks.isNotEmpty)
+      'blocks': [for (final block in blocks) block.toJson()],
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory TrajectoryRequestMessageSummary.fromJson(Map<String, dynamic> json) {
+    return TrajectoryRequestMessageSummary(
+      role: json['role'] as String? ?? '',
+      chars: json['chars'] as int? ?? 0,
+      preview: json['preview'] as String? ?? '',
+      blocks: [
+        for (final block in (json['blocks'] as List?) ?? const [])
+          TrajectoryRequestMessageBlock.fromJson(
+            (block as Map).cast<String, dynamic>(),
+          ),
+      ],
+    );
+  }
+}
+
+/// Cheap outbound-request summary recorded before each provider call.
+///
+/// Sizes and previews only: the full payload is already in the transcript,
+/// so the summary carries just enough for the Request tab to describe what
+/// the model was about to receive.
+final class TrajectoryRequestDetail {
+  /// Creates a [TrajectoryRequestDetail].
+  const TrajectoryRequestDetail({
+    required this.messageCount,
+    required this.systemPromptChars,
+    required this.toolCount,
+    required this.toolNames,
+    required this.messages,
+    this.systemPromptHash,
+    this.toolManifestHash,
+    this.wireDumpHash,
+    this.spillFile,
+    this.droppedMessagesCount = 0,
+    this.droppedMessagesChars = 0,
+  });
+
+  /// Number of messages in the outbound request.
+  final int messageCount;
+
+  /// Length of the system prompt, when one was sent.
+  final int systemPromptChars;
+
+  /// Number of tools advertised with the request.
+  final int toolCount;
+
+  /// Advertised tool names, in request order.
+  final List<String> toolNames;
+
+  /// Per-message summaries, in request order.
+  final List<TrajectoryRequestMessageSummary> messages;
+
+  /// Pointer into the session's prompt-blob table (F1); null when the
+  /// prompt text was not captured for this session (E6).
+  final String? systemPromptHash;
+
+  /// Pointer into the session's manifest-blob table (F2); null when not
+  /// captured (E6).
+  final String? toolManifestHash;
+
+  /// Pointer into the session's wire-dump table (F5); null when wire
+  /// dumps are off or not captured.
+  final String? wireDumpHash;
+
+  /// Relative path of the gh-1745 request blob carrying this request's
+  /// FULL detail (per-message previews and block texts) —
+  /// `.fah/trajectories/<sid>/requests/<n>.json`. Null on legacy sessions
+  /// and when the host spills nothing (kill switch, failed write): the
+  /// record then carries its detail inline as it always did.
+  final String? spillFile;
+
+  /// How many OLDER messages the stripped record folded out of [messages]
+  /// into a size aggregate (issue #1882 AC1) — zero when nothing was
+  /// folded (small requests, legacy records).
+  final int droppedMessagesCount;
+
+  /// Σ `chars` of the folded messages: together with [messages]' own Σ
+  /// chars this keeps the usage-estimation basis truthful without
+  /// embedding every stub.
+  final int droppedMessagesChars;
+
+  /// Serializes to a JSON map.
+  Map<String, dynamic> toJson() => {
+    'messageCount': messageCount,
+    'systemPromptChars': systemPromptChars,
+    'toolCount': toolCount,
+    'toolNames': toolNames,
+    'messages': [for (final message in messages) message.toJson()],
+    if (systemPromptHash != null) 'systemPromptHash': systemPromptHash,
+    if (toolManifestHash != null) 'toolManifestHash': toolManifestHash,
+    if (wireDumpHash != null) 'wireDumpHash': wireDumpHash,
+    if (spillFile != null) 'spillFile': spillFile,
+    if (droppedMessagesCount > 0)
+      'droppedMessages': {
+        'count': droppedMessagesCount,
+        'chars': droppedMessagesChars,
+      },
+  };
+
+  /// Deserializes from a JSON map produced by [toJson].
+  factory TrajectoryRequestDetail.fromJson(Map<String, dynamic> json) {
+    final dropped = json['droppedMessages'];
+    return TrajectoryRequestDetail(
+      messageCount: json['messageCount'] as int? ?? 0,
+      systemPromptChars: json['systemPromptChars'] as int? ?? 0,
+      toolCount: json['toolCount'] as int? ?? 0,
+      toolNames: [
+        for (final name in (json['toolNames'] as List?) ?? const [])
+          name as String,
+      ],
+      messages: [
+        for (final message in (json['messages'] as List?) ?? const [])
+          TrajectoryRequestMessageSummary.fromJson(
+            (message as Map).cast<String, dynamic>(),
+          ),
+      ],
+      systemPromptHash: json['systemPromptHash'] as String?,
+      toolManifestHash: json['toolManifestHash'] as String?,
+      wireDumpHash: json['wireDumpHash'] as String?,
+      spillFile: json['spillFile'] as String?,
+      droppedMessagesCount: dropped is Map ? dropped['count'] as int? ?? 0 : 0,
+      droppedMessagesChars: dropped is Map ? dropped['chars'] as int? ?? 0 : 0,
+    );
+  }
+}
+
+/// How many per-message summaries stay in FULL (preview + block texts)
+/// in a persisted `model_request_summary` record (gh-1073): a 1030-message
+/// request wrote ~0.5 MB per record — 18,753 records = 9 GB of ledger on
+/// the ticket's session. The newest [requestSummaryMaxMessages] summaries
+/// are the tail the Request tab is actually scrolled to; everything older
+/// degrades to a role+chars size stub (order and count stay truthful).
+const int requestSummaryMaxMessages = 64;
+
+/// Char budget of the full-summary portion of one `model_request_summary`
+/// record (gh-1073): a block text runs to [requestBlockChars], so 64 full
+/// messages can still reach ~1 MB — the budget stops the walk early.
+const int requestSummaryCharsBudget = 256 << 10;
+
+/// Bounds the per-message summaries of [detail] (gh-1073): newest messages
+/// keep their full summaries while both caps allow, older ones become
+/// size-only stubs. `messageCount`, sizes, tool names and hashes pass
+/// through untouched — the record keeps describing the WHOLE request, it
+/// just stops embedding every message's text. Returns [detail] itself when
+/// everything already fits.
+TrajectoryRequestDetail capTrajectoryRequestDetail(
+  TrajectoryRequestDetail detail,
+) {
+  final messages = detail.messages;
+  var fullChars = 0;
+  var fullCount = 0;
+  // Walk from the NEWEST end; the first [requestSummaryMaxMessages]
+  // messages (or until the char budget runs out) stay full.
+  for (var i = messages.length - 1; i >= 0; i--) {
+    final message = messages[i];
+    final weight =
+        message.preview.length +
+        [
+          for (final b in message.blocks) b.text.length,
+        ].fold<int>(0, (a, b) => a + b);
+    if (fullCount >= requestSummaryMaxMessages ||
+        fullChars + weight > requestSummaryCharsBudget) {
+      break;
+    }
+    fullChars += weight;
+    fullCount++;
+  }
+  if (fullCount >= messages.length) return detail;
+  final fullFrom = messages.length - fullCount;
+  return TrajectoryRequestDetail(
+    messageCount: detail.messageCount,
+    systemPromptChars: detail.systemPromptChars,
+    toolCount: detail.toolCount,
+    toolNames: detail.toolNames,
+    systemPromptHash: detail.systemPromptHash,
+    toolManifestHash: detail.toolManifestHash,
+    wireDumpHash: detail.wireDumpHash,
+    droppedMessagesCount: detail.droppedMessagesCount,
+    droppedMessagesChars: detail.droppedMessagesChars,
+    messages: [
+      for (var i = 0; i < messages.length; i++)
+        i < fullFrom
+            ? TrajectoryRequestMessageSummary(
+                role: messages[i].role,
+                chars: messages[i].chars,
+                preview: '',
+              )
+            : messages[i],
+    ],
+  );
+}
+
+/// How many role+chars stubs the STRIPPED (gh-1745 spill-path)
+/// `model_request_summary` record keeps (issue #1882 AC1): a stub is
+/// ~45 bytes of JSON, so 300 keep the stub section ≈15 KB and the whole
+/// record ≤ ~20 KB even with full tool metadata — the AC1 bound. Older
+/// messages fold into the `droppedMessages` {count, chars} aggregate (Σ
+/// chars — the usage-estimation basis — stays truthful); the spill blob
+/// carries the full per-message detail for the Request tab.
+const int requestStubMaxMessages = 300;
+
+/// Reduces [detail] to the gh-1745 lightweight in-JSONL shape: per-message
+/// role+chars stubs (no previews, no block texts — the estimation basis Σ
+/// chars stays truthful) plus the [spillFile] pointer to the request blob
+/// carrying the full detail. Counts, sizes, tool names and blob hashes
+/// pass through untouched; [wireDumpHash] overrides the pointer when the
+/// raw wire dump spilled into the same blob.
+///
+/// Issue #1882 AC1: only the newest [requestStubMaxMessages] stubs stay in
+/// the record — older messages fold into `droppedMessages` (their count
+/// and Σ chars), so a 1000+-message request no longer writes a ~50 KB
+/// record. The fold is additive on the wire (legacy readers just miss the
+/// estimate on mega-requests; counts and sizes stay exact).
+TrajectoryRequestDetail stripTrajectoryRequestDetail(
+  TrajectoryRequestDetail detail, {
+  required String spillFile,
+  String? wireDumpHash,
+}) {
+  final messages = detail.messages;
+  final keep = messages.length > requestStubMaxMessages
+      ? requestStubMaxMessages
+      : messages.length;
+  final foldedFrom = messages.length - keep;
+  var droppedCount = detail.droppedMessagesCount;
+  var droppedChars = detail.droppedMessagesChars;
+  for (var i = 0; i < foldedFrom; i++) {
+    droppedCount++;
+    droppedChars += messages[i].chars;
+  }
+  return TrajectoryRequestDetail(
+    messageCount: detail.messageCount,
+    systemPromptChars: detail.systemPromptChars,
+    toolCount: detail.toolCount,
+    toolNames: detail.toolNames,
+    systemPromptHash: detail.systemPromptHash,
+    toolManifestHash: detail.toolManifestHash,
+    wireDumpHash: wireDumpHash ?? detail.wireDumpHash,
+    spillFile: spillFile,
+    droppedMessagesCount: droppedCount,
+    droppedMessagesChars: droppedChars,
+    messages: [
+      for (var i = foldedFrom; i < messages.length; i++)
+        TrajectoryRequestMessageSummary(
+          role: messages[i].role,
+          chars: messages[i].chars,
+          preview: '',
+        ),
+    ],
+  );
+}
+
+/// Base of the trajectory ledger hierarchy.
+///
+/// Sealed counterpart of the TS `TrajectoryCellProps` union over record
+/// kinds. Every record has a 1-based [index], a stable [recordId], and a
+/// [kind] consumed by exhaustive renderer switches.
+sealed class TrajectoryRecord {
+  /// Creates a [TrajectoryRecord].
+  const TrajectoryRecord({required this.index, required this.recordId});
+
+  /// 1-based record index shown as `#N`.
+  final int index;
+
+  /// Stable identity surviving prepends of older projected records.
+  final String recordId;
+
+  /// Closed-set kind for exhaustive renderer dispatch.
+  TrajectoryCellKind get kind;
+}
+
+/// A finalized assistant response row (`message` kind).
+final class TrajectoryAssistantRecord extends TrajectoryRecord {
+  /// Creates a [TrajectoryAssistantRecord].
+  const TrajectoryAssistantRecord({
+    required super.index,
+    required super.recordId,
+    required this.messageId,
+    required this.turn,
+    required this.step,
+    this.provider,
+    this.model,
+    this.usage,
+    this.inputTokens,
+    this.cacheReadTokens,
+    this.cacheWriteTokens,
+    this.outputTokens,
+    this.reasoningTokens,
+    this.stepStartTime,
+    this.firstTokenTime,
+    this.completedTime,
+    this.sourceBlocks = const [],
+    this.outputBlocks = const [],
+    this.partialBlocks = const [],
+    this.schemaDetail,
+    this.thinkingDetail,
+    this.inputDetail,
+    this.outputDetail,
+    this.promptDetail,
+    this.previousPromptDetail,
+    this.timeSeconds,
+    this.isError,
+    this.errorCode,
+    this.errorMessage,
+    this.requestOnly = false,
+    this.displayText = '',
+    this.requestDetail,
+  });
+
+  /// Outbound-request summary captured before this step's provider call.
+  final TrajectoryRequestDetail? requestDetail;
+
+  /// Session record id of the owning message.
+  final String messageId;
+
+  /// 1-based model turn this step belongs to.
+  final int turn;
+
+  /// 1-based assistant step within [turn].
+  final int step;
+
+  /// Provider id, when known.
+  final String? provider;
+
+  /// Model id, when known.
+  final String? model;
+
+  /// Full token/cost accounting for this response.
+  final Usage? usage;
+
+  /// Prompt token count.
+  final int? inputTokens;
+
+  /// Input tokens served from a provider cache.
+  final int? cacheReadTokens;
+
+  /// Input tokens written into a provider cache.
+  final int? cacheWriteTokens;
+
+  /// Completion token count.
+  final int? outputTokens;
+
+  /// Reasoning token count, when reported.
+  final int? reasoningTokens;
+
+  /// Wall-clock time the request was issued.
+  final DateTime? stepStartTime;
+
+  /// Time-to-first-token marker.
+  final DateTime? firstTokenTime;
+
+  /// Wall-clock time the response completed.
+  final DateTime? completedTime;
+
+  /// Original message blocks in source order.
+  final List<TrajectorySourceBlock> sourceBlocks;
+
+  /// Finalized output blocks in source order.
+  final List<TrajectorySourceBlock> outputBlocks;
+
+  /// In-flight streaming blocks (finalized rows keep this empty).
+  final List<TrajectoryPartialBlock> partialBlocks;
+
+  /// Call-time model-visible tool schema (markdown).
+  final String? schemaDetail;
+
+  /// Full reasoning text.
+  final String? thinkingDetail;
+
+  /// Full request content (markdown).
+  final String? inputDetail;
+
+  /// Full response content (markdown).
+  final String? outputDetail;
+
+  /// Conversation prompt snapshot introduced with this step (markdown).
+  final String? promptDetail;
+
+  /// Conversation prompt snapshot replaced by this step (markdown).
+  final String? previousPromptDetail;
+
+  /// Wall-clock duration; null while the step is running.
+  final Duration? timeSeconds;
+
+  /// Whether the response failed or was aborted.
+  final bool? isError;
+
+  /// Provider/machine error code, when known.
+  final String? errorCode;
+
+  /// Human-readable error description.
+  final String? errorMessage;
+
+  /// Whether the row is a request-only separator without a message record.
+  final bool requestOnly;
+
+  /// Fallback row label when the message has no visible content.
+  final String displayText;
+
+  /// Identity/summary entries shared by the lossless JSON export
+  /// (`trajectory_export.dart`) and the UI cell JSON (fa_ui
+  /// `trajectory_cell.dart`); both extend this map with their own fields.
+  Map<String, dynamic> identityJson() => {
+    'messageId': messageId,
+    'turn': turn,
+    'step': step,
+    'provider': provider,
+    'model': model,
+    'usage': usage?.toJson(),
+    'thinkingDetail': thinkingDetail,
+  };
+
+  @override
+  TrajectoryCellKind get kind => TrajectoryCellKind.message;
+}
+
+/// A tool (or nested subtool) call row with its result once it arrives.
+final class TrajectoryToolRecord extends TrajectoryRecord {
+  /// Creates a [TrajectoryToolRecord].
+  const TrajectoryToolRecord({
+    required super.index,
+    required super.recordId,
+    required this.callId,
+    required this.parentCallId,
+    required this.name,
+    required this.argsRaw,
+    this.result = '',
+    this.resultPreviewMarkdown,
+    this.isError = false,
+    this.timeSeconds,
+    this.startedAt,
+  });
+
+  /// Provider-assigned tool call id.
+  final String callId;
+
+  /// Call id of the enclosing tool call, or null for a top-level call.
+  final String? parentCallId;
+
+  /// Invoked tool name.
+  final String name;
+
+  /// Raw JSON arguments of the call.
+  final String argsRaw;
+
+  /// Result text; empty while the call is running.
+  final String result;
+
+  /// Raw Markdown source of the result summary.
+  final String? resultPreviewMarkdown;
+
+  /// Whether the tool execution failed.
+  final bool isError;
+
+  /// Own duration; null while running.
+  final Duration? timeSeconds;
+
+  /// Wall-clock start of the execution, when known.
+  final DateTime? startedAt;
+
+  @override
+  TrajectoryCellKind get kind => parentCallId == null
+      ? TrajectoryCellKind.tool
+      : TrajectoryCellKind.subtool;
+
+  /// A copy with the result of the call applied.
+  TrajectoryToolRecord withResult({
+    required String result,
+    required bool isError,
+    Duration? timeSeconds,
+  }) {
+    return TrajectoryToolRecord(
+      index: index,
+      recordId: recordId,
+      callId: callId,
+      parentCallId: parentCallId,
+      name: name,
+      argsRaw: argsRaw,
+      result: result,
+      resultPreviewMarkdown: resultPreviewMarkdown ?? result,
+      isError: isError,
+      timeSeconds: timeSeconds ?? this.timeSeconds,
+      startedAt: startedAt,
+    );
+  }
+
+  /// A copy with the execution start stamped.
+  TrajectoryToolRecord withStartedAt(DateTime startedAt) {
+    return TrajectoryToolRecord(
+      index: index,
+      recordId: recordId,
+      callId: callId,
+      parentCallId: parentCallId,
+      name: name,
+      argsRaw: argsRaw,
+      result: result,
+      resultPreviewMarkdown: resultPreviewMarkdown,
+      isError: isError,
+      timeSeconds: timeSeconds,
+      startedAt: startedAt,
+    );
+  }
+}
+
+/// A user message row (`user` kind).
+final class TrajectoryUserRecord extends TrajectoryRecord {
+  /// Creates a [TrajectoryUserRecord].
+  const TrajectoryUserRecord({
+    required super.index,
+    required super.recordId,
+    required this.text,
+    this.previewMarkdown,
+    this.sourceBlocks = const [],
+    required this.opensTurn,
+    this.inputDetail,
+    this.startedAt,
+    this.sourceSeq,
+  });
+
+  /// Plain-text content of the message.
+  final String text;
+
+  /// Raw Markdown source of the single-line summary.
+  final String? previewMarkdown;
+
+  /// Original content blocks in source order.
+  final List<TrajectorySourceBlock> sourceBlocks;
+
+  /// Whether this message opens a new model turn (no parent user message).
+  final bool opensTurn;
+
+  /// Full request content for the details panel (markdown).
+  final String? inputDetail;
+
+  /// Wall-clock time the message was appended.
+  final DateTime? startedAt;
+
+  /// Source event seq for cross-record navigation, when the host has one.
+  final int? sourceSeq;
+
+  @override
+  TrajectoryCellKind get kind => TrajectoryCellKind.user;
+}
+
+/// An application context-injection row (`context` kind).
+final class TrajectoryContextRecord extends TrajectoryRecord {
+  /// Creates a [TrajectoryContextRecord].
+  const TrajectoryContextRecord({
+    required super.index,
+    required super.recordId,
+    required this.text,
+    this.previewMarkdown,
+    this.sourceSeq,
+    this.startedAt,
+  });
+
+  /// Plain-text content of the injection.
+  final String text;
+
+  /// Raw Markdown source of the single-line summary.
+  final String? previewMarkdown;
+
+  /// Source event seq for cross-record navigation, when the host has one.
+  final int? sourceSeq;
+
+  /// Wall-clock time the injection was appended, when known.
+  final DateTime? startedAt;
+
+  @override
+  TrajectoryCellKind get kind => TrajectoryCellKind.context;
+}
+
+/// A compaction or branch-summary row (`compacted` kind).
+final class TrajectoryCompactedRecord extends TrajectoryRecord {
+  /// Creates a [TrajectoryCompactedRecord].
+  const TrajectoryCompactedRecord({
+    required super.index,
+    required super.recordId,
+    required this.text,
+    required this.summary,
+    this.firstKeptEntryId,
+    this.timeSeconds,
+    this.startedAt,
+    this.interrupted = false,
+    this.hiddenRecordIds,
+  });
+
+  /// Bounded preview of the summary.
+  final String text;
+
+  /// Full summary text.
+  final String summary;
+
+  /// Id of the first record kept verbatim after the summary.
+  final String? firstKeptEntryId;
+
+  /// How long the compaction took; null when unknown.
+  final Duration? timeSeconds;
+
+  /// Wall-clock time the compaction completed.
+  final DateTime? startedAt;
+
+  /// Whether the compaction was interrupted before it finished.
+  final bool interrupted;
+
+  /// Ids of the records covered by a hidden-range event (F4), when this
+  /// row projects one. Null for plain compactions; the covered records
+  /// resolve lazily from the session storage on drill-in — never
+  /// preloaded into the snapshot (AC5).
+  final List<String>? hiddenRecordIds;
+
+  @override
+  TrajectoryCellKind get kind => TrajectoryCellKind.compacted;
+}
+
+/// A session-state change row (`system` kind).
+final class TrajectorySystemRecord extends TrajectoryRecord {
+  /// Creates a [TrajectorySystemRecord].
+  const TrajectorySystemRecord({
+    required super.index,
+    required super.recordId,
+    required this.text,
+    required this.change,
+    this.detail,
+    this.time,
+    this.errorCode,
+    this.errorMessage,
+    this.activeToolNames,
+    this.systemPromptHash,
+    this.previousSystemPromptHash,
+    this.toolManifestHash,
+    this.previousToolManifestHash,
+  });
+
+  /// Short human-readable description of the change.
+  final String text;
+
+  /// Which session-level state changed.
+  final TrajectorySystemChange change;
+
+  /// Full change detail (markdown), when the host records one.
+  final String? detail;
+
+  /// Wall-clock time of the change.
+  final DateTime? time;
+
+  /// Error code for a failed turn end, when known.
+  final String? errorCode;
+
+  /// Error description for a failed turn end.
+  final String? errorMessage;
+
+  /// Active tool names for a `toolsChange` row (F7b: the tab renders the
+  /// real set instead of an unconditional missing stub). Null otherwise.
+  final List<String>? activeToolNames;
+
+  /// Prompt-blob pointer active from this row on (F7a: the System-prompt
+  /// tab renders the full text from the blob table instead of a stub).
+  /// Null when not captured (E6). [previousSystemPromptHash] enables the
+  /// diff view between prompt versions.
+  final String? systemPromptHash;
+  final String? previousSystemPromptHash;
+
+  /// Manifest-blob pointer active from this row on, plus the previous
+  /// version for the tool diff (F2/F7b). Null when not captured.
+  final String? toolManifestHash;
+  final String? previousToolManifestHash;
+
+  /// Returns a copy with the blob-table pointers stamped by the snapshot
+  /// builder when the row's following request summary lands (F7): the
+  /// full system prompt / tool manifest active from this row on, plus the
+  /// previous versions for the diff views. Null fields pass through.
+  TrajectorySystemRecord withHashes({
+    String? systemPromptHash,
+    String? previousSystemPromptHash,
+    String? toolManifestHash,
+    String? previousToolManifestHash,
+  }) => TrajectorySystemRecord(
+    index: index,
+    recordId: recordId,
+    text: text,
+    change: change,
+    detail: detail,
+    time: time,
+    errorCode: errorCode,
+    errorMessage: errorMessage,
+    activeToolNames: activeToolNames,
+    systemPromptHash: systemPromptHash ?? this.systemPromptHash,
+    previousSystemPromptHash:
+        previousSystemPromptHash ?? this.previousSystemPromptHash,
+    toolManifestHash: toolManifestHash ?? this.toolManifestHash,
+    previousToolManifestHash:
+        previousToolManifestHash ?? this.previousToolManifestHash,
+  );
+  @override
+  TrajectoryCellKind get kind => TrajectoryCellKind.system;
+}
+
+/// Resolves the identity that survives prepending older projected records.
+///
+/// Ported from the TS `trajectoryRecordId`: an explicit [recordId] wins,
+/// then the owning tool [callId], then the host [sourceSeq], and finally the
+/// [index] fixture fallback.
+String trajectoryRecordId({
+  required String kind,
+  String? recordId,
+  String? callId,
+  int? sourceSeq,
+  required int index,
+}) {
+  if (recordId != null) return recordId;
+  if (callId != null) return '$kind\u0000call\u0000$callId';
+  if (sourceSeq != null) return '$kind\u0000seq\u0000$sourceSeq';
+  return '$kind\u0000index\u0000$index';
+}

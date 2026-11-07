@@ -1,0 +1,235 @@
+# crap4dart configuration for the flutter_app package.
+# https://github.com/IstiN/crap4dart
+#
+# RATCHET (issue #433): the threshold is pinned at the CURRENT worst score
+# measured by the SAME pipeline the CI gate uses — `flutter test --coverage`
+# lcov (E2: widget-test coverage differs from the core's dart lcov, so the
+# number must come from this pipeline, not the core's).
+# Bootstrap (2026-09-15): 2450.0 — `JsAppEngine._faCall` (CC 49, 0% line
+# coverage). Descent #1 (same day): the issue's three named offenders went
+# under the next milestone line (CRAP ≤ 40 each) and the threshold followed
+# the measured new worst: 2450.0 → 870.0 (`wasm_shell_git.run` and
+# `main`, CC 29 at 0% coverage). Descent #2 (issue #475): both beasts
+# decomposed into route-table dispatch + per-family handlers with a 51-test
+# golden suite, and the cluster's own 812/702/600/506 beasts went down with
+# them; the threshold follows the new measured worst: 870.0 → 650.0
+# (`runCodemieSsoFlow`, CC 25 at 0% cov — another lane's ladder card).
+# Descent #9 (issue #485): the on-device provider stream functions moved to
+# one shared pump + codec walk (lib/on_device/), and the beasts went down
+# with them — gemma 992 → 9, transformers.js 552/506 → 17/1, webllm 420 → 6
+# (all fully covered by the provider suites + the new codec-table/pump
+# tests); the threshold follows the measured new worst: 650.0 → 380.0
+# (`WasiSandboxShell._runStage`, CC 19 at 0% cov — the wasm_shell cluster,
+# another lane's ladder card).
+# Pushes may only make the codebase BETTER,
+# never worse; scripts/check_crap_guards.py --only-down rejects a raised
+# threshold in CI. The staged ladder continues in follow-up cards:
+# 870 → … → 40 (see AGENTS.md "Quality gates"). Re-measure after each fix:
+# cd flutter_app && flutter test --coverage &&
+# dart pub global run crap4dart analyze.
+
+sources: [lib]
+
+# Same generated set as the root config (E1 parity — asserted by
+# scripts/check_crap_guards.py).
+exclude:
+  - '**.g.dart'
+  - '**.freezed.dart'
+  - '**.mocks.dart'
+  - 'build/**'
+
+crap:
+  enabled: true
+  # Current max CRAP score in flutter_app/lib under the flutter lcov
+  # pipeline. Descent #10 (issue #558): the wasm_shell pipeline-engine
+  # cluster went down (_runStage 380→4, _runPipeline 210→4, _evalExpr
+  # 182→3, _rewriteRelativeArgs 110→2, _maybeRewritePath 72→3, all 100%
+  # covered by test/wasm_shell_pipeline_test.dart); the threshold follows
+  # the measured new worst: 380.0 → 272.0 (`WasiSandboxShell._xargsBuiltin`,
+  # CC 16 at 0% cov — the wasm_shell builtins cluster, the next lane's
+  # ladder card). Only down.
+  # Descent #11 (issue #559): the wasm_shell builtins cluster went down
+  # (xargs 272→7, _parsePrimary 210→3, _testBuiltin 132→9, du 132→3,
+  # tac 90→6, tr 25.9→4, pip 72→3, _expandTrSet 30.8→gone — table/spec
+  # driven parse helpers now live in wasm_shell_builtins.dart with direct
+  # unit tests, the exec halves are covered e2e in
+  # test/wasm_shell_pipeline_test.dart); the threshold follows the
+  # measured new worst: 272.0 → 210.0 (`GemmaService.chatStream`, CC 14
+  # at 0% cov — another lane's ladder card). Only down.
+  # Descent #12 (issue #701): the 0%-coverage trio went down (_statBuiltin
+  # 156→12.1 @ 91% cov via test/wasm_shell_stat_test.dart, isFaCliInstalled
+  # 110→6 via the extracted faCliProbe seam + test/sessions_root_test.dart,
+  # _showAppMenu 90→9 @ 100% cov via test/apps/apps_panel_menu_test.dart);
+  # the threshold follows the measured new worst: 210.0 → 30.0 (the CC-5
+  # 0%-cov tier: routeExtHostMessage, codemie _createController, attached
+  # _AttachedRow.build, GemmaService.loadModel — the next ladder cards).
+  # Re-measured on the CI pipeline (app-crap-gate run 35479048998): local
+  # lcov is impossible on the agent cube (the flutter coverage collector
+  # canonicalizes source paths and lstat EPERMs through .worktrees). Only
+  # down.
+  # TEMP raise (owner call 2026-09-26, mirrors dmtools-dart #256): the #955
+  # network-mode merge shipped widgets without tests — max CRAP 72.0
+  # (_ChannelRailState._createChannel, CC 8 @ 0% cov). Restore to 30.0 via
+  # the linked issue.
+  # raise-issue: gh-992
+  # Restored (gh-992, 2026-09-27): the agents/enroll DAP-tab rework
+  # (fcd2d0232) covered the #955 network UI — 5 enroll dialog groups +
+  # channel_rail/chat_page call-site suites, 72 focused tests; re-measured
+  # on the full local flutter lcov (3292 green): max CRAP 30.0, the
+  # threshold follows back down 75.0 → 30.0. Only down.
+  # TEMP raise (crap4dart 0.11.0 -> 0.14.2 migration, PR #1637, mirrors the
+  # core repin in gh-1234): the new analyzer counts pattern-matching/switch
+  # complexity higher, re-measuring the sandbox cluster above the old 30.0
+  # line. Measured on the CI pipeline (app-crap-gate, run 39295865454
+  # crap_report artifact): max CRAP 74.13 (`MemoryShell._runCommand`, CC 74
+  # @ 97% cov), then 43.59 (`WasiSandboxShell._runBuiltin`, CC 43 @ 93%),
+  # 42.0 (`WasmSshCommands.builtinsFor`, CC 6 @ 0%), 40.58
+  # (_connectionDisplayName, CC 12 @ 42%), 39.0 (detectLanguage, CC 39 @
+  # 100%), 33.58 (_interpretEchoEscapes, CC 11 @ 43%). Restore to 30.0 by
+  # decomposing the cluster under 0.14.2.
+  # raise-issue: gh-1713
+  # Restored (gh-1713, 2026-10-21): the sandbox cluster decomposed under
+  # 0.14.2 — MemoryShell._runCommand 74→3 (route-table dispatch, the #558
+  # pattern: static _commandRoutes + per-command closures, aliases and the
+  # checksum family as entries), WasiSandboxShell._runBuiltin 43→2 (the
+  # same treatment: _builtinRoutes), detectLanguage 39→3 (_extensionLanguages
+  # data table), _connectionDisplayName 12→5 (+ _presetDisplayName 2, the
+  # _presetDisplayNames data table), _interpretEchoEscapes 11→3 (+ the
+  # _echoEscapeAt seam and the _echoEscapes data table, covered by the
+  # echo -e test in test/memory_shell_test.dart), and the 0%-cov
+  # builtinsFor (6) covered by test/wasm_shell_ssh_builtins_test.dart.
+  # Existing suites stay green (473 tests across the touched shell/guard
+  # suites locally). The threshold follows back down 74.13 → 30.0. Only
+  # down; re-measure on the CI pipeline (local lcov stays impossible).
+  # Descent #13 (issue #1848 tier 1, the app ladder 30→24): the card's
+  # 13-method hit list went down — the five 0%-cov CC-5 methods covered
+  # by branch tests (_faPrefixGranted, _toPluginMessage, appLauncher,
+  # setSkillsAccess, _sendTestReport), grepText/_stage/expandGlobPattern
+  # decomposed by concern (slim loop/expression dispatcher + per-arm
+  # private helpers, error text byte-identical — the established #558
+  # pattern), and the 29-42%-cov quartet covered (_sweepStalePipeDirs,
+  # _filteredApps, the _ensureSession pair, _acquireCredentials).
+  # flutter test is unavailable on the fleet lane (host guard SIGKills
+  # dart; flutter cache EPERM), so the per-method AFTER scores are
+  # projections from the measured CRAP anchors (0% cov → CC²+CC, 100%
+  # cov → CC; CC9@100% = 9.00 and CC5@0% = 30.00 measured on the same
+  # pipeline in gh-1848 tier 0/fa_llm) — the measured before/after table
+  # belongs to the app-crap-gate run on this PR. The ≈23 cluster
+  # (collectStageRedirects, parsePipArgs, CC 23 @ 100% cov) came down with
+  # tier 3: every method above 18 on the gate's own merged lcov either
+  # decomposed (the >24 CC beasts and the ≈18-23 CC11-23 band into
+  # ≤CC7 pieces; the CI-0% CC4 family into ≤CC3 pieces so CRAP ≤ 12 at
+  # 0% cov — the engine suite skips on ubuntu, so coverage can never land
+  # there) or, for the four remaining >18 outliers, the same split. The
+  # threshold follows the tier line 24.0 → 18.0 → 12.0 (tier 4 swept the
+  # whole 12-18 band: 105 methods, pieces ≤CC5 at ≥85% cov, ≤CC4 at
+  # 50-84%, ≤CC3 below). Only down.
+  threshold: 12.0
+
+coverage:
+  # The CI app-crap-gate job merges the two flutter-tests shard reports
+  # (scripts/merge_lcov.py) right before the CRAP step. Pre-commit stays
+  # core-only: flutter coverage is too heavy for every commit.
+  lcov_path: coverage/lcov.info
+  required: true
+  # flutter's lcov carries no BRDA branch records; branch coverage stays
+  # a core-package gate concern.
+  branch_coverage: false
+  # crap4dart 0.9.5 flipped the run_tests default to true — a bare
+  # `analyze`/`check` would silently re-run the whole flutter suite
+  # first. Coverage comes from the CI shard merge (scripts/merge_lcov.py)
+  # and pre-commit stays core-only (#433 split); nobody wants a second
+  # suite run inside a 6-minute gate job.
+  run_tests: false
+
+# ─── Gates (issue #447) ────────────────────────────────────────────────────
+# This config is the single source of which gates `crap4dart check` runs
+# (CI app-crap-gate job, pre-commit core hook): 0.9.5 default-enables ALL
+# built-in gates, so everything not enforced below is disabled explicitly
+# (gh-1738: `similarity` is 0.15.0-only and ships default-off; it is
+# pinned OFF explicitly below so the invariant survives future defaults).
+gates:
+  # Issue #1234: whole-tree ≤2800-line guard (was scripts/ci_fast_gate.sh
+  # stage_size + the ci.yml shell guard). agent_service.dart and
+  # wasm_shell.dart sit under 2800 today; the app_localizations*.dart
+  # pattern covers ALL gen-l10n output (base + every locale variant —
+  # en/ru today, future locales automatically): generated files no human
+  # edits, excluded here, not baselined.
+  loc:
+    enabled: true
+    max_lines: 2800
+    exclude:
+      - 'lib/l10n/app_localizations*.dart'
+  test_coverage: {enabled: false} # own ≥80% coverage-gate job
+  complexity: {enabled: false} # CRAP ratchet below already covers it
+  method_size: {enabled: false}
+  nesting: {enabled: false}
+  class_size: {enabled: false}
+  weight_of_class: {enabled: false}
+  unused_code: {enabled: false}
+  unused_files: {enabled: false}
+  banned_imports: {enabled: false}
+  duplication: {enabled: false} # own jscpd <1% guard (global %) — 0.10.0's
+    # `duplication.sources` cross-module key stays available if the jscpd
+    # guards are ever retired (mirrors the root crap4dart.yaml)
+  file_naming: {enabled: false}
+  magic_constants: {enabled: false}
+  test_assertions: {enabled: false}
+  folder_structure: {enabled: false}
+  external: {enabled: false}
+  public_docs: {enabled: false}
+  # gh-1738: similarity ships default-off (0.15.0) and stays off HERE on
+  # purpose — the ROOT config's whole-tree gate (md+dart, own excludes +
+  # baseline) already covers flutter_app/ plus packages/ and everything
+  # else; a second scanner here would double-scan and fork the baseline.
+  # Kept explicit so this config's "everything not enforced below is
+  # disabled" invariant stays literally true as gates are added upstream.
+  similarity: {enabled: false}
+
+  # Pixel gate over the golden set (165 PNGs). severity: warning + the
+  # excludes below are the documented INTERIM mitigation (#447): the
+  # 0.9.5 detector knows only 3 shapes — it missed both classes that
+  # broke the 40 pre-font goldens of de2f11b9 (solid Ahem text
+  # rectangles, hollow icon squares without an X) and false-positives on:
+  #   - the Habit Tracker checkmark tile (green square + white V
+  #     converging like an X signature; light theme only, the same 22px
+  #     tile at x=234 in all 5 hits),
+  #   - the yellow "25:00" digits on the dark timer card (row y=195 of
+  #     apps_panel/panel_dark: yellow glyph edges alternate with the
+  #     dark card ≥8px with ≥4 transitions — passes the stripe
+  #     heuristic).
+  # crap4dart >=0.14.2 fixed the upstream detector bugs (checkmark V,
+  # yellow-on-dark digits, copy-icon panels, checkbox squares) — the
+  # six old excludes are gone and severity is ERROR. One documented
+  # residual, re-verify via scripts/check_golden_detector.py.
+  broken_goldens:
+    enabled: true
+    severity: error
+    dirs: [test/golden/goldens]
+    exclude:
+      # false positive (only remaining): the white dock-tile row reads
+      # as solid glyph rectangles — same shape as Ahem text, no
+      # geometric discriminator; upstream issue comment documents it.
+      - 'test/golden/goldens/onboarding_p3_dark_phone.png'
+
+  # Widget → golden coverage. WARNING (not error): the 0.9.5 widget
+  # census is broader than the enforced test/golden/golden_guard_test.dart
+  # list — 10.5% of lib/ widgets have goldens today. Flip to error when
+  # the census reaches parity with the guard (follow-up card).
+  golden:
+    enabled: true
+    severity: warning
+
+  # Tooltips/labels — the app ships to stores. WARNING: 28+ interactive
+  # widgets lack labels today (InkWell/GestureDetector semantics).
+  # Flip to error after the a11y sweep card lands.
+  accessibility:
+    enabled: true
+    severity: warning
+
+  # l10n discipline (we already ship _ru goldens). WARNING: the sweep of
+  # remaining labelText/hintText/tooltip literals is pending.
+  # Flip to error when lib/ is clean.
+  hardcoded_strings:
+    enabled: true
+    severity: warning

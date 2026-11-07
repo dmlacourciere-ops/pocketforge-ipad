@@ -1,0 +1,1450 @@
+import 'dart:convert';
+
+import 'package:flutter_agent_harness/src/agent/agent_loop.dart';
+import 'package:flutter_agent_harness/src/context.dart';
+import 'package:flutter_agent_harness/src/session/session_record.dart';
+import 'package:flutter_agent_harness/src/tools/checkpoint_tool.dart';
+import 'package:flutter_agent_harness/src/trajectory/trajectory_blobs.dart';
+import 'package:flutter_agent_harness/src/trajectory/trajectory_record.dart';
+import 'package:flutter_agent_harness/src/trajectory/trajectory_snapshot.dart';
+import 'package:flutter_agent_harness/src/trajectory/trajectory_snapshot_builder.dart';
+import 'package:flutter_agent_harness/src/types.dart';
+import 'package:test/test.dart';
+
+final _base = DateTime.utc(2026, 1, 1, 12);
+
+DateTime _at(int seconds) => _base.add(Duration(seconds: seconds));
+
+MessageRecord _userRecord(String id, {String? parentId, String text = 'hi'}) =>
+    MessageRecord(
+      id: id,
+      parentId: parentId,
+      timestamp: _at(0),
+      message: UserMessage.text(text),
+    );
+
+MessageRecord _assistantRecord(
+  String id, {
+  String? parentId,
+  List<ContentBlock> content = const [TextContent(text: 'answer')],
+  StopReason stopReason = StopReason.stop,
+  String? errorMessage,
+  Usage? usage,
+}) {
+  return MessageRecord(
+    id: id,
+    parentId: parentId,
+    timestamp: _at(1),
+    message: AssistantMessage(
+      content: content,
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      model: 'claude-test',
+      usage:
+          usage ??
+          const Usage(
+            input: 100,
+            output: 20,
+            cacheRead: 30,
+            cacheWrite: 5,
+            reasoning: 8,
+            totalTokens: 163,
+            cost: UsageCost(),
+          ),
+      stopReason: stopReason,
+      errorMessage: errorMessage,
+      timestamp: _at(1),
+    ),
+  );
+}
+
+ToolCall _toolCall(
+  String id, {
+  String name = 'bash',
+  Map<String, dynamic>? args,
+  String? parentCallId,
+}) => ToolCall(
+  id: id,
+  name: name,
+  arguments: args ?? const {'cmd': 'ls'},
+  parentCallId: parentCallId,
+);
+
+MessageRecord _toolResultRecord(
+  String id, {
+  required String parentId,
+  required String callId,
+  String text = 'done',
+  bool isError = false,
+}) {
+  return MessageRecord(
+    id: id,
+    parentId: parentId,
+    timestamp: _at(6),
+    message: ToolResultMessage(
+      toolCallId: callId,
+      toolName: 'bash',
+      content: [TextContent(text: text)],
+      isError: isError,
+      timestamp: _at(6),
+    ),
+  );
+}
+
+void main() {
+  group('mapping rules', () {
+    test('user message maps to a user record that opens the turn', () {
+      final snapshot = TrajectorySnapshotBuilder().append(_userRecord('u1'));
+      final record = snapshot.records.single as TrajectoryUserRecord;
+      expect(record.kind, TrajectoryCellKind.user);
+      expect(record.text, 'hi');
+      expect(record.opensTurn, isTrue);
+      expect(record.previewMarkdown, 'hi');
+      expect(record.startedAt, _at(0));
+    });
+
+    test('assistant message maps to a message record with usage facts', () {
+      final builder = TrajectorySnapshotBuilder()..append(_userRecord('u1'));
+      final snapshot = builder.append(_assistantRecord('a1', parentId: 'u1'));
+      final record = snapshot.records.last as TrajectoryAssistantRecord;
+      expect(record.kind, TrajectoryCellKind.message);
+      expect(record.messageId, 'a1');
+      expect(record.provider, 'anthropic');
+      expect(record.model, 'claude-test');
+      expect(record.inputTokens, 100);
+      expect(record.cacheReadTokens, 30);
+      expect(record.cacheWriteTokens, 5);
+      expect(record.outputTokens, 20);
+      expect(record.reasoningTokens, 8);
+      expect(record.completedTime, _at(1));
+      expect(record.isError, isFalse);
+      expect(record.turn, 1);
+      expect(record.step, 1);
+    });
+
+    test('failed assistant stop reason surfaces as an error', () {
+      final builder = TrajectorySnapshotBuilder()..append(_userRecord('u1'));
+      final snapshot = builder.append(
+        _assistantRecord(
+          'a1',
+          parentId: 'u1',
+          stopReason: StopReason.error,
+          errorMessage: 'boom',
+        ),
+      );
+      final record = snapshot.records.last as TrajectoryAssistantRecord;
+      expect(record.isError, isTrue);
+      expect(record.errorMessage, 'boom');
+    });
+
+    test('assistant tool calls create tool records after the message', () {
+      final builder = TrajectorySnapshotBuilder()..append(_userRecord('u1'));
+      final snapshot = builder.append(
+        _assistantRecord(
+          'a1',
+          parentId: 'u1',
+          content: [
+            const TextContent(text: 'running'),
+            _toolCall('c1'),
+            _toolCall('c2', name: 'read'),
+          ],
+        ),
+      );
+      expect(snapshot.records, hasLength(4));
+      final assistant = snapshot.records[1] as TrajectoryAssistantRecord;
+      expect(assistant.step, 1);
+      final first = snapshot.records[2] as TrajectoryToolRecord;
+      expect(first.kind, TrajectoryCellKind.tool);
+      expect(first.callId, 'c1');
+      expect(first.parentCallId, isNull);
+      expect(first.name, 'bash');
+      expect(first.argsRaw, '{"cmd":"ls"}');
+      expect(first.result, '');
+      expect(first.recordId, 'tool\u0000call\u0000c1');
+      final second = snapshot.records[3] as TrajectoryToolRecord;
+      expect(second.callId, 'c2');
+      expect(second.name, 'read');
+    });
+
+    test('nested tool calls map to subtool records bound to their parent', () {
+      final builder = TrajectorySnapshotBuilder()..append(_userRecord('u1'));
+      builder.append(
+        _assistantRecord(
+          'a1',
+          parentId: 'u1',
+          content: [
+            const TextContent(text: 'running'),
+            _toolCall('c1'),
+            _toolCall('c1-1', name: 'read', parentCallId: 'c1'),
+          ],
+        ),
+      );
+      final snapshot = builder.append(
+        _toolResultRecord('r1', parentId: 'a1', callId: 'c1'),
+      );
+      final settled = builder.append(
+        _toolResultRecord('r2', parentId: 'a1', callId: 'c1-1'),
+      );
+      expect(snapshot.records, hasLength(4));
+      final parent = snapshot.records[2] as TrajectoryToolRecord;
+      expect(parent.kind, TrajectoryCellKind.tool);
+      expect(parent.parentCallId, isNull);
+      final nested = settled.records[3] as TrajectoryToolRecord;
+      expect(nested.kind, TrajectoryCellKind.subtool);
+      expect(nested.callId, 'c1-1');
+      expect(nested.parentCallId, 'c1');
+      expect(nested.index, parent.index + 1);
+      // The result binding went through withResult and kept the link.
+      expect(nested.result, 'done');
+    });
+
+    test('ToolCall serializes parentCallId only when set', () {
+      final nested = _toolCall('c1-1', parentCallId: 'c1');
+      expect(nested.toJson()['parentCallId'], 'c1');
+      expect(ToolCall.fromJson(nested.toJson()).parentCallId, 'c1');
+      final top = _toolCall('c1');
+      expect(top.toJson().containsKey('parentCallId'), isFalse);
+      expect(ToolCall.fromJson(top.toJson()).parentCallId, isNull);
+    });
+
+    test('tool result updates the matching tool record', () {
+      final builder = TrajectorySnapshotBuilder()..append(_userRecord('u1'));
+      builder.append(
+        _assistantRecord('a1', parentId: 'u1', content: [_toolCall('c1')]),
+      );
+      final snapshot = builder.append(
+        _toolResultRecord('r1', parentId: 'a1', callId: 'c1', text: 'files'),
+      );
+      expect(snapshot.records, hasLength(3));
+      final tool = snapshot.records[2] as TrajectoryToolRecord;
+      expect(tool.result, 'files');
+      expect(tool.resultPreviewMarkdown, 'files');
+      expect(tool.isError, isFalse);
+      expect(tool.timeSeconds, const Duration(seconds: 5));
+      expect(tool.index, 3);
+      expect(tool.recordId, 'tool\u0000call\u0000c1');
+    });
+
+    test('failed tool result marks the tool record', () {
+      final builder = TrajectorySnapshotBuilder()..append(_userRecord('u1'));
+      builder.append(
+        _assistantRecord('a1', parentId: 'u1', content: [_toolCall('c1')]),
+      );
+      final snapshot = builder.append(
+        _toolResultRecord('r1', parentId: 'a1', callId: 'c1', isError: true),
+      );
+      expect((snapshot.records[2] as TrajectoryToolRecord).isError, isTrue);
+    });
+
+    test('tool result for an unknown call is ignored', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        _toolResultRecord('r1', parentId: 'a1', callId: 'ghost'),
+      );
+      expect(snapshot.records, isEmpty);
+      expect(snapshot.revision, 1);
+    });
+
+    test('compaction record maps to a compacted record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        CompactionRecord(
+          id: 'cp1',
+          parentId: null,
+          timestamp: _at(2),
+          summary: 'so far',
+          firstKeptEntryId: 'u5',
+          tokensBefore: 900,
+        ),
+      );
+      final record = snapshot.records.single as TrajectoryCompactedRecord;
+      expect(record.kind, TrajectoryCellKind.compacted);
+      expect(record.summary, 'so far');
+      expect(record.firstKeptEntryId, 'u5');
+      expect(record.interrupted, isFalse);
+      expect(record.startedAt, _at(2));
+    });
+
+    test('branch summary maps to a standalone compacted record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        BranchSummaryRecord(
+          id: 'bs1',
+          parentId: null,
+          timestamp: _at(2),
+          fromId: 'u3',
+          summary: 'detour',
+        ),
+      );
+      final record = snapshot.records.single as TrajectoryCompactedRecord;
+      expect(record.kind, TrajectoryCellKind.compacted);
+      expect(record.summary, 'detour');
+      expect(record.firstKeptEntryId, isNull);
+    });
+
+    test('model change maps to a system record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        ModelChangeRecord(
+          id: 'm1',
+          parentId: null,
+          timestamp: _at(0),
+          provider: 'openai',
+          modelId: 'gpt-test',
+        ),
+      );
+      final record = snapshot.records.single as TrajectorySystemRecord;
+      expect(record.kind, TrajectoryCellKind.system);
+      expect(record.change, TrajectorySystemChange.modelChange);
+      expect(record.text, 'openai/gpt-test');
+      expect(record.time, _at(0));
+    });
+
+    test('active tools change maps to a system record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        ActiveToolsChangeRecord(
+          id: 't1',
+          parentId: null,
+          timestamp: _at(0),
+          activeToolNames: const ['bash', 'read'],
+        ),
+      );
+      final record = snapshot.records.single as TrajectorySystemRecord;
+      expect(record.change, TrajectorySystemChange.toolsChange);
+      expect(record.text, 'bash, read');
+    });
+
+    test('thinking level change maps to a system record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        ThinkingLevelChangeRecord(
+          id: 'tl1',
+          parentId: null,
+          timestamp: _at(0),
+          thinkingLevel: 'high',
+        ),
+      );
+      final record = snapshot.records.single as TrajectorySystemRecord;
+      expect(record.change, TrajectorySystemChange.thinkingLevelChange);
+      expect(record.text, 'high');
+    });
+
+    test('checkpoint maps to a system record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        CheckpointRecord(
+          id: 'ck1',
+          parentId: null,
+          timestamp: _at(0),
+          messageCount: 4,
+          goal: 'explore auth',
+        ),
+      );
+      final record = snapshot.records.single as TrajectorySystemRecord;
+      expect(record.change, TrajectorySystemChange.checkpoint);
+      expect(record.text, 'explore auth');
+    });
+
+    test('checkpoint auto-close audit record maps to a system record '
+        '(issue #286)', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        CustomMessageRecord(
+          id: 'ac1',
+          parentId: null,
+          timestamp: _at(0),
+          customType: checkpointAutoClosedCustomType,
+          content:
+              'Previous checkpoint auto-closed (a user turn arrived '
+              'after the checkpoint; goal: first detour; anchored at message '
+              '3).',
+          display: false,
+          details: const {'reason': 'userTurn'},
+        ),
+      );
+      final record = snapshot.records.single as TrajectorySystemRecord;
+      expect(record.change, TrajectorySystemChange.checkpointAutoClosed);
+      expect(record.text, contains('auto-closed'));
+      expect(record.text, contains('first detour'));
+      expect(record.time, _at(0));
+    });
+
+    test('displayed context custom message maps to a context record', () {
+      final snapshot = TrajectorySnapshotBuilder().append(
+        CustomMessageRecord(
+          id: 'cm1',
+          parentId: null,
+          timestamp: _at(0),
+          customType: 'context',
+          content: 'project instructions',
+          display: true,
+        ),
+      );
+      final record = snapshot.records.single as TrajectoryContextRecord;
+      expect(record.kind, TrajectoryCellKind.context);
+      expect(record.text, 'project instructions');
+      expect(record.previewMarkdown, 'project instructions');
+      expect(record.startedAt, _at(0));
+    });
+
+    test('hidden custom messages and non-ledger records are skipped', () {
+      final builder = TrajectorySnapshotBuilder();
+      final hidden = CustomMessageRecord(
+        id: 'cm2',
+        parentId: null,
+        timestamp: _at(0),
+        customType: 'context',
+        content: 'hidden',
+        display: false,
+      );
+      final skipped = [
+        hidden,
+        LabelRecord(
+          id: 'l1',
+          parentId: null,
+          timestamp: _at(0),
+          targetId: 'u1',
+          label: 'keep',
+        ),
+        SessionInfoRecord(
+          id: 'si1',
+          parentId: null,
+          timestamp: _at(0),
+          name: 'session',
+        ),
+        LeafRecord(
+          id: 'lf1',
+          parentId: null,
+          timestamp: _at(0),
+          targetId: 'u1',
+        ),
+      ];
+      for (final record in skipped) {
+        builder.append(record);
+      }
+      // Issue #385 AC7: an unknown custom record kind is never silent —
+      // it renders a synthetic context row and feeds unknownRecordCount.
+      builder.append(
+        CustomRecord(
+          id: 'cu1',
+          parentId: null,
+          timestamp: _at(0),
+          customType: 'misc',
+        ),
+      );
+      final snapshot = builder.build();
+      expect(snapshot.records, hasLength(1));
+      expect(
+        (snapshot.records.single as TrajectoryContextRecord).text,
+        contains('misc'),
+      );
+      expect(snapshot.unknownRecordCount, 1);
+      // Skipped records still advance the revision: one per append.
+      expect(snapshot.revision, skipped.length + 1);
+    });
+  });
+
+  group('turn and step assignment', () {
+    test('a second prompt after a turn opens turn two', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      builder.append(_assistantRecord('a1', parentId: 'u1'));
+      builder.append(_toolResultRecord('r1', parentId: 'a1', callId: 'ghost'));
+      builder.append(_userRecord('u2', parentId: 'r1', text: 'go on'));
+      final snapshot = builder.append(_assistantRecord('a2', parentId: 'u2'));
+      final user2 = snapshot.records[2] as TrajectoryUserRecord;
+      expect(user2.opensTurn, isTrue);
+      final assistant2 = snapshot.records[3] as TrajectoryAssistantRecord;
+      expect(assistant2.turn, 2);
+      expect(assistant2.step, 1);
+    });
+
+    test('assistant steps increment within a turn', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      builder.append(_assistantRecord('a1', parentId: 'u1'));
+      final snapshot = builder.append(_assistantRecord('a2', parentId: 'a1'));
+      expect((snapshot.records[1] as TrajectoryAssistantRecord).step, 1);
+      expect((snapshot.records[2] as TrajectoryAssistantRecord).step, 2);
+      expect((snapshot.records[2] as TrajectoryAssistantRecord).turn, 1);
+    });
+
+    test('consecutive user messages merge into one turn', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      builder.append(_userRecord('u2', parentId: 'u1', text: 'attachment'));
+      final snapshot = builder.append(_assistantRecord('a1', parentId: 'u2'));
+      expect((snapshot.records[1] as TrajectoryUserRecord).opensTurn, isFalse);
+      final assistant = snapshot.records[2] as TrajectoryAssistantRecord;
+      expect(assistant.turn, 1);
+      expect(assistant.step, 1);
+    });
+  });
+
+  group('snapshot semantics', () {
+    test('fresh builder yields the empty snapshot with revision zero', () {
+      final snapshot = TrajectorySnapshotBuilder().build();
+      expect(snapshot.records, isEmpty);
+      expect(snapshot.requests, isEmpty);
+      expect(snapshot.callSchemas, isEmpty);
+      expect(snapshot.runningCalls, isEmpty);
+      expect(snapshot.partial, isNull);
+      expect(snapshot.recordLocations, isEmpty);
+      expect(snapshot.revision, 0);
+      expect(TrajectorySnapshot.empty.revision, 0);
+    });
+
+    test('indexes are 1-based and stable, and locations map record ids', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      builder.append(_assistantRecord('a1', parentId: 'u1'));
+      builder.append(
+        _assistantRecord('a2', parentId: 'a1', content: [_toolCall('c1')]),
+      );
+      final snapshot = builder.build();
+      expect(snapshot.records.map((record) => record.index).toList(), [
+        1,
+        2,
+        3,
+        4,
+      ]);
+      expect(snapshot.recordLocations['u1'], 0);
+      expect(snapshot.recordLocations['a1'], 1);
+      expect(snapshot.recordLocations['tool\u0000call\u0000c1'], 3);
+    });
+
+    test('append returns a fresh snapshot and earlier ones stay frozen', () {
+      final builder = TrajectorySnapshotBuilder();
+      final first = builder.append(_userRecord('u1'));
+      expect(first.revision, 1);
+      final second = builder.append(_assistantRecord('a1', parentId: 'u1'));
+      expect(second.revision, 2);
+      expect(identical(first, second), isFalse);
+      expect(first.records, hasLength(1));
+      expect(second.records, hasLength(2));
+      expect(first.revision, 1, reason: 'earlier snapshots are immutable');
+    });
+
+    test('build does not advance the revision', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      final before = builder.build().revision;
+      expect(builder.build().revision, before);
+    });
+
+    test('reset clears records and revision', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      builder.reset();
+      final snapshot = builder.build();
+      expect(snapshot.records, isEmpty);
+      expect(snapshot.revision, 0);
+      final after = builder.append(_userRecord('u2'));
+      expect(after.records.single.index, 1);
+    });
+  });
+
+  group('kind dispatch', () {
+    test('tool record with a parent call id is a subtool', () {
+      const record = TrajectoryToolRecord(
+        index: 1,
+        recordId: 'tool\u0000call\u0000c9',
+        callId: 'c9',
+        parentCallId: 'c1',
+        name: 'grep',
+        argsRaw: '{}',
+      );
+      expect(record.kind, TrajectoryCellKind.subtool);
+    });
+  });
+
+  group('tool start times and request details', () {
+    const detail = TrajectoryRequestDetail(
+      messageCount: 2,
+      systemPromptChars: 40,
+      toolCount: 1,
+      toolNames: ['bash'],
+      messages: [
+        TrajectoryRequestMessageSummary(
+          role: 'user',
+          chars: 11,
+          preview: 'list files',
+        ),
+        TrajectoryRequestMessageSummary(
+          role: 'toolResult',
+          chars: 6,
+          preview: 'files',
+        ),
+      ],
+    );
+
+    AssistantMessage streamMessage(
+      DateTime timestamp, {
+      List<ContentBlock> content = const [],
+      StopReason stopReason = StopReason.stop,
+      String? errorMessage,
+    }) => AssistantMessage(
+      content: content,
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      model: 'claude-test',
+      usage: const Usage(
+        input: 10,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 12,
+        cost: UsageCost(),
+      ),
+      stopReason: stopReason,
+      errorMessage: errorMessage,
+      timestamp: timestamp,
+    );
+
+    test('replayed tool rows start when the assistant issued the call', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      final snapshot = builder.append(
+        _assistantRecord(
+          'a1',
+          parentId: 'u1',
+          content: [
+            const TextContent(text: 'running'),
+            _toolCall('c1'),
+          ],
+        ),
+      );
+      final tool = snapshot.records.last as TrajectoryToolRecord;
+      expect(tool.startedAt, _at(1), reason: 'assistant record timestamp');
+      final settled = builder.append(
+        _toolResultRecord('r1', parentId: 'a1', callId: 'c1'),
+      );
+      final settledTool = settled.records.last as TrajectoryToolRecord;
+      expect(settledTool.startedAt, _at(1), reason: 'withResult keeps it');
+      expect(settledTool.result, 'done');
+      expect(settledTool.timeSeconds, const Duration(seconds: 5));
+    });
+
+    test('live tool start stamps the row and the running call', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.applyEvent(
+        MessageEndEvent(UserMessage.text('hi', timestamp: _at(0))),
+      );
+      builder.applyEvent(
+        MessageEndEvent(
+          streamMessage(
+            _at(1),
+            content: [
+              ToolCall(id: 'c1', name: 'bash', arguments: const {'cmd': 'ls'}),
+            ],
+          ),
+        ),
+      );
+      final snapshot = builder.applyEvent(
+        ToolExecutionStartEvent(
+          toolCallId: 'c1',
+          toolName: 'bash',
+          args: const {},
+          timestamp: _at(3),
+        ),
+      );
+      expect((snapshot.records[2] as TrajectoryToolRecord).startedAt, _at(3));
+      expect(snapshot.runningCalls.single.startedAt, _at(3));
+    });
+
+    test('a persisted model_request_summary survives a JSONL round-trip', () {
+      final summary = CustomRecord(
+        id: 'cu9',
+        parentId: 'u1',
+        timestamp: _at(0),
+        customType: 'model_request_summary',
+        data: detail.toJson(),
+      );
+      final restored = SessionRecord.fromJson(
+        jsonDecode(jsonEncode(summary.toJson())) as Map<String, dynamic>,
+      );
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      final snapshot = builder.append(restored as CustomRecord);
+      expect(snapshot.records, hasLength(1), reason: 'record stays hidden');
+      final replayed = builder.append(_assistantRecord('a1', parentId: 'u1'));
+      expect(
+        (replayed.records[1] as TrajectoryAssistantRecord).requestDetail
+            ?.toJson(),
+        detail.toJson(),
+      );
+    });
+
+    test('compacted rows measure their duration from the ledger cursor', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      final snapshot = builder.append(
+        CompactionRecord(
+          id: 'cp1',
+          parentId: 'u1',
+          timestamp: _at(5),
+          summary: 'summary of history',
+          firstKeptEntryId: 'r1',
+          tokensBefore: 100,
+        ),
+      );
+      final record = snapshot.records.last as TrajectoryCompactedRecord;
+      expect(record.timeSeconds, const Duration(seconds: 5));
+      expect(record.startedAt, _at(5));
+    });
+  });
+
+  group('scripted multi-turn session', () {
+    test('tool rows carry startedAt and steps carry request summaries', () {
+      const firstDetail = TrajectoryRequestDetail(
+        messageCount: 1,
+        systemPromptChars: 0,
+        toolCount: 1,
+        toolNames: ['bash'],
+        messages: [
+          TrajectoryRequestMessageSummary(
+            role: 'user',
+            chars: 10,
+            preview: 'list files',
+          ),
+        ],
+      );
+      const secondDetail = TrajectoryRequestDetail(
+        messageCount: 3,
+        systemPromptChars: 0,
+        toolCount: 1,
+        toolNames: ['bash'],
+        messages: [
+          TrajectoryRequestMessageSummary(
+            role: 'user',
+            chars: 10,
+            preview: 'list files',
+          ),
+          TrajectoryRequestMessageSummary(
+            role: 'assistant',
+            chars: 30,
+            preview: '',
+          ),
+          TrajectoryRequestMessageSummary(
+            role: 'toolResult',
+            chars: 7,
+            preview: 'files',
+          ),
+        ],
+      );
+      AssistantMessage step({
+        required DateTime timestamp,
+        List<ContentBlock> content = const [],
+        StopReason stopReason = StopReason.stop,
+        String? errorMessage,
+      }) => AssistantMessage(
+        content: content,
+        api: 'anthropic-messages',
+        provider: 'anthropic',
+        model: 'claude-test',
+        usage: const Usage(
+          input: 10,
+          output: 2,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 12,
+          cost: UsageCost(),
+        ),
+        stopReason: stopReason,
+        errorMessage: errorMessage,
+        timestamp: timestamp,
+      );
+
+      // Live tail: a two-step turn whose first step calls a tool.
+      final live = TrajectorySnapshotBuilder();
+      live.applyEvent(
+        MessageEndEvent(UserMessage.text('list files', timestamp: _at(0))),
+      );
+      live.applyEvent(ModelRequestEvent(detail: firstDetail));
+      final step1 = step(
+        timestamp: _at(2),
+        content: [
+          const TextContent(text: 'running'),
+          ToolCall(id: 'c1', name: 'bash', arguments: const {'cmd': 'ls'}),
+        ],
+      );
+      live.applyEvent(MessageEndEvent(step1));
+      live.applyEvent(
+        ToolExecutionStartEvent(
+          toolCallId: 'c1',
+          toolName: 'bash',
+          args: const {},
+          timestamp: _at(3),
+        ),
+      );
+      live.applyEvent(
+        MessageEndEvent(
+          ToolResultMessage(
+            toolCallId: 'c1',
+            toolName: 'bash',
+            content: const [TextContent(text: 'files')],
+            isError: false,
+            timestamp: _at(6),
+          ),
+        ),
+      );
+      live.applyEvent(ModelRequestEvent(detail: secondDetail));
+      live.applyEvent(
+        MessageEndEvent(
+          step(
+            timestamp: _at(8),
+            stopReason: StopReason.error,
+            errorMessage: 'boom',
+          ),
+        ),
+      );
+      final liveSnapshot = live.build();
+
+      final tools = liveSnapshot.records
+          .whereType<TrajectoryToolRecord>()
+          .toList();
+      expect(tools, hasLength(1));
+      expect(tools.single.startedAt, _at(3));
+      expect(tools.single.result, 'files');
+      expect(tools.single.isError, isFalse);
+      final assistants = liveSnapshot.records
+          .whereType<TrajectoryAssistantRecord>()
+          .toList();
+      expect(assistants, hasLength(2));
+      expect(assistants[0].requestDetail?.toJson(), firstDetail.toJson());
+      expect(assistants[1].isError, isTrue);
+      expect(assistants[1].errorMessage, 'boom');
+      expect(assistants[1].requestDetail?.toJson(), secondDetail.toJson());
+      expect(liveSnapshot.runningCalls, isEmpty);
+      expect(liveSnapshot.requests.map((request) => request.status).toList(), [
+        TrajectoryRequestStatus.completed,
+        TrajectoryRequestStatus.failed,
+      ]);
+
+      // Durable replay of the same session: the summaries persist as
+      // hidden custom records, and every fact matches the live snapshot.
+      CustomRecord summary(Object data, String id, String parentId) =>
+          CustomRecord(
+            id: id,
+            parentId: parentId,
+            timestamp: _at(0),
+            customType: 'model_request_summary',
+            data: data,
+          );
+      final replay = TrajectorySnapshotBuilder();
+      replay.append(_userRecord('u1'));
+      replay.append(summary(firstDetail.toJson(), 's1', 'u1'));
+      replay.append(
+        _assistantRecord(
+          'a1',
+          parentId: 'u1',
+          content: [
+            const TextContent(text: 'running'),
+            _toolCall('c1'),
+          ],
+        ),
+      );
+      replay.append(_toolResultRecord('r1', parentId: 'a1', callId: 'c1'));
+      replay.append(summary(secondDetail.toJson(), 's2', 'r1'));
+      replay.append(
+        _assistantRecord(
+          'a2',
+          parentId: 'r1',
+          stopReason: StopReason.error,
+          errorMessage: 'boom',
+        ),
+      );
+      final replaySnapshot = replay.build();
+      final replayTools = replaySnapshot.records
+          .whereType<TrajectoryToolRecord>()
+          .toList();
+      expect(
+        replayTools.single.startedAt,
+        _at(1),
+        reason: 'replay stamps startedAt from the assistant record',
+      );
+      final replayAssistants = replaySnapshot.records
+          .whereType<TrajectoryAssistantRecord>()
+          .toList();
+      expect(
+        replayAssistants[0].requestDetail?.toJson(),
+        assistants[0].requestDetail?.toJson(),
+        reason: 'replayed request detail equals the live one',
+      );
+      expect(
+        replayAssistants[1].requestDetail?.toJson(),
+        assistants[1].requestDetail?.toJson(),
+      );
+    });
+  });
+  group('bulk backfill (issue #262)', () {
+    /// Deterministic chained script: [turns] turns of user + assistant
+    /// (thinking + 2 calls + text) + 2 tool results = 4 records per turn.
+    List<SessionRecord> bulkRecords(int turns) {
+      final records = <SessionRecord>[_userRecord('rec-u0', text: 'boot')];
+      var prev = records.first;
+      for (var t = 1; t <= turns; t++) {
+        final user = _userRecord(
+          'rec-$t-u',
+          parentId: prev.id,
+          text: 'question $t',
+        );
+        final assistant = _assistantRecord(
+          'rec-$t-a',
+          parentId: user.id,
+          content: [
+            ThinkingContent(thinking: 'thought $t'),
+            ToolCall(id: 'rec-$t-c1', name: 'read', arguments: {}),
+            ToolCall(id: 'rec-$t-c2', name: 'bash', arguments: {}),
+            TextContent(text: 'answer $t'),
+          ],
+        );
+        MessageRecord result(int n, String parentId) => MessageRecord(
+          id: 'rec-$t-r$n',
+          parentId: parentId,
+          timestamp: _at(t * 10 + n),
+          message: ToolResultMessage(
+            toolCallId: 'rec-$t-c$n',
+            toolName: 'read',
+            content: [TextContent(text: 'out $n')],
+            isError: false,
+            timestamp: _at(t * 10 + n),
+          ),
+        );
+        final r1 = result(1, assistant.id);
+        final r2 = result(2, r1.id);
+        records.addAll([user, assistant, r1, r2]);
+        prev = r2;
+      }
+      return records;
+    }
+
+    test('appendAll emits exactly ONE snapshot over a 30k-record backfill', () {
+      final builder = TrajectorySnapshotBuilder();
+      final snapshot = builder.appendAll(bulkRecords(7500)); // 30 001.
+      expect(builder.snapshotsBuilt, 1);
+      expect(snapshot.records, hasLength(30001));
+    });
+
+    test('bulk projection equals the final per-append snapshot', () {
+      final records = bulkRecords(50);
+      final bulkSnapshot = TrajectorySnapshotBuilder().appendAll(records);
+      final liveBuilder = TrajectorySnapshotBuilder();
+      TrajectorySnapshot liveSnapshot = liveBuilder.append(records.first);
+      for (final record in records.skip(1)) {
+        liveSnapshot = liveBuilder.append(record);
+      }
+      expect(bulkSnapshot.records, hasLength(liveSnapshot.records.length));
+      expect(bulkSnapshot.revision, liveSnapshot.revision);
+      expect(
+        [for (final r in bulkSnapshot.records) r.recordId],
+        [for (final r in liveSnapshot.records) r.recordId],
+      );
+      expect(bulkSnapshot.requests.length, liveSnapshot.requests.length);
+    });
+    test('30k-record bulk load stays within the open budget', () {
+      final records = bulkRecords(7500);
+      final builder = TrajectorySnapshotBuilder();
+      final sw = Stopwatch()..start();
+      builder.appendAll(records);
+      expect(sw.elapsed, lessThan(const Duration(seconds: 5)));
+      expect(builder.snapshotsBuilt, 1);
+    });
+
+    test('scaling 30k to 60k records is near-linear, not quadratic', () {
+      // Structural complexity assert (issue #358). The original form timed
+      // 30k vs 60k backfills and asserted a wall-clock ratio < 3.0 — that
+      // flaked twice on CI shard 2: one GC pause, scheduler deschedule, or
+      // hypervisor steal inside the 2x-longer 60k window flips a true 2.0
+      // ratio past 3.0 on a loaded shared runner. Wall clock cannot tell
+      // "slower machine" from "quadratic algorithm".
+      //
+      // Instead count the operation the #262 quadratic actually wasted:
+      // parent-chain hops walked while folding turn/step. The incremental
+      // fold is O(1) hops per chained record, so a linear backfill stays
+      // under a small per-record envelope; the pre-#262 fold (full chain
+      // walk per user/assistant record) walks ~n²/8 hops — hundreds of
+      // millions at 30k — and must still fail this.
+      final builder30 = TrajectorySnapshotBuilder()
+        ..appendAll(bulkRecords(7500)); // 30 001.
+      final builder60 = TrajectorySnapshotBuilder()
+        ..appendAll(bulkRecords(15000)); // 60 001.
+      // Linear envelope: ≤ 2 hops per record on average (chained bulk
+      // scripts walk ~0; the slack tolerates bounded branch/replay walks).
+      expect(builder30.chainWalkHops, lessThan(2 * 30001));
+      expect(builder60.chainWalkHops, lessThan(2 * 60001));
+      // Per-append snapshot materialization is the other #262 quadratic.
+      expect(builder30.snapshotsBuilt, 1);
+      expect(builder60.snapshotsBuilt, 1);
+    });
+
+    test(
+      'appendAll 50k records stays within the open budget (issue #1497)',
+      () {
+        final records = bulkRecords(12500); // 50 001.
+        final builder = TrajectorySnapshotBuilder();
+        final sw = Stopwatch()..start();
+        final snapshot = builder.appendAll(records);
+        sw.stop();
+        expect(sw.elapsed, lessThan(const Duration(seconds: 5)));
+        expect(snapshot.records, hasLength(50001));
+        expect(builder.snapshotsBuilt, 1);
+      },
+    );
+
+    test(
+      'live-tail appends scale near-linearly, not quadratically (#1497)',
+      () {
+        // The per-append snapshot used to copy every ledger row, rebuild the
+        // whole recordLocations map, and re-sort + refold every request fact
+        // on EVERY append — O(n) per append, O(n²) per live session: ~1.5ms
+        // per append at 20k records, 381s for a 65k-record live tail. The
+        // snapshot now shares frozen row chunks and rebuilds only the dirty
+        // request suffix.
+        //
+        // Primary guard is the deterministic operation the quadratic
+        // wasted (the #358 approach): snapshotRowCopies counts row
+        // references copied per publish. Chunk sharing keeps it a small
+        // constant per append (bounded chunk clones + pointer copies);
+        // the pre-#1497 shape copies every row per append (~n/2 rows per
+        // append on average) and must still fail the envelope. Wall clock
+        // only bounds the absolute budget — ratios flake on shared
+        // runners (issue #358) AND carry a JIT-tier cliff on cold first
+        // runs (a cold 20k-append loop measured 60x its warmed cost),
+        // so no ratio is asserted here.
+        List<SessionRecord> script(int turns) {
+          final records = bulkRecords(turns);
+          return records.sublist(1); // drop the bootstrap user record
+        }
+
+        final large = script(5000); // 20000 records.
+        final builder = TrajectorySnapshotBuilder();
+        final sw = Stopwatch()..start();
+        for (final record in large) {
+          builder.append(record);
+        }
+        sw.stop();
+        expect(builder.snapshotsBuilt, large.length);
+        // Row-copy envelope: chunked sharing copies a bounded constant of
+        // rows per append (the ≤512-row copy-on-write clone for patched
+        // rows + the chunk-pointer list); 600/append absorbs that with
+        // slack while the quadratic shape (≈n/2 rows per append on
+        // average — 10k at this size) fails it by 3 orders of magnitude.
+        expect(
+          builder.snapshotRowCopies,
+          lessThan(large.length * 600),
+          reason:
+              'per-append snapshot publishing must share rows, not '
+              'copy them (${builder.snapshotRowCopies} row copies for '
+              '${large.length} appends)',
+        );
+        // Absolute budget (the issue's open-budget form): warmed runs do
+        // this in well under 100ms; even a cold JIT-tier cliff stays
+        // under 3s (M4 Pro). The pre-#1497 shape measured 31s for the
+        // same loop. 12s (not 8s): a loaded CI runner measured 8.82s for
+        // this same green path (~4x this box). 20s (not 12s): the same
+        // green path measured 12.35s on a loaded arm CI shard (pr-1581
+        // run 38470824770, shard 1) and redded the leg by 0.35s — a
+        // shared-runner stall, not a shape change (the row-copy
+        // envelope and snapshotsBuilt were green on that run, and the
+        // identical head passes this loop in well under the budget on
+        // an unloaded box). 20s keeps ~1.6x headroom over the worst
+        // green observation while every quadratic shape still fails:
+        // >=31s on the fastest measured box, and package:test's 30s
+        // per-test default timeout independently kills the loop before
+        // any slower box could pass it. The row-copy envelope above is
+        // the primary guard regardless — wall clock here is only the
+        // absolute trip-wire.
+        expect(sw.elapsed, lessThan(const Duration(seconds: 20)));
+      },
+    );
+
+    test(
+      'a published snapshot never observes later appends (#1497 sharing)',
+      () {
+        // The chunk-sharing / cached-request rewrite must keep snapshots
+        // immutable: rows appended, tool results patched in, and request
+        // facts finalized after a snapshot was handed out must not leak
+        // into it — including the lazily derived recordLocations map.
+        final builder = TrajectorySnapshotBuilder();
+        final records = bulkRecords(3);
+        final stale = builder.append(records[0]);
+        final firstRows = stale.records.length;
+        final firstRevision = stale.revision;
+        stale.recordLocations[stale.records.first.recordId]; // force derive
+        expect(
+          () => stale.recordLocations['x'] = 0,
+          throwsUnsupportedError,
+          reason: 'the lazy locations view stays unmodifiable',
+        );
+        for (final record in records.skip(1)) {
+          builder.append(record);
+        }
+        final tail = builder.build();
+        expect(tail.records.length, greaterThan(firstRows));
+        expect(tail.requests, isNotEmpty);
+        // The stale snapshot is untouched by the later appends.
+        expect(stale.records, hasLength(firstRows));
+        expect(stale.revision, firstRevision);
+        expect(stale.requests, isEmpty);
+        expect(
+          stale.recordLocations,
+          hasLength(firstRows),
+          reason: 'the lazily derived map freezes at first access',
+        );
+        expect(stale.recordLocations.values.toSet().toList(), [
+          for (var i = 0; i < firstRows; i++) i,
+        ], reason: 'locations stay byte-identical to the eager derivation');
+      },
+    );
+
+    test('bulk replay folds request facts created between snapshots', () {
+      // appendAll materializes no intermediate snapshots, so a summary
+      // fact is created and finalized inside one fold — the touched-fact
+      // path runs against a fact with no cached sorted position yet.
+      const detail = TrajectoryRequestDetail(
+        messageCount: 1,
+        systemPromptChars: 4,
+        systemPromptHash: 'h1',
+        toolCount: 0,
+        toolNames: [],
+        messages: [],
+      );
+      final records = <SessionRecord>[
+        _userRecord('bu1'),
+        CustomRecord(
+          id: 'bs1',
+          parentId: 'bu1',
+          timestamp: _at(0),
+          customType: 'model_request_summary',
+          data: detail.toJson(),
+        ),
+        _assistantRecord(
+          'ba1',
+          parentId: 'bu1',
+          usage: const Usage(
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 15,
+            cost: UsageCost(),
+          ),
+        ),
+        // A second usage-carrying fact: with only one, cumulative and own
+        // usage are indistinguishable and a broken fold (seeded per
+        // request from null) cannot fail this test.
+        _assistantRecord(
+          'ba2',
+          parentId: 'ba1',
+          usage: const Usage(
+            input: 20,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 20,
+            cost: UsageCost(),
+          ),
+        ),
+      ];
+      final bulk = TrajectorySnapshotBuilder().appendAll(records);
+      expect(bulk.requests, hasLength(2));
+      expect(bulk.requests[0].status, TrajectoryRequestStatus.completed);
+      expect(bulk.requests[0].seq, 1);
+      expect(bulk.requests[0].usage?.totalTokens, 15);
+      expect(
+        bulk.requests[0].cumulativeUsage?.totalTokens,
+        15,
+        reason: 'the full-rebuild fold seeds cumulative usage from zero',
+      );
+      expect(bulk.requests[1].seq, 2);
+      expect(bulk.requests[1].usage?.totalTokens, 20);
+      expect(
+        bulk.requests[1].cumulativeUsage?.totalTokens,
+        35,
+        reason: 'the full-rebuild fold threads the running cumulative',
+      );
+      // Same session through per-append snapshots: identical requests.
+      final live = TrajectorySnapshotBuilder();
+      for (final record in records) {
+        live.append(record);
+      }
+      final liveSnapshot = live.build();
+      expect(liveSnapshot.requests, hasLength(2));
+      expect(liveSnapshot.requests[0].status, bulk.requests[0].status);
+      expect(liveSnapshot.requests[0].cumulativeUsage?.totalTokens, 15);
+      expect(
+        liveSnapshot.requests[1].cumulativeUsage?.totalTokens,
+        35,
+        reason: 'the suffix fold threads the same running cumulative',
+      );
+    });
+  });
+  test('a persisted model_request_summary carries blob pointers', () {
+    const detail = TrajectoryRequestDetail(
+      messageCount: 1,
+      systemPromptChars: 18,
+      systemPromptHash: 'abc123',
+      toolCount: 1,
+      toolNames: ['bash'],
+      toolManifestHash: 'def456',
+      wireDumpHash: '789abc',
+      messages: [],
+    );
+    final summary = CustomRecord(
+      id: 'cu1',
+      parentId: 'u1',
+      timestamp: _at(0),
+      customType: 'model_request_summary',
+      data: detail.toJson(),
+    );
+    final builder = TrajectorySnapshotBuilder();
+    builder.append(_userRecord('u1'));
+    builder.append(summary);
+    final assistant = builder.append(_assistantRecord('a1', parentId: 'u1'));
+    expect(
+      (assistant.records[1] as TrajectoryAssistantRecord)
+          .requestDetail
+          ?.systemPromptHash,
+      'abc123',
+    );
+    expect(
+      (assistant.records[1] as TrajectoryAssistantRecord)
+          .requestDetail
+          ?.wireDumpHash,
+      '789abc',
+    );
+  });
+
+  group('trajectory blobs and unknown records (issue #385)', () {
+    CustomRecord blobRecord(
+      String id,
+      String type,
+      Map<String, dynamic> data,
+    ) => CustomRecord(
+      id: id,
+      parentId: 'u1',
+      timestamp: _at(0),
+      customType: type,
+      data: data,
+    );
+
+    test('two equal prompt blobs fold to one table entry (AC1)', () {
+      final blob = TrajectoryPromptBlob.of('the system prompt');
+      final data = blob.toJson();
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      var snapshot = builder.append(
+        blobRecord('c1', 'trajectory_prompt_blob', data),
+      );
+      snapshot = builder.append(
+        blobRecord('c2', 'trajectory_prompt_blob', data),
+      );
+      expect(snapshot.blobs.systemPrompts, hasLength(1));
+      expect(
+        snapshot.blobs.systemPrompts[blob.hash]?.text,
+        'the system prompt',
+      );
+    });
+
+    test('wire dumps and manifests land in the snapshot blob table', () {
+      final manifest = TrajectoryToolManifestBlob.of([
+        const Tool(
+          name: 'bash',
+          description: 'run it',
+          parameters: {'type': 'object'},
+        ),
+      ]);
+      final dump = TrajectoryWireDump(
+        hash: 'wh1',
+        payload: '{"systemPrompt":"p"}',
+        truncated: false,
+      );
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      var snapshot = builder.append(
+        blobRecord('c1', 'trajectory_manifest_blob', manifest.toJson()),
+      );
+      snapshot = builder.append(
+        blobRecord('c2', 'trajectory_wire_dump', dump.toJson()),
+      );
+      expect(
+        snapshot.blobs.toolManifests[manifest.hash]?.tools.single.name,
+        'bash',
+      );
+      expect(
+        snapshot.blobs.wireDumps['wh1']?.payload,
+        contains('systemPrompt'),
+      );
+    });
+
+    test('an unknown custom record counts once and renders a row (AC7)', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      var snapshot = builder.append(
+        CustomRecord(
+          id: 'c1',
+          parentId: 'u1',
+          timestamp: _at(0),
+          customType: 'future_plugin_thing',
+          data: {'x': 1},
+        ),
+      );
+      expect(snapshot.unknownRecordCount, 1);
+      final contextRow = snapshot.records
+          .whereType<TrajectoryContextRecord>()
+          .where((r) => r.text.contains('unknown'))
+          .toList();
+      expect(contextRow, hasLength(1));
+      expect(contextRow.single.text, contains('future_plugin_thing'));
+    });
+
+    test('a hidden range keeps its record ids on the compacted row (F4)', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      final snapshot = builder.append(
+        HiddenRangeRecord(
+          id: 'h1',
+          parentId: 'u1',
+          timestamp: _at(2),
+          recordIds: const ['r1', 'r2', 'r3'],
+        ),
+      );
+      final compacted = snapshot.records
+          .whereType<TrajectoryCompactedRecord>()
+          .single;
+      expect(compacted.hiddenRecordIds, ['r1', 'r2', 'r3']);
+    });
+  });
+
+  group('system-row hash stamping (issue #385 F7)', () {
+    test('initial and tools rows receive the request blob pointers', () {
+      const prompt = 'You are a test agent.';
+      const detail = TrajectoryRequestDetail(
+        messageCount: 1,
+        systemPromptChars: prompt.length,
+        systemPromptHash: 'phash1',
+        toolCount: 1,
+        toolNames: ['bash'],
+        toolManifestHash: 'mhash1',
+        messages: [],
+      );
+      final builder = TrajectorySnapshotBuilder();
+      final snapshot = builder.append(_userRecord('u1'));
+      // A model change creates the system rows the request stamps.
+      builder.append(
+        ModelChangeRecord(
+          id: 'mc1',
+          parentId: 'u1',
+          timestamp: _at(0),
+          provider: 'anthropic',
+          modelId: 'claude-test',
+        ),
+      );
+      builder.append(
+        ActiveToolsChangeRecord(
+          id: 'tc1',
+          parentId: 'mc1',
+          timestamp: _at(0),
+          activeToolNames: const ['bash'],
+        ),
+      );
+      final withSystem = builder.append(
+        CustomRecord(
+          id: 'cu1',
+          parentId: 'tc1',
+          timestamp: _at(0),
+          customType: 'model_request_summary',
+          data: detail.toJson(),
+        ),
+      );
+      final stamped = builder.append(_assistantRecord('a1', parentId: 'cu1'));
+      final stampedAssistant = stamped.records
+          .whereType<TrajectoryAssistantRecord>()
+          .single;
+      expect(stampedAssistant.requestDetail?.systemPromptHash, 'phash1');
+      final systemRows = withSystem.records
+          .whereType<TrajectorySystemRecord>()
+          .toList();
+      expect(systemRows, isNotEmpty);
+      final promptRows = systemRows
+          .where((r) => r.systemPromptHash != null)
+          .toList();
+      expect(promptRows, isNotEmpty);
+      expect(promptRows.last.systemPromptHash, 'phash1');
+      final manifestRows = systemRows
+          .where((r) => r.toolManifestHash != null)
+          .toList();
+      expect(manifestRows, isNotEmpty);
+      expect(manifestRows.last.toolManifestHash, 'mhash1');
+      // The blob table itself stays empty here: only dedicated blob
+      // records feed it; the rows carry pointers.
+      expect(snapshot.blobs.systemPrompts, isEmpty);
+    });
+  });
+
+  group('synthetic row replacement (live mirroring)', () {
+    AssistantMessage streamedAssistant(DateTime timestamp) => AssistantMessage(
+      content: const [
+        TextContent(text: 'running'),
+        ToolCall(id: 'c1', name: 'bash', arguments: {'cmd': 'ls'}),
+      ],
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      model: 'claude-test',
+      usage: const Usage(
+        input: 10,
+        output: 2,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 12,
+        cost: UsageCost(),
+      ),
+      stopReason: StopReason.stop,
+      timestamp: timestamp,
+    );
+
+    test('a synthetic row that is no longer the tail is filtered out of the '
+        'middle with a full index rebuild (non-tail discard)', () {
+      final builder = TrajectorySnapshotBuilder();
+      builder.append(_userRecord('u1'));
+      // Turn 1 step 1 streams: a synthetic assistant row plus its
+      // synthetic tool row, keyed `1\0<step 1>`.
+      builder.applyEvent(MessageEndEvent(streamedAssistant(_at(1))));
+      // A queued prompt streams into turn 2 — the turn-1 synthetic rows
+      // are no longer the tail, so the fast truncation path cannot
+      // replace them.
+      builder.applyEvent(
+        MessageEndEvent(UserMessage.text('queued', timestamp: _at(2))),
+      );
+      final midStream = builder.build();
+      expect(midStream.records, hasLength(4));
+      expect(
+        midStream.records.last,
+        isA<TrajectoryUserRecord>(),
+        reason: 'the turn-1 synthetic rows sit mid-ledger now',
+      );
+
+      // The real turn-1 assistant lands: its synthetic rows must be
+      // filtered out of the middle and the tool-row index rebuilt.
+      final snapshot = builder.append(
+        _assistantRecord(
+          'a1',
+          parentId: 'u1',
+          content: const [
+            TextContent(text: 'answer'),
+            ToolCall(id: 'c1', name: 'bash', arguments: {'cmd': 'ls'}),
+          ],
+        ),
+      );
+      expect(snapshot.records, hasLength(4));
+      final assistants = snapshot.records
+          .whereType<TrajectoryAssistantRecord>()
+          .toList();
+      expect(assistants, hasLength(1), reason: 'the streamed ghost is gone');
+      expect(assistants.single.turn, 1);
+      expect(assistants.single.step, 1);
+      final tools = snapshot.records.whereType<TrajectoryToolRecord>();
+      expect(tools, hasLength(1));
+      expect(tools.single.callId, 'c1');
+      expect(tools.single.index, 4);
+      // The queued turn-2 prompt row survives the mid-ledger filter.
+      final queued = snapshot.records[1];
+      expect(queued, isA<TrajectoryUserRecord>());
+      expect((queued as TrajectoryUserRecord).text, 'queued');
+    });
+  });
+}

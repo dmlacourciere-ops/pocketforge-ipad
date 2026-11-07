@@ -1,0 +1,1135 @@
+# Fastfile for the Fa app (flutter_app).
+#
+# TestFlight submit lanes, adapted 1:1 from learn.ai's deploy setup: builds
+# happen in the CI workflows (flutter build ipa / flutter build macos), so
+# these lanes only upload the produced artifacts with the App Store Connect
+# API key from the environment:
+#
+# The daily's submit_only lanes distribute straight to the EXTERNAL
+# TestFlight group (issue #239): the group name and Beta App Review contact
+# ride repo variables (TESTFLIGHT_EXTERNAL_GROUP, BETA_REVIEW_CONTACT_*,
+# BETA_APP_FEEDBACK_EMAIL). release-appstore.yml drives the manual
+# submit_for_review lanes (App Store review submission).
+#   APP_STORE_CONNECT_KEY_ID / APP_STORE_CONNECT_ISSUER_ID /
+#   APP_STORE_CONNECT_KEY_CONTENT
+#
+# Android (#289): the build_only/build_release + upload_only lanes follow
+# the same split against Google Play; the service-account JSON rides
+# PLAY_STORE_SERVICE_ACCOUNT_JSON and
+# the track rides PLAY_TRACK (internal first, then external beta).
+#
+# iOS:    IOS_IPA_PATH points at the built .ipa (default: build/ios/*.ipa's
+#         conventional location).
+# macOS:  MACOS_PKG_PATH points at the signed .pkg (Mac Installer
+#         Distribution cert) and MACOS_BUNDLE_ID overrides dev.fa1.app.
+
+require_relative "appstore_preflight"
+require_relative "play_listing_sync"
+require_relative "play_upload_preflight"
+require_relative "store_version_create"
+require_relative "version_floor"
+
+# gh-2026: fastlane probes `xcodebuild -showBuildSettings` with a 3 s base
+# timeout. This host is ONE Mac shared by three runner registrations, and
+# the nightly wave runs build-macos + build-mobile + the extension build
+# concurrently — run 41276490153 attempts 1-2 completed the 663 s archive
+# and then died timing the probe out at 3/6/12/24 s. Give the probe a real
+# budget (||= keeps an explicit CI override possible).
+ENV["FASTLANE_XCODEBUILD_SETTINGS_TIMEOUT"] ||= "45"
+ENV["FASTLANE_XCODEBUILD_SETTINGS_RETRIES"] ||= "8"
+
+def asc_api_key
+  app_store_connect_api_key(
+    key_id: ENV["APP_STORE_CONNECT_KEY_ID"],
+    issuer_id: ENV["APP_STORE_CONNECT_ISSUER_ID"],
+    key_content: ENV["APP_STORE_CONNECT_KEY_CONTENT"],
+    is_key_content_base64: false,
+    in_house: false
+  )
+end
+
+# App Store locale map for the store pipeline: fastlane/metadata folder →
+# App Store Connect locale. Golden screenshots live one level below under
+# the plain language code (test/goldens/store/<en|ru>/<ios|ipad|mac>).
+def store_locale_map
+  { "en-US" => "en-US", "ru-RU" => "ru" }
+end
+
+# Latest "## [version]" section of store_artefacts/metadata/<lang>/changelog.md.
+def store_latest_changelog(lang)
+  file_path = File.expand_path("../../store_artefacts/metadata/#{lang}/changelog.md", __dir__)
+  return "" unless File.exist?(file_path)
+  content = File.read(file_path)
+  match = content.match(/## \[.*?\][^\n]*\n(.*?)(?=\n## \[|\z)/m)
+  match ? match[1].strip : ""
+end
+
+# gh-1522: the version string every store lane reports/verifies. The
+# derived BUILD_NAME env (build-mobile.yml / build-macos.yml version job,
+# from the latest tag + 1) wins — the committed pubspec carries the static
+# 0.0.0-dev placeholder now, so the pubspec parse is only the LAST-resort
+# fallback (a hand-run lane outside the CI env).
+def store_pubspec_version
+  derived = ENV["BUILD_NAME"].to_s.strip
+  return derived unless derived.empty?
+  pubspec_path = File.expand_path("../pubspec.yaml", __dir__)
+  return "1.0.0" unless File.exist?(pubspec_path)
+  match = File.read(pubspec_path).match(/version:\s+([0-9.]+)/)
+  match ? match[1] : "1.0.0"
+end
+
+# gh-1692: xcpretty "can result in missing some build errors" (fastlane's
+# own warning) — the 10-17/10-18 daily runs printed `** ARCHIVE FAILED **`
+# with NO error line and the real xcodebuild error only lived in
+# ~/Library/Logs/gym/ on the runner. xcbeautify keeps error lines, and on
+# lane failure the newest gym log tail is dumped into the job log so the
+# failure is diagnosable from the GH run page without the artifact.
+def print_gym_log_tail(lines: 80, since: nil)
+  log_dir = File.expand_path("~/Library/Logs/gym")
+  return unless Dir.exist?(log_dir)
+
+  newest = Dir.glob(File.join(log_dir, "**", "*.log")).max_by { |f| File.mtime(f) }
+  return if newest.nil?
+
+  # gh-1954: a gym log older than the lane start is STALE — run 40849468765
+  # printed an Oct-27 profile/cert error while the REAL failure was the
+  # -showBuildSettings keychain-prompt timeout. Never attribute a previous
+  # build's error to the current failure.
+  if since && File.mtime(newest) < since
+    UI.error("gh-1692: newest gym log (#{newest}) is STALE (mtime #{File.mtime(newest)} < lane start #{since}) — NOT dumping it; the real error is in the fastlane output above.")
+    return
+  end
+
+  UI.error("gh-1692: newest gym log tail (#{newest}) — the REAL xcodebuild error:")
+  File.readlines(newest).last(lines).each { |l| UI.error(l.chomp) }
+end
+
+# ── External TestFlight distribution (issue #239) ─────────────────────────
+# A missing repo variable is a LOUD named failure at lane start (AC1) —
+# never a fastlane stack trace mid-upload. The variables are set once as
+# repo variables and passed through by build-mobile.yml / build-macos.yml.
+def require_env!(name, what)
+  value = ENV[name].to_s.strip
+  UI.user_error!("#{name} is not set — #{what}") if value.empty?
+  value
+end
+
+def external_testflight_group!
+  require_env!("TESTFLIGHT_EXTERNAL_GROUP",
+               "external TestFlight distribution needs the group name (create the 'External Beta' group in App Store Connect, then set the TESTFLIGHT_EXTERNAL_GROUP repo variable)")
+end
+
+# Beta App Review contact (AC2): external distribution only flips green
+# unattended when the review info is complete. The app is local-first —
+# it boots without any account or key, so no demo account is required.
+def beta_app_review_info!
+  {
+    contact_first_name: ENV.fetch("BETA_REVIEW_CONTACT_FIRST_NAME", "Uladzimir"),
+    contact_last_name: ENV.fetch("BETA_REVIEW_CONTACT_LAST_NAME", "Klyshevich"),
+    contact_email: require_env!("BETA_REVIEW_CONTACT_EMAIL", "Beta App Review needs a contact email (set the BETA_REVIEW_CONTACT_EMAIL repo variable)"),
+    contact_phone: require_env!("BETA_REVIEW_CONTACT_PHONE", "Beta App Review needs a contact phone (set the BETA_REVIEW_CONTACT_PHONE repo variable)"),
+    demo_account_required: false,
+    notes: "Local-first AI agent app. No account, sign-in or API key is required — the app boots fully on-device with local models, so there is nothing to sign into."
+  }
+end
+
+def beta_app_feedback_email!
+  require_env!("BETA_APP_FEEDBACK_EMAIL", "external TestFlight testing needs a feedback email (set the BETA_APP_FEEDBACK_EMAIL repo variable)")
+end
+
+# distribute_external requires a "What to Test" changelog — pilot raises in
+# non-interactive CI without one. Reuse the store release notes.
+def testflight_changelog
+  notes = store_latest_changelog("en")
+  notes.empty? ? "Bug fixes and improvements." : notes
+end
+
+# Bounded wait for ASC processing (E1): external distribution needs a
+# PROCESSED build — pilot silently SKIPS distribution when the wait is
+# skipped. Default 90 min; override with TESTFLIGHT_WAIT_TIMEOUT_SECONDS.
+def testflight_wait_timeout
+  seconds = ENV["TESTFLIGHT_WAIT_TIMEOUT_SECONDS"].to_i
+  seconds.positive? ? seconds : 5400
+end
+
+def asc_token!
+  require "spaceship"
+  Spaceship::ConnectAPI.token ||= Spaceship::ConnectAPI::Token.create(
+    key_id: ENV["APP_STORE_CONNECT_KEY_ID"],
+    issuer_id: ENV["APP_STORE_CONNECT_ISSUER_ID"],
+    key: ENV["APP_STORE_CONNECT_KEY_CONTENT"]
+  )
+end
+
+def asc_app!(bundle_id:)
+  require "spaceship"
+  app = Spaceship::ConnectAPI::App.find(bundle_id)
+  UI.user_error!("App #{bundle_id} not found in App Store Connect") if app.nil?
+  app
+end
+
+# E3: pilot resolves groups BY NAME and silently skips adding the build when
+# the name resolves to nothing — fail loudly instead, pointing at the
+# variable. Returns [app, matched_group].
+def find_external_testflight_group!(bundle_id:, group:)
+  asc_token!
+  app = asc_app!(bundle_id: bundle_id)
+  found = app.get_beta_groups(includes: nil, limit: 200).select { |g| g.name == group }
+  UI.user_error!("TestFlight external group '#{group}' (TESTFLIGHT_EXTERNAL_GROUP) not found in App Store Connect — create it or fix the repo variable. Nothing was uploaded.") if found.empty?
+  [app, found.first]
+end
+
+# gh-1041 (AC1): appearance is NO LONGER the submit leg's job — ASC
+# read-side lag (group membership trailing an already-successful
+# distribution, #855: run 36382214186 died in a 900s wait-loop while the
+# build was in fact live) must never fail a green `upload_to_testflight`.
+# After a successful upload ONE read-only probe runs, purely informational
+# and unable to raise: found → ✅ line; not yet → a note pointing at the
+# deferred store-appearance-check workflow, which re-checks the store
+# 120 min after the legs start and files/updates exactly one stub if the
+# version is still absent past the horizon. Leg success = upload success.
+def verify_external_distribution!(bundle_id:, group:, app_version:)
+  probe = lambda do
+    app, beta_group = find_external_testflight_group!(bundle_id: bundle_id, group: group)
+    group_build_ids = beta_group.fetch_builds.map(&:id)
+    build = Spaceship::ConnectAPI::Build.all(
+      app_id: app.id,
+      includes: "preReleaseVersion,buildBetaDetail",
+      processing_states: "VALID",
+      sort: "-uploadedDate",
+      limit: 100
+    ).select { |b| b.app_version == app_version && group_build_ids.include?(b.id) }
+     .max_by { |b| b.version.to_i }
+    if build
+      # fastlane deleted BuildBetaDetail#ready_for_external_testing? but left
+      # Build#ready_for_external_testing? calling it — NoMethodError the
+      # moment ASC returns buildBetaDetail (issue #362; green runs only saw
+      # nil, which short-circuits). Read external_build_state from the beta
+      # detail directly: IN_BETA_TESTING/BETA_APPROVED = live, anything else
+      # (incl. nil detail) = still waiting for Beta App Review.
+      external_state = build.build_beta_detail&.external_build_state
+      if external_state == "IN_BETA_TESTING" || external_state == "BETA_APPROVED"
+        UI.success("✅ #{app_version} (build #{build.version}) is live to the external group '#{group}' — distributed with zero clicks")
+      else
+        UI.important("Build #{app_version} (#{build.version}) is in '#{group}' and waiting for Beta App Review — external visibility flips automatically on approval, no clicks needed.")
+      end
+    else
+      UI.important("Build #{app_version} not visible in '#{group}' yet — the submit stays GREEN (gh-1041: store read-side lag is not a failure). The deferred store-appearance-check workflow re-checks ASC 120 min after the daily legs start and files/updates one stub if the version is still absent past the horizon.")
+    end
+  end
+  begin
+    probe.call
+  rescue StandardError => e
+    UI.important("Post-submit appearance probe skipped (#{e.class}: #{e.message.to_s[0, 160]}) — the upload above already succeeded; the deferred store-appearance-check workflow owns appearance verification (gh-1041, #855).")
+  end
+end
+
+# Read-only ASC facts for one platform → AppstorePreflight decision (AC3:
+# every check happens BEFORE any mutation).
+def appstore_submission_decision(bundle_id:, platform:, version:, confirm:)
+  app = asc_app!(bundle_id: bundle_id)
+  # gh-1519 read-side: a version freshly created by store-metadata.yml can
+  # trail in ASC reads — bounded retry (3 × 20s) instead of an instant
+  # fail, covering BOTH arms like the macOS app_store lane's preflight
+  # probe: a nil find (read lag) AND a raised call (transient ASC 500).
+  # The retry decision lives in AppstorePreflight so the matrix is
+  # plain-ruby testable (test/appstore_preflight_test.rb).
+  app_store_version = AppstorePreflight.with_visibility_retries(
+    attempts: 3,
+    delay: 20,
+    log: ->(msg) { UI.important(msg) },
+    sleep_fn: ->(secs) { sleep(secs) }
+  ) do
+    app
+      .get_app_store_versions(filter: { platform: platform })
+      .find { |v| v.version_string == version }
+  end
+  builds = Spaceship::ConnectAPI::Build.all(
+    app_id: app.id,
+    version: version,
+    platform: platform,
+    processing_states: "PROCESSING,VALID,FAILED,INVALID"
+  )
+  decision = AppstorePreflight.decide(
+    version: version,
+    confirm: confirm,
+    app_store_version: app_store_version && { "state" => app_store_version.app_store_state },
+    builds: builds.map { |b| { "number" => b.version, "state" => b.processing_state } }
+  )
+  [app, decision]
+end
+
+def store_summary_line(line)
+  path = ENV["GITHUB_STEP_SUMMARY"]
+  File.write(path, "#{line}\n", mode: "a") if path
+  UI.success(line)
+end
+
+# Builds a temp metadata dir for deliver from fastlane/metadata/<platform_key>/
+# with App Store locale names, release_notes.txt from the store_artefacts
+# changelogs (en fallback per locale), and WITHOUT name.txt/subtitle.txt —
+# App Info is not editable once the app is released, and deliver would fail.
+def build_store_metadata_dir(platform_key:, out_dir:)
+  FileUtils.rm_rf(out_dir)
+  FileUtils.mkdir_p(out_dir)
+  store_locale_map.each do |src_locale, as_locale|
+    src = "metadata/#{platform_key}/#{src_locale}"
+    FileUtils.cp_r(src, "#{out_dir}/#{as_locale}") if Dir.exist?(src)
+  end
+  en_notes = store_latest_changelog("en")
+  ru_notes = store_latest_changelog("ru")
+  store_locale_map.each_value do |as_locale|
+    dir = "#{out_dir}/#{as_locale}"
+    FileUtils.mkdir_p(dir)
+    notes = as_locale == "ru" && !ru_notes.empty? ? ru_notes : en_notes
+    File.write("#{dir}/release_notes.txt", notes)
+    FileUtils.rm_f("#{dir}/name.txt")
+    FileUtils.rm_f("#{dir}/subtitle.txt")
+  end
+end
+
+# Copies committed store goldens (flutter_app/test/goldens/store/<lang>/<device>)
+# into the deliver screenshots folder with App Store locale names, falling
+# back to English when a locale has no localized screenshots.
+def copy_store_screenshots(device:, suffix:, out_root:)
+  goldens = File.expand_path("../test/goldens/store", __dir__)
+  store_locale_map.each do |src_locale, as_locale|
+    lang = src_locale.split("-").first.downcase
+    dir = "#{out_root}/#{as_locale}"
+    FileUtils.mkdir_p(dir)
+    files = Dir.glob("#{goldens}/#{lang}/#{device}/*.png").sort.first(10)
+    if files.empty?
+      files = Dir.glob("#{goldens}/en/#{device}/*.png").sort.first(10)
+      UI.message("No #{device} screenshots for #{as_locale}, using en fallback") unless files.empty?
+    end
+    files.each do |f|
+      FileUtils.cp(f, "#{dir}/#{File.basename(f, ".*")}#{suffix}.png")
+    end
+  end
+end
+
+# Apple's Connect API 500s in bursts (even seconds apart on identical
+# requests) — retry the block a few times on "Server error got 500".
+def with_apple_retries(attempts: 3, delay: 25)
+  tries = 0
+  begin
+    tries += 1
+    yield
+  rescue => e
+    if e.message.include?("Server error got 500") && tries < attempts
+      UI.important("Apple API 500 (attempt #{tries}/#{attempts}) — retrying in #{delay}s...")
+      sleep(delay)
+      retry
+    end
+    raise
+  end
+end
+
+# gh-1519: store-metadata's app_store lanes must CREATE the App Store
+# version when absent — deliver runs with skip_app_version_update:true,
+# which never materializes the record, so release-appstore.yml's
+# pre-flight dead-ended on every fresh version (v1.0.548 needed a manual
+# ASC click). Idempotent: POSTs appStoreVersions only when the version is
+# missing, so re-running store-metadata on an existing version stays a
+# metadata-only update (no duplicate version error).
+def ensure_app_store_version!(bundle_id:, platform:, version:)
+  asc_token!
+  app = asc_app!(bundle_id: bundle_id)
+  existing = with_apple_retries(attempts: 3, delay: 20) do
+    app.get_app_store_versions(filter: { platform: platform }).map(&:version_string)
+  end
+  return app unless StoreVersionCreate.needs_create?(existing: existing, version: version)
+
+  UI.message("App Store version #{version} (#{platform}) does not exist yet — creating the version record before deliver (gh-1519)")
+  begin
+    app.create_app_store_version(
+      attributes: StoreVersionCreate.create_attributes(platform: platform, version: version)
+    )
+  rescue => e
+    # gh-1519 rework (review thread, PR #1520): ASC read lag can hide a
+    # version a PREVIOUS run created, so needs_create? above answers true
+    # and the POST collides with the existing record — on a workflow
+    # re-run that conflict is idempotency, not failure (the ticket's REG:
+    # re-running store-metadata on an existing version stays a
+    # metadata-only update). Re-read once (bounded retries) and no-op
+    # when the version now exists; anything else still raises.
+    if StoreVersionCreate.create_conflict?(message: e.message)
+      UI.important("create_app_store_version reports #{version} (#{platform}) already exists — re-reading once to confirm (ASC read lag)")
+      existing = with_apple_retries(attempts: 3, delay: 20) do
+        app.get_app_store_versions(filter: { platform: platform }).map(&:version_string)
+      end
+      return app unless StoreVersionCreate.needs_create?(existing: existing, version: version)
+    end
+    raise
+  end
+  UI.success("Created App Store version #{version} (#{platform}) — store-metadata can now attach metadata/screenshots to it")
+  app
+end
+
+# Directly updates App Store version localizations via the Spaceship API.
+# Fallback when deliver fails because App Info is not editable.
+def upload_version_metadata_via_api(metadata_dir:, bundle_id:, platform:)
+  require "spaceship"
+
+  app = Spaceship::ConnectAPI::App.find(bundle_id)
+  if app.nil?
+    UI.error("Could not find app with bundle_id: #{bundle_id}")
+    return
+  end
+
+  version = app.get_edit_app_store_version(platform: platform)
+  if version.nil?
+    UI.important("No editable version found for #{bundle_id} on #{platform} - skipping")
+    return
+  end
+
+  locs = version.get_app_store_version_localizations
+  updated = 0
+  locs.each do |loc|
+    locale_dir = File.join(metadata_dir, loc.locale)
+    attrs = {}
+    {
+      "release_notes"    => :whatsNew,
+      "description"      => :description,
+      "keywords"         => :keywords,
+      "promotional_text" => :promotionalText
+    }.each do |file_name, attr_key|
+      file_path = File.join(locale_dir, "#{file_name}.txt")
+      attrs[attr_key] = File.read(file_path).strip if File.exist?(file_path)
+    end
+    unless attrs.empty?
+      loc.update(attributes: attrs)
+      updated += 1
+    end
+  end
+  UI.success("Updated #{updated} locale(s) version metadata via Spaceship API")
+end
+
+platform :ios do
+  # gh-798 AC1/AC2: the daily TestFlight leg asserts the version it is
+  # about to stamp is strictly ABOVE the latest ASC-approved version BEFORE
+  # any build runs — #785's failure class (altool 90062 at the end of a
+  # 20-minute build) dies here in seconds instead. Reads the SAME version
+  # source the build stamps (BUILD_NAME — pubspec → tag → version job, the
+  # one-version scheme gh-785 centralized). The decision lives in
+  # version_floor.rb (plain-ruby tested); this lane only fetches ASC facts.
+  desc "Assert the stamped version is above the ASC-approved floor before building (gh-798)"
+  lane :assert_version_floor do
+    stamped = ENV["BUILD_NAME"].to_s.strip
+    UI.user_error!("[gh-798] BUILD_NAME is not set — the version-floor pre-check needs the version the build will stamp") if stamped.empty?
+
+    if ENV["APP_STORE_CONNECT_KEY_CONTENT"].to_s.strip.empty?
+      # ASC keys are optional repo secrets: without them the submit leg
+      # skips the upload anyway, so there is no floor to guard. The skip
+      # stays a visible marker, never a silent pass (gh-798 AC4).
+      UI.important("[gh-798] version-floor pre-check: SKIPPED — no APP_STORE_CONNECT_KEY_CONTENT secret (the upload leg would skip too)")
+      next
+    end
+
+    bundle_id = ENV["IOS_BUNDLE_ID"] || "dev.fa1.app"
+    # E1: ASC unreachable/rate-limited gets exactly one retry, then a
+    # fail-closed named error — a skipped floor check is a silent floor.
+    tries = 0
+    begin
+      tries += 1
+      asc_token!
+      app = asc_app!(bundle_id: bundle_id)
+      approved = app.get_app_store_versions(filter: { platform: Spaceship::ConnectAPI::Platform::IOS }).map do |v|
+        { "state" => v.app_store_state, "version" => v.version_string }
+      end
+    rescue FastlaneCore::Interface::FastlaneError
+      # gh-800 r2: deterministic lane errors (missing ASC app, missing
+      # TestFlight group, any UI.user_error!) are NOT transient — re-raise
+      # immediately instead of retrying them and mislabeling the failure
+      # "App Store Connect unreachable".
+      raise
+    rescue StandardError => e
+      retry if tries < 2
+      UI.user_error!("[gh-798] version-floor pre-check: App Store Connect unreachable after one retry (#{e.class}: #{e.message.to_s[0, 200]}) — failing closed: cannot verify the version floor, refusing to build")
+    end
+
+    decision = VersionFloor.decide(stamped: stamped, approved: approved)
+    # AC4 leg-level marker: the pre-check RAN and what it decided — visible
+    # in the daily report, so a silently-skipped check can never hide.
+    UI.message("[gh-798] version-floor pre-check RAN: stamped=#{stamped} approved_floor=#{decision['floor']} verdict=#{decision['action']}")
+    UI.user_error!(decision["reason"]) if decision["action"] == "abort"
+    UI.success("✅ #{decision['reason']}")
+  end
+
+  desc "Build iOS IPA only (for CI split build/submit pattern)"
+  lane :build_only do
+    # gh-1865 model v3: the signing identity lives in the PERSISTENT host
+    # keychain (ci-signing.keychain-db), provisioned by the workflow via
+    # ~/bin/ci-sign. No per-job keychain, no search-list writes here (the
+    # additive-helper dance retired with per-job keychains — gh-1866/
+    # gh-1865). Point-of-use unlock right before the archive: hours can
+    # pass between the workflow's provision step and gym, and an explicit
+    # unlock is immune to any gap length (the gh-1798 auto-lock window
+    # hack is retired). gh-1910 lesson kept: resolve the script absolutely
+    # from the Fastfile location (__dir__ = flutter_app/fastlane →
+    # repo/scripts) — fastlane's sh does not honor the assumed lane cwd.
+    ci_sign = File.expand_path("../../scripts/ci-sign", __dir__)
+    sh(ci_sign, "unlock")
+    lane_start = Time.now
+
+    team_id = ENV["IOS_TEAM_ID"] || "YP9HC3USZ3"
+    bundle_id = ENV["IOS_BUNDLE_ID"] || "dev.fa1.app"
+    profile_name = ENV["IOS_PROVISIONING_PROFILE_NAME"] || "Fa Profile"
+    live_activity_profile_name = ENV["IOS_LIVE_ACTIVITY_PROFILE_NAME"] || "FaLiveActivity Profile"
+    # gh-1865: CI passes a SHA-1 fingerprint (IOS_SIGNING_IDENTITY read
+    # from the job's own keychain right after import) — never resolve the
+    # identity by NAME, which is a lottery when the additive per-user
+    # search list holds two same-CN "Apple Distribution" certs from
+    # concurrent signing legs. The bare name below is a LOCAL-dev fallback
+    # only; the workflow always pins.
+    signing_identity = ENV["IOS_SIGNING_IDENTITY"] || "iPhone Distribution"
+
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: "ios/Runner.xcodeproj",
+      team_id: team_id,
+      bundle_identifier: bundle_id,
+      profile_name: profile_name,
+      code_sign_identity: signing_identity,
+      # ONLY the app target: without this filter the action rewrites EVERY
+      # target's PRODUCT_BUNDLE_IDENTIFIER (incl. the FaLiveActivity
+      # extension), producing a CFBundleIdentifier collision at upload.
+      targets: ["Runner"]
+    )
+
+    # The FaLiveActivity extension signs MANUALLY as well: the runner's Xcode
+    # has no Apple account, so automatic signing / -allowProvisioningUpdates
+    # cannot create its profile — it is installed from a secret by the
+    # workflow and only gets pointed at here.
+    update_code_signing_settings(
+      use_automatic_signing: false,
+      path: "ios/Runner.xcodeproj",
+      team_id: team_id,
+      bundle_identifier: "#{bundle_id}.FaLiveActivity",
+      profile_name: live_activity_profile_name,
+      code_sign_identity: signing_identity,
+      targets: ["FaLiveActivity"]
+    )
+
+    sh("flutter", "clean")
+    sh("flutter", "pub", "get")
+    cocoapods(podfile: "ios/Podfile")
+
+    if ENV["BUILD_NUMBER"]
+      increment_build_number(xcodeproj: "ios/Runner.xcodeproj", build_number: ENV["BUILD_NUMBER"])
+    else
+      increment_build_number(xcodeproj: "ios/Runner.xcodeproj")
+    end
+
+    # Issue #726 (run 35564638018): ASC closes a version train once a build
+    # of it was approved (90186) and rejects submissions not higher than the
+    # previously approved version (90062) — with pubspec pinned at 1.0.0 the
+    # daily TestFlight upload can never land again. BUILD_NAME comes from
+    # build-mobile.yml (the derived next-tag version, strictly increasing);
+    # unset = legacy manual flow, keep the pubspec version.
+    build_name_args = ENV["BUILD_NAME"] ? ["--build-name", ENV["BUILD_NAME"]] : []
+    sh("xcrun simctl list > /dev/null 2>&1 || true")
+    sh("xcrun simctl boot 'iPhone 16' 2>/dev/null || xcrun simctl boot 'iPhone 15' 2>/dev/null || true")
+    sh("flutter", "build", "ios", "--release", "--no-codesign", *build_name_args)
+
+    # gh-1954: point-of-use re-unlock right before gym — the lane-start
+    # unlock goes stale during the long CocoaPods/SPM phase, and gym's
+    # `xcodebuild -showBuildSettings` hangs on a locked keychain's GUI
+    # prompt (headless = fastlane timeout, run 40849468765).
+    sh(ci_sign, "unlock")
+
+    # gh-1954: keychain re-unlock WATCHDOG for the whole gym window. The
+    # keychain auto-locks after ~5 min of inactivity and
+    # set-keychain-settings can never fix it non-interactively on this
+    # host (GUI SecurityAgent prompt — screenshot-confirmed). A locked
+    # keychain mid-archive/export = xcodebuild hangs on the password
+    # prompt. unlock-keychain -p never prompts, so re-unlocking every
+    # 60 s keeps the signing identity usable through archive AND export.
+    unlock_watchdog = Thread.new do
+      loop do
+        sleep 60
+        begin
+          sh(ci_sign, "unlock")
+        rescue StandardError
+          # best effort — a transient unlock failure must not kill the build
+        end
+      end
+    end
+
+    # gh-1954: xcodebuild resolves signing identities ONLY through the
+    # user keychain search list — and on the shared host a concurrent
+    # signing leg rewrites that list mid-build (run 40843155381: doctor OK
+    # at 08:38, then gym at 08:53 resolved a same-team "Apple Distribution"
+    # from a DIFFERENT keychain instead of the pinned 9007ED87 from
+    # ci-signing.keychain-db — profile/cert mismatch). Pin the search list
+    # for the duration of gym and restore it in ensure. This is NOT the
+    # retired per-job keychain model: the keychain itself stays persistent;
+    # only xcodebuild's visibility window is pinned.
+    # gh-1972 root cause: the save/restore dance entrenched whatever it
+    # captured — one System duplicate slipping in between the two writers
+    # (this pin + ci-sign install append) was then written back by EVERY
+    # subsequent run, and a later "Reset To Defaults" on the host turned
+    # the stale login path dangling ("Keychain Not Found" GUI dialogs,
+    # gh auth failure). The pin below IS the canonical persistent list;
+    # there is nothing to restore to.
+    sh("security", "list-keychains", "-d", "user", "-s",
+       File.expand_path("~/Library/Keychains/login.keychain-db"),
+       "/Library/Keychains/System.keychain",
+       File.expand_path("~/Library/Keychains/ci-signing.keychain-db"))
+
+    # gh-1692: xcbeautify, never xcpretty (xcpretty swallowed the archive
+    # error — silent `** ARCHIVE FAILED **`), and on failure the newest
+    # gym log tail lands in the job log via print_gym_log_tail.
+    begin
+      build_app(
+        workspace: "ios/Runner.xcworkspace",
+        scheme: "Runner",
+        export_method: "app-store",
+        output_directory: "build/ios/ipa",
+        output_name: "fa.ipa",
+        skip_build_archive: false,
+        clean: true,
+        sdk: "iphoneos",
+        xcodebuild_formatter: "xcbeautify",
+        export_options: {
+          method: "app-store",
+          provisioningProfiles: {
+            bundle_id => profile_name,
+            "#{bundle_id}.FaLiveActivity" => live_activity_profile_name
+          },
+          signingStyle: "manual",
+          # gh-1865: pin the export step by the same fingerprint — the
+          # exportOptions signingCertificate accepts a SHA-1 (that is what
+          # Xcode itself writes into exportOptions plists), so
+          # -exportArchive cannot resolve a shadowing same-CN cert either.
+          signingCertificate: signing_identity,
+          teamID: team_id,
+          manageAppVersionAndBuildNumber: false,
+          uploadBitcode: false,
+          compileBitcode: false
+        },
+        export_xcargs: "-allowProvisioningUpdates"
+      )
+    rescue StandardError => e
+      print_gym_log_tail(since: lane_start)
+      raise e
+    ensure
+      unlock_watchdog.kill
+      # gh-1954: restore the pre-gym search list (best effort — never mask
+      # the gym result with a restore failure).
+      begin
+        # gh-1972: no write-back restore. The pinned list is canonical and
+        # idempotent — restoring a captured copy only re-entrenches any
+        # garbage captured at pin time (see the root-cause note above).
+      rescue StandardError
+      end
+    end
+  end
+
+  desc "Upload the built IPA to TestFlight and distribute to the external group (no metadata/screenshots)"
+  lane :submit_only do
+    ipa = ENV["IOS_IPA_PATH"] || File.expand_path("../build/ios/ipa/fa.ipa", __dir__)
+    UI.user_error!("IPA not found: #{ipa} (set IOS_IPA_PATH)") unless File.exist?(ipa)
+
+    # Loud named failures at lane start (AC1) — a missing variable must
+    # never surface as a fastlane stack trace after the upload.
+    group = external_testflight_group!
+    review_info = beta_app_review_info!
+    feedback_email = beta_app_feedback_email!
+    bundle_id = ENV["IOS_BUNDLE_ID"] || "dev.fa1.app"
+    find_external_testflight_group!(bundle_id: bundle_id, group: group)
+
+    upload_to_testflight(
+      api_key: asc_api_key,
+      ipa: ipa,
+      # External distribution needs a PROCESSED build: skipping the wait
+      # makes pilot silently skip distribution (bounded, E1).
+      skip_waiting_for_build_processing: false,
+      wait_processing_timeout_duration: testflight_wait_timeout,
+      distribute_external: true,
+      groups: [group],
+      notify_external_testers: true,
+      changelog: testflight_changelog,
+      beta_app_review_info: review_info,
+      beta_app_feedback_email: feedback_email,
+      uses_non_exempt_encryption: false
+    )
+
+    # Select the uploaded build by the marketing version it actually ships
+    # (BUILD_NAME when the build lane set it, issue #726; pubspec otherwise).
+    verify_external_distribution!(bundle_id: bundle_id, group: group, app_version: ENV["BUILD_NAME"] || store_pubspec_version)
+  end
+
+  desc "Submit the version's latest processed TestFlight build to App Store review (release-appstore.yml)"
+  lane :submit_for_review do
+    version = require_env!("APP_STORE_VERSION", "the app version to submit, e.g. 1.2.3")
+    confirm = require_env!("APP_STORE_CONFIRM", "must repeat the version string exactly (fat-finger guard)")
+    # E5: flipping to automatic release stays a one-line repo variable.
+    automatic_release = ENV.fetch("APP_STORE_AUTOMATIC_RELEASE", "false") == "true"
+    bundle_id = ENV["IOS_BUNDLE_ID"] || "dev.fa1.app"
+
+    asc_token!
+    app, decision = appstore_submission_decision(bundle_id: bundle_id, platform: Spaceship::ConnectAPI::Platform::IOS, version: version, confirm: confirm)
+    UI.user_error!(decision["reason"]) if decision["action"] == "fail"
+    if decision["action"] == "noop"
+      UI.success("ℹ️ #{decision['reason']}")
+      next
+    end
+
+    UI.message("#{decision['reason']} (automatic_release=#{automatic_release})")
+    deliver(
+      app_identifier: bundle_id,
+      api_key: asc_api_key,
+      app_version: version,
+      build_number: decision["build_number"],
+      submit_for_review: true,
+      automatic_release: automatic_release,
+      phased_release: false,
+      skip_binary_upload: true,
+      skip_metadata: true,
+      skip_screenshots: true,
+      force: true,
+      run_precheck_before_submit: false,
+      submission_information: { add_id_info_uses_idfa: false }
+    )
+    store_summary_line("iOS #{version} (build #{decision['build_number']}) submitted for App Store review — https://appstoreconnect.apple.com/apps/#{app.id}")
+  end
+
+  desc "Deploy iOS App Store metadata and screenshots (no binary)"
+  lane :app_store do
+    # IOS_DEPLOY_METADATA=false → skip texts/descriptions
+    # IOS_DEPLOY_SCREENSHOTS=false → skip screenshots
+    do_metadata    = ENV.fetch("IOS_DEPLOY_METADATA",    "true") == "true"
+    do_screenshots = ENV.fetch("IOS_DEPLOY_SCREENSHOTS", "true") == "true"
+    UI.message("App Store deploy: metadata=#{do_metadata}, screenshots=#{do_screenshots}")
+
+    metadata_dir = "metadata/ios_deliver"
+    build_store_metadata_dir(platform_key: "ios", out_dir: metadata_dir)
+
+    if do_screenshots
+      UI.message("Copying store goldens to the screenshots folder...")
+      # iPhone 6.9" (1290x2796) — accepted for all iPhone sizes; iPad Pro 13".
+      copy_store_screenshots(device: "ios", suffix: "_iphone69", out_root: "screenshots")
+      copy_store_screenshots(device: "ipad", suffix: "_ipadPro", out_root: "screenshots")
+    end
+
+    api_key = asc_api_key
+    bundle_id = ENV["IOS_BUNDLE_ID"] || "dev.fa1.app"
+    version_name = store_pubspec_version
+
+    # gh-1519: materialize the App Store version record when absent
+    # (idempotent — no-op on an existing version) so deliver has a version
+    # to attach the metadata/screenshots to; without this the lane went
+    # green while creating nothing and release-appstore's pre-flight
+    # dead-ended on every fresh version.
+    if do_metadata || do_screenshots
+      ensure_app_store_version!(bundle_id: bundle_id, platform: Spaceship::ConnectAPI::Platform::IOS, version: version_name)
+    end
+
+    # Step 1: metadata only (fast, reliable)
+    if do_metadata
+      begin
+        with_apple_retries do
+          deliver(
+            app_identifier: bundle_id,
+            api_key: api_key,
+            copyright: "2026 Uladzimir Klyshevich",
+            metadata_path: File.expand_path(metadata_dir),
+            screenshots_path: File.expand_path("screenshots"),
+            skip_binary_upload: true,
+            skip_app_version_update: true,
+            app_version: version_name,
+            force: true,
+            submit_for_review: false,
+            automatic_release: false,
+            phased_release: false,
+            skip_screenshots: true,
+            run_precheck_before_submit: false,
+            version_check_wait_retry_limit: 1
+          )
+        end
+        UI.success("iOS metadata uploaded successfully!")
+      rescue => e
+        if e.message.strip == "No data" || e.message.include?("fetch_app_store_review_detail")
+          # Known first-version deliver bug (fastlane#20538): the review-detail
+          # fetch crashes AFTER the localized metadata was already uploaded.
+          UI.important("deliver hit the first-version 'No data' review-detail bug after uploading metadata — continuing.")
+        elsif e.message.include?("Cannot update languages") || e.message.include?("Cannot find edit app info")
+          UI.important("deliver failed (App Info not editable) - uploading version metadata directly via Spaceship API...")
+          upload_version_metadata_via_api(
+            metadata_dir: File.expand_path(metadata_dir),
+            bundle_id: bundle_id,
+            platform: Spaceship::ConnectAPI::Platform::IOS
+          )
+        else
+          raise
+        end
+      end
+    else
+      UI.message("Skipping metadata upload (IOS_DEPLOY_METADATA=false)")
+    end
+
+    # Step 2: screenshots separately — Apple's API returns 500 intermittently,
+    # so screenshot errors never fail the lane.
+    if do_screenshots
+      begin
+        with_apple_retries do
+          deliver(
+            app_identifier: bundle_id,
+            api_key: api_key,
+            metadata_path: File.expand_path(metadata_dir),
+            screenshots_path: File.expand_path("screenshots"),
+            skip_binary_upload: true,
+            skip_app_version_update: true,
+            app_version: version_name,
+            force: true,
+            submit_for_review: false,
+            automatic_release: false,
+            phased_release: false,
+            skip_metadata: true,
+            overwrite_screenshots: true,
+            run_precheck_before_submit: false,
+            screenshot_processing_timeout: 30,
+            version_check_wait_retry_limit: 2
+          )
+        end
+        UI.success("iOS screenshots uploaded successfully!")
+      rescue => e
+        UI.important("Screenshot upload encountered Apple API errors: #{e.message}")
+        UI.important("Screenshots may still have been uploaded — check App Store Connect.")
+        UI.important("Continuing without failing the pipeline...")
+      end
+    else
+      UI.message("Skipping screenshots upload (IOS_DEPLOY_SCREENSHOTS=false)")
+    end
+  end
+end
+
+platform :mac do
+  desc "Upload the built PKG to TestFlight and distribute to the external group (no metadata/screenshots)"
+  lane :submit_only do
+    pkg = ENV["MACOS_PKG_PATH"] || File.expand_path("../build/macos/fa.pkg", __dir__)
+    UI.user_error!("PKG not found: #{pkg} (set MACOS_PKG_PATH)") unless File.exist?(pkg)
+
+    group = external_testflight_group!
+    review_info = beta_app_review_info!
+    feedback_email = beta_app_feedback_email!
+    bundle_id = ENV["MACOS_BUNDLE_ID"] || "dev.fa1.app"
+    find_external_testflight_group!(bundle_id: bundle_id, group: group)
+
+    upload_to_testflight(
+      api_key: asc_api_key,
+      pkg: pkg,
+      app_identifier: bundle_id,
+      skip_waiting_for_build_processing: false,
+      wait_processing_timeout_duration: testflight_wait_timeout,
+      distribute_external: true,
+      groups: [group],
+      notify_external_testers: true,
+      changelog: testflight_changelog,
+      beta_app_review_info: review_info,
+      beta_app_feedback_email: feedback_email,
+      uses_non_exempt_encryption: false
+    )
+
+    verify_external_distribution!(bundle_id: bundle_id, group: group, app_version: store_pubspec_version)
+  end
+
+  desc "Submit the version's latest processed TestFlight build to App Store review (release-appstore.yml)"
+  lane :submit_for_review do
+    version = require_env!("APP_STORE_VERSION", "the app version to submit, e.g. 1.2.3")
+    confirm = require_env!("APP_STORE_CONFIRM", "must repeat the version string exactly (fat-finger guard)")
+    automatic_release = ENV.fetch("APP_STORE_AUTOMATIC_RELEASE", "false") == "true"
+    bundle_id = ENV["MACOS_BUNDLE_ID"] || "dev.fa1.app"
+
+    asc_token!
+    app, decision = appstore_submission_decision(bundle_id: bundle_id, platform: Spaceship::ConnectAPI::Platform::MAC_OS, version: version, confirm: confirm)
+    UI.user_error!(decision["reason"]) if decision["action"] == "fail"
+    if decision["action"] == "noop"
+      UI.success("ℹ️ #{decision['reason']}")
+      next
+    end
+
+    UI.message("#{decision['reason']} (automatic_release=#{automatic_release})")
+    deliver(
+      app_identifier: bundle_id,
+      api_key: asc_api_key,
+      platform: "osx",
+      app_version: version,
+      build_number: decision["build_number"],
+      submit_for_review: true,
+      automatic_release: automatic_release,
+      phased_release: false,
+      skip_binary_upload: true,
+      skip_metadata: true,
+      skip_screenshots: true,
+      force: true,
+      run_precheck_before_submit: false,
+      submission_information: { add_id_info_uses_idfa: false }
+    )
+    store_summary_line("macOS #{version} (build #{decision['build_number']}) submitted for App Store review — https://appstoreconnect.apple.com/apps/#{app.id}")
+  end
+
+  desc "Deploy macOS App Store metadata and screenshots (no binary)"
+  lane :app_store do
+    # MACOS_DEPLOY_METADATA=false → skip texts/descriptions
+    # MACOS_DEPLOY_SCREENSHOTS=false → skip screenshots
+    do_metadata    = ENV.fetch("MACOS_DEPLOY_METADATA",    "true") == "true"
+    do_screenshots = ENV.fetch("MACOS_DEPLOY_SCREENSHOTS", "true") == "true"
+    UI.message("Mac App Store deploy: metadata=#{do_metadata}, screenshots=#{do_screenshots}")
+
+    metadata_dir = "metadata/mac_deliver"
+    build_store_metadata_dir(platform_key: "macos", out_dir: metadata_dir)
+
+    if do_screenshots
+      UI.message("Copying macOS store goldens to the screenshots folder...")
+      # Separate folder from the iOS lane: deliver classifies by resolution.
+      copy_store_screenshots(device: "mac", suffix: "_mac", out_root: "screenshots_mac")
+    end
+
+    api_key = asc_api_key
+    bundle_id = ENV["MACOS_BUNDLE_ID"] || "dev.fa1.app"
+    version_name = store_pubspec_version
+
+    # gh-1519: materialize the App Store version record when absent
+    # (idempotent — no-op on an existing version) BEFORE the editable-
+    # version probe below, so a fresh macOS version no longer dead-ends
+    # into "Create the macOS version in App Store Connect ...".
+    if do_metadata || do_screenshots
+      ensure_app_store_version!(bundle_id: bundle_id, platform: Spaceship::ConnectAPI::Platform::MAC_OS, version: version_name)
+    end
+
+    # Preflight: without an editable (prepare-for-submission) macOS version in
+    # App Store Connect, deliver dies on Apple's opaque "Server error got 500"
+    # while resolving the version — check first and report instead of forcing.
+    # Apple's API also 500s intermittently, so probe twice before concluding.
+    mac_version = nil
+    preflight_error = nil
+    2.times do |attempt|
+      begin
+        mac_app = Spaceship::ConnectAPI::App.find(bundle_id)
+        mac_version = mac_app&.get_edit_app_store_version(platform: Spaceship::ConnectAPI::Platform::MAC_OS)
+        preflight_error = nil
+        break
+      rescue => e
+        preflight_error = e
+        UI.important("ASC preflight attempt #{attempt + 1} failed: #{e.message}")
+        sleep(20)
+      end
+    end
+    if mac_version.nil?
+      if preflight_error
+        UI.important("Could not verify the macOS App Store version for #{bundle_id} (Apple API errors) — re-run the workflow later.")
+      else
+        UI.important("No editable macOS App Store version for #{bundle_id}.")
+        UI.important("Create the macOS #{version_name} version in App Store Connect (app page → macOS → '+ Version') and re-run.")
+      end
+      UI.important("Skipping the macOS upload without failing the pipeline.")
+      next
+    end
+
+    if do_metadata
+      begin
+        with_apple_retries do
+          deliver(
+            app_identifier: bundle_id,
+            api_key: api_key,
+            platform: "osx",
+            copyright: "2026 Uladzimir Klyshevich",
+            metadata_path: File.expand_path(metadata_dir),
+            screenshots_path: File.expand_path("screenshots_mac"),
+            skip_binary_upload: true,
+            skip_app_version_update: true,
+            app_version: version_name,
+            force: true,
+            submit_for_review: false,
+            automatic_release: false,
+            phased_release: false,
+            skip_screenshots: true,
+            run_precheck_before_submit: false,
+            version_check_wait_retry_limit: 1
+          )
+        end
+        UI.success("macOS metadata uploaded successfully!")
+      rescue => e
+        if e.message.strip == "No data" || e.message.include?("fetch_app_store_review_detail")
+          # Known first-version deliver bug (fastlane#20538): the review-detail
+          # fetch crashes AFTER the localized metadata was already uploaded.
+          UI.important("deliver hit the first-version 'No data' review-detail bug after uploading metadata — continuing.")
+        elsif e.message.include?("Cannot update languages") || e.message.include?("Cannot find edit app info") || e.message.include?("cannot create a new version") || e.message.include?("You cannot create a new version")
+          UI.important("deliver failed (App Info not editable) - uploading version metadata directly via Spaceship API...")
+          upload_version_metadata_via_api(
+            metadata_dir: File.expand_path(metadata_dir),
+            bundle_id: bundle_id,
+            platform: Spaceship::ConnectAPI::Platform::MAC_OS
+          )
+        else
+          raise
+        end
+      end
+    else
+      UI.message("Skipping metadata upload (MACOS_DEPLOY_METADATA=false)")
+    end
+
+    if do_screenshots
+      begin
+        with_apple_retries do
+          deliver(
+            app_identifier: bundle_id,
+            api_key: api_key,
+            platform: "osx",
+            metadata_path: File.expand_path(metadata_dir),
+            screenshots_path: File.expand_path("screenshots_mac"),
+            skip_binary_upload: true,
+            skip_app_version_update: true,
+            app_version: version_name,
+            force: true,
+            submit_for_review: false,
+            automatic_release: false,
+            phased_release: false,
+            skip_metadata: true,
+            overwrite_screenshots: true,
+            run_precheck_before_submit: false,
+            screenshot_processing_timeout: 30,
+            version_check_wait_retry_limit: 2
+          )
+        end
+        UI.success("macOS screenshots uploaded successfully!")
+      rescue => e
+        UI.important("macOS screenshot upload encountered Apple API errors: #{e.message}")
+        UI.important("Screenshots may still have been uploaded — check App Store Connect.")
+        UI.important("Continuing without failing the pipeline...")
+      end
+    else
+      UI.message("Skipping screenshots upload (MACOS_DEPLOY_SCREENSHOTS=false)")
+    end
+  end
+end
+
+# ── Android / Play (issue #289) ───────────────────────────────────────────
+# Mirrors the iOS split: the build lane produces the release AAB from the
+# CI secrets (the upload keystore rides ANDROID_KEYSTORE_BASE64 et al. and
+# is decoded by app/build.gradle.kts — see the release signingConfig), the
+# upload lane ships it to Google Play. Track policy: the FIRST real upload
+# goes to the internal track (owner, one-time console step — Play App
+# Signing enrollment may also require the console UI); afterwards the
+# daily-publish Play leg publishes to the external beta (open testing)
+# track via PLAY_TRACK=beta. Every decision routes through
+# play_upload_preflight.rb so the lane logic is testable without the Play
+# API (fastlane/test/play_upload_preflight_test.rb).
+platform :android do
+  desc "Build the release AAB only (CI split build/submit pattern; #289 build_release)"
+  lane :build_release do
+    sh("flutter", "pub", "get")
+    # gh-1522: stamp the versionName from the derived BUILD_NAME (latest tag
+    # + 1) so the AAB's version string matches the iOS/macOS builds — the
+    # committed pubspec carries the static 0.0.0-dev placeholder and never
+    # churns. BUILD_NUMBER stays the run number (Play versionCode).
+    args = ["flutter", "build", "appbundle", "--release", "--flavor", "store"]
+    args << "--build-name=#{ENV['BUILD_NAME']}" if ENV["BUILD_NAME"].to_s.strip != ""
+    args << "--build-number=#{ENV['BUILD_NUMBER']}" if ENV["BUILD_NUMBER"].to_s.strip != ""
+    sh(*args)
+    aab = PlayUploadPreflight.default_aab_path(File.expand_path("..", __dir__))
+    UI.user_error!("AAB not found at #{aab} after the build") unless File.exist?(aab)
+    UI.success("Release AAB built: #{aab}")
+  end
+
+  desc "Alias of build_release — keeps the iOS `build_only` lane name so `fastlane android build_only` works"
+  lane :build_only do
+    build_release
+  end
+
+  desc "Upload the built AAB to Google Play (upload_to_play_store). PLAY_TRACK selects internal/alpha/beta/production (default internal); PLAY_VALIDATE_ONLY=1 authenticates and resolves the track without publishing"
+  lane :upload_only do
+    repo_root = File.expand_path("..", __dir__)
+    json_key = PlayUploadPreflight.play_json_key!(ENV)
+    track = PlayUploadPreflight.track!(ENV)
+    aab = PlayUploadPreflight.aab_path!(ENV, repo_root: repo_root)
+    validate_only = PlayUploadPreflight.validate_only?(ENV)
+
+    package_name = PlayUploadPreflight.package_name!(repo_root)
+    UI.message("Play upload: track=#{track} aab=#{aab} validate_only=#{validate_only} " \
+               "package=#{package_name}")
+    upload_to_play_store(
+      PlayUploadPreflight
+        .supply_options(track: track, aab: aab, validate_only: validate_only)
+        .merge(json_key_data: json_key,
+               package_name: package_name)
+    )
+    if validate_only
+      UI.success("✅ Play validate-only pass: authenticated, track '#{track}' + #{File.basename(aab)} resolved — nothing published")
+    else
+      store_summary_line("Android #{store_pubspec_version} uploaded to the Play '#{track}' track — #{File.basename(aab)}")
+    end
+  end
+
+  desc "Deploy the Google Play store listing (metadata + images + screenshots, no binary). PLAY_DEPLOY_METADATA=false skips texts, PLAY_DEPLOY_IMAGES=false skips icon/featureGraphic/screenshots, PLAY_VALIDATE_ONLY=1 authenticates and resolves the track without uploading"
+  lane :play_store do
+    # The store-listing half of the Android release (issue #289), the
+    # supply twin of the iOS/mac `app_store` lanes: the texts live in
+    # fastlane/metadata/android/<locale>/ and the images are COMMITTED
+    # GOLDENS rendered by test/golden/store_screenshots_test.dart and
+    # test/golden/play_store_assets_test.dart (sizes enforced by
+    # test/play_store_listing_guard_test.dart). Never a binary — AABs ride
+    # upload_only — and never changelogs (Play release notes need a
+    # version code and belong to the binary upload).
+    #
+    # Issue #947: supply only APPENDS screenshot uploads, which is how the
+    # old "The first…" screenshot survived on the live listing after the
+    # repo goldens were fixed. The images go through PlayListingSync: the
+    # whole set is replaced per locale + device type (stale shots deleted,
+    # ru-RU tenInch and other dropped sets cleared) and the committed
+    # state is verified via edits.images.list — a mismatch fails the lane.
+    #
+    # gh-1402 (owner steering) — App-token rule for the release path: any
+    # automation that commits/pushes release-path changes (store metadata
+    # fixes, version bumps, changelogs) MUST use the fa-release-bot GitHub
+    # App token (the #1172 ruleset-bypass machinery) — never a PAT, never
+    # the default GITHUB_TOKEN: main's required status checks reject both
+    # (#1098).
+    #
+    # gh-1402 pre-flight, the lane's first step: the LOCAL
+    # language-completeness gate — every metadata/android/<lang>/ must
+    # carry non-empty title/short_description/full_description before any
+    # network call. Google rejects a listing edit AT COMMIT (HTTP 403
+    # "This app has no title for language ru-RU", 2026-10-08) when a
+    # touched language is untitled; the gate never lets Google say it
+    # first, and sync_and_verify! additionally skips store-side listings
+    # that have no title (the texts deploy below creates/completes them).
+    PlayListingSync.validate_listing_completeness!(
+      File.expand_path("metadata/android", __dir__)
+    )
+    do_metadata = ENV.fetch("PLAY_DEPLOY_METADATA", "true") == "true"
+    do_images = ENV.fetch("PLAY_DEPLOY_IMAGES", "true") == "true"
+    repo_root = File.expand_path("..", __dir__)
+    track = PlayUploadPreflight.track!(ENV)
+    validate_only = PlayUploadPreflight.validate_only?(ENV)
+    json_key = PlayUploadPreflight.play_json_key!(ENV)
+    package_name = PlayUploadPreflight.package_name!(repo_root)
+    UI.message("Play store listing deploy: metadata=#{do_metadata}, images=#{do_images}, track=#{track}, validate_only=#{validate_only}")
+
+    if do_images && !validate_only
+      store_summary_line(
+        PlayListingSync.sync_and_verify!(
+          metadata_dir: File.expand_path("metadata/android", __dir__),
+          json_key: json_key,
+          package_name: package_name
+        )
+      )
+    end
+    upload_to_play_store(
+      PlayUploadPreflight
+        .supply_listing_options(
+          track: track, metadata: do_metadata, images: do_images,
+          validate_only: validate_only
+        )
+        .merge(json_key_data: json_key,
+               package_name: package_name)
+    )
+    if validate_only
+      UI.success("✅ Play listing validate-only pass: authenticated, track '#{track}' resolved — nothing uploaded")
+    else
+      store_summary_line("Google Play store listing updated (metadata=#{do_metadata}, images=#{do_images})")
+    end
+  end
+end

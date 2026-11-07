@@ -1,0 +1,369 @@
+/// UT for the `fa hub serve` CLI dispatch (issue #304): flag parsing,
+/// secret resolution, the usage-exit dispatch path, and the
+/// graceful-exit seam — the CRAP-ratchet coverage for the split
+/// `runHubCommand` dispatcher. The SIGINT/SIGTERM wiring stays covered
+/// by `test/hub/fah_hub_serve_test.dart`.
+///
+/// The port-binding serve paths (taken-port binds, the live-hub
+/// idempotent no-op, the happy path, the unwritable-pid path) live in
+/// `fah_hub_serve_ports_test.dart` — they bind real loopback ports and
+/// flake under the gate's parallel run on macOS (gh-740 M2), so they
+/// carry `@Tags(['io', 'integration'])` and stay OUT of this
+/// gate-included file. This file must keep covering
+/// `bin/fah_hub_serve.dart`: the CRAP ratchet (crap4dart.yaml) measures
+/// coverage from exactly the gate selector
+/// (`dart test --coverage --exclude-tags integration`).
+@TestOn('vm')
+library;
+
+import 'dart:io';
+
+import 'package:flutter_agent_harness/io.dart'
+    show LocalHub, defaultHubStateFile, readHubState;
+import 'package:flutter_agent_harness/src/hub/dap_local_hub_state.dart'
+    show parseDapLocalHubState;
+import 'package:test/test.dart';
+
+import '../../bin/fah_dap_command.dart'
+    show envHubPidFile, writeHubPidState, writeSecretFile0600;
+import '../../bin/fah_hub_serve.dart';
+
+const timeout = Timeout(Duration(seconds: 20));
+
+void main() {
+  late Directory tempHome;
+
+  setUp(() async {
+    tempHome = await Directory.systemTemp.createTemp('fah-hub-cli-');
+  });
+
+  tearDown(() async {
+    if (await tempHome.exists()) {
+      tempHome.deleteSync(recursive: true);
+    }
+  });
+
+  File stateFileFor() =>
+      defaultHubStateFile(home: tempHome.path, environment: const {});
+
+  /// Hubs in this file bind port 0 and read the kernel-assigned port back
+  /// from `hub.url.port` (issue #943): the old freePort() bind-close dance
+  /// handed out a port another parallel-gate test could take between close
+  /// and start — the hosted "Hostile ambient env" leg's green-on-retry
+  /// flake. Nothing here needs the port BEFORE the hub starts.
+  LocalHub ephemeralHub() =>
+      LocalHub(port: 0, stateFile: stateFileFor());
+
+  group('parseFlagValues / parseHubServeSpec', () {
+    test('collapses --flag value pairs; later duplicates win', () {
+      expect(parseFlagValues(const ['--port', '9000', '--secret', 's']), {
+        '--port': '9000',
+        '--secret': 's',
+      });
+      expect(parseFlagValues(const ['--port', '1', '--port', '2']), {
+        '--port': '2',
+      });
+    });
+
+    test('positional noise and valueless trailing flags are ignored', () {
+      expect(parseFlagValues(const ['x', '--port']), isEmpty);
+    });
+
+    test('bare boolean flags never consume the next flag (issue #792 '
+        'review: --relay-allow-any-host --bind lan)', () {
+      expect(
+        parseFlagValues(
+          const ['--relay-allow-any-host', '--bind', 'lan'],
+          boolFlags: const {'--relay-allow-any-host'},
+        ),
+        {'--bind': 'lan'},
+      );
+      final spec = parseHubServeSpec(const [
+        '--relay-allow-any-host',
+        '--bind',
+        'lan',
+      ]);
+      expect(spec.flagBind, 'lan');
+      expect(spec.relayAllowAnyHost, isTrue);
+    });
+
+    test('fa hub token: hubTokenHint reads the running hub relay bearer '
+        'and names the pane storage key (issue #792 provisioning)', () {
+      final tmp = Directory.systemTemp.createTempSync('fah-token');
+      addTearDown(() => tmp.deleteSync(recursive: true));
+      final file = File('${tmp.path}/hub.pid');
+      writeHubPidState(file, pid: 42, port: 8787, relaySecret: 'sk-test');
+      final hint = hubTokenHint(file);
+      expect(hint, isNotNull);
+      expect(hint, contains('http://127.0.0.1:8787/relay'));
+      expect(hint, contains('Bearer sk-test'));
+      expect(hint, contains('fa_office_relay_token'));
+      expect(hubSubcommands.containsKey('token'), isTrue);
+    });
+
+    test('fa hub token: no pid file or no relay secret answers null '
+        '(the command refuses by name, never prints an empty hint)', () {
+      expect(
+        hubTokenHint(File('${Directory.systemTemp.path}/none-here')),
+        isNull,
+      );
+      final tmp = Directory.systemTemp.createTempSync('fah-token2');
+      addTearDown(() => tmp.deleteSync(recursive: true));
+      final file = File('${tmp.path}/hub.pid');
+      writeHubPidState(file, pid: 42, port: 8787, relaySecret: null);
+      expect(hubTokenHint(file), isNull);
+    });
+
+    test('fa hub token refusal: hubTokenRefusalMessage names the actual '
+        'situation (protected hub vs not running)', () {
+      final protected = hubTokenRefusalMessage(protectedHub: true);
+      expect(protected, contains('password-protected'));
+      expect(protected, contains('master secret'));
+      expect(protected, isNot(contains('not running')));
+      final down = hubTokenRefusalMessage(protectedHub: false);
+      expect(down, contains('not running'));
+      expect(down, isNot(contains('password-protected')));
+    });
+
+    test('writeSecretFile0600: content survives a chmod-less platform '
+        '(guarded chmod, never an empty state file)', () {
+      final tmp = Directory.systemTemp.createTempSync('fah-0600');
+      addTearDown(() => tmp.deleteSync(recursive: true));
+      final file = File('${tmp.path}/secret.pid');
+      const body =
+          '{"pid":42,"port":8787,"startedAt":"2026-09-23T00:00:00Z",'
+          '"relaySecret":"sk-test"}';
+      writeSecretFile0600(file, body);
+      expect(
+        file.readAsStringSync(),
+        body,
+        reason: 'the content is on disk regardless of chmod support',
+      );
+      // The file is parseable — the exact failure the ordering guards.
+      expect(parseDapLocalHubState(file.readAsStringSync())!.port, 8787);
+      // The mode landed where chmod exists (POSIX CI): 0600, no group/
+      // world bits. Windows has no chmod — the umask mode stands.
+      if (!Platform.isWindows) {
+        final mode = FileStat.statSync(file.path).mode;
+        // 63 = 0o77 — group+world bits must be clear.
+        expect(mode & 63, 0, reason: 'only the owner may read $file');
+      }
+    });
+
+    test('port: a bad value keeps the default; secret passes through', () {
+      expect(parseHubServeSpec(const []), (
+        port: defaultHubServePort,
+        flagSecret: null,
+        flagBind: null,
+        relayAllowAnyHost: false,
+      ));
+      expect(parseHubServeSpec(const ['--port', 'x']), (
+        port: defaultHubServePort,
+        flagSecret: null,
+        flagBind: null,
+        relayAllowAnyHost: false,
+      ));
+      expect(parseHubServeSpec(const ['--port', '9100', '--secret', 'k']), (
+        port: 9100,
+        flagSecret: 'k',
+        flagBind: null,
+        relayAllowAnyHost: false,
+      ));
+      expect(parseHubServeSpec(const ['--bind', 'lan']), (
+        port: defaultHubServePort,
+        flagSecret: null,
+        flagBind: 'lan',
+        relayAllowAnyHost: false,
+      ));
+      expect(
+        parseHubServeSpec(const ['--relay-allow-any-host']).relayAllowAnyHost,
+        isTrue,
+        reason: 'the dev opt-in is a bare boolean flag (issue #792)',
+      );
+      expect(parseHubServeSpec(const []).relayAllowAnyHost, isFalse);
+    });
+  });
+
+  group('hubPidFileFor', () {
+    test('DAP_HUB_PID_FILE wins, then home, then HOME/USERPROFILE', () {
+      expect(
+        hubPidFileFor(environment: {envHubPidFile: '/tmp/p'}).path,
+        '/tmp/p',
+      );
+      expect(
+        hubPidFileFor(environment: const {'HOME': '/h'}, home: '/w').path,
+        contains('/w'),
+      );
+      expect(
+        hubPidFileFor(environment: const {'HOME': '/h'}).path,
+        contains('/h'),
+      );
+      expect(
+        hubPidFileFor(environment: const {'USERPROFILE': '/u'}).path,
+        contains('/u'),
+      );
+    });
+  });
+
+  group('resolveHubServeSecret', () {
+    test('--secret beats DAP_HUB_SECRET beats the persisted state', () async {
+      final stateFile = stateFileFor();
+      await stateFile.parent.create(recursive: true);
+      stateFile.writeAsStringSync('{"masterSecret":"stored","clients":{}}');
+      expect(
+        await resolveHubServeSecret(
+          stateFile,
+          flagSecret: 'flag',
+          environment: const {},
+        ),
+        'flag',
+      );
+      expect(
+        await resolveHubServeSecret(
+          stateFile,
+          environment: {'DAP_HUB_SECRET': 'env'},
+        ),
+        'env',
+      );
+      expect(
+        await resolveHubServeSecret(stateFile, environment: const {}),
+        'stored',
+      );
+    });
+
+    test(
+      'nothing stored and no interactive terminal: null, no prompt',
+      () async {
+        var prompted = 0;
+        final secret = await resolveHubServeSecret(
+          File('${tempHome.path}/no-hub.json'),
+          environment: const {},
+          prompt: (_) async {
+            prompted++;
+            return 'p';
+          },
+        );
+        expect(secret, isNull);
+        expect(prompted, 0, reason: 'dart test has no terminal');
+      },
+    );
+  });
+
+  group('persistHubSecretChoice', () {
+    test('a chosen password is stored', () async {
+      final stateFile = File('${tempHome.path}/nested/hub.json');
+      await persistHubSecretChoice(stateFile, 'pw');
+      expect(readHubState(stateFile).masterSecret, 'pw');
+    });
+
+    test('an explicit empty choice is remembered as open', () async {
+      final stateFile = stateFileFor();
+      await stateFile.parent.create(recursive: true);
+      await persistHubSecretChoice(stateFile, '');
+      expect(readHubState(stateFile).masterSecret, isNull);
+      expect(stateFile.existsSync(), isTrue);
+    });
+
+    test('persistence failure never throws (best-effort)', () async {
+      // A file where the state dir should be: createSync must fail.
+      final blocker = File('${tempHome.path}/blocker')..writeAsStringSync('x');
+      await persistHubSecretChoice(File('${blocker.path}/hub.json'), 'pw');
+    });
+  });
+
+  group('runHubCommand dispatch', () {
+    test('no verb / unknown verb: usage, exit 1', () async {
+      expect(await runHubCommand(const []), 1);
+      expect(await runHubCommand(const ['explode']), 1);
+    });
+  });
+
+  group('hubGracefulExit (the seam)', () {
+    test('stops the hub, clears the pid state, exits 0', () async {
+      final hub = ephemeralHub();
+      await hub.start();
+      final port = hub.url.port;
+      final pidFile = File('${tempHome.path}/gone.pid')
+        ..writeAsStringSync('{"pid":1,"port":1,"startedAt":"x"}');
+      final exits = <int>[];
+      await hubGracefulExit(
+        hub,
+        pidFile,
+        // Real subscriptions: the cancel loop must run, not be skipped.
+        watchHubTerminateSignals(() {}),
+        exitProcess: exits.add,
+      );
+      expect(exits, [0]);
+      expect(pidFile.existsSync(), isFalse);
+      expect(await hubHealthz(port), isFalse, reason: 'the hub stopped');
+    }, timeout: timeout);
+
+    test('a stuck pid file never blocks shutdown', () async {
+      final hub = ephemeralHub();
+      await hub.start();
+      // A directory where the pid file should be: deleteSync throws.
+      final stuck = Directory('${tempHome.path}/stuck.pid')
+        ..createSync(recursive: true);
+      final exits = <int>[];
+      await hubGracefulExit(
+        hub,
+        File(stuck.path),
+        const [],
+        exitProcess: exits.add,
+      );
+      expect(exits, [0]);
+      await hub.stop();
+    }, timeout: timeout);
+  });
+
+  // Issue #943: re-enabled (gh-938 skip 'stray terminate signal'). Root
+  // cause: the leg wired the REAL terminate watchers, so a hosted
+  // runner's stray SIGINT/SIGTERM (orphan cleanup pkill) fired the
+  // graceful exit mid-test. The new [watchSignals] seam keeps the wiring
+  // under test while excluding ambient delivery by construction; the
+  // real-signal path stays covered by test/hub/fah_hub_serve_test.dart.
+  test(
+    'wireHubTerminate: wired but not fired — the hub keeps serving',
+    () async {
+      final hub = ephemeralHub();
+      await hub.start();
+      final port = hub.url.port;
+      final exits = <int>[];
+      final subs = wireHubTerminate(
+        hub,
+        stateFileFor(),
+        exitProcess: exits.add,
+        watchSignals: (_) => const [],
+      );
+      // Nothing terminated the hub: still up, no exit.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(await hubHealthz(port), isTrue);
+      expect(exits, isEmpty);
+      for (final sub in subs) {
+        await sub.cancel();
+      }
+      await hub.stop();
+    },
+    timeout: timeout,
+  );
+
+  test('hubTerminateHandler: firing it runs the graceful exit', () async {
+    final hub = ephemeralHub();
+    await hub.start();
+    final port = hub.url.port;
+    final pidFile = File('${tempHome.path}/fired.pid')
+      ..writeAsStringSync('{"pid":1,"port":1,"startedAt":"x"}');
+    final exits = <int>[];
+    final fire = hubTerminateHandler(
+      hub,
+      pidFile,
+      watchHubTerminateSignals(() {}),
+      exitProcess: exits.add,
+    );
+    fire();
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(exits, [0]);
+    expect(pidFile.existsSync(), isFalse);
+    expect(await hubHealthz(port), isFalse);
+  }, timeout: timeout);
+}

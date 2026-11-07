@@ -1,0 +1,138 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:flutter/material.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+
+import 'package:fa_ui/src/providers/media_slot_picker_page.dart';
+import 'package:fa_ui/src/stores/media_models_store.dart';
+import 'package:fa_ui/src/stores/provider_registry.dart';
+import 'package:fa_ui/src/stores/task_models_store.dart';
+import 'package:fa_ui/src/utils/page_presentation.dart';
+import 'package:fa_ui/src/widgets/settings_scaffold.dart';
+
+/// The settings "Task models" section: one row per [TaskRole.all] entry
+/// showing the effective endpoint — the role's override (`modelId`) or the
+/// main connection fallback ("Same as main"). Tapping a row opens the SAME
+/// two-step flow the media slots use: [MediaSlotProviderPickerPage]
+/// (provider list: main connection, hosted presets, saved providers, add
+/// provider) → [MediaSlotModelPage] (the endpoint's model list with quick
+/// search + manual entry). "Main connection" clears the override.
+///
+/// The store comes from [store] or the nearest [TaskModelsScope]; the whole
+/// section hides when no store is available (tests pumping the bare form).
+/// [mainBaseUrl] / [mainModelId] supply the current connection for the
+/// picker.
+class TaskModelsSection extends StatelessWidget {
+  const TaskModelsSection({
+    super.key,
+    this.store,
+    this.mainBaseUrl = '',
+    this.mainModelId = '',
+    this.registry,
+    this.modelsFetcher,
+  });
+
+  /// Store override; falls back to the nearest [TaskModelsScope].
+  final TaskModelsStore? store;
+
+  /// The main connection's base URL (shown under the main-connection row).
+  final String mainBaseUrl;
+
+  /// The main connection's model id (the row's fallback subtitle).
+  final String mainModelId;
+
+  /// The user-added providers listed in the picker.
+  final ProviderRegistry? registry;
+
+  /// `/models` fetch override (tests), forwarded to the model page.
+  final ModelsEndpointFetcher? modelsFetcher;
+
+  /// The icon each role's row shows.
+  static const roleIcons = <String, IconData>{
+    TaskRole.smol: Icons.bolt_outlined,
+    TaskRole.subagent: Icons.groups_outlined,
+  };
+
+  /// Display labels for known roles (the rest fall back to the raw id).
+  static const roleTitles = <String, String>{
+    TaskRole.smol: 'Quick model', // l10n:ignore
+    TaskRole.subagent: 'Subagents model', // l10n:ignore
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final store = this.store ?? TaskModelsScope.maybeOf(context);
+    return faStoreSection(
+      store,
+      (context, store) => [
+        for (final role in TaskRole.all) _buildRoleRow(context, store, role),
+      ],
+    );
+  }
+
+  Widget _buildRoleRow(
+    BuildContext context,
+    TaskModelsStore store,
+    String role,
+  ) {
+    final override = store.overrideFor(role);
+    final title = roleTitles[role] ?? role;
+    final subtitle = override?.modelId.isNotEmpty == true
+        ? override!.modelId
+        : 'Same as main'; // l10n:ignore
+    return FaSettingsRow(
+      icon: roleIcons[role] ?? Icons.tune,
+      title: title,
+      subtitle: subtitle,
+      onTap: () => _editRole(context, store, role),
+    );
+  }
+
+  Future<void> _editRole(
+    BuildContext context,
+    TaskModelsStore store,
+    String role,
+  ) async {
+    // pushFaPage shows a dialog on wide screens (matching the settings
+    // style) and a full page on narrow. The media-slot pages run the
+    // generic provider→model flow with slot: null (no voice/chips).
+    final current = store.overrideFor(role);
+    final result = await pushFaPage<MediaSlotEditorResult>(
+      context,
+      MediaSlotProviderPickerPage(
+        slot: null,
+        title: roleTitles[role] ?? role,
+        initial: current == null
+            ? null
+            : MediaSlotOverride(
+                providerKind: current.providerKind,
+                baseUrl: current.baseUrl,
+                modelId: current.modelId,
+                apiKeyName: current.apiKeyName,
+              ),
+        mainBaseUrl: mainBaseUrl,
+        registry: registry,
+        modelsFetcher: modelsFetcher,
+        // Role pickers choose among connected providers only.
+        connectedOnly: true,
+      ),
+    );
+    if (result == null) return;
+    if (result.cleared) {
+      await store.setOverride(role, null);
+      return;
+    }
+    final override = result.override!;
+    await store.setOverride(
+      role,
+      TaskRoleConfig(
+        providerKind: override.providerKind,
+        baseUrl: override.baseUrl,
+        modelId: override.modelId,
+        apiKeyName: override.apiKeyName,
+      ),
+    );
+  }
+}

@@ -1,0 +1,1309 @@
+/// Pure startup-resolution phases for the `fah` executable
+/// (`bin/fah.dart`): the `serve --a2a` argument interception, provider/model
+/// restoration from the saved config, the secure-store preload set, the
+/// startup API-key decision, and the secret-redactor / web-search secret
+/// assembly that `_runApp` composes into a launch.
+///
+/// The phases live in `lib/` (mirroring `headless_provider_key.dart`) so
+/// they unit-test without spawning the CLI; `bin/fah.dart` keeps only the
+/// process glue (`_fail`/`exit`, stdio, signals).
+///
+/// `dart:io` lives here (exported only from `lib/io.dart`) so the agent
+/// core stays pure Dart.
+library;
+
+import 'dart:io';
+import 'package:yaml/yaml.dart';
+
+import '../exceptions.dart';
+import '../model_roles/provider_catalog.dart';
+import '../model_roles/provider_model_binding.dart';
+import '../model_roles/providers_queue.dart';
+import '../model_roles/roles_config.dart';
+import '../providers/chatgpt_oauth.dart' show chatGptOAuthCredentialsEnvName;
+import '../secrets/secrets_store.dart';
+import '../secrets/secure_key_store.dart';
+import '../secrets/secret_redactor.dart';
+import 'cli_args.dart';
+import 'cli_config.dart';
+import '../redact/redaction_pipeline.dart';
+import 'custom_providers.dart';
+import 'env_provider_preconfig.dart';
+import 'headless_provider_key.dart';
+
+/// `fa serve [--a2a|--bridge] [--port N] [--token T]` interception: the args
+/// parser does not know the serve forms, so [args] is scanned for the bare
+/// `serve` invocation and the serve-specific flags (and their values) are
+/// stripped from the list that reaches [parseCliArgs]. Exactly one serve
+/// form must be selected: [serveA2a]/[serveBridge] say which, and the
+/// caller fails with the usage line when a `serve` invocation carries
+/// neither, both, or is missing its marker.
+({bool serveA2a, bool serveBridge, List<String> cliArgs}) splitServeA2aArgs(
+  List<String> args,
+) {
+  final isServe = args.contains('serve');
+  final cliArgs = isServe
+      ? [
+          for (var i = 0; i < args.length; i++)
+            if (args[i] != 'serve' &&
+                args[i] != '--a2a' &&
+                args[i] != '--bridge' &&
+                args[i] != '--port' &&
+                args[i] != '--token' &&
+                (i == 0 ||
+                    (args[i - 1] != '--port' && args[i - 1] != '--token')))
+              args[i],
+        ]
+      : args;
+  return (
+    serveA2a: isServe && args.contains('--a2a'),
+    serveBridge: isServe && args.contains('--bridge'),
+    cliArgs: cliArgs,
+  );
+}
+
+/// The `fa wire-serve` interception result (see [splitWireServeArgs]).
+typedef WireServeArgs = ({
+  bool wireServe,
+  bool stdio,
+  int? port,
+  String? token,
+  List<String> cliArgs,
+});
+
+/// `fa wire-serve [--port N] [--stdio] [--token T]` interception (issue
+/// #1103): same shape as [splitServeA2aArgs] — the args parser does not
+/// know the wire-serve form, so the bare invocation is detected ONLY in
+/// the subcommand position (`fa wire-serve ...`; the literal word as any
+/// other argument — e.g. a prompt — never intercepts, review #1113 r2)
+/// and the wire-serve flags are stripped from the list that reaches
+/// [parseCliArgs]. Exactly one transport: `--stdio` and `--port` together
+/// are a usage error (the card pins a loud startup failure, never a
+/// silent fallback); a bad `--port` value is one too. Repeated flags:
+/// last occurrence wins, for both --port and --token (review #1113 r2).
+/// Decomposed into one-decision helpers — each stays at cyclomatic 3 or
+/// under, the CRAP ratchet floor for covered code.
+WireServeArgs splitWireServeArgs(List<String> args) {
+  final isWireServe = args.isNotEmpty && args.first == 'wire-serve';
+  if (!isWireServe) {
+    return (
+      wireServe: false,
+      stdio: false,
+      port: null,
+      token: null,
+      cliArgs: args,
+    );
+  }
+  final stdio = _hasStandaloneFlag(args, '--stdio');
+  final port = _readPort(args);
+  final token = _readToken(args);
+  _checkTransportExclusivity(stdio, port);
+  return (
+    wireServe: true,
+    stdio: stdio,
+    port: port,
+    token: token,
+    cliArgs: _keepCliArgs(args),
+  );
+}
+
+/// The card pins exactly one transport per serve process.
+void _checkTransportExclusivity(bool stdio, int? port) {
+  if (stdio && port != null) {
+    throw const FormatException(
+      'wire-serve: --stdio and --port are mutually exclusive',
+    );
+  }
+}
+
+/// The last `--port` value in [args] (repeated flags: last wins, same as
+/// [_readToken]), or null when the flag is absent. A present-but-
+/// unparseable value is a usage error.
+int? _readPort(List<String> args) {
+  final index = args.lastIndexOf('--port');
+  if (index < 0) {
+    return null;
+  }
+  return _parsePortValue(_flagValue(args, index));
+}
+
+int _parsePortValue(String? raw) {
+  final parsed = int.tryParse(raw ?? '');
+  if (parsed == null || parsed < 0) {
+    throw const FormatException('wire-serve: --port needs a port number');
+  }
+  return parsed;
+}
+
+/// The last `--token` value in [args] (later flags win, matching a scan),
+/// or null when the flag is absent. A present-but-missing value is a
+/// usage error.
+String? _readToken(List<String> args) {
+  final index = args.lastIndexOf('--token');
+  if (index < 0) {
+    return null;
+  }
+  final raw = _flagValue(args, index);
+  if (raw == null) {
+    throw const FormatException('wire-serve: --token needs a value');
+  }
+  return raw;
+}
+
+/// The value following the flag at [flagIndex], or null at the end.
+String? _flagValue(List<String> args, int flagIndex) =>
+    flagIndex + 1 < args.length ? args[flagIndex + 1] : null;
+
+/// True when [flag] appears at an index that is NOT the verbatim value
+/// of a value-taking flag — `fa wire-serve --token --stdio` consumes the
+/// word as the token and must not also mean `--stdio` (review #1113 r2).
+bool _hasStandaloneFlag(List<String> args, String flag) {
+  for (var i = 0; i < args.length; i++) {
+    if (args[i] != flag) continue;
+    if (_wireServeValueFlags.contains(_previousArg(args, i))) continue;
+    return true;
+  }
+  return false;
+}
+
+const _wireServeFlags = {'wire-serve', '--stdio', '--port', '--token'};
+const _wireServeValueFlags = {'--port', '--token'};
+
+/// The args that survive wire-serve interception: the subcommand and its
+/// flags (and each flag's value) are stripped; everything else reaches
+/// [parseCliArgs].
+List<String> _keepCliArgs(List<String> args) => _dropFlagValues(
+  args,
+).where((arg) => !_wireServeFlags.contains(arg)).toList();
+
+/// Drops the value that follows every value-taking flag (`--port N`).
+List<String> _dropFlagValues(List<String> args) => [
+  for (var i = 0; i < args.length; i++)
+    if (!_wireServeValueFlags.contains(_previousArg(args, i))) args[i],
+];
+
+String? _previousArg(List<String> args, int index) =>
+    index == 0 ? null : args[index - 1];
+
+/// Provider/model restoration. Precedence: an explicit `--provider` flag
+/// (full manual control, preconfigs disabled) > the `FA_PROVIDER_*` env
+/// declaration ([faProviderPreconfig]) > the saved `provider:` (the
+/// persisted /provider switch) > the parsed default.
+///
+/// The saved kind restores whenever it resolves through the catalog
+/// ([resolveCliProviderSpec] — every catalog name AND adapter kind,
+/// `chatgpt-codex` included; coverage by construction, issue #760) and
+/// restores AS THE RESOLVED SPEC'S KIND: a saved catalog *name* (`openai`,
+/// `chatgpt`) resolves to its adapter kind here, because everything
+/// downstream (`AgentCliConfig.providerKind` → `providerStreamFunction`)
+/// speaks kinds only. A
+/// saved id NO version knows must never brick the boot: it is reported
+/// back as [unknownSavedProvider] and the parsed default (a known
+/// provider) takes over — the executable prints the loud named warning
+/// (bad value, file, fallback taken) and keeps booting.
+///
+/// The preconfig supplies model/baseUrl too, so the saved restore never
+/// leaks through while it is active (--model/--base-url flags still
+/// override individual fields). No env-key auto-pick: a bare API key in
+/// the environment never activates a provider — the model would be an
+/// implicit default, and providers carry none by design. FA_PROVIDER_*
+/// stays: it names the model explicitly.
+/// The environment is injected ([env] is required): the CLI passes
+/// `Platform.environment`, tests pass exactly the map they mean —
+/// resolution never reads ambient process state.
+///
+/// The boot result carrier ([resolveEffectiveCliArgs]'s return type).
+/// A class, not a record — 6 fields exceeded the record_size cap
+/// (issue #1997); the field docs live on the resolver below.
+final class EffectiveCliArgs {
+  const EffectiveCliArgs({
+    required this.args,
+    required this.provider,
+    required this.faPreconfig,
+    required this.unknownSavedProvider,
+    required this.incompatibleSavedEndpoint,
+    required this.bindingWarnings,
+  });
+
+  final CliArgs args;
+  final String provider;
+  final EnvProviderPreconfig? faPreconfig;
+  final String? unknownSavedProvider;
+  final String? incompatibleSavedEndpoint;
+  final List<String> bindingWarnings;
+}
+
+/// Returns the effective [CliArgs], the resolved provider kind — the same
+/// value, the explicit field saves the caller a re-derivation — the
+/// `FA_PROVIDER_*` declaration when one is active (the caller needs it
+/// for the roles pinning, the key decision and the extra redaction), the
+/// saved provider id when it was unrecognizable, the saved provider id
+/// when the persisted provider/baseUrl pair was unservable (endpoint-locked
+/// kind, foreign baseUrl — the caller degrades it with a named warning),
+/// and the revalidated binding's warnings when a `--model`/`--base-url`
+/// flag authored an unverified dialect mismatch (gh-1624 review r2 — the
+/// flag path renders them like the FA_PROVIDER notice does; warnings the
+/// active preconfig binding already carries are deduped). Both report
+/// fields are null otherwise. See [EffectiveCliArgs].
+EffectiveCliArgs resolveEffectiveCliArgs(
+  CliArgs parsed,
+  CliConfig saved, {
+  required Map<String, String> env,
+}) {
+  final faPreconfig = faProviderPreconfig(parsed, saved, env: env);
+  final restore = _judgeSavedRestore(saved);
+  // issue #1973: while the saved slot is the untouched factory triple, the
+  // first custom provider is the boot default — a config that only ever
+  // gained custom providers must not start new folders on a provider the
+  // user never configured. Explicit flags and FA_PROVIDER_* preconfigs keep
+  // winning below; the fresh-install wizard needs NO custom provider, so it
+  // can never be short-circuited by this branch.
+  final customDefault = _customProviderBootDefault(saved);
+  final restoredKind = restore.endpointConflict
+      ? null
+      : (customDefault?.kind ?? restore.spec?.kind);
+  final provider = _bootProvider(
+    parsed: parsed,
+    faPreconfig: faPreconfig,
+    restoredKind: restoredKind,
+  );
+  final explicitOverride = parsed.providerExplicit || faPreconfig != null;
+  final reports = _savedRestoreReports(
+    savedRaw: restore.raw,
+    savedSpec: restore.spec,
+    endpointConflict: restore.endpointConflict,
+    explicitOverride: explicitOverride,
+  );
+  // gh-1570 (L9/E2): an endpoint-conflict DEGRADE must not inherit the
+  // stale pair — the saved kind was refused over its baseUrl. "Stale" is
+  // the binding's verdict, not the URL's spelling: the pair rides the
+  // degraded boot only when it still resolves through the one validating
+  // constructor (E2 "rebuilds a valid binding") — the gh-760
+  // mock-endpoint partial write keeps serving, the codex-over-openrouter
+  // default spelling keeps working, and a pair the degraded kind cannot
+  // bind (a claude id pinned over api.openai.com) is dropped.
+  final degraded = restore.endpointConflict && !explicitOverride;
+  final degradedDefault = resolveCliProviderSpec(provider)?.defaultBaseUrl;
+  final keepSavedPair = !degraded || _degradedPairResolves(provider, saved);
+  final modelId =
+      parsed.model ??
+      faPreconfig?.modelId ??
+      customDefault?.modelId ??
+      saved.modelId;
+  final baseUrl =
+      parsed.baseUrl ??
+      faPreconfig?.baseUrl ??
+      customDefault?.baseUrl ??
+      saved.baseUrl;
+  final effective = CliArgs(
+    model: keepSavedPair ? modelId : (parsed.model ?? faPreconfig?.modelId),
+    provider: provider,
+    baseUrl: keepSavedPair ? baseUrl : (parsed.baseUrl ?? faPreconfig?.baseUrl),
+    visionModel: parsed.visionModel,
+    visionBaseUrl: parsed.visionBaseUrl,
+    transcribeModel: parsed.transcribeModel,
+    transcribeBaseUrl: parsed.transcribeBaseUrl,
+    plugins: parsed.plugins,
+    promptTemplateDirs: parsed.promptTemplateDirs,
+    mode: parsed.mode ?? saved.mode,
+    tools: parsed.tools,
+    redact: parsed.redact ?? saved.redact,
+    cwd: parsed.cwd,
+    sessionRoot: parsed.sessionRoot,
+    session: parsed.session,
+  );
+  // gh-1570 (AC3/H2): an explicit `--model`/`--base-url` over a restored
+  // or preconfigured binding is a PARTIAL override — the effective
+  // binding (flag slot winning, everything else from the current source)
+  // is revalidated through the one constructor and a mismatch is a
+  // boot-time rejection naming both sides, never a silent cross-provider
+  // ride (`--model gpt-5` over a saved/active anthropic binding dies
+  // here, before any network call). An ACTIVE FA_PROVIDER_* preconfig is
+  // a binding too (AC3/H2 review): its kind survives and the flag wins
+  // its slot, so the same joint check applies.
+  final bindingWarnings = _revalidatePartialOverride(
+    parsed,
+    faPreconfig,
+    saved,
+    provider: provider,
+    baseUrl: baseUrl,
+    keepSavedPair: keepSavedPair,
+    degradedDefault: degradedDefault,
+  );
+  return EffectiveCliArgs(
+    args: effective,
+    provider: provider,
+    faPreconfig: faPreconfig,
+    unknownSavedProvider: reports.unknownSavedProvider,
+    incompatibleSavedEndpoint: reports.incompatibleSavedEndpoint,
+    bindingWarnings: bindingWarnings,
+  );
+}
+
+/// The provider triple [CliConfig] ships as field defaults: every fresh
+/// config persists it until the user actually picks a provider/model, so the
+/// saved slot is indistinguishable from a deliberate choice (issue #1973).
+const _factoryProviderKind = 'openai-completions';
+const _factoryModelId = 'openai/gpt-4o-mini';
+const _factoryBaseUrl = 'https://openrouter.ai/api/v1';
+
+/// The first custom provider as the boot default, when the saved slot is
+/// still the untouched factory triple (issue #1973).
+///
+/// A config that only ever gained custom providers kept the factory slot at
+/// the top level, so every NEW folder booted into a provider the user never
+/// configured — a keyless OPENROUTER banner, then a coherence refusal blaming
+/// the user's own provider ("no key resolved ... (mismatched: key)") for a
+/// secret that was sitting in the keychain. The first custom provider is the
+/// honest default there.
+///
+/// Null — i.e. the factory slot restores as before — when the slot was set,
+/// when no custom provider exists, or when an entry's `apiType` has no
+/// catalog spec. Deliberate selection is indistinguishable from factory
+/// state, so the guard is "still exactly the factory triple".
+({String kind, String modelId, String baseUrl})? _customProviderBootDefault(
+  CliConfig saved,
+) {
+  if (saved.providerKind.trim() != _factoryProviderKind ||
+      saved.modelId != _factoryModelId ||
+      saved.baseUrl != _factoryBaseUrl) {
+    return null;
+  }
+  for (final entry in saved.customProviders) {
+    if (entry.modelId.trim().isEmpty || entry.baseUrl.trim().isEmpty) continue;
+    final spec = resolveCliProviderSpec(entry.apiType);
+    if (spec == null) continue;
+    return (kind: spec.kind, modelId: entry.modelId, baseUrl: entry.baseUrl);
+  }
+  return null;
+}
+
+/// The saved-restore judgement (gh-760 review): the saved id trimmed and
+/// resolved through the catalog, plus the provider/baseUrl PAIR verdict.
+/// A blank saved value is UNSET, not unknown — no version-skew warning for
+/// a hand-edit artifact. An endpoint-locked spec ([ProviderSpec
+/// .endpointLocked]) over a foreign persisted baseUrl is an unservable
+/// PAIR: a partial write (provider overwritten, stale endpoint kept) would
+/// otherwise die at the key gate with self-contradictory guidance.
+({String raw, ProviderSpec? spec, bool endpointConflict}) _judgeSavedRestore(
+  CliConfig saved,
+) {
+  final raw = saved.providerKind.trim();
+  final spec = raw.isEmpty ? null : resolveCliProviderSpec(raw);
+  final endpointConflict =
+      spec != null &&
+      spec.endpointLocked &&
+      saved.baseUrl != spec.defaultBaseUrl;
+  return (raw: raw, spec: spec, endpointConflict: endpointConflict);
+}
+
+/// Whether the saved model+baseUrl pair still forms a VALID binding under
+/// the [degradedKind] the boot fell back to (gh-1570 L9/E2): the degrade
+/// refuses the SAVED KIND, not every endpoint it was pointed at — a pair
+/// the one validating constructor accepts (a custom endpoint the degraded
+/// kind can serve, gh-760's mock-endpoint partial write; the openrouter
+/// default spelling) keeps riding the boot, and a pair it rejects (a
+/// foreign-dialect model id on a family-exclusive canonical endpoint) is
+/// the L9 poison the caller drops. A blank half is no binding at all.
+bool _degradedPairResolves(String degradedKind, CliConfig saved) {
+  if (saved.modelId.trim().isEmpty || saved.baseUrl.trim().isEmpty) {
+    return false;
+  }
+  try {
+    ProviderModelBinding.resolve(
+      providerKind: degradedKind,
+      modelId: saved.modelId,
+      baseUrl: saved.baseUrl,
+      provenance: BindingProvenance.restore,
+    );
+    return true;
+  } on ConfigException {
+    return false;
+  }
+}
+
+/// The AC3/H2 partial-override gate (gh-1570): an explicit `--model` or
+/// `--base-url` over a restored or preconfigured binding revalidates the
+/// EFFECTIVE binding (flag slot winning, the rest from the current
+/// source) through the one validating constructor — a dialect mismatch
+/// dies here naming both sides, before any network call. A blank
+/// effective model is no binding to revalidate (`--base-url` over a
+/// model-less saved config fails later at the model gate, unchanged).
+///
+/// Returns the effective binding's warnings (gh-1624 review r2): a
+/// vendor-prefix mismatch on an endpoint that carries no dialect verdict
+/// is NOT fatal, and the flag path must not swallow the note either — the
+/// caller renders them like the FA_PROVIDER notice's
+/// `warning: binding — …` lines. Warnings the active [faPreconfig]
+/// binding already carries are deduped (its boot notice renders them).
+List<String> _revalidatePartialOverride(
+  CliArgs parsed,
+  EnvProviderPreconfig? faPreconfig,
+  CliConfig saved, {
+  required String provider,
+  required String baseUrl,
+  required bool keepSavedPair,
+  required String? degradedDefault,
+}) {
+  if (parsed.providerExplicit) return const [];
+  if (parsed.model == null && parsed.baseUrl == null) return const [];
+  final effectiveModelId =
+      parsed.model ?? faPreconfig?.modelId ?? saved.modelId;
+  if (effectiveModelId.trim().isEmpty) return const [];
+  final binding = ProviderModelBinding.resolve(
+    providerKind: provider,
+    modelId: effectiveModelId,
+    baseUrl: keepSavedPair ? baseUrl : (parsed.baseUrl ?? degradedDefault),
+    provenance: BindingProvenance.flag,
+  );
+  final alreadySaid = faPreconfig?.binding.warnings ?? const <String>[];
+  return [
+    for (final warning in binding.warnings)
+      if (!alreadySaid.contains(warning)) warning,
+  ];
+}
+
+/// The boot provider: an explicit `--provider` flag or an `FA_PROVIDER_*`
+/// declaration wins; otherwise the saved restore's kind (null when the
+/// pair was judged unservable) or the parsed default.
+String _bootProvider({
+  required CliArgs parsed,
+  required EnvProviderPreconfig? faPreconfig,
+  required String? restoredKind,
+}) {
+  if (parsed.providerExplicit) return parsed.provider;
+  return faPreconfig?.spec.kind ?? restoredKind ?? parsed.provider;
+}
+
+/// The degrade reports for the saved restore: the raw saved id when no
+/// version knows it, and the raw saved id when the provider/baseUrl pair
+/// was judged unservable. An explicit override (flag or preconfig) silences
+/// both — the saved value never took effect, so there is nothing to warn
+/// about.
+({String? unknownSavedProvider, String? incompatibleSavedEndpoint})
+_savedRestoreReports({
+  required String savedRaw,
+  required ProviderSpec? savedSpec,
+  required bool endpointConflict,
+  required bool explicitOverride,
+}) {
+  if (explicitOverride) {
+    return (unknownSavedProvider: null, incompatibleSavedEndpoint: null);
+  }
+  return (
+    unknownSavedProvider: savedSpec == null && savedRaw.isNotEmpty
+        ? savedRaw
+        : null,
+    incompatibleSavedEndpoint: endpointConflict ? savedRaw : null,
+  );
+}
+
+/// The explicit `FA_PROVIDER_*` env preconfig (Docker/headless):
+/// `FA_PROVIDER_TYPE` + `FA_PROVIDER_NAME` + `FA_PROVIDER_CONFIG` (a JSON
+/// object with required `baseUrl`/`model` and an optional `apiKeyEnvVar`)
+/// plus the key env var the config references. Every text input has a
+/// `_BASE64` twin (`FA_PROVIDER_CONFIG_BASE64`, `<apiKeyEnvVar>_BASE64`)
+/// for platforms that mangle special characters; when both carry the same
+/// value the plain one is used. This is an explicit declaration, so it
+/// wins over the saved config restore too — a container that declares its
+/// provider in env vars runs on it, store or config notwithstanding. An
+/// explicit `--provider` flag means full manual control and disables the
+/// preconfig entirely (mixing the flag's provider with the env endpoint
+/// would be a silent misconfiguration).
+///
+/// Throws [ConfigException] on a malformed declaration: a container that
+/// names its provider wrong must fail loud at boot, not 401 mid-run (the
+/// executable maps that to its `fa:` usage failure).
+EnvProviderPreconfig? faProviderPreconfig(
+  CliArgs parsed,
+  CliConfig saved, {
+  required Map<String, String> env,
+}) {
+  if (parsed.providerExplicit) return null;
+  return parseEnvProviderPreconfig(
+    providerType: env['FA_PROVIDER_TYPE'],
+    providerName: env['FA_PROVIDER_NAME'],
+    providerConfig: env['FA_PROVIDER_CONFIG'],
+    providerConfigBase64: env['FA_PROVIDER_CONFIG_BASE64'],
+    envVarValue: (name) => env[name],
+    takenNames: [for (final entry in saved.customProviders) entry.name],
+  );
+}
+
+/// Every chain ref a roles config declares (roles + path overrides).
+List<ModelRef> _rolesChainRefs(ModelRolesConfig rolesConfig) => [
+  for (final chain in rolesConfig.roles.values) ...chain,
+  for (final override in rolesConfig.pathOverrides)
+    for (final chain in override.roles.values) ...chain,
+];
+
+/// The explicit `apiKeyName`s referenced by a roles config (the
+/// secure-store preload set; the catalog names are always preloaded), plus
+/// the endpoint-scoped `FA_KEY_<HOST>` slot of every chain entry pinned to
+/// a custom endpoint (gh-1000 AC5 — the same source a manual provider
+/// switch resolves; the catalog env names describe default endpoints
+/// only). [customProviders] mirrors the resolver's registry leg (issue
+/// #1552): a catalog-unknown ref that names one of these entries resolves
+/// its default endpoint from the entry, so an explicit ref baseUrl over a
+/// custom entry is a non-default pin the same way.
+Set<String> roleKeyNames(
+  ModelRolesConfig rolesConfig, {
+  List<CustomProviderEntry> customProviders = const [],
+}) {
+  final refs = _rolesChainRefs(rolesConfig);
+  return {
+    for (final ref in refs) ...[
+      if (ref.apiKeyName != null) ref.apiKeyName!,
+      // gh-1570 incident REG: the resolver's fallbacks probe the whole
+      // cross-version slot family, so the snapshot must carry it — the
+      // endpoint-scoped candidates of every custom-endpoint ref (the
+      // unpinned leg, mirroring ModelRolesResolver
+      // ._endpointScopedKeyNames exactly) plus, for an explicitly pinned
+      // ref, the pin's own endpoint family (the empty-pin fallback set —
+      // the 1.0.556 → 1.0.564 lockout shape). The unpinned leg keeps the
+      // issue #1552 customProviders mirror (see the doc comment above):
+      // an unknown provider naming a custom entry resolves its spec
+      // through the entry.
+      if (_refNeedsEndpointSlot(ref, customProviders))
+        ...CustomProviderRegistry.keySlotCandidates(ref.baseUrl!),
+      if (ref.apiKeyName != null && ref.baseUrl != null)
+        ...CustomProviderRegistry.keySlotCandidates(ref.baseUrl!),
+    ],
+  };
+}
+
+/// Whether [ref] pins a NON-default endpoint — the roles resolver then
+/// probes the endpoint-scoped `FA_KEY_<HOST>` slot for it (gh-1000 AC5),
+/// so the snapshot must carry that slot. A catalog-default pin resolves
+/// through the provider's env-name chain instead and adds no slot
+/// (mirroring [ModelRolesResolver._endpointScopedKeyName] exactly: the
+/// ref's OWN spec decides); an unknown provider skips in the resolver and
+/// consumes no key, so it adds no slot either — unless it names a
+/// [customProviders] entry (issue #1552): then the entry's apiType spec
+/// decides, the same mirror the resolver applies.
+bool _refNeedsEndpointSlot(
+  ModelRef ref,
+  List<CustomProviderEntry> customProviders,
+) {
+  final baseUrl = ref.baseUrl;
+  if (baseUrl == null) return false;
+  var spec = resolveCliProviderSpec(ref.provider, honorBuildFilter: true);
+  if (spec == null) {
+    final lower = ref.provider.trim().toLowerCase();
+    for (final entry in customProviders) {
+      if (entry.name.toLowerCase() == lower) {
+        spec = resolveCliProviderSpec(entry.apiType, honorBuildFilter: true);
+        break;
+      }
+    }
+  }
+  // Trailing-slash-normalized — mirrors ModelRolesResolver
+  // ._endpointScopedKeyName exactly (the shared sameEndpoint rule).
+  return spec != null && !sameEndpoint(baseUrl, spec.defaultBaseUrl);
+}
+
+/// Every key name a resolved queue entry references (gh-1781): its
+/// `apiKeyEnv`, its `refreshTokenEnv` (`chatgpt-codex`, issue #1704),
+/// and the DEFAULT Keychain slot for a `chatgpt-codex` entry that named
+/// no `apiKeyEnv` — the saved-login slot the secure store holds.
+Set<String> queueEntryKeyNames(Iterable<ProviderQueueEntry> entries) => {
+  for (final entry in entries) ...[
+    ?entry.apiKeyEnv,
+    ?entry.refreshTokenEnv,
+    if (entry.apiKeyEnv == null && entry.providerType == 'chatgpt-codex')
+      chatGptOAuthCredentialsEnvName,
+  ],
+};
+
+/// Every provider key name the startup snapshot must preload: each catalog
+/// provider's env names, the endpoint-scoped `FA_KEY_<HOST>` name for every
+/// catalog default endpoint plus the configured endpoint and every saved
+/// custom provider's, the two non-catalog media slots, the explicit
+/// `apiKeyName`s referenced by the roles config, and every key name the
+/// resolved boot queue's entries reference (gh-1781 — a queue-only boot
+/// must resolve its keys from the store on cold starts).
+Set<String> secureKeyPreloadNames(
+  CliConfig saved, {
+  required String? baseUrl,
+  Iterable<ProviderQueueEntry> queueEntries = const [],
+}) {
+  return {
+    for (final spec in providerCatalog.values) ...[
+      ...spec.apiKeyEnvNames,
+      // Endpoint-scoped keys (FA_KEY_<HOST>): catalog defaults.
+      CustomProviderRegistry.keyNameFor(spec.defaultBaseUrl),
+    ],
+    if (baseUrl != null) CustomProviderRegistry.keyNameFor(baseUrl),
+    for (final entry in saved.customProviders)
+      entry.keyName ?? CustomProviderRegistry.keyNameFor(entry.baseUrl),
+    'VISION_API_KEY',
+    'TRANSCRIBE_API_KEY',
+    if (saved.modelRoles != null)
+      ...roleKeyNames(
+        saved.modelRoles!,
+        customProviders: saved.customProviders,
+      ),
+    ...queueEntryKeyNames(queueEntries),
+  };
+}
+
+/// Fresh-install detection (issue #969): true when NO saved custom provider
+/// exists AND no provider key resolves anywhere — no catalog env name (nor
+/// its rotation stack) in the environment, and nothing in the preloaded
+/// secure-store snapshot. This is the state where the REPL would otherwise
+/// boot into the default provider's "no key set" banner noise with no way
+/// to configure one except discovering `/provider` first. Every stored
+/// snapshot name counts as a resolved key (the host preloads exactly the
+/// provider slots: catalog name backups, endpoint-scoped names, media
+/// slots, role apiKeyNames) — conservative: anything configured means the
+/// user is not fresh and the wizard must not hijack the boot.
+///
+/// The executable's boot glue (`bin/fah.dart`) ANDs this pure decision with
+/// conditions the snapshot cannot see — enumerate there when touching the
+/// glue so the two levels stay in sync:
+///
+/// - not headless (`-p`/positional prompt args and `--output` events mode
+///   never get the wizard; the headless hard key gate stays untouched);
+/// - no per-folder model restore pending, no explicit `--provider`/`--model`
+///   /`--base-url`, no `FA_PROVIDER_*` preconfig, no roles resolution, no
+///   provider queue — an explicitly driven boot is not fresh;
+/// - the saved default entry is undisturbed: default `providerKind`
+///   (`openai-completions`) and default catalog `baseUrl` (a pointed
+///   elsewhere entry is a configured provider);
+/// - no `--session <name>` resume (a named resumed boot is never fresh)
+///   and no pi harness mode (`--pi`/`FA_PI_MODE`/`agent.mode: pi` — the
+///   benchmark profile stays deterministic).
+bool freshInstallProviderState({
+  required Iterable<CustomProviderEntry> customProviders,
+  required SecureKeyCache keys,
+  Map<String, String>? env,
+}) {
+  // The snapshot answers first: an O(1) read that covers every store slot,
+  // while the env sweep below costs O(env entries × catalog base names).
+  if (keys.names.isNotEmpty) return false;
+  if (customProviders.isNotEmpty) return false;
+  final environment = env ?? Platform.environment;
+  final bases = {
+    for (final spec in providerCatalog.values) ...spec.apiKeyEnvNames,
+  };
+  // One sweep: exact base names plus rotation stacks (`NAME_2`, `NAME_3`,
+  // …) — a base prefix + `_` + digits only (empty values never count).
+  for (final entry in environment.entries) {
+    if (entry.value.isEmpty) continue;
+    for (final base in bases) {
+      if (entry.key == base) return false;
+      if (entry.key.length > base.length &&
+          entry.key.startsWith(base) &&
+          entry.key.codeUnitAt(base.length) == 0x5f &&
+          int.tryParse(entry.key.substring(base.length + 1)) != null) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/// The store-key names the SAVED CONFIG explicitly references (gh-1059):
+/// every custom provider entry's own `keyName` plus the roles config's
+/// `apiKeyName`s. Queue entries resolved from the project/user config join
+/// the set via [queueEntries] (gh-1781) — a stored queue key that never
+/// resolves must say so in the boot diagnostics. Env-only setups reference
+/// nothing — the boot warning must stay silent for them (a missing env key
+/// has its own loud banner). A queue key name the [env] view resolves
+/// (non-empty value — the [freshInstallProviderState] rule) is not
+/// store-referenced either (gh-1781 review: the documented env-keyed
+/// project/user-config queue — the canonical `apiKeyEnv: SOME_ENV` shape
+/// the shipped skill doc recommends — printed a false "resolved NOTHING …
+/// boot keyless" alarm on every boot); [secureKeyPreloadNames] keeps the
+/// UNFILTERED names — preloading a name the env shadows is harmless. The
+/// env check scopes to the queue names only: legacy customProviders/roles
+/// names never env-filter (byte-identical legacy diagnostics).
+Set<String> referencedSecureKeyNames(
+  CliConfig saved, {
+  Iterable<ProviderQueueEntry> queueEntries = const [],
+  Map<String, String>? env,
+}) {
+  final environment = env ?? Platform.environment;
+  return {
+    for (final entry in saved.customProviders)
+      if (entry.keyName != null) entry.keyName!,
+    if (saved.modelRoles != null)
+      ...roleKeyNames(
+        saved.modelRoles!,
+        customProviders: saved.customProviders,
+      ),
+    for (final name in queueEntryKeyNames(queueEntries))
+      if ((environment[name] ?? '').isEmpty) name,
+  };
+}
+
+/// The referenced names whose preload outcome classified [status].
+Set<String> _referencedNamesWithStatus(
+  Set<String> referencedKeyNames,
+  SecureKeyPreloadReport report,
+  SecureKeyReadStatus status,
+) {
+  return referencedKeyNames
+      .where(
+        (name) =>
+            report.outcomes.any((o) => o.name == name && o.status == status),
+      )
+      .toSet();
+}
+
+/// The hint suffix shared by the boot warnings: point at the `[keys]`
+/// lines when they were printed, else at the debug switch.
+String _bootWarningHint(bool debug, String debugTail) {
+  return debug
+      ? 'see the [keys] lines above'
+      : 'run with --debug-secrets (or FA_DEBUG_KEYS=1) to see $debugTail';
+}
+
+/// The store-unavailable boot lines: the debug marker when asked, plus the
+/// nothing-resolved warning when the config references store keys (with no
+/// backend they resolve 0 too — "never stay invisible").
+List<String> _storeUnavailableLines({
+  required String label,
+  required bool debug,
+  required Set<String> referencedKeyNames,
+}) {
+  return [
+    if (debug) '[keys] $label unavailable — no keychain reads attempted',
+    if (referencedKeyNames.isNotEmpty)
+      'warning: ${referencedKeyNames.length} provider key(s) referenced '
+          'by the config (custom providers / roles) resolved NOTHING from '
+          'the $label (store unavailable, no reads attempted) — those '
+          'providers boot keyless',
+  ];
+}
+
+/// One `[keys]` line per preload outcome plus the totals summary.
+List<String> _debugKeyLines({
+  required SecureKeyPreloadReport report,
+  required Set<String> referencedKeyNames,
+  required String label,
+}) {
+  return [
+    for (final outcome in report.outcomes)
+      switch (outcome.status) {
+        SecureKeyReadStatus.found => '[keys] ${outcome.name}: found',
+        SecureKeyReadStatus.absent => '[keys] ${outcome.name}: absent',
+        SecureKeyReadStatus.error =>
+          '[keys] ${outcome.name}: error: ${outcome.error ?? 'unknown'}',
+      },
+    '[keys] ${referencedKeyNames.length} config-referenced, '
+        '${report.foundCount} found, ${report.absentCount} absent, '
+        '${report.errorCount} errors ($label)',
+  ];
+}
+
+/// The boot key-snapshot diagnostics (gh-1059): the lines the executable
+/// prints after `preload`. With [debug] (`--debug-secrets` / truthy
+/// `FA_DEBUG_KEYS`) one `[keys]` line per preload outcome plus a summary —
+/// `found` / `absent` / `error: <diagnostic>` — so a degraded keychain is
+/// diagnosable instead of silently empty. INDEPENDENT of [debug]:
+/// - one warning fires when the store answered but NONE of the
+///   config-referenced [referencedKeyNames] resolved — the "every provider
+///   boots keyless with no log trail" state — naming the count;
+/// - a per-name warning fires whenever any referenced name classified
+///   `error` (gh-1059 review: a boot where 7 of 8 keys fail to read but one
+///   resolves is just as keyless for those 7) — the store ANSWERED and
+///   failed, exactly the state worth naming.
+List<String> secureKeyBootDiagnostics({
+  required SecureKeyPreloadReport report,
+  required Set<String> referencedKeyNames,
+  required bool debug,
+  String? storeLabel,
+}) {
+  final lines = <String>[];
+  final label = storeLabel ?? 'secure store';
+  if (!report.storeAvailable) {
+    // Referenced store keys with no backend resolve 0 too — the boot is
+    // keyless for them all the same ("never stay invisible").
+    return _storeUnavailableLines(
+      label: label,
+      debug: debug,
+      referencedKeyNames: referencedKeyNames,
+    );
+  }
+  if (debug) {
+    lines.addAll(
+      _debugKeyLines(
+        report: report,
+        referencedKeyNames: referencedKeyNames,
+        label: label,
+      ),
+    );
+  }
+  final resolvedReferenced = _referencedNamesWithStatus(
+    referencedKeyNames,
+    report,
+    SecureKeyReadStatus.found,
+  );
+  if (referencedKeyNames.isNotEmpty && resolvedReferenced.isEmpty) {
+    final hint = _bootWarningHint(debug, 'the per-name reads');
+    lines.add(
+      'warning: ${referencedKeyNames.length} provider key(s) referenced by '
+      'the config (custom providers / roles) resolved NOTHING from the '
+      '$label — those providers boot keyless; re-enter a key or $hint '
+      '(the stored values were not touched)',
+    );
+  }
+  // gh-1059 review: `error` means the store answered and FAILED — the
+  // exact state worth naming, even when other referenced keys resolved.
+  final erroredReferenced = _referencedNamesWithStatus(
+    referencedKeyNames,
+    report,
+    SecureKeyReadStatus.error,
+  ).toList()..sort();
+  if (erroredReferenced.isNotEmpty) {
+    final hint = _bootWarningHint(debug, 'the errors');
+    lines.add(
+      'warning: ${erroredReferenced.length} provider key(s) referenced by '
+      'the config failed to read from the $label: '
+      '${erroredReferenced.join(', ')} — those providers boot keyless; '
+      're-enter a key or $hint (the stored values were not touched)',
+    );
+  }
+  return lines;
+}
+
+/// The boot save-degradation lines (gh-1679 AC2): one line per slot whose
+/// key never reached the durable store — the in-process failed-save names
+/// the cache tracks, plus registry entries the wizard flagged
+/// (`keyNotPersisted`, the marker persisted across boots) while their slot
+/// still resolves nothing. Each line names the slot, the last diagnostic,
+/// and the retry command — slots and diagnostics only, never values.
+/// Empty when nothing is degraded, so a healthy boot prints nothing new.
+List<String> secureKeySaveDegradationLines({
+  required SecureKeyCache keys,
+  required List<CustomProviderEntry> customProviders,
+}) {
+  final degraded = <String, String>{};
+  for (final name in keys.failedSaveNames) {
+    degraded[name] = keys.saveFailureDiagnostic(name) ?? 'write failed';
+  }
+  for (final entry in customProviders) {
+    final keyName = entry.keyName;
+    if (keyName == null || !entry.keyNotPersisted) continue;
+    // The slot resolved since — the failure generation ended.
+    if (keys.read(keyName) != null) continue;
+    degraded.putIfAbsent(
+      keyName,
+      () => 'a previous save failed (the entry was recorded without its key)',
+    );
+  }
+  if (degraded.isEmpty) return const [];
+  final label = keys.label ?? 'secure store';
+  final names = degraded.keys.toList()..sort();
+  return [
+    for (final name in names)
+      'warning: key "$name" did not reach the $label '
+          '(${degraded[name]}) — the provider boots keyless for it; fix the '
+          'store, then /key set $name <value>',
+  ];
+}
+
+/// The key slots the registry leg (issue #1552) can consume: for every
+/// saved [customProviders] entry a roles chain actually names — a
+/// catalog-unknown `provider:` matched against the entry names, trim +
+/// case-fold exactly like `ModelRolesResolver._findCustomProvider` (entry
+/// names are reserved against the catalog, so the match is unambiguous) —
+/// the entry's pinned `keyName` and its endpoint-scoped `FA_KEY_<HOST>`
+/// slot. Unreferenced entries contribute nothing.
+Set<String> _referencedCustomKeyNames(
+  ModelRolesConfig rolesConfig,
+  List<CustomProviderEntry> customProviders,
+) {
+  final named = {
+    for (final ref in _rolesChainRefs(rolesConfig))
+      ref.provider.trim().toLowerCase(),
+  };
+  return {
+    for (final entry in customProviders)
+      if (named.contains(entry.name.toLowerCase())) ...[
+        if (entry.keyName != null) entry.keyName!,
+        CustomProviderRegistry.keyNameFor(entry.baseUrl),
+      ],
+  };
+}
+
+/// Collects the secrets snapshot for the model-roles resolver: every
+/// provider catalog env name plus its rotation stack (`NAME`, `NAME_2`,
+/// `NAME_3`, ...), plus any base name referenced by an explicit
+/// `apiKeyName` in the roles config. The platform secure store backs up
+/// base names where the environment has none (env wins; rotation stacks
+/// stay env-only — secure storage holds base names only). [customProviders]
+/// (the `customProviders:` section) feeds the registry leg (issue #1552):
+/// a chain entry naming one of these entries resolves keys through the
+/// entry — its pinned `keyName` first, else the endpoint-scoped slot — so
+/// both names ride the snapshot, scoped to the entries the chains actually
+/// NAME: an unreferenced saved entry changes nothing (existing configs
+/// stay byte-identical — the PR contract).
+Map<String, String> collectRoleSecrets(
+  ModelRolesConfig rolesConfig,
+  SecureKeyCache keys, {
+  Map<String, String>? env,
+  List<CustomProviderEntry> customProviders = const [],
+}) {
+  final baseNames = <String>{
+    for (final spec in providerCatalog.values) ...spec.apiKeyEnvNames,
+    ...roleKeyNames(rolesConfig, customProviders: customProviders),
+    ..._referencedCustomKeyNames(rolesConfig, customProviders),
+  };
+  final secrets = <String, String>{};
+  final environment = env ?? Platform.environment;
+  for (final base in baseNames) {
+    final suffix = RegExp('^${RegExp.escape(base)}_\\d+\$');
+    for (final entry in environment.entries) {
+      if ((entry.key == base || suffix.hasMatch(entry.key)) &&
+          entry.value.isNotEmpty) {
+        secrets[entry.key] = entry.value;
+      }
+    }
+    if (!secrets.containsKey(base)) {
+      final stored = keys.read(base);
+      if (stored != null) secrets[base] = stored;
+    }
+  }
+  return secrets;
+}
+
+/// Headless startup API-key resolution: a base URL other than the catalog
+/// default (--base-url or config baseUrl) means a user-configured endpoint:
+/// local llama.cpp/Ollama/LM Studio servers need no key at all, so the key
+/// is optional there (the hosted presets keep requiring one; the config
+/// default IS the OpenRouter URL, so compare values, not nullness). Roles
+/// mode already tolerates a missing key; the openai-completions adapter
+/// omits the Authorization header entirely when the key is empty. The
+/// interactive REPL can start without a key: the user can switch providers,
+/// models, or base URLs with slash commands before the first run. Headless
+/// mode needs a key immediately because it performs a single run and exits.
+///
+/// Saved custom entries for [baseUrl] carry name-scoped keys
+/// (multi-account); they resolve right after the host-scoped slot.
+/// [pinnedKeyName] (the restored folder state's saved provider entry,
+/// gh-1000) resolves BEFORE both — it names the account the session
+/// actually ran on.
+///
+/// [queueResolved] (gh-1781): an active provider queue replaces the
+/// main-model resolution — the gate degrades from "missing key = hard
+/// startup failure" to an OPTIONAL key lookup (a missing key resolves to
+/// the empty string, never throws). The queue's own entries already
+/// passed their key gates in `ProviderQueueRuntime.build` (an all-keyless
+/// queue failed there with the loud queue error), and the legacy
+/// single-provider key never reaches the queue lane's streams — so the
+/// headless boot stays fail-loud exactly where a missing key still
+/// matters.
+///
+/// Throws [ConfigException] when the key is required and missing — the
+/// executable maps that to its `fa:` usage failure.
+String startupApiKey(
+  String provider,
+  SecureKeyCache keys, {
+  required String? baseUrl,
+  required List<CustomProviderEntry> customProviders,
+  required bool defaultRoleResolved,
+  required bool interactive,
+  Map<String, String>? env,
+  String? pinnedKeyName,
+  bool queueResolved = false,
+}) {
+  // A base URL other than the catalog default (--base-url or config
+  // baseUrl) means a user-configured endpoint: local servers need no key.
+  // Trailing-slash-normalized (the shared sameEndpoint rule, gh-1570
+  // L10) — a default endpoint spelled with one trailing slash must not
+  // read as custom and silently boot keyless.
+  final customEndpoint =
+      provider == 'openai-completions' &&
+      baseUrl != null &&
+      baseUrl.isNotEmpty &&
+      !sameEndpoint(baseUrl, providerCatalog['openrouter']!.defaultBaseUrl);
+  // Saved custom entries for this endpoint carry name-scoped keys
+  // (multi-account); they resolve right after the host-scoped slot.
+  // Endpoint comparison is normalized (gh-1570 S4) — a saved entry and
+  // the boot URL disagreeing on one trailing slash must not hide the
+  // entry's key.
+  final entryKeyNames = [
+    for (final entry in customProviders)
+      if (baseUrl != null &&
+          baseUrl.isNotEmpty &&
+          sameEndpoint(entry.baseUrl, baseUrl) &&
+          entry.keyName != null)
+        entry.keyName!,
+  ];
+  // gh-1781: an active provider queue replaces the main-model resolution —
+  // the legacy single-provider key never reaches the queue lane's streams,
+  // so the gate degrades to an optional lookup (the queue's own entries'
+  // gates already ran in ProviderQueueRuntime.build).
+  final key =
+      defaultRoleResolved || customEndpoint || interactive || queueResolved
+      ? (optionalProviderApiKey(
+              provider,
+              keys,
+              baseUrl: baseUrl,
+              scopedKeyNames: entryKeyNames,
+              env: env,
+              pinnedKeyName: pinnedKeyName,
+            ) ??
+            '')
+      : _requiredProviderApiKey(
+          provider,
+          keys,
+          baseUrl: baseUrl,
+          scopedKeyNames: entryKeyNames,
+          env: env,
+          pinnedKeyName: pinnedKeyName,
+        );
+  return key;
+}
+
+/// Whether an active provider queue owns the boot model identity (gh-1781
+/// I6): the launch pinned none of its own — no explicit `--provider` /
+/// `--model` / `--base-url` flag, no `FA_PROVIDER_*` env preconfig, no
+/// per-folder model restore — so the boot model, the provider kind, and
+/// the capability boot notes name the queue's active head instead of the
+/// unused `CliConfig` default. Any explicit pin keeps the legacy boot
+/// identity byte-identical (I7).
+bool queueOwnsBootModel({
+  required bool modelFlag,
+  required bool providerFlag,
+  required bool baseUrlFlag,
+  required bool hasProviderPreconfig,
+  required bool folderRestoreApplied,
+}) =>
+    !modelFlag &&
+    !providerFlag &&
+    !baseUrlFlag &&
+    !hasProviderPreconfig &&
+    !folderRestoreApplied;
+
+/// The required variant of [optionalProviderApiKey]: identical resolution,
+/// but a missing key is a hard startup failure (headless mode performs one
+/// run and exits — a silent empty key would surface as a provider 401).
+String _requiredProviderApiKey(
+  String provider,
+  SecureKeyCache keys, {
+  String? baseUrl,
+  Iterable<String>? scopedKeyNames,
+  Map<String, String>? env,
+  String? pinnedKeyName,
+}) {
+  final key = optionalProviderApiKey(
+    provider,
+    keys,
+    baseUrl: baseUrl,
+    scopedKeyNames: scopedKeyNames,
+    env: env,
+    pinnedKeyName: pinnedKeyName,
+  );
+  if (key == null || key.isEmpty) {
+    throw ConfigException(
+      pinnedKeyName != null
+          // A RESTORED pin: the catalog env name describes the DEFAULT
+          // endpoint — wrong-slot guidance (gh-1000 AC2, round-3 review).
+          // Name the pinned slot the restore actually probed.
+          ? 'missing API key for the restored provider: '
+                'set it with /key set $pinnedKeyName <value>'
+          : 'missing API key: set ${apiKeyEnvNames(provider).first} in the '
+                'environment',
+    );
+  }
+  return key;
+}
+
+/// Assembles the startup [SecretRedactor]: the API keys this CLI knows
+/// about (every catalog provider's env names, the web-search slots) are
+/// masked from tool results and the provider context so they cannot leak
+/// into the LLM conversation or the session files. The rotation stacks
+/// collected for the roles resolver and the values preloaded from the
+/// platform secure store (keychain values must never reach the transcript
+/// either) are redacted too. [queueSecrets] (gh-1781) registers every
+/// resolved provider-queue credential — queue entries routinely carry
+/// CUSTOM env var names (`COPILOT_EPAM_KEY`, `ZAI_CODE_KEY`, …) that no
+/// catalog list knows, so the values must ride the redaction explicitly.
+/// The spawned shell already inherits the process environment, so no env
+/// injection is needed here.
+SecretRedactor buildSecretRedactor({
+  Map<String, String> roleSecrets = const {},
+  Map<String, String> queueSecrets = const {},
+  SecureKeyCache? keys,
+  Map<String, String>? env,
+  RedactionPipeline? pipeline,
+}) {
+  final redactor = SecretRedactor();
+  // Every secret this function registers into the legacy exact-value
+  // redactor ALSO feeds the layered pipeline's registered layer, so both
+  // masking systems stay in sync (issue #24 stage 3).
+  void registerBoth(String name, String value) {
+    redactor.register(name, value);
+    pipeline?.registerSecret(value);
+  }
+
+  final environment = env ?? Platform.environment;
+  for (final name in [
+    for (final spec in providerCatalog.values) ...spec.apiKeyEnvNames,
+    'BRAVE_API_KEY',
+    'TAVILY_API_KEY',
+  ]) {
+    final value = environment[name];
+    if (value != null) registerBoth(name, value);
+  }
+  for (final entry in roleSecrets.entries) {
+    registerBoth(entry.key, entry.value);
+  }
+  for (final entry in queueSecrets.entries) {
+    registerBoth(entry.key, entry.value);
+  }
+  if (keys != null) {
+    for (final name in keys.names) {
+      final value = keys.read(name);
+      if (value != null) registerBoth(name, value);
+    }
+  }
+  return redactor;
+}
+
+/// Assembles the layered [RedactionPipeline] (issue #24) from the `redact:`
+/// config section and this process's well-known secrets. Returns `null`
+/// when the section disables redaction (`enabled: false`) so the hooks
+/// never attach. Secret registration happens through
+/// [buildSecretRedactor]'s `pipeline` parameter — call that first with this
+/// pipeline, or register later via [RedactionPipeline.registerSecret].
+RedactionPipeline? buildRedactionPipeline(RedactionConfig? config) {
+  if (config != null && !config.enabled) return null;
+  return RedactionPipeline(
+    registeredSecrets: const [],
+    config: config ?? const RedactionConfig(),
+  );
+}
+
+/// Web search works out of the box via keyless DuckDuckGo; keyed providers
+/// (Brave, Tavily) join the chain when their API key is in the environment.
+InMemorySecretsStore webSearchSecrets({Map<String, String>? env}) {
+  final environment = env ?? Platform.environment;
+  return InMemorySecretsStore({
+    for (final name in const ['BRAVE_API_KEY', 'TAVILY_API_KEY'])
+      if (environment[name] case final value? when value.isNotEmpty)
+        name: value,
+  });
+}
+
+/// `'hub'` ships default-on. A `.fah/packages.yaml` entry enables a plugin
+/// with a truthy value (`inspect_image:`/`hub: {url: …}`) and opts it OUT
+/// with a falsy one (`hub: false`, `hub:`) — so only the keys with truthy
+/// values join the enabled set.
+Set<String> resolveEnabledPlugins(
+  List<String> argPlugins,
+  Map<String, dynamic> config,
+) {
+  final enabled = <String>{'hub', ...argPlugins};
+  for (final entry in config.entries) {
+    if (entry.value == null || entry.value == false) {
+      enabled.remove(entry.key);
+    } else {
+      enabled.add(entry.key);
+    }
+  }
+  return enabled;
+}
+
+/// Resolves the FA_PROVIDERS_QUEUE scope chain at boot: the env var, the
+/// project `.fah/config.yaml` `providersQueue:` section, the user
+/// `~/.fah/config.yaml` one. Absent files/sections are not present; a
+/// present-but-invalid section throws [ConfigException] naming the file
+/// (strict, like every other config section).
+ProviderQueueResolution resolveProviderQueueAtBoot({
+  required String projectDir,
+  required String homeDir,
+  Map<String, String>? env,
+}) {
+  final environment = env ?? Platform.environment;
+  final envText = environment['FA_PROVIDERS_QUEUE'];
+  final inputs = <ProviderQueueScopeInput>[
+    ProviderQueueScopeInput(
+      scope: ProviderQueueScope.env,
+      isPresent: envText != null && envText.trim().isNotEmpty,
+      parse: envText == null || envText.trim().isEmpty
+          ? null
+          : parseProviderQueueEnv(envText),
+    ),
+    ...[
+      for (final (scope, path) in [
+        (ProviderQueueScope.project, '$projectDir/.fah/config.yaml'),
+        (ProviderQueueScope.user, '$homeDir/.fah/config.yaml'),
+      ])
+        ?_queueScopeFromFile(scope, path),
+    ],
+  ];
+  return resolveProviderQueueScopes(inputs);
+}
+
+ProviderQueueScopeInput? _queueScopeFromFile(
+  ProviderQueueScope scope,
+  String path,
+) {
+  final file = File(path);
+  if (!file.existsSync()) return null;
+  String body;
+  try {
+    body = file.readAsStringSync();
+  } on Object {
+    return null;
+  }
+  final Object? doc;
+  try {
+    doc = loadYaml(body);
+  } on Object catch (error) {
+    throw ConfigException('$path: ${error.toString()}');
+  }
+  if (doc is! YamlMap) return null;
+  final node = doc['providersQueue'];
+  if (node == null) return null;
+  return ProviderQueueScopeInput(
+    scope: scope,
+    isPresent: true,
+    parse: parseProviderQueueYaml(node, source: path),
+  );
+}
+
+/// Collects the secrets snapshot for the queue: each entry's `apiKeyEnv`
+/// resolves from the environment, else the secure store (env wins — the
+/// same precedence as the roles snapshot). A `chatgpt-codex` entry that
+/// named no `apiKeyEnv` resolves its DEFAULT Keychain slot
+/// ([chatGptOAuthCredentialsEnvName]) under the same rule, and a
+/// `refreshTokenEnv` name resolves the same way (issue #1704). Every
+/// resolved base name also sweeps its ROTATION STACK from the environment
+/// (`NAME_2`, `NAME_3`, … — the same rule [collectRoleSecrets] applies,
+/// gh-1781): `buildProviderQueueChain`'s `collectKeyStack` builds a
+/// multi-credential `ApiKeyRing` from it for in-entry key rotation.
+/// Rotation-stack names stay env-only (the store holds base names only).
+Map<String, String> collectQueueSecrets(
+  List<ProviderQueueEntry> entries,
+  SecureKeyCache keys, {
+  Map<String, String>? env,
+}) {
+  final environment = env ?? Platform.environment;
+  final secrets = <String, String>{};
+  for (final entry in entries) {
+    // gh-1781 review r1: one ladder for "which key names does a queue
+    // entry reference" — [queueEntryKeyNames] is the source of truth.
+    for (final name in queueEntryKeyNames([entry])) {
+      if (secrets.containsKey(name)) continue;
+      final fromEnv = environment[name];
+      if (fromEnv != null && fromEnv.isNotEmpty) {
+        secrets[name] = fromEnv;
+      } else {
+        final stored = keys.read(name);
+        if (stored != null) secrets[name] = stored;
+      }
+      final suffix = RegExp('^${RegExp.escape(name)}_\\d+\$');
+      for (final candidate in environment.entries) {
+        if (suffix.hasMatch(candidate.key) && candidate.value.isNotEmpty) {
+          secrets[candidate.key] = candidate.value;
+        }
+      }
+    }
+  }
+  return secrets;
+}

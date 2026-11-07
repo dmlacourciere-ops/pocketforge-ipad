@@ -1,0 +1,352 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+// Part of agent_service.dart: the agent-event handling member of
+// [AgentService] lives here so the main file stays under the 2800-line
+// guard. Same library, so private members resolve; notifications go
+// through `_notify()` (`notifyListeners` is @protected, callable only
+// inside the class).
+//
+// The full agent-event switch: streaming deltas, transcript tiles
+// (assistant/thinking/tool/system/widget), the dynamic-message marker
+// splice, Live Activity status, idle watchdog rearming, end-of-run
+// persistence + auto-compaction + queued-run continuation.
+
+part of 'agent_service.dart';
+
+/// Internal marker in `_pendingRequestRecords`: the flush turns it into
+/// a real `ModelChangeRecord` (issue #440) — the System row the request
+/// summary that follows on the chain stamps with the blob pointers (F7a).
+/// Never passed to `appendCustomEntry`.
+const String _pendingModelChangeMarker = '_pending_model_change';
+
+/// Per-kind handlers for [AgentServiceEvents._onAgentEvent] (issue
+/// #486). Unmapped kinds — the family's transport-only events — stay
+/// the historic no-op. Top-level because extensions cannot carry
+/// instance fields, and so the one-line adapters never count against
+/// any method's complexity.
+final Map<Type, Future<void> Function(AgentService, AgentEvent, CancelToken)>
+_agentEventHandlers = {
+  AgentStartEvent: (service, _, _) async => service._onAgentStart(),
+  TurnStartEvent: (service, _, _) async => service._onTurnStart(),
+  MessageUpdateEvent: (service, event, _) async => service._onMessageUpdate(
+    (event as MessageUpdateEvent).assistantMessageEvent,
+  ),
+  MessageEndEvent: (service, event, _) async =>
+      service._onMessageEnd((event as MessageEndEvent).message),
+  ToolExecutionStartEvent: (service, event, _) async {
+    final start = event as ToolExecutionStartEvent;
+    return service._onToolExecutionStart(start.toolName, start.args);
+  },
+  ToolExecutionEndEvent: (service, event, _) async {
+    final end = event as ToolExecutionEndEvent;
+    return service._onToolExecutionEnd(
+      toolName: end.toolName,
+      result: end.result,
+      isError: end.isError,
+    );
+  },
+  ModelRequestEvent: (service, event, _) =>
+      service._persistModelRequest(event as ModelRequestEvent),
+  ToolPairingRepairEvent: (service, event, _) async =>
+      service._onToolPairingRepair(event as ToolPairingRepairEvent),
+  AgentEndEvent: (service, _, _) => service._onAgentEnd(),
+};
+
+extension AgentServiceEvents on AgentService {
+  Future<void> _onAgentEvent(AgentEvent event, CancelToken cancelToken) async {
+    // Any event proves the run is alive — rearm the idle watchdog.
+    if (event is! AgentEndEvent) _armIdleWatchdog();
+    _trajectory.applyEvent(event);
+    // Event-kind dispatch (issue #486): one handler per kind; the sealed
+    // AgentEvent family keeps the table exact (no subclasses), unknown
+    // kinds stay no-ops.
+    await _agentEventHandlers[event.runtimeType]?.call(
+      this,
+      event,
+      cancelToken,
+    );
+  }
+
+  /// gh-1449 AC6: persist a batch of FIRST-TIME orphan notes as the
+  /// hidden `orphan_report` record — the resume seed (see loadSession).
+  /// Re-drops of already-reported orphans write nothing.
+  /// Redaction note: the keys are canonical tool-call ids/timestamps
+  /// (no user content), so unlike the CLI path this write skips the
+  /// redaction pipeline on purpose.
+  void _onToolPairingRepair(ToolPairingRepairEvent event) {
+    final session = _session;
+    if (event.report.notedOrphanKeys.isEmpty || session == null) return;
+    unawaited(
+      session
+          .appendCustomEntry(
+            customType: orphanReportRecordType,
+            data: orphanReportRecordData(event.report.notedOrphanKeys.toSet()),
+          )
+          // A failed append must stay diagnosable: the batch is never
+          // persisted, and the next open would re-report the orphans it
+          // "already reported" with nothing pointing at the cause.
+          .then(
+            (_) {},
+            onError: (Object e) {
+              AppLog.i('persist', 'orphan_report append failed: $e');
+            },
+          ),
+    );
+  }
+
+  /// Run start: fresh streaming state, steering ledger and a fresh
+  /// dynamic-message budget (the cap is per agent turn, host-enforced).
+  void _onAgentStart() {
+    isStreaming = true;
+    _currentAssistantMessage = null;
+    _inFlightToolRows.clear();
+    _turnStartCount = 0;
+    pendingSteerTexts.clear();
+    dynamicMessages.onRunStart();
+    _notify();
+  }
+
+  /// Continuation turns (steering injected mid-run) start with a second
+  /// TurnStartEvent; clear the pending banner now so it doesn't outlive
+  /// the injected user messages.
+  void _onTurnStart() {
+    if (_turnStartCount > 0 && pendingSteerTexts.isNotEmpty) {
+      pendingSteerTexts.clear();
+      _notify();
+    }
+    _turnStartCount++;
+  }
+
+  void _onMessageUpdate(AssistantMessageEvent assistantMessageEvent) {
+    if (assistantMessageEvent is TextDeltaEvent) {
+      _appendAssistantDelta(assistantMessageEvent.delta);
+    } else if (assistantMessageEvent is ThinkingDeltaEvent) {
+      _appendThinkingDelta(assistantMessageEvent.delta);
+    }
+  }
+
+  void _onMessageEnd(Message message) {
+    if (message is UserMessage) {
+      // User messages (initial prompts and injected steering) reach the
+      // transcript through the agent loop so ordering matches the context.
+      messages.add(_toChatMessage(message));
+      // If this text was shown as pending while the agent was busy, drop
+      // it from the banner now that it is in the live transcript.
+      final text = _userMessageText(message);
+      if (text != null) pendingSteerTexts.remove(text);
+      _notify();
+    } else if (message is AssistantMessage) {
+      _finalizeAssistant(message);
+    }
+    _persistSoon();
+  }
+
+  /// Tool calls can run long (builds, installs) without producing agent
+  /// events — the idle watchdog must not fire during them.
+  void _onToolExecutionStart(String toolName, Map<String, dynamic> args) {
+    _activeToolCalls++;
+    // The activity tile is an unpersisted live row: tracked so a mid-run
+    // view rebuild (jump-to-tail) can re-append it instead of dropping
+    // the in-flight tool from the transcript (review -Fl1).
+    final row = FahChatMessage(
+      role: 'system',
+      content: '[$toolName] ${_shortArgs(args)}',
+    );
+    _inFlightToolRows.add((toolName: toolName, row: row));
+    messages.add(row);
+    _pushLiveActivityStatus();
+    _notify();
+  }
+
+  void _onToolExecutionEnd({
+    required String toolName,
+    required ToolExecutionResult result,
+    required bool isError,
+  }) {
+    _activeToolCalls--;
+    _armIdleWatchdog();
+    // The activity tile landed (its result tile follows); stop tracking
+    // it as in-flight. First match = call order per tool name.
+    final inFlight = _inFlightToolRows.indexWhere(
+      (e) => e.toolName == toolName,
+    );
+    if (inFlight >= 0) _inFlightToolRows.removeAt(inFlight);
+    if (AgentService._kMutatingToolNames.contains(toolName)) {
+      // "Hook" for file-watching UI: the agent may have changed files.
+      fsRevision.value++;
+    }
+    _persistSoon();
+    final text = result.content
+        .whereType<TextContent>()
+        .map((b) => b.text)
+        .join('\n');
+    messages.add(
+      FahChatMessage(
+        role: 'tool',
+        content: text,
+        toolName: toolName,
+        isError: isError,
+      ),
+    );
+    // A dynamic message presented by this tool call renders directly
+    // under its result tile (presentation order = call order).
+    if (toolName == 'dynamic_message') {
+      final presented = dynamicMessages.takePendingMarker();
+      if (presented != null) {
+        messages.add(
+          FahChatMessage(
+            role: DynamicMessagesService.markerRole,
+            content: presented.title,
+            data: presented.id,
+          ),
+        );
+        // The ✦ sheet's jump-to-message targets `msg-<index>` rows.
+        presented.markerIndex = messages.length - 1;
+      }
+    }
+    _pushLiveActivityStatus();
+    _notify();
+  }
+
+  /// Run end: stop streaming, cancel the idle watchdog, persist the
+  /// transcript (best effort), auto-compact + resume an over-window
+  /// interrupted turn, then start a queued run if any.
+  Future<void> _onAgentEnd() async {
+    _idleWatchdog?.cancel();
+    isStreaming = false;
+    _currentAssistantMessage = null;
+    _notify();
+    // Session persistence is best effort: a failed append must not
+    // propagate back into the agent's event plumbing (a throwing
+    // listener re-enters the loop's failure path, duplicates the
+    // failure events, and escapes the run as an unhandled error).
+    //
+    // `_persist()` is single-flight: the finalizer either runs the pass
+    // itself or joins the in-flight drain (which re-runs any state that
+    // landed mid-sweep). It resolves only when every persist-worthy
+    // change so far is on disk, so when this returns the transcript is
+    // fully written and the idle boundary (`waitForIdle`) can't overtake
+    // a pending append (issue #1102).
+    try {
+      await _persist();
+    } on Object {
+      // The transcript stays in memory; the next run retries the
+      // missed appends (see _persistedCount).
+    }
+    final compacted = await _maybeAutoCompact();
+    // The loop's over-window guard stopped the run: once the
+    // post-run compaction freed the window, continue the interrupted
+    // turn on its own (once per user text) instead of idling with an
+    // error — a live session that hit the guard mid-task (200676/200k
+    // on glm) used to sit dead until a manual "continue".
+    final lastMessage = _agent.state.messages.lastOrNull;
+    if (!_overWindowAutoResumed &&
+        compacted &&
+        lastMessage is AssistantMessage &&
+        isContextWindowExhaustedError(lastMessage.errorMessage)) {
+      _overWindowAutoResumed = true;
+      Future(
+        () => _runWithTimeout(
+          () => _agent.prompt(AgentService._overWindowContinuationNotice),
+        ),
+      );
+    }
+    // Steering/follow-up messages queued during the run get their own
+    // run once this lifecycle fully finished — also after a manual
+    // stop, so a queued message never silently dies in the transcript.
+    if (_agent.hasQueuedMessages()) {
+      Future(() => _runWithTimeout(() => _agent.continueRun()));
+    }
+  }
+
+  /// Extracts the textual content of a [UserMessage] for matching against
+  /// [pendingSteerTexts]. Returns `null` for empty or non-text messages.
+  String? _userMessageText(UserMessage message) {
+    final content = message.content;
+    if (content is String) {
+      return content.isEmpty ? null : content;
+    }
+    final text = (content as List<ContentBlock>)
+        .whereType<TextContent>()
+        .map((b) => b.text)
+        .join('\n');
+    return text.isEmpty ? null : text;
+  }
+
+  /// Buffers the outbound-request capture for the next persist pass. The
+  /// pass serializes through the same writer as message appends and flushes
+  /// records right before their assistant message, so the request summary
+  /// stays ahead of it on the record chain (the replay walk expects that).
+  ///
+  /// gh-1745: the heavy half of the capture (per-message previews/block
+  /// texts, the raw wire dump) spills into the session's request-blob dir
+  /// first; the buffered `model_request_summary` keeps lightweight
+  /// metadata plus the spill pointer. A failed (or killed-switch) spill
+  /// falls back to the legacy inline persistence.
+  Future<void> _persistModelRequest(ModelRequestEvent event) async {
+    final persister = _trajectoryBlobPersisterFor();
+    // Issue #440: a new request-context version lands a `model_change`
+    // ahead of its blob/summary records (content-addressed, once per
+    // version run — the app twin of the CLI's model-change rows).
+    if (persister.shouldAppendModelChange(event.detail)) {
+      _pendingRequestRecords.add((
+        customType: _pendingModelChangeMarker,
+        data: const {},
+      ));
+    }
+    var detail = event.detail;
+    var rawWireDump = event.rawWireDump;
+    final store = _requestBlobStoreFor();
+    if (store != null) {
+      final spill = await store.write(
+        detail: event.detail,
+        rawWireDump: event.rawWireDump,
+        redactWireDump: _redactionPipeline?.redact,
+      );
+      if (spill != null) {
+        detail = stripTrajectoryRequestDetail(
+          event.detail,
+          spillFile: spill.file,
+          wireDumpHash: spill.wireDumpHash,
+        );
+        rawWireDump = null;
+      }
+    }
+    _pendingRequestRecords.addAll(
+      persister.recordsFor(
+        detail,
+        promptBlob: event.promptBlob,
+        manifestBlob: event.manifestBlob,
+        rawWireDump: rawWireDump,
+      ),
+    );
+  }
+
+  void _appendAssistantDelta(String delta) {
+    var target = _currentAssistantMessage;
+    if (target == null) {
+      target = FahChatMessage(role: 'assistant', content: '');
+      _currentAssistantMessage = target;
+      messages.add(target);
+      // The status line flips to "writing…" — update the Live Activity.
+      _pushLiveActivityStatus();
+    }
+    target.content += delta;
+    _notify();
+  }
+
+  void _appendThinkingDelta(String delta) {
+    var target = _currentThinkingMessage;
+    if (target == null) {
+      target = FahChatMessage(role: 'thinking', content: '');
+      _currentThinkingMessage = target;
+      messages.add(target);
+      // The status line flips to "thinking…" — update the Live Activity.
+      _pushLiveActivityStatus();
+    }
+    target.content += delta;
+    _notify();
+  }
+}

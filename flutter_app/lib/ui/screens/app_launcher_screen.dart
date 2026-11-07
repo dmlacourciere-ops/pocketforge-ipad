@@ -1,0 +1,2117 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:async';
+
+import 'package:fa/l10n/l10n_ext.dart';
+import 'package:fa/network/network_mode.dart';
+import 'package:fa/network/network_session_manager.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+
+import 'package:fa/apps/app_icon.dart';
+import 'package:fa/apps/app_tile_host.dart';
+import 'package:fa/apps/app_load_error.dart';
+import 'package:fa/apps/apps_store.dart';
+import 'package:fa/apps/catalog_auto_update.dart';
+import 'package:fa/apps/catalog_service.dart';
+import 'package:fa/apps/js_app_navigation.dart';
+import 'package:fa/apps/session_chat_sheet.dart';
+import 'package:fa/apps/unpacked_load_flow.dart';
+import 'package:fa/apps/unpacked_loader.dart';
+import 'package:fa/apps/widgets_catalog_sheet.dart';
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/services/app_log.dart';
+import 'package:fa/services/analytics.dart';
+import 'package:fa/services/asr_service.dart';
+import 'package:fa/services/flutter_session_manager.dart';
+import 'package:fa/services/folder_picker.dart';
+import 'package:fa/services/last_connection.dart';
+import 'package:fa/services/launcher_layout_store.dart';
+import 'package:fa/services/session_names_store.dart';
+import 'package:fa/services/widget_publication_store.dart';
+import 'package:fa/services/widget_publish_service.dart';
+import 'package:fa/ui/widgets/github_account_section.dart';
+import 'package:fa/ui/widgets/widget_publish_sheet.dart';
+import 'package:fa/services/upload.dart';
+import 'package:fa/ui/screens/settings.dart';
+import 'package:fa/ui/widgets/fa_mark.dart';
+import 'package:fa/ui/network/network_mode_chip.dart';
+import 'package:fa/ui/widgets/file_browser.dart';
+import 'package:fa/ui/widgets/fah_wallpaper.dart';
+import 'package:fa/ui/widgets/span_grid_delegate.dart';
+import 'package:fa_ui/fa_ui.dart';
+import 'package:fa/ui/widgets/wide_layout_shell.dart'
+    show faAppBar, faIsMacOSDesktop;
+
+/// iOS-home-screen-style apps launcher: the app's home on narrow layouts
+/// (the wide layout keeps the classic chat home). A dynamic square grid of
+/// the JS apps living in the env's `apps/` folder plus two system tiles
+/// (Settings, Files); tiles reorder by drag&amp;drop, an app dropped onto
+/// the CENTER of another app groups both into a folder (drop onto an edge
+/// reorders, drop onto a folder adds to it), and a folder tap opens it as a
+/// floating panel whose tiles launch on tap or drag out to ungroup. An app
+/// whose manifest declares a `"widget"` section renders a live tile
+/// ([AppTileHost]) in place of the static icon + label, spanning the
+/// declared WxH grid cells (see [SpanGridDelegate]).
+///
+/// The layout (order, folders) persists through [LauncherLayoutStore]; the
+/// apps list refreshes on the active session's [AgentService.fsRevision]
+/// bumps, so apps the agent creates appear without a restart. The collapsed
+/// session chat sheet (P2) floats above this grid in the same [Stack].
+class AppLauncherScreen extends StatefulWidget {
+  const AppLauncherScreen({
+    super.key,
+    required this.manager,
+    this.registry,
+    this.lastConnectionStore,
+    this.layoutStore,
+    this.appsStore,
+    this.sessionNamesStore,
+    this.uploadPicker,
+    this.asr,
+    this.asrTranscriber,
+    this.audioControllerFactory,
+    this.videoControllerFactory,
+    this.tileEngineFactory,
+    this.hideChatSheet = false,
+    this.restoreAppsMode = false,
+    this.networkMode,
+    this.networkSessions,
+  });
+
+  /// The multi-session manager owning the active [AgentService].
+  final FlutterSessionManager manager;
+
+  /// The custom-provider registry handed to the settings screen.
+  final ProviderRegistry? registry;
+
+  /// The last-connection store handed to the settings screen.
+  final LastConnectionStore? lastConnectionStore;
+
+  /// The persisted tile layout; `null` loads it from the env (a spinner
+  /// shows until then — like the sidebar's session-names store).
+  final LauncherLayoutStore? layoutStore;
+
+  /// App discovery/seeding; tests inject one with canned assets.
+  final AppsStore? appsStore;
+
+  /// The user-given session titles shown in the chat sheet header;
+  /// forwarded to [SessionChatSheet].
+  final SessionNamesStore? sessionNamesStore;
+
+  /// File chooser for the chat sheet's composer; forwarded to
+  /// [SessionChatSheet].
+  final UploadPicker? uploadPicker;
+
+  /// Microphone backend override for the chat sheet's composer (tests).
+  final AsrApi? asr;
+
+  /// Transcriber override for the chat sheet's composer (tests).
+  final AsrTranscriber? asrTranscriber;
+
+  /// Playback engine factory for inline audio in the chat sheet transcript.
+  final SandboxAudioControllerFactory? audioControllerFactory;
+
+  /// Playback engine factory for inline video in the chat sheet transcript.
+  final SandboxVideoControllerFactory? videoControllerFactory;
+
+  /// Test seam for live tiles: substitutes the [AppTileHost] engine so
+  /// widget tests and goldens render a deterministic tile tree.
+  final TileEngineFactory? tileEngineFactory;
+
+  /// When true the [SessionChatSheet] floating overlay is NOT rendered —
+  /// the wide-screen [WideLayoutShell] owns chat instead.
+  final bool hideChatSheet;
+
+  /// Restore the persisted apps↔chat surface mode (issue #224) in the
+  /// chat sheet; forwarded from [faHomeScreen]. Tests/goldens keep the
+  /// default false — the apps grid stays the deterministic resting state.
+  final bool restoreAppsMode;
+
+  /// Network mode (issue #955): when both are provided, the launcher
+  /// header carries the Local | Network mode chip. Null (tests, non-
+  /// network hosts) keeps the classic header.
+  final NetworkModeController? networkMode;
+  final NetworkSessionManager? networkSessions;
+
+  @override
+  State<AppLauncherScreen> createState() => _AppLauncherScreenState();
+}
+
+class _AppLauncherScreenState extends State<AppLauncherScreen> {
+  /// Size of the drag-feedback icon for classic app tiles (widget tiles
+  /// drag a full-size card replica instead — see [_tileFeedback]).
+  static const double _feedbackSize = 64;
+
+  /// The pointer's grab point inside the dragged tile, captured by the
+  /// drag-anchor strategy at drag start: `DragTargetDetails.offset` is the
+  /// feedback's top-left corner, so `offset + _grabOffset` always recovers
+  /// the pointer — for a 64px icon and a 356px widget card alike.
+  Offset _grabOffset = const Offset(32, 32);
+
+  /// Pointer speed below which a cancelled drag counts as
+  /// hold-release-without-movement (the iOS "edit menu" gesture).
+  static const double _holdMaxVelocity = 50;
+
+  LauncherLayoutStore? _layout;
+  late final AppsStore _appsStore;
+  List<JsAppInfo>? _apps;
+  Object? _error;
+  String? _openFolderId;
+
+  /// Search field above the grid; a non-empty query swaps the draggable
+  /// grid for a flat filtered results grid (no drag&drop in search mode).
+  final TextEditingController _searchController = TextEditingController();
+
+  /// The active content tab: the app grid or the widgets catalog.
+  _LauncherTab _tab = _LauncherTab.widgets;
+
+  /// Key into the session chat sheet so the header's session chip can
+  /// expand it (the chip shows WHICH session is active — the sheet hosts it).
+  final _sheetKey = GlobalKey<SessionChatSheetState>();
+
+  /// Live reorder preview while dragging: the order the grid animates to
+  /// (the persisted order is only mutated on drop).
+  List<String>? _previewOrder;
+
+  /// Tile key currently highlighted as a FOLDER drop target (center-band
+  /// hover on an app tile, or any hover on a folder tile); null while the
+  /// drag is a reorder (or no drag).
+  String? _folderHoverKey;
+
+  /// Debounce for re-reading `launcher_layout.json` on fsRevision bumps
+  /// (the agent/user may have edited grid/tileSizes/order — see §3).
+  Timer? _layoutReloadDebounce;
+
+  Map<String, JsAppInfo> get _appsById => {
+    for (final app in _apps ?? const <JsAppInfo>[]) app.id: app,
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    AppAnalytics.instance.screenOpened('launcher');
+    _appsStore = widget.appsStore ?? AppsStore(widget.manager.env);
+    _layout = widget.layoutStore;
+    widget.manager.addListener(_onManagerChanged);
+    _attachFsRevision();
+    _layout?.addListener(_onLayoutChanged);
+    _searchController.addListener(_onSearchChanged);
+    if (_layout == null) unawaited(_loadLayout());
+    unawaited(_reloadApps());
+    unawaited(_autoUpdateWidgets());
+  }
+
+  /// Silent catalog auto-update: clean (never user-modified) widget
+  /// installs follow the catalog forward on their own — a stale first-
+  /// install keeps its old layout/bugs forever otherwise (a pomodoro
+  /// 1.0.0 tile overflowed its cell and swallowed the Start button).
+  /// Modified widgets stay on the sheet's manual Update path. Offline =
+  /// no-op; the board runs from what's installed.
+  Future<void> _autoUpdateWidgets() async {
+    try {
+      final updated = await autoUpdateCleanWidgets(
+        store: _appsStore,
+        catalog: CatalogService(widget.manager.env),
+      );
+      if (updated.isNotEmpty) {
+        AppLog.i('apps', 'auto-updated widgets: ${updated.join(', ')}');
+        widget.manager.active?.service.fsRevision.value++;
+      }
+    } on Object {
+      // No network or catalog down — nothing to do.
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.manager.removeListener(_onManagerChanged);
+    _searchController.removeListener(_onSearchChanged);
+    _searchController.dispose();
+    _detachFsRevision();
+    _layout?.removeListener(_onLayoutChanged);
+    _layoutReloadDebounce?.cancel();
+    _cancelFolderDwell();
+    super.dispose();
+  }
+
+  void _onSearchChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _loadLayout() async {
+    final store = await LauncherLayoutStore.load(widget.manager.env);
+    if (!mounted || _layout != null) return;
+    setState(() {
+      _layout = store..addListener(_onLayoutChanged);
+    });
+    _syncApps();
+  }
+
+  void _onManagerChanged() {
+    _attachFsRevision();
+    if (mounted) setState(() {});
+  }
+
+  void _onLayoutChanged() {
+    if (!mounted) return;
+    // A folder dissolved under the open panel (last tile dragged out).
+    final openId = _openFolderId;
+    if (openId != null && _layout?.folderById(openId) == null) {
+      _openFolderId = null;
+    }
+    setState(() {});
+  }
+
+  ValueNotifier<int>? _fsRevisionSource;
+
+  void _attachFsRevision() {
+    final source = widget.manager.active?.service.fsRevision;
+    if (identical(source, _fsRevisionSource)) return;
+    _fsRevisionSource?.removeListener(_onFsRevision);
+    _fsRevisionSource = source;
+    source?.addListener(_onFsRevision);
+  }
+
+  void _detachFsRevision() {
+    _fsRevisionSource?.removeListener(_onFsRevision);
+    _fsRevisionSource = null;
+  }
+
+  void _onFsRevision() {
+    unawaited(_reloadApps());
+    // The agent/user may also have edited launcher_layout.json (grid
+    // columns, tile sizes, order) — re-read it, debounced like the tile
+    // engine reloads (agent edits often write several files back to back).
+    _layoutReloadDebounce?.cancel();
+    _layoutReloadDebounce = Timer(const Duration(milliseconds: 600), () {
+      if (mounted) unawaited(_layout?.reload());
+    });
+  }
+
+  Future<void> _reloadApps() async {
+    try {
+      // The publish ledger persists in the app sandbox (issue #35); the
+      // launcher owns the env, so it initializes the shared instance the
+      // settings section and menus read.
+      unawaited(initSharedWidgetPublicationStore(widget.manager.env));
+      await _appsStore.seedBundledApps();
+      final apps = await _appsStore.listApps();
+      // Publish eligibility (issue #35): catalog downloads are already
+      // published BY the catalog — only user/agent-created widgets publish.
+      final installed = <String>{};
+      for (final app in apps) {
+        if (await _appsStore.isCatalogInstalled(app.id)) installed.add(app.id);
+      }
+      if (!mounted) return;
+      setState(() {
+        _apps = apps;
+        _catalogInstalled = installed;
+        _error = null;
+      });
+      _syncApps();
+    } on Object catch (error) {
+      if (mounted) setState(() => _error = error);
+    }
+  }
+
+  /// App ids installed from the widget catalog (see [_reloadApps]) — the
+  /// tile menu hides "Publish…" for them.
+  Set<String> _catalogInstalled = const {};
+
+  /// The folder picker for "Load unpacked" (gh-1616) — null on hosts
+  /// that cannot pick folders, which hides the entry instead of showing
+  /// a button that errors.
+  FolderPicker? get _unpackedPicker => createFolderPicker();
+
+  /// Reconciles the persisted layout with the discovered apps (new apps
+  /// append, deleted apps vanish, empty folders dissolve).
+  void _syncApps() {
+    final apps = _apps;
+    if (apps == null) return;
+    _layout?.syncApps(apps.map((app) => app.id));
+  }
+
+  // --- drag & drop ---------------------------------------------------------
+
+  /// Continuous hover while dragging over [targetKey]'s slot: the CENTER
+  /// band of an app tile arms FOLDER intent only after a short dwell (iOS
+  /// semantics — a fast pass or an edge hover means REORDER; positional
+  /// alone must never steal the insert intent, big tiles cannot hit the
+  /// outer sliver reliably). Any position on a folder tile arms
+  /// immediately. The edge halves set a live insertion preview so the
+  /// other tiles animate aside (the persisted order only changes on drop,
+  /// see [_onDrop]).
+  void _onDragHover(String targetKey, DragTargetDetails<String> details) {
+    final draggedKey = details.data;
+    if (draggedKey == targetKey) return;
+    final layout = _layout;
+    if (layout == null) return;
+    // details.offset is the drag feedback's top-left corner; the grab
+    // offset captured at drag start recovers the pointer position.
+    final fx = _fractionOnTile(targetKey, details.offset + _grabOffset);
+    final center = (fx - 0.5).abs();
+    if (LauncherLayoutStore.isFolderKey(targetKey)) {
+      // Dropping ON a folder is unambiguous — immediate intent.
+      _armFolderIntent(targetKey);
+      return;
+    }
+    if (_hoverFolderIntent(draggedKey, targetKey, center)) return;
+    _cancelFolderDwell();
+    // Reorder dead zone: once a preview exists, the before/after decision
+    // only flips outside fx 0.35..0.65 — dragging a big tile across a slot
+    // boundary no longer oscillates the whole grid.
+    if (_inReorderDeadZone(fx)) {
+      if (_folderHoverKey != null) {
+        setState(() => _folderHoverKey = null);
+      }
+      return;
+    }
+    _previewInsert(draggedKey, targetKey, fx);
+  }
+
+  /// Arms folder intent for [targetKey] immediately (a drop ON a folder
+  /// tile is unambiguous) and clears any live reorder preview — only
+  /// when the state actually changes, so hover spam doesn't rebuild.
+  void _armFolderIntent(String targetKey) {
+    if (_folderHoverKey != targetKey || _previewOrder != null) {
+      setState(() {
+        _folderHoverKey = targetKey;
+        _previewOrder = null;
+      });
+    }
+  }
+
+  /// The APP-tile half of a hover (both keys are apps): an armed folder
+  /// intent holds until the pointer leaves the wider band, a CENTER-band
+  /// hit arms folder intent after a dwell. Returns true when the hover
+  /// was fully handled — the caller stops without touching the reorder
+  /// preview (gh-1848 split).
+  bool _hoverFolderIntent(String draggedKey, String targetKey, double center) {
+    final bothApps =
+        draggedKey.startsWith('app:') && targetKey.startsWith('app:');
+    if (!bothApps) return false;
+    if (_folderHoverKey == targetKey) {
+      // Armed: hold until the pointer leaves the wider band (no flicker
+      // at the boundary).
+      if (center <= 0.3) return true;
+      setState(() => _folderHoverKey = null);
+      return false;
+    } else if (center <= 0.2) {
+      // Center band: arm folder intent only after a dwell — see dartdoc
+      // on [_onDragHover].
+      if (_folderDwellKey != targetKey) _startFolderDwell(targetKey);
+      return true;
+    }
+    return false;
+  }
+
+  /// Starts the folder-intent dwell timer: 450 ms in the CENTER band
+  /// arms folder intent (iOS semantics — a fast pass or an edge hover
+  /// means REORDER).
+  void _startFolderDwell(String targetKey) {
+    _cancelFolderDwell();
+    _folderDwellKey = targetKey;
+    _folderDwell = Timer(const Duration(milliseconds: 450), () {
+      if (mounted && _folderDwellKey == targetKey) {
+        setState(() {
+          _folderHoverKey = targetKey;
+          _previewOrder = null;
+        });
+      }
+    });
+  }
+
+  /// True while a live preview exists and the pointer sits in the
+  /// before/after dead zone (fx 0.35..0.65): the preview holds instead
+  /// of oscillating the whole grid.
+  bool _inReorderDeadZone(double fx) =>
+      _previewOrder != null && fx > 0.35 && fx < 0.65;
+
+  /// Folder-intent dwell timer (see [_onDragHover]).
+  Timer? _folderDwell;
+  String? _folderDwellKey;
+
+  void _cancelFolderDwell() {
+    _folderDwell?.cancel();
+    _folderDwell = null;
+    _folderDwellKey = null;
+  }
+
+  /// Applies one live reorder-preview step: [draggedKey] inserted
+  /// before/after [targetKey] at horizontal fraction [fx] (the same math
+  /// the drop persists). Shared by the per-tile hover and the grid
+  /// background drop surface.
+  void _previewInsert(String draggedKey, String targetKey, double fx) {
+    final layout = _layout;
+    if (layout == null) return;
+    final order = _previewOrder ?? layout.topLevelKeys;
+    final insertion = launcherInsertionIndex(
+      order: order,
+      draggedKey: draggedKey,
+      targetKey: targetKey,
+      fx: fx,
+    );
+    if (insertion < 0) return;
+    final next = moveLauncherKey(order, draggedKey, insertion);
+    if (!_sameKeys(next, order)) {
+      setState(() {
+        _folderHoverKey = null;
+        _previewOrder = next;
+      });
+    } else if (_folderHoverKey != null) {
+      setState(() => _folderHoverKey = null);
+    }
+  }
+
+  /// The grid stack's render box — converts global drag coordinates to
+  /// grid-local for the background drop surface.
+  RenderBox? _gridBox;
+
+  /// The last resolved background hover target (key, fx) — the background
+  /// drop accepts onto it.
+  (String, double)? _backgroundTarget;
+
+  /// Continuous hover over the grid BACKGROUND (gaps, row ends, above the
+  /// first row): resolves the pointer to the nearest tile + before/after
+  /// and drives the same live preview — iOS lets you drop a tile into the
+  /// very first slot, and so do we.
+  void _onGridBackgroundHover(
+    DragTargetDetails<String> details,
+    List<String> keys,
+    List<TileRect> rects,
+  ) {
+    if (!_hasBackgroundTarget(keys)) return;
+    final box = _gridBox;
+    final pointer = box!.globalToLocal(details.offset + _grabOffset);
+    final (targetKey, fx) = launcherGridHoverTarget(
+      pointer: pointer,
+      keys: keys,
+      rects: rects,
+    );
+    _backgroundTarget = (targetKey, fx);
+    _previewInsert(details.data, targetKey, fx);
+  }
+
+  /// The background hover needs the layout, a measurable grid box and at
+  /// least one tile rect — before the first layout pass none exist
+  /// (gh-1848 split).
+  bool _hasBackgroundTarget(List<String> keys) {
+    if (_layout == null) return false;
+    if (_gridBox == null) return false;
+    return keys.isNotEmpty;
+  }
+
+  /// One drop onto the slot of [targetKey]: folder-add on folder tiles,
+  /// folder-create when the center-band hover armed folder intent, reorder
+  /// elsewhere (left half inserts before, right half after — the same math
+  /// the live preview used). [avatarTopLeft] is the drag-feedback's
+  /// top-left corner (what `DragTargetDetails.offset` carries); the fixed
+  /// drag anchor recovers the pointer position.
+  void _onDrop(String draggedKey, String targetKey, Offset avatarTopLeft) {
+    final layout = _layout;
+    if (layout == null) {
+      _clearDragPreview();
+      return;
+    }
+    if (_dropIntoFolder(layout, draggedKey, targetKey)) return;
+    if (_createFolderFromDrop(layout, draggedKey, targetKey)) return;
+    _applyDropOrder(layout, draggedKey, targetKey, avatarTopLeft);
+  }
+
+  /// A drop ON a folder tile (not the dragged one) adds the dragged app
+  /// to that folder. Returns true when handled (gh-1848 split).
+  bool _dropIntoFolder(
+    LauncherLayoutStore layout,
+    String draggedKey,
+    String targetKey,
+  ) {
+    if (draggedKey == targetKey ||
+        !LauncherLayoutStore.isFolderKey(targetKey)) {
+      return false;
+    }
+    layout.addToFolder(LauncherLayoutStore.folderIdOf(targetKey), draggedKey);
+    _clearDragPreview();
+    return true;
+  }
+
+  /// A drop of one app tile onto ANOTHER app tile while the center-band
+  /// hover armed folder intent: creates a folder named after both apps.
+  /// Returns true when handled (gh-1848 split).
+  bool _createFolderFromDrop(
+    LauncherLayoutStore layout,
+    String draggedKey,
+    String targetKey,
+  ) {
+    final bothApps =
+        draggedKey.startsWith('app:') && targetKey.startsWith('app:');
+    if (draggedKey == targetKey || !bothApps || _folderHoverKey != targetKey) {
+      return false;
+    }
+    final apps = _appsById;
+    final nameA = apps[draggedKey.substring(4)]?.name;
+    final nameB = apps[targetKey.substring(4)]?.name;
+    final autoName = nameA != null && nameB != null
+        ? '$nameA & $nameB'
+        : context.l10n.launcherFolderDefaultName;
+    AppAnalytics.instance.launcherFolder('created');
+    layout.createFolder(draggedKey, targetKey, name: autoName);
+    _clearDragPreview();
+    return true;
+  }
+
+  /// The reorder tail of a drop (gh-1848 split): the live preview IS the
+  /// arrangement the user saw — apply it as-is, even when the pointer
+  /// ended over the dragged tile itself (its own slot rejects drops,
+  /// which is exactly where a big tile's pointer usually is). Only
+  /// without a preview fall back to the slot math.
+  void _applyDropOrder(
+    LauncherLayoutStore layout,
+    String draggedKey,
+    String targetKey,
+    Offset avatarTopLeft,
+  ) {
+    final preview = _previewOrder;
+    if (preview != null) {
+      _clearDragPreview();
+      layout.applyTopLevelOrder(preview);
+      return;
+    }
+    if (draggedKey == targetKey) return;
+    final order = layout.topLevelKeys;
+    final from = order.indexOf(draggedKey);
+    final to = launcherInsertionIndex(
+      order: order,
+      draggedKey: draggedKey,
+      targetKey: targetKey,
+      fx: _fractionOnTile(targetKey, avatarTopLeft + _grabOffset),
+    );
+    if (from < 0 || to < 0) return;
+    layout.reorder(from, to);
+  }
+
+  /// The drag ended: a real drag applies the LAST previewed arrangement
+  /// (iOS semantics — what you saw when you let go is what you get), even
+  /// when the pointer was released outside any accepting slot. When the
+  /// drag never left its tile and carried ~no velocity, this was a
+  /// hold-release WITHOUT movement — the iOS "edit menu" gesture — so
+  /// open the tile menu.
+  void _onDragCanceled(String key, Velocity velocity, Offset offset) {
+    final preview = _previewOrder;
+    final hadPreview = preview != null || _folderHoverKey != null;
+    _clearDragPreview();
+    if (hadPreview) {
+      // A real drag cancelled outside any target: keep the arrangement
+      // the user last saw instead of snapping back.
+      if (preview != null) _layout?.applyTopLevelOrder(preview);
+      return;
+    }
+    if (velocity.pixelsPerSecond.distance > _holdMaxVelocity) return;
+    final box = _tileBoxes[key];
+    if (box == null || !box.hasSize) return;
+    // The offset is the feedback's top-left corner; recover the pointer.
+    final pointer = offset + _grabOffset;
+    final local = box.globalToLocal(pointer);
+    final inside =
+        local.dx >= 0 &&
+        local.dx <= box.size.width &&
+        local.dy >= 0 &&
+        local.dy <= box.size.height;
+    if (inside) unawaited(_showTileMenu(key, pointer));
+  }
+
+  void _clearDragPreview() {
+    _cancelFolderDwell();
+    if (_previewOrder == null && _folderHoverKey == null) return;
+    setState(() {
+      _previewOrder = null;
+      _folderHoverKey = null;
+    });
+  }
+
+  /// The horizontal fraction (0..1) of [globalPointer] within [key]'s slot;
+  /// 0.5 when the slot's render box is unknown.
+  double _fractionOnTile(String key, Offset globalPointer) {
+    final box = _tileBoxes[key];
+    if (box != null && box.hasSize && box.size.width > 0) {
+      final local = box.globalToLocal(globalPointer);
+      return (local.dx / box.size.width).clamp(0.0, 1.0);
+    }
+    return 0.5;
+  }
+
+  static bool _sameKeys(List<String> a, List<String> b) => listEquals(a, b);
+
+  // --- tile menu (hold-release without movement) ---------------------------
+
+  /// The iOS-style tile context menu: live-tile apps get the preset span
+  /// choices (issue #166: Icon 1x1 / Tall 1x2 / Wide 2x1 / Small 2x2 /
+  /// Column 1x3 / Row 3x1 / Medium 4x2 / Large 4x4, persisted as a
+  /// `tileSizes` override) plus "Reset to default" while an override
+  /// exists. Demo apps additionally get "Restore reference version" — the
+  /// escape hatch when ownership-aware seeding skips user/agent-modified
+  /// (possibly broken) demo files; `storage.json` is never touched.
+  Future<void> _showTileMenu(String key, Offset globalPosition) async {
+    if (!key.startsWith('app:')) return;
+    final app = _appsById[key.substring(4)];
+    final tile = app?.tileWidget;
+    final layout = _layout;
+    if (layout == null) return;
+    final overlay = Overlay.of(context).context.findRenderObject();
+    if (overlay is! RenderBox) return;
+    if (app == null) {
+      await _restoreDeadDemoMenu(key.substring(4), globalPosition, overlay);
+      return;
+    }
+    final appId = app.id;
+    final isDemo = AppsStore.demoAppIds.contains(appId);
+    // Every app gets a menu now: tile sizes for live-tile apps, Restore
+    // for bundled demos, Remove for everything else (catalog downloads,
+    // agent-created) — no early return for plain icon apps.
+    final override = layout.tileSizeFor(appId);
+    final current = tile == null
+        ? null
+        : override ?? (w: tile.widthCells, h: tile.heightCells);
+    final choices = <({String label, TileSize size})>[
+      (label: context.l10n.launcherTileSizeIcon, size: (w: 1, h: 1)),
+      (label: context.l10n.launcherTileSizeTall, size: (w: 1, h: 2)),
+      (label: context.l10n.launcherTileSizeWide, size: (w: 2, h: 1)),
+      (label: context.l10n.launcherTileSizeSmall, size: (w: 2, h: 2)),
+      (label: context.l10n.launcherTileSizeColumn, size: (w: 1, h: 3)),
+      (label: context.l10n.launcherTileSizeRow, size: (w: 3, h: 1)),
+      (label: context.l10n.launcherTileSizeMedium, size: (w: 4, h: 2)),
+      (label: context.l10n.launcherTileSizeLarge, size: (w: 4, h: 4)),
+    ];
+    final selected = await showMenu<Object?>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPosition & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem<Object?>(
+          value: 'open',
+          child: Row(
+            children: [
+              const Icon(Icons.open_in_new, size: 18),
+              const SizedBox(width: 12),
+              Text(context.l10n.launcherOpenApp),
+            ],
+          ),
+        ),
+        if (!isDemo && !_catalogInstalled.contains(appId))
+          PopupMenuItem<Object?>(
+            value: 'publish',
+            child: Row(
+              children: [
+                const Icon(Icons.cloud_upload_outlined, size: 18),
+                const SizedBox(width: 12),
+                Text(context.l10n.launcherPublishWidget),
+              ],
+            ),
+          ),
+        if (tile != null) ...[
+          for (final choice in choices)
+            PopupMenuItem<Object?>(
+              value: choice.size,
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 24,
+                    child: choice.size == current
+                        ? const Icon(Icons.check, size: 18)
+                        : null,
+                  ),
+                  Text(choice.label),
+                ],
+              ),
+            ),
+          if (override != null)
+            PopupMenuItem<Object?>(
+              value: 'reset',
+              child: Text(context.l10n.launcherTileSizeReset),
+            ),
+        ],
+        if (isDemo)
+          PopupMenuItem<Object?>(
+            value: 'restore',
+            child: Text(context.l10n.launcherRestoreDemoApp),
+          ),
+        if (!isDemo)
+          PopupMenuItem<Object?>(
+            value: 'remove',
+            child: Row(
+              children: [
+                Icon(
+                  Icons.delete_outline,
+                  size: 18,
+                  color: Theme.of(context).colorScheme.error,
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  context.l10n.launcherRemoveWidget,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+    _handleTileMenuSelection(key, layout, app, selected);
+  }
+
+  /// The menu of a DEAD placeholder (demo app with broken/removed
+  /// files): the only sensible action is restoring the reference
+  /// version (gh-1848 split).
+  Future<void> _restoreDeadDemoMenu(
+    String demoId,
+    Offset globalPosition,
+    RenderBox overlay,
+  ) async {
+    if (!AppsStore.demoAppIds.contains(demoId)) return;
+    final selected = await showMenu<Object?>(
+      context: context,
+      position: RelativeRect.fromRect(
+        globalPosition & const Size(1, 1),
+        Offset.zero & overlay.size,
+      ),
+      items: [
+        PopupMenuItem<Object?>(
+          value: 'restore',
+          child: Text(context.l10n.launcherRestoreDemoApp),
+        ),
+      ],
+    );
+    if (selected == 'restore') unawaited(_restoreDemoApp(demoId));
+  }
+
+  /// Dispatches the tile menu's pick (gh-1848 split): open the app,
+  /// publish it, reset or apply a tile size, restore a demo, remove.
+  void _handleTileMenuSelection(
+    String key,
+    LauncherLayoutStore layout,
+    JsAppInfo app,
+    Object? selected,
+  ) {
+    final appId = app.id;
+    if (selected == 'open') {
+      _onTileTap(key);
+    } else if (selected == 'publish') {
+      unawaited(_publishApp(app));
+    } else if (selected == 'reset') {
+      AppAnalytics.instance.launcherTileResized('reset');
+      layout.setTileSize(appId, null);
+    } else if (selected is TileSize) {
+      AppAnalytics.instance.launcherTileResized('${selected.w}x${selected.h}');
+      layout.setTileSize(appId, selected);
+    } else if (selected == 'restore') {
+      unawaited(_restoreDemoApp(appId));
+    } else if (selected == 'remove') {
+      unawaited(_removeApp(app));
+    }
+  }
+
+  /// Opens the publish sheet for a user widget (issue #35): the app env
+  /// backs the ledger, the shared GitHub account store carries the
+  /// connection, eligibility was checked when the menu was built.
+  Future<void> _publishApp(JsAppInfo app) async {
+    final keys = SessionKeysScope.maybeOf(context);
+    final account = sharedGithubAccountStore(
+      keys ?? await SessionKeysStore.load(widget.manager.env),
+    );
+    final ledger = await initSharedWidgetPublicationStore(widget.manager.env);
+    final service = WidgetPublishService(
+      env: widget.manager.env,
+      account: account,
+      ledger: ledger,
+    );
+    if (!mounted) return;
+    await showWidgetPublishSheet(
+      context,
+      app: app,
+      account: account,
+      service: service,
+      ledger: ledger,
+    );
+  }
+
+  /// Confirms and removes a non-demo app (catalog download or agent-created)
+  /// through [AppsStore.removeWidget] — code files go, `storage.json`
+  /// survives, the layout prunes the tile (and dissolves emptied folders)
+  /// on the next apps reload.
+  Future<void> _removeApp(JsAppInfo app) async {
+    final l10n = context.l10n;
+    final appName = app.displayName(
+      Localizations.localeOf(context).toLanguageTag(),
+    );
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(l10n.launcherRemoveWidgetTitle(appName)),
+        content: Text(l10n.launcherRemoveWidgetBody),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: Text(l10n.commonCancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: Text(l10n.commonDelete),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    AppAnalytics.instance.widgetEvent('remove', params: {'id': app.id});
+    final removed = await _appsStore.removeWidget(app.id, force: true);
+    if (!mounted) return;
+    await _finishRemove(removed, l10n.launcherRestoreDemoAppFailed);
+  }
+
+  /// The removal tail (gh-1848 split): refresh the grid on success; the
+  /// failure snack covers the rare storage error without dying silently.
+  Future<void> _finishRemove(bool removed, String failureMessage) async {
+    if (removed) {
+      await _reloadApps();
+    } else {
+      showFahErrorSnack(context, failureMessage);
+    }
+  }
+
+  /// Force-restores a demo app's bundled code files and reloads the grid
+  /// (see [AppsStore.resetDemoApp] — user data in `storage.json` survives).
+  Future<void> _restoreDemoApp(String appId) async {
+    final restored = await _appsStore.resetDemoApp(appId);
+    _logRestore(appId, restored);
+    if (!mounted) return;
+    await _reloadIfRestored(restored);
+    if (!mounted) return;
+    _showRestoreResult(restored);
+  }
+
+  /// Refreshes the grid after a successful restore; a failed restore
+  /// leaves the grid as-is (gh-1848 split).
+  Future<void> _reloadIfRestored(bool restored) async {
+    if (restored) await _reloadApps();
+  }
+
+  void _logRestore(String appId, bool restored) {
+    AppLog.i(
+      'apps',
+      'restore demo app: $appId → ${restored ? 'ok' : 'FAILED'}',
+    );
+  }
+
+  void _showRestoreResult(bool restored) {
+    restored
+        ? showFahSnack(context, context.l10n.launcherRestoreDemoAppDone)
+        : showFahErrorSnack(context, context.l10n.launcherRestoreDemoAppFailed);
+  }
+
+  // Registry of tile render boxes so [_onDrop] can translate the global
+  // drop offset into a within-cell fraction.
+  final Map<String, RenderBox> _tileBoxes = {};
+
+  // --- navigation ----------------------------------------------------------
+
+  Future<void> _launchApp(JsAppInfo app) async {
+    // Every launch surface funnels through the broken-app guard (issue
+    // #866 review): home tiles, search results, deep links.
+    if (await guardBrokenApp(context, app)) return;
+    if (!mounted) return;
+    AppLog.i('apps', 'open app: ${app.id}');
+    try {
+      await pushJsApp(
+        context,
+        manager: widget.manager,
+        app: app,
+        source: 'launcher',
+      );
+    } on Object catch (error) {
+      _reportLaunchFailure(app, error);
+    }
+  }
+
+  /// Never a silent dead tile: log + show why the app did not open.
+  void _reportLaunchFailure(JsAppInfo app, Object error) {
+    AppLog.i('apps', 'open app FAILED: ${app.id} — $error');
+    if (!mounted) return;
+    showFahErrorSnack(context, context.l10n.launcherOpenAppError('$error'));
+  }
+
+  Future<void> _openSettings() async {
+    final service = widget.manager.active?.service;
+    if (service == null) return;
+    AppAnalytics.instance.settingsOpened();
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsScreen(
+          service: service,
+          env: widget.manager.env,
+          registry: widget.registry,
+          lastConnectionStore: widget.lastConnectionStore,
+          // The same store instance the launcher listens to — grid changes
+          // apply live.
+          layoutStore: _layout,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openFiles() async {
+    final service = widget.manager.active?.service;
+    if (service == null) return;
+    AppAnalytics.instance.filesOpened('launcher');
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => Scaffold(
+          appBar: faAppBar(title: Text(context.l10n.chatFilesTooltip)),
+          body: FileBrowser(
+            env: service.env,
+            inlinePreview: false,
+            fsRevision: service.fsRevision,
+            onProjectMountChanged: service.refreshProjectMountPrompt,
+          ),
+        ),
+      ),
+    );
+  }
+
+  // --- folder panel --------------------------------------------------------
+
+  void _openFolder(String folderId) {
+    AppAnalytics.instance.launcherFolder('opened');
+    setState(() => _openFolderId = folderId);
+  }
+
+  void _closeFolder() => setState(() => _openFolderId = null);
+
+  Future<void> _renameFolder(LauncherFolder folder) async {
+    final controller = TextEditingController(text: folder.name);
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(dialogContext.l10n.launcherRenameFolderTooltip),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: InputDecoration(
+            hintText: dialogContext.l10n.launcherFolderNameHint,
+          ),
+          onSubmitted: (value) => Navigator.of(dialogContext).pop(value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: Text(dialogContext.l10n.commonCancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(controller.text),
+            child: Text(dialogContext.l10n.settingsSaveButton),
+          ),
+        ],
+      ),
+    );
+    if (saved != null) {
+      AppAnalytics.instance.launcherFolder('renamed');
+      _layout?.renameFolder(folder.id, saved);
+    }
+  }
+
+  void _dissolveFolder(LauncherFolder folder) {
+    AppAnalytics.instance.launcherFolder('dissolved');
+    _layout?.dissolveFolder(folder.id);
+    _closeFolder();
+  }
+
+  // --- build ---------------------------------------------------------------
+
+  /// The active-session indicator in the header: which conversation the
+  /// agent is in right now (custom or date-derived title); tapping expands
+  /// the session sheet. Rebuilds on every manager change (switch/rename).
+  Widget _buildSessionChip(FahColors colors) {
+    final active = widget.manager.active;
+    if (active == null) return const SizedBox.shrink();
+    final title =
+        widget.sessionNamesStore?.titleFor(active.id) ??
+        derivedSessionTitle(
+          context,
+          id: active.id,
+          createdAt: active.createdAt,
+        );
+    return GestureDetector(
+      onTap: () => _sheetKey.currentState?.expand(),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        constraints: const BoxConstraints(maxWidth: 220),
+        decoration: BoxDecoration(
+          color: colors.panel,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: colors.border),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            Icon(Icons.chat_bubble_outline, size: 13, color: colors.dim),
+            const SizedBox(width: 6),
+            Flexible(
+              child: Text(
+                title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: colors.dim),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = FahColors.of(context);
+    return Scaffold(
+      // Bottom false: the stack reaches the screen's bottom edge so the
+      // floating mini chat bar hovers over the GRID (not over an empty
+      // scaffold-colored band) and the expanded sheet docks edge-to-edge;
+      // the grid keeps its own bottom clearance below.
+      body: SafeArea(
+        bottom: false,
+        child: Stack(
+          children: [
+            const Positioned.fill(child: FahWallpaper()),
+            _buildGridArea(colors),
+            // The iMessage-style session chat overlay: the always-visible
+            // input bar, the sessions drawer (from the left) and the session
+            // panel sliding up under the bar.
+            if (!widget.hideChatSheet)
+              SessionChatSheet(
+                key: _sheetKey,
+                manager: widget.manager,
+                registry: widget.registry,
+                lastConnectionStore: widget.lastConnectionStore,
+                sessionNamesStore: widget.sessionNamesStore,
+                uploadPicker: widget.uploadPicker,
+                asr: widget.asr,
+                asrTranscriber: widget.asrTranscriber,
+                audioControllerFactory: widget.audioControllerFactory,
+                videoControllerFactory: widget.videoControllerFactory,
+                restoreAppsMode: widget.restoreAppsMode,
+              ),
+            if (_openFolderId != null) ...[
+              _buildFolderBarrier(colors),
+              _buildFolderPanel(colors),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGridArea(FahColors colors) {
+    final error = _error;
+    if (error != null) {
+      return Center(child: Text(context.l10n.appsLoadError('$error')));
+    }
+    final layout = _layout;
+    if (_apps == null || layout == null) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          // macOS: extra room so the floating traffic lights don't crowd
+          // the brand tile / session chip at the very top edge.
+          padding: EdgeInsets.fromLTRB(20, faIsMacOSDesktop ? 32 : 16, 20, 8),
+          child: Row(
+            children: [
+              // The Fa entry (#864): tap ALWAYS continues the active session
+              // (expand the sheet, zero minting); long-press is the ONLY
+              // navigation way to mint a fresh one. The hint tooltip names
+              // both gestures.
+              // Hover-only hint: triggerMode manual — the touch long-press
+              // is deliberately yielded to the InkWell below so it ALWAYS
+              // mints (#864) and can never degrade into a tooltip; the
+              // hint still reaches screen readers via semantics.
+              Tooltip(
+                message: context.l10n.faEntryHintTooltip,
+                triggerMode: TooltipTriggerMode.manual,
+                child: InkWell(
+                  key: const ValueKey('launcherFaBrand'),
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => _sheetKey.currentState?.expand(),
+                  onLongPress: () => unawaited(
+                    _sheetKey.currentState?.mintAndOpenNewSession(),
+                  ),
+                  child: const FaBrandTile(size: 28),
+                ),
+              ),
+              const SizedBox(width: 10),
+              // The screen title yields to the session chip on narrow frames:
+              // it ellipsizes first, the chip keeps a readable width.
+              Flexible(
+                child: Text(
+                  context.l10n.appsGridTitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w600),
+                ),
+              ),
+              const SizedBox(width: 8),
+              _buildSessionChip(colors),
+              if (widget.networkMode != null &&
+                  widget.networkSessions != null) ...[
+                const SizedBox(width: 8),
+                NetworkModeChip(
+                  controller: widget.networkMode!,
+                  manager: widget.networkSessions!,
+                ),
+              ],
+            ],
+          ),
+        ),
+        // ── Search ───────────────────────────────────────────────
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 6),
+          child: TextField(
+            controller: _searchController,
+            decoration: InputDecoration(
+              prefixIcon: const Icon(Icons.search, size: 18),
+              hintText: context.l10n.launcherSearchHint,
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 8,
+              ),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide(color: colors.border),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide(color: colors.border),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide(color: colors.indigo, width: 1.2),
+              ),
+              filled: true,
+              fillColor: colors.panelAlt,
+            ),
+          ),
+        ),
+        // ── Tabs: the app grid or the widgets catalog ────────────
+        Padding(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 4),
+          child: Row(
+            children: [
+              for (final tab in _LauncherTab.values)
+                _LauncherTabButton(
+                  label: switch (tab) {
+                    _LauncherTab.widgets => context.l10n.launcherTabWidgets,
+                    _LauncherTab.getWidgets =>
+                      context.l10n.launcherTabGetWidgets,
+                  },
+                  selected: _tab == tab,
+                  onTap: () => setState(() => _tab = tab),
+                ),
+              // gh-1616: Chrome-parity "Load unpacked" — a local
+              // apps/<id>/ folder loads, validates and persists like a
+              // catalog install. Hidden on hosts with no folder picker.
+              if (_unpackedPicker != null) ...[
+                const Spacer(),
+                _LauncherTabButton(
+                  label: context.l10n.launcherLoadUnpacked,
+                  selected: false,
+                  onTap: () => unawaited(
+                    loadUnpackedWidget(
+                      context,
+                      manager: widget.manager,
+                      appsStore: _appsStore,
+                      picker: _unpackedPicker,
+                    ),
+                  ),
+                  icon: Icons.folder_open,
+                ),
+              ],
+            ],
+          ),
+        ),
+        Expanded(
+          child: _tab == _LauncherTab.getWidgets
+              // The catalog inline (no bottom-sheet chrome) — install,
+              // update, preview and open widgets without leaving home.
+              // Shares the launcher's AppsStore so installs are visible to
+              // the tile menu (Remove) immediately.
+              ? WidgetsCatalogSheet(
+                  env: widget.manager.env,
+                  manager: widget.manager,
+                  appsStore: _appsStore,
+                  embedded: true,
+                )
+              : _searchController.text.trim().isNotEmpty
+              ? _buildSearchResults(colors)
+              : _buildDraggableGrid(colors),
+        ),
+      ],
+    );
+  }
+
+  /// Flat filtered grid while the search field has a query: tap opens,
+  /// long-press shows the same tile menu (remove included) — drag&drop
+  /// and folders stay exclusive to the main grid.
+  Widget _buildSearchResults(FahColors colors) {
+    final matches = _searchMatches();
+    if (matches.isEmpty) {
+      return Center(
+        child: Text(
+          '∅',
+          style: Theme.of(
+            context,
+          ).textTheme.headlineMedium?.copyWith(color: colors.dim),
+        ),
+      );
+    }
+    return GridView.builder(
+      padding: EdgeInsets.fromLTRB(
+        16,
+        8,
+        16,
+        MediaQuery.viewPaddingOf(context).bottom + 128,
+      ),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 4,
+        childAspectRatio: 0.82,
+        crossAxisSpacing: 8,
+        mainAxisSpacing: 12,
+      ),
+      itemCount: matches.length,
+      itemBuilder: (context, index) =>
+          _searchResultTile(colors, context, matches[index]),
+    );
+  }
+
+  /// Case-insensitive match over display name, id and description (in
+  /// the resolved locale).
+  List<JsAppInfo> _searchMatches() {
+    final query = _searchController.text.trim().toLowerCase();
+    final locale = Localizations.localeOf(context).toLanguageTag();
+    return (_apps ?? const <JsAppInfo>[])
+        .where(
+          (app) =>
+              app.displayName(locale).toLowerCase().contains(query) ||
+              app.id.toLowerCase().contains(query) ||
+              app.displayDescription(locale).toLowerCase().contains(query),
+        )
+        .toList();
+  }
+
+  Widget _searchResultTile(
+    FahColors colors,
+    BuildContext context,
+    JsAppInfo app,
+  ) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      hoverColor: colors.indigo.withValues(alpha: 0.06),
+      onTap: () => unawaited(_launchApp(app)),
+      onSecondaryTapUp: (details) =>
+          unawaited(_showTileMenu('app:${app.id}', details.globalPosition)),
+      onLongPress: () =>
+          unawaited(_showTileMenu('app:${app.id}', _tileCenter(context))),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          AppIcon(app: app, env: widget.manager.env, size: 32),
+          const SizedBox(height: 6),
+          Text(
+            app.displayName(Localizations.localeOf(context).toLanguageTag()),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Global center of [context]'s render box (long-press menu anchor).
+  Offset _tileCenter(BuildContext context) {
+    final box = context.findRenderObject();
+    return box is RenderBox
+        ? box.localToGlobal(box.size.center(Offset.zero))
+        : Offset.zero;
+  }
+
+  /// The main content: the iOS-style draggable grid (extracted from the
+  /// build method unchanged when tabs/search were added).
+  Widget _buildDraggableGrid(FahColors colors) {
+    // _buildGridArea already guards _apps/_layout being null.
+    final layout = _layout!;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final crossAxisCount = _crossAxisCount(constraints.maxWidth);
+              // iOS-like distribution: the 16px side padding stays, the
+              // leftover width stretches the gaps (capped) so the grid
+              // always fills the screen width instead of huddling in the
+              // center with dead margins.
+              final spacing = _gridSpacing(
+                constraints.maxWidth,
+                crossAxisCount,
+              );
+              final keys = _previewOrder ?? layout.topLevelKeys;
+              final rects = layOutTileRects(
+                crossAxisCount: crossAxisCount,
+                spans: [for (final key in keys) _tileSpan(key, crossAxisCount)],
+                spacing: spacing,
+                // Only the CROSS-axis gaps stretch with the screen width —
+                // the row gap stays the tight spec default.
+                mainAxisSpacing: LauncherGridSpec.spacing,
+              );
+              final gridWidth =
+                  crossAxisCount * LauncherGridSpec.cellCrossExtent +
+                  (crossAxisCount - 1) * spacing;
+              return SingleChildScrollView(
+                // Bottom clearance for the floating mini chat bar (bar
+                // height + its margin above the home indicator).
+                padding: EdgeInsets.fromLTRB(
+                  16,
+                  8,
+                  16,
+                  MediaQuery.viewPaddingOf(context).bottom + 128,
+                ),
+                child: Center(
+                  child: SizedBox(
+                    width: gridWidth,
+                    height: packedTilesHeight(rects),
+                    // No clipping: edge-column labels bleed a few px into
+                    // the screen padding (iOS-style) instead of being cut
+                    // mid-glyph at the grid's edge.
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        // Background drop surface BEHIND the tiles: covers
+                        // the gaps, row ends, and the space above the first
+                        // row, so any landing spot resolves to a live
+                        // insertion (the tiles' own targets win on top).
+                        Positioned.fill(
+                          child: LayoutBuilder(
+                            builder: (context, _) {
+                              WidgetsBinding.instance.addPostFrameCallback((_) {
+                                final box = context.findRenderObject();
+                                if (box is RenderBox && mounted) {
+                                  _gridBox = box;
+                                }
+                              });
+                              return DragTarget<String>(
+                                onMove: (details) => _onGridBackgroundHover(
+                                  details,
+                                  keys,
+                                  rects,
+                                ),
+                                onAcceptWithDetails: (details) {
+                                  final target = _backgroundTarget;
+                                  if (target != null) {
+                                    _onDrop(
+                                      details.data,
+                                      target.$1,
+                                      details.offset,
+                                    );
+                                  }
+                                },
+                                builder: (context, _, _) =>
+                                    const SizedBox.expand(),
+                              );
+                            },
+                          ),
+                        ),
+                        for (var i = 0; i < keys.length; i++)
+                          AnimatedPositioned(
+                            key: ValueKey('tilePos:${keys[i]}'),
+                            duration: const Duration(milliseconds: 180),
+                            curve: Curves.easeOut,
+                            left: rects[i].x,
+                            top: rects[i].y,
+                            width: rects[i].w,
+                            height: rects[i].h,
+                            child: _buildCell(colors, keys[i], spacing),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// The grid column count: the layout's `grid.columns` override when set,
+  /// else 4 on narrow screens / 6 on wide ones — clamped to the store's
+  /// 3..8 range and to what actually fits the available width.
+  int _crossAxisCount(double width) {
+    final configured = _layout?.gridColumns ?? (width < 600 ? 4 : 6);
+    final fits =
+        ((width + LauncherGridSpec.spacing) /
+                (LauncherGridSpec.cellCrossExtent + LauncherGridSpec.spacing))
+            .floor()
+            .clamp(1, LauncherLayoutStore.maxGridColumns);
+    return configured
+        .clamp(
+          LauncherLayoutStore.minGridColumns,
+          LauncherLayoutStore.maxGridColumns,
+        )
+        .clamp(1, fits);
+  }
+
+  /// Gap between cells for the current width: the side padding (16+16)
+  /// stays fixed, the leftover width distributes into the gaps — iOS-like
+  /// full-width grids on any screen. Capped so huge windows keep sane
+  /// spacing (the grid then centers, as before).
+  static double _gridSpacing(double width, int columns) {
+    if (columns <= 1) return LauncherGridSpec.spacing;
+    const minSpacing = LauncherGridSpec.spacing;
+    const maxSpacing = 44.0;
+    final inner = width - 32; // the GridView's horizontal padding
+    final raw = (inner - columns * LauncherGridSpec.iconSize) / (columns - 1);
+    return raw.clamp(minSpacing, maxSpacing);
+  }
+
+  /// The grid span of one tile: apps with a live tile get their WxH —
+  /// the `tileSizes` override when set, else the manifest's declared size
+  /// (width clamped to the column count); everything else is one icon slot.
+  TileSpan _tileSpan(String key, int crossAxisCount) {
+    if (key.startsWith('app:')) {
+      final appId = key.substring(4);
+      final tile = _appsById[appId]?.tileWidget;
+      if (tile != null) {
+        final override = _layout?.tileSizeFor(appId);
+        final w = override?.w ?? tile.widthCells;
+        final h = override?.h ?? tile.heightCells;
+        return (w: w.clamp(1, crossAxisCount), h: h);
+      }
+    }
+    return (w: 1, h: 1);
+  }
+
+  /// The effective live-tile span of [appId] (override wins over the
+  /// manifest), or null for plain icon apps. A 1x1 result means
+  /// icon-only: the launcher shows the static icon block and boots no
+  /// tile engine (the "Icon" size choice in the tile menu).
+  TileSpan? _effectiveTileSpan(String appId) {
+    final tile = _appsById[appId]?.tileWidget;
+    if (tile == null) return null;
+    final override = _layout?.tileSizeFor(appId);
+    return (
+      w: override?.w ?? tile.widthCells,
+      h: override?.h ?? tile.heightCells,
+    );
+  }
+
+  /// The drag feedback: classic tiles drag their 64px icon; apps with a
+  /// live tile drag a FULL-SIZE static replica of the card (rounded panel
+  /// with the app icon and name) so it is obvious WHAT is being dragged —
+  /// spinning up a second live engine just for the avatar would be
+  /// pointless weight.
+  Widget _tileFeedback(
+    FahColors colors,
+    String key,
+    BoxConstraints constraints,
+  ) {
+    final app = key.startsWith('app:') ? _appsById[key.substring(4)] : null;
+    if (app != null && app.tileWidget != null) {
+      return Container(
+        width: constraints.maxWidth,
+        height: constraints.maxHeight,
+        decoration: BoxDecoration(
+          color: colors.panelAlt,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black38,
+              blurRadius: 16,
+              offset: Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            AppIcon(app: app, env: widget.manager.env, size: 32),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Text(
+                app.displayName(
+                  Localizations.localeOf(context).toLanguageTag(),
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: colors.text),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return _maybeSeedErrorBadge(
+      colors,
+      key,
+      _tileIcon(colors, key, size: _feedbackSize),
+    );
+  }
+
+  Widget _buildCell(FahColors colors, String key, double spacing) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final box = context.findRenderObject();
+          if (box is RenderBox && mounted) _tileBoxes[key] = box;
+        });
+        return DragTarget<String>(
+          key: ValueKey('launcherCell:$key'),
+          onWillAcceptWithDetails: (details) => details.data != key,
+          onMove: (details) => _onDragHover(key, details),
+          onAcceptWithDetails: (details) =>
+              _onDrop(details.data, key, details.offset),
+          builder: (context, candidateData, rejectedData) {
+            final folderHover = _folderHoverKey == key;
+            return LongPressDraggable<String>(
+              data: key,
+              // Anchor the feedback at the GRAB POINT inside the tile (and
+              // remember it for the hover/drop pointer math above): a
+              // widget card is dragged by exactly the spot the user holds.
+              dragAnchorStrategy: (draggable, context, position) {
+                final box = context.findRenderObject();
+                if (box is RenderBox && box.hasSize) {
+                  _grabOffset = box.globalToLocal(position);
+                }
+                return _grabOffset;
+              },
+              onDraggableCanceled: (velocity, offset) =>
+                  _onDragCanceled(key, velocity, offset),
+              // NOTE the framework's callback order: onDragEnd fires
+              // BEFORE onDraggableCanceled. Never clear the preview here
+              // on rejection — _onDragCanceled needs it to apply the last
+              // previewed arrangement.
+              onDragEnd: (details) {
+                if (details.wasAccepted) _clearDragPreview();
+              },
+              feedback: Material(
+                color: Colors.transparent,
+                child: Opacity(
+                  opacity: 0.9,
+                  child: _tileFeedback(colors, key, constraints),
+                ),
+              ),
+              childWhenDragging: Opacity(
+                opacity: 0.35,
+                child: _tileContent(colors, key, spacing),
+              ),
+              child: AnimatedScale(
+                scale: folderHover
+                    ? 1.12
+                    : (candidateData.isNotEmpty ? 1.08 : 1),
+                duration: const Duration(milliseconds: 120),
+                child: _tileContent(colors, key, spacing),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  /// The tile body: the icon slot (icon square + label strip, exactly one
+  /// [LauncherGridSpec] cell) — or, for apps declaring a `"widget"`
+  /// manifest section, the live tile ([AppTileHost]) filling its WxH span
+  /// edge-to-edge with the icon block it replaces. Taps launch/navigate;
+  /// folder taps open the folder panel.
+  Widget _tileContent(FahColors colors, String key, double spacing) {
+    final theme = Theme.of(context);
+    if (key.startsWith('app:')) {
+      final app = _appsById[key.substring(4)];
+      final tile = app?.tileWidget;
+      // 1x1 override = icon-only: the plain icon block below renders and
+      // no tile engine boots (the live tile would overflow a 1x1 cell).
+      final span = app == null ? null : _effectiveTileSpan(app.id);
+      if (app != null && tile != null && !(span?.w == 1 && span?.h == 1)) {
+        // Live tile: the app draws its own mini UI (icon+label replaced).
+        // A body tap opens the full app; interactive tiles (the manifest's
+        // widget.interactive) route button taps to the tile engine instead —
+        // the inner inkWell wins the arena over this outer one.
+        return InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: () => _onTileTap(key),
+          onSecondaryTapUp: (details) =>
+              unawaited(_showTileMenu(key, details.globalPosition)),
+          child: AppTileHost(
+            app: app,
+            env: widget.manager.env,
+            fsRevision: widget.manager.active?.service.fsRevision,
+            engineFactory: widget.tileEngineFactory,
+            onOpen: () => _onTileTap(key),
+          ),
+        );
+      }
+    }
+    // The hover/splash lives ONLY on the icon square (a full-cell wash
+    // over icon+label looked like a stray blob); the label stays tappable
+    // via a plain GestureDetector.
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        InkWell(
+          borderRadius: BorderRadius.circular(16),
+          hoverColor: colors.indigo.withValues(alpha: 0.08),
+          onTap: () => _onTileTap(key),
+          onSecondaryTapUp: (details) =>
+              unawaited(_showTileMenu(key, details.globalPosition)),
+          child: _maybeUnpackedBadge(
+            colors,
+            key,
+            _maybeSeedErrorBadge(colors, key, _tileIcon(colors, key)),
+          ),
+        ),
+        SizedBox(
+          height: LauncherGridSpec.labelHeight,
+          // iOS-style: the label may bleed into the (empty) inter-icon
+          // gap, so it measures up to one cell PITCH wide, not just the
+          // icon square — keeps names like "Habit Tracker" readable.
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => _onTileTap(key),
+            onSecondaryTapUp: (details) =>
+                unawaited(_showTileMenu(key, details.globalPosition)),
+            child: OverflowBox(
+              // Bottom-aligned: the label strip is taller than the text and
+              // that slack is the breathing room between the icon square
+              // and the label (a label glued to the tile looked cramped).
+              alignment: Alignment.bottomCenter,
+              maxWidth: LauncherGridSpec.cellCrossExtent + spacing,
+              child: Text(
+                _tileLabel(key),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: theme.textTheme.bodySmall?.copyWith(fontSize: 11),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _tileIcon(FahColors colors, String key, {double size = 56}) {
+    final child = switch (key) {
+      LauncherLayoutStore.settingsKey => Icon(
+        Icons.settings_outlined,
+        size: size * 0.5,
+        color: colors.dim,
+      ),
+      LauncherLayoutStore.filesKey => Icon(
+        Icons.folder_outlined,
+        size: size * 0.5,
+        color: colors.dim,
+      ),
+      _ when LauncherLayoutStore.isFolderKey(key) => _folderMiniIcons(
+        colors,
+        LauncherLayoutStore.folderIdOf(key),
+        size,
+      ),
+      _ => Center(
+        child: AppIcon(
+          app: _appsById[key.substring(4)] ?? _fallbackApp(key),
+          env: widget.manager.env,
+          size: size * 0.55,
+        ),
+      ),
+    };
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: colors.panelAlt,
+        borderRadius: BorderRadius.circular(size * 0.25),
+        border: Border.all(color: colors.border),
+      ),
+      child: child,
+    );
+  }
+
+  /// The corner badge on a tile whose demo seed failed (missing/corrupt
+  /// asset) or whose manifest no longer parses (an agent edit, issue
+  /// #866): the app stays on the grid — flagged, never fatal.
+  /// gh-1616 I3: a small corner badge on tiles loaded from a local folder
+  /// ("unpacked" provenance), so the grid shows the install source at a
+  /// glance. Composes with the seed-error badge (both can show at once):
+  /// it hugs the TOP-LEFT corner while the error badge keeps the
+  /// top-right, so a broken unpacked app still shows both — the folder
+  /// badge must never paint over the copyable-error affordance.
+  Widget _maybeUnpackedBadge(FahColors colors, String key, Widget tile) {
+    if (!key.startsWith('app:')) return tile;
+    final app = _appsById[key.substring(4)];
+    if (app == null || app.installSource != UnpackedWidgetLoader.origin) {
+      return tile;
+    }
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        tile,
+        Positioned(
+          top: -3,
+          left: -3,
+          child: Tooltip(
+            message: context.l10n.unpackedSourceBadgeTooltip,
+            child: Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                color: colors.indigo,
+                shape: BoxShape.circle,
+                border: Border.all(color: colors.bg, width: 2),
+              ),
+              child: const Icon(
+                Icons.folder_open,
+                size: 8,
+                color: Colors.white,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _maybeSeedErrorBadge(FahColors colors, String key, Widget tile) {
+    if (!key.startsWith('app:')) return tile;
+    final id = key.substring(4);
+    final failed =
+        _appsStore.failedSeeds.value.containsKey(id) ||
+        (_appsById[id]?.error != null);
+    if (!failed) return tile;
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        tile,
+        Positioned(
+          top: -3,
+          right: -3,
+          child: Container(
+            width: 16,
+            height: 16,
+            decoration: BoxDecoration(
+              color: colors.error,
+              shape: BoxShape.circle,
+              border: Border.all(color: colors.bg, width: 2),
+            ),
+            child: const Center(
+              child: Text(
+                '!',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  height: 1,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// A never-persisted placeholder so a tile still renders while the app
+  /// list reloads underneath it (transient — syncApps prunes stale keys).
+  JsAppInfo _fallbackApp(String key) => JsAppInfo(
+    id: key.substring(4),
+    name: key.substring(4),
+    description: '',
+    icon: '📦',
+    declaredPermissions: const AppPermissions(),
+  );
+
+  Widget _folderMiniIcons(FahColors colors, String folderId, double size) {
+    final folder = _layout?.folderById(folderId);
+    final tiles = folder?.tiles ?? const <String>[];
+    final apps = _appsById;
+    final shown = tiles.take(4).toList();
+    return Padding(
+      padding: EdgeInsets.all(size * 0.14),
+      child: GridView.count(
+        crossAxisCount: 2,
+        padding: EdgeInsets.zero,
+        physics: const NeverScrollableScrollPhysics(),
+        shrinkWrap: true,
+        children: [
+          for (final tile in shown)
+            Center(
+              child: AppIcon(
+                app: apps[tile.substring(4)] ?? _fallbackApp(tile),
+                env: widget.manager.env,
+                size: size * 0.28,
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  String _tileLabel(String key) {
+    if (key == LauncherLayoutStore.settingsKey) {
+      return context.l10n.settingsTitle;
+    }
+    if (key == LauncherLayoutStore.filesKey) {
+      return context.l10n.chatFilesTooltip;
+    }
+    if (LauncherLayoutStore.isFolderKey(key)) {
+      return _layout?.folderById(LauncherLayoutStore.folderIdOf(key))?.name ??
+          context.l10n.launcherFolderDefaultName;
+    }
+    return _appsById[key.substring(4)]?.name ?? key.substring(4);
+  }
+
+  void _onTileTap(String key) {
+    if (key == LauncherLayoutStore.settingsKey) {
+      unawaited(_openSettings());
+      return;
+    }
+    if (key == LauncherLayoutStore.filesKey) {
+      unawaited(_openFiles());
+      return;
+    }
+    if (LauncherLayoutStore.isFolderKey(key)) {
+      _openFolder(LauncherLayoutStore.folderIdOf(key));
+      return;
+    }
+    final app = _appsById[key.substring(4)];
+    if (app == null) {
+      // A layout key whose app no longer lists (broken/removed files)
+      // renders a dead placeholder. For a demo id that's recoverable:
+      // force-reseed the reference version instead of a silent no-op.
+      final demoId = key.substring(4);
+      AppLog.i('apps', 'tile tap on dead placeholder: $key (demo=$demoId)');
+      if (AppsStore.demoAppIds.contains(demoId)) {
+        unawaited(_restoreDemoApp(demoId));
+      }
+      return;
+    }
+    AppLog.i('apps', 'tile tap: ${app.id}');
+    // A tile whose demo seed failed shows its stored error instead of a
+    // dead-end launch — copyable, so the user can hand it to Fa for a fix.
+    final seedError = _appsStore.failedSeeds.value[app.id];
+    if (seedError != null) {
+      unawaited(
+        showAppLoadError(
+          context,
+          app,
+          seedError,
+          context.l10n.launcherSeedErrorTitle,
+        ),
+      );
+      return;
+    }
+    // A manifest the agent edited into garbage (issue #866) is caught by
+    // the shared guard inside [_launchApp] — same copyable dialog.
+    unawaited(_launchApp(app));
+  }
+
+  /// Full-screen drop surface behind the open folder panel: a tile dragged
+  /// out of the folder lands here and re-enters the top-level grid. A plain
+  /// tap closes the panel.
+  Widget _buildFolderBarrier(FahColors colors) {
+    return Positioned.fill(
+      child: DragTarget<String>(
+        onWillAcceptWithDetails: (details) {
+          final folder = _layout?.folderById(_openFolderId ?? '');
+          return folder?.tiles.contains(details.data) ?? false;
+        },
+        onAcceptWithDetails: (details) {
+          final openId = _openFolderId;
+          if (openId != null) {
+            _layout?.removeFromFolder(openId, details.data);
+          }
+        },
+        builder: (context, candidateData, rejectedData) => GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: _closeFolder,
+          child: Container(color: Colors.black.withValues(alpha: 0.45)),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFolderPanel(FahColors colors) {
+    final folder = _layout?.folderById(_openFolderId ?? '');
+    if (folder == null) return const SizedBox.shrink();
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 320, maxHeight: 380),
+        child: Material(
+          key: const ValueKey('launcherFolderPanel'),
+          color: colors.panelAlt,
+          borderRadius: BorderRadius.circular(20),
+          elevation: 12,
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        folder.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.edit_outlined, size: 18),
+                      tooltip: context.l10n.launcherRenameFolderTooltip,
+                      visualDensity: VisualDensity.compact,
+                      color: colors.dim,
+                      onPressed: () => unawaited(_renameFolder(folder)),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.folder_off_outlined, size: 18),
+                      tooltip: context.l10n.launcherDissolveFolder,
+                      visualDensity: VisualDensity.compact,
+                      color: colors.dim,
+                      onPressed: () => _dissolveFolder(folder),
+                    ),
+                  ],
+                ),
+                Divider(height: 16, color: colors.border),
+                Flexible(
+                  child: GridView.count(
+                    crossAxisCount: 3,
+                    padding: EdgeInsets.zero,
+                    shrinkWrap: true,
+                    children: [
+                      for (final tile in folder.tiles)
+                        LongPressDraggable<String>(
+                          data: tile,
+                          dragAnchorStrategy: (draggable, context, position) =>
+                              // 64px icon feedback centered on the
+                              // pointer (folder-panel drags need no
+                              // grab-point math).
+                              const Offset(32, 32),
+                          feedback: Material(
+                            color: Colors.transparent,
+                            child: Opacity(
+                              opacity: 0.9,
+                              child: _maybeSeedErrorBadge(
+                                colors,
+                                tile,
+                                _tileIcon(colors, tile, size: _feedbackSize),
+                              ),
+                            ),
+                          ),
+                          childWhenDragging: Opacity(
+                            opacity: 0.35,
+                            child: _tileContent(
+                              colors,
+                              tile,
+                              LauncherGridSpec.spacing,
+                            ),
+                          ),
+                          child: _tileContent(
+                            colors,
+                            tile,
+                            LauncherGridSpec.spacing,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// The launcher's content tabs: the app grid vs the widgets catalog.
+enum _LauncherTab { widgets, getWidgets }
+
+/// One tab button in the launcher header row (pill highlight, the same
+/// look the desktop apps panel's filter tabs use).
+class _LauncherTabButton extends StatelessWidget {
+  const _LauncherTabButton({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.icon,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  /// Optional leading icon (the "Load unpacked" action renders as a
+  /// folder chip in the same tab row).
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = FahColors.of(context);
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(right: 4),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: selected ? colors.panelAlt : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (icon != null) ...[
+                Icon(icon, size: 14, color: colors.dim),
+                const SizedBox(width: 4),
+              ],
+              Text(
+                label,
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: selected ? colors.text : colors.dim,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                  fontSize: 12,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

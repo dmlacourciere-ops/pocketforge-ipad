@@ -1,0 +1,1169 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by an MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+
+import 'package:fa/network/envelope_codec.dart';
+import 'package:fa/network/invite_codec.dart';
+import 'package:fa/network/key_wallet.dart';
+import 'package:fa/network/models.dart';
+import 'package:fa/network/network_session.dart';
+import 'package:fa/network/network_session_manager.dart';
+import 'package:fa/ui/app_theme.dart';
+import 'package:fa/ui/network/add_agent_dialog.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'fakes.dart';
+
+/// A session manager over the test fakes — the AddAgentDialog enrolls
+/// agents through it (the management JWT lives there).
+Future<NetworkSessionManager> buildManager({
+  required KeyWallet wallet,
+  FakeHttpClient? httpClient,
+  String? jwt,
+}) async => NetworkSessionManager(
+  baseUrl: testBase,
+  wallet: wallet,
+  httpClient: httpClient ?? FakeHttpClient(),
+  wsConnector: FakeWsConnector(),
+  jwtToken: jwt,
+);
+
+void main() {
+  group('dapAgentInstance', () {
+    test('is deterministic, lowercase SHA-256 prefix, and secret-specific', () {
+      const expected = '4ee4ebd649acee94';
+      expect(dapAgentInstance('sk_enroll_123'), expected);
+      expect(dapAgentInstance('sk_enroll_123'), expected);
+      expect(dapAgentInstance('sk_enroll_456'), '0f266ef261130bd4');
+      expect(dapAgentInstance('sk_enroll_456'), isNot(expected));
+      expect(expected, matches(RegExp(r'^[0-9a-f]{16}$')));
+    });
+  });
+
+  _registerNetworkScopeGroup();
+  group('AddAgentDialog', () {
+    late ({String pub, String priv}) channelKeys;
+
+    setUp(() async {
+      channelKeys = await EnvelopeCodec.newX25519KeyPair();
+    });
+
+    Future<Widget> pumpDialog(WidgetTester tester) async {
+      final wallet = await walletWithChannel(
+        channelPub: channelKeys.pub,
+        channelPriv: channelKeys.priv,
+      );
+      const channel = Channel(
+        id: 'c1',
+        networkId: 'net1',
+        name: 'general',
+        isPublic: false,
+      );
+      final dialog = AddAgentDialog(
+        wallet: wallet,
+        manager: await buildManager(wallet: wallet),
+        networkId: 'net1',
+        channel: channel,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          home: Scaffold(body: dialog),
+        ),
+      );
+      await tester.pump();
+      return dialog;
+    }
+
+    testWidgets('DAP is the first, default format and shows its paste hint', (
+      tester,
+    ) async {
+      await pumpDialog(tester);
+
+      final formats = tester.widget<SegmentedButton<AgentInviteFormat>>(
+        find.byKey(const ValueKey('inviteFormat')),
+      );
+      expect(formats.segments.map((segment) => segment.value), [
+        AgentInviteFormat.dap,
+        AgentInviteFormat.link,
+        AgentInviteFormat.cli,
+        AgentInviteFormat.env,
+      ]);
+      expect(formats.selected, {AgentInviteFormat.dap});
+      expect(
+        tester.widget<Text>(find.byKey(const ValueKey('inviteDapHint'))).data,
+        'Copy this block and paste it into the fa chat (CLI, macOS, iOS or '
+        'web) — the agent joins the channel automatically.',
+      );
+
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+      expect(find.byKey(const ValueKey('inviteDapHint')), findsNothing);
+    });
+
+    testWidgets('shows the invite: channel + pub, priv only inside the '
+        'fragment', (tester) async {
+      await pumpDialog(tester);
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+      final invite = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+
+      expect(invite, startsWith('wss://hub.fa1.dev/ws'));
+      expect(
+        invite,
+        contains('channel=c1'),
+        reason: 'fa_network relays onto DAP channels named by id',
+      );
+      final fragmentStart = invite.indexOf('#');
+      expect(fragmentStart, greaterThan(0));
+      // The private key material appears ONLY after the '#' fragment —
+      // never in the wire-visible part of the URI (RFC 3986).
+      final parsed = parseAgentInvite(invite);
+      expect(parsed.channel, 'c1');
+      expect(parsed.pub, isNotEmpty);
+      expect(invite.substring(0, fragmentStart), isNot(contains('priv=')));
+      expect(
+        Uri.splitQueryString(invite.substring(fragmentStart + 1))['priv'],
+        parsed.priv,
+      );
+      // The warning is mandatory.
+      expect(
+        find.textContaining('anyone with this string can read the channel'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('public channel: keyless invite with the channel id', (
+      tester,
+    ) async {
+      const channel = Channel(
+        id: 'pc9',
+        networkId: 'net1',
+        name: 'lobby',
+        isPublic: true,
+      );
+      final wallet = await walletWithChannel(
+        channelPub: channelKeys.pub,
+        channelPriv: channelKeys.priv,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          home: Scaffold(
+            body: AddAgentDialog(
+              wallet: wallet,
+              manager: await buildManager(wallet: wallet),
+              networkId: 'net1',
+              channel: channel,
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+      final invite = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(invite, contains('channel=pc9'));
+      expect(invite, isNot(contains('#')), reason: 'no key material');
+      expect(find.byKey(const ValueKey('copyInvite')), findsOneWidget);
+    });
+
+    testWidgets('the invite leaves the device only via the user Copy', (
+      tester,
+    ) async {
+      final clipboard = FakeClipboard()..install(tester);
+      await pumpDialog(tester);
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+      final invite = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+
+      await tester.tap(find.byKey(const ValueKey('copyInvite')));
+      await tester.pump();
+
+      expect(clipboard.text, invite);
+    });
+  });
+  _registerResponsiveLayoutGroup();
+}
+
+void _registerResponsiveLayoutGroup() {
+  group('AddAgentDialog responsive layout (issue #1913)', () {
+    late ({String pub, String priv}) channelKeys;
+
+    setUp(() async {
+      channelKeys = await EnvelopeCodec.newX25519KeyPair();
+    });
+
+    Future<void> pumpResponsiveDialog(
+      WidgetTester tester, {
+      required double width,
+      required double textScale,
+      required FakeHttpClient httpClient,
+    }) async {
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = Size(width, 844);
+      addTearDown(tester.view.reset);
+      final wallet = await walletWithChannel(
+        channelPub: channelKeys.pub,
+        channelPriv: channelKeys.priv,
+      );
+      final manager = await buildManager(
+        wallet: wallet,
+        httpClient: httpClient,
+        jwt: 'jwt-1',
+      );
+      const channel = Channel(
+        id: 'c1',
+        networkId: 'net1',
+        name: 'general',
+        isPublic: false,
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          builder: (context, child) => MediaQuery(
+            data: MediaQuery.of(
+              context,
+            ).copyWith(textScaler: TextScaler.linear(textScale)),
+            child: child!,
+          ),
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: TextButton(
+                  onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => AddAgentDialog(
+                      wallet: wallet,
+                      manager: manager,
+                      networkId: 'net1',
+                      channel: channel,
+                    ),
+                  ),
+                  child: const Text('Open add-agent dialog'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('Open add-agent dialog'));
+      await tester.pumpAndSettle();
+    }
+
+    Future<void> tapOption(WidgetTester tester, String label) async {
+      final option = find.text(label);
+      await tester.ensureVisible(option);
+      await tester.pumpAndSettle();
+      await tester.tap(option);
+      await tester.pumpAndSettle();
+      expect(tester.takeException(), isNull);
+    }
+
+    for (final (width, textScale) in <(double, double)>[
+      (320, 1.0),
+      (320, 1.3),
+      (360, 1.0),
+      (360, 1.3),
+      (393, 1.0),
+      (393, 1.3),
+    ]) {
+      testWidgets('${width.round()} px at ${textScale}x keeps every control '
+          'readable, selectable, and reachable', (tester) async {
+        final http = FakeHttpClient()
+          ..respond(
+            201,
+            body:
+                '{"name":"mobile-agent",'
+                '"hubUrl":"wss://hub.fa1.dev/ws",'
+                '"clientSecret":"sk_enroll_mobile",'
+                '"enrolledAt":"2026-02-03T04:05:06Z"}',
+          );
+        await pumpResponsiveDialog(
+          tester,
+          width: width,
+          textScale: textScale,
+          httpClient: http,
+        );
+
+        expect(
+          tester.takeException(),
+          isNull,
+          reason: 'No RenderFlex overflow at $width px / ${textScale}x',
+        );
+        _expectReadableOptionLabels(tester, textScale);
+
+        final content = find.descendant(
+          of: find.byType(AlertDialog),
+          matching: find.byType(SingleChildScrollView),
+        );
+        expect(content, findsOneWidget);
+        final scrollable = tester.state<ScrollableState>(
+          find
+              .descendant(
+                of: find.byType(AlertDialog),
+                matching: find.byType(Scrollable),
+              )
+              .first,
+        );
+        if (scrollable.position.maxScrollExtent > 0) {
+          await tester.drag(content, const Offset(0, -180));
+          await tester.pumpAndSettle();
+          expect(scrollable.position.pixels, greaterThan(0));
+        }
+
+        await tapOption(tester, 'Whole network');
+        expect(find.byKey(const ValueKey('inviteScopeHint')), findsOneWidget);
+        await tapOption(tester, 'This channel');
+        expect(find.byKey(const ValueKey('inviteHint')), findsOneWidget);
+
+        await tapOption(tester, 'Link (app)');
+        expect(
+          tester.widget<Text>(find.byKey(const ValueKey('agentInvite'))).data,
+          startsWith('wss://hub.fa1.dev/ws'),
+        );
+        await tapOption(tester, 'CLI command');
+        expect(find.byKey(const ValueKey('inviteCliHint')), findsOneWidget);
+        await tapOption(tester, 'Env (CI)');
+        expect(find.byKey(const ValueKey('inviteEnvHint')), findsOneWidget);
+        await tapOption(tester, 'DAP');
+        expect(find.byKey(const ValueKey('inviteDapHint')), findsOneWidget);
+
+        final field = find.byKey(const ValueKey('agentNameField'));
+        await tester.ensureVisible(field);
+        await tester.pumpAndSettle();
+        await tester.enterText(field, 'mobile-agent');
+        await tester.pumpAndSettle();
+        expect(tester.getSize(field).width, greaterThanOrEqualTo(120));
+        final enroll = find.byKey(const ValueKey('enrollAgent'));
+        expect(tester.widget<FilledButton>(enroll).onPressed, isNotNull);
+        expect(tester.getSize(enroll).width, greaterThanOrEqualTo(100));
+        await tester.ensureVisible(enroll);
+        await tester.pumpAndSettle();
+        await tester.tap(enroll);
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(
+          find.byKey(const ValueKey('envRow:DAP_CLIENT_SECRET')),
+          findsOneWidget,
+        );
+
+        _expectOnScreen(tester, find.text('Close'), width);
+        _expectOnScreen(
+          tester,
+          find.byKey(const ValueKey('copyInvite')),
+          width,
+        );
+        await tester.tap(find.text('Close'));
+        await tester.pumpAndSettle();
+        expect(find.byType(AddAgentDialog), findsNothing);
+        expect(tester.takeException(), isNull);
+      });
+    }
+  });
+}
+
+void _expectReadableOptionLabels(WidgetTester tester, double textScale) {
+  for (final label in [
+    'This channel',
+    'Whole network',
+    'DAP',
+    'Link (app)',
+    'CLI command',
+    'Env (CI)',
+  ]) {
+    final finder = find.text(label);
+    expect(finder, findsOneWidget);
+    final paragraph = tester.renderObject<RenderParagraph>(finder);
+    final probe = TextPainter(
+      text: TextSpan(text: 'Ag', style: paragraph.text.style),
+      textDirection: paragraph.textDirection,
+      textScaler: TextScaler.linear(textScale),
+    )..layout();
+    final oneLineHeight = probe.height;
+    probe.dispose();
+    expect(
+      paragraph.size.height,
+      lessThanOrEqualTo(oneLineHeight * 2.2),
+      reason: '$label must wrap by word, not one character per line',
+    );
+  }
+}
+
+void _expectOnScreen(WidgetTester tester, Finder finder, double width) {
+  expect(finder, findsOneWidget);
+  final rect = tester.getRect(finder);
+  expect(rect.left, greaterThanOrEqualTo(0));
+  expect(rect.right, lessThanOrEqualTo(width));
+  expect(rect.top, greaterThanOrEqualTo(0));
+  expect(rect.bottom, lessThanOrEqualTo(844));
+}
+
+void _registerNetworkScopeGroup() {
+  group('AddAgentDialog scope × format', () {
+    late ({String pub, String priv}) channelKeys;
+
+    setUp(() async {
+      channelKeys = await EnvelopeCodec.newX25519KeyPair();
+    });
+
+    Future<KeyWallet> buildWallet({String? password}) async {
+      final wallet = await KeyWallet.load(MemoryWalletBackend());
+      await wallet.createIfMissing(displayName: 'Me');
+      await wallet.addNetwork(
+        networkId: 'net1',
+        name: 'fa-team',
+        password: password,
+      );
+      await wallet.addChannelKeys(
+        networkId: 'net1',
+        channel: 'c1',
+        pub: channelKeys.pub,
+        priv: channelKeys.priv,
+      );
+      return wallet;
+    }
+
+    Future<void> pump(
+      WidgetTester tester, {
+      required KeyWallet wallet,
+      bool public = false,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          home: Scaffold(
+            body: AddAgentDialog(
+              wallet: wallet,
+              manager: await buildManager(wallet: wallet),
+              networkId: 'net1',
+              channel: Channel(
+                id: 'c1',
+                networkId: 'net1',
+                name: 'general',
+                isPublic: public,
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+    }
+
+    testWidgets('network scope renders the join link with pw in the fragment', (
+      tester,
+    ) async {
+      await pump(tester, wallet: await buildWallet(password: 'sekret42'));
+      await tester.tap(find.text('Whole network'));
+      await tester.pump();
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+
+      final invite = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(invite, startsWith('https://network.fa1.dev/join?network=net1'));
+      expect(invite, contains('#pw=sekret42'));
+      expect(find.byKey(const ValueKey('inviteNoPassword')), findsNothing);
+    });
+
+    testWidgets('network scope without password: link asks for it', (
+      tester,
+    ) async {
+      await pump(tester, wallet: await buildWallet());
+      await tester.tap(find.text('Whole network'));
+      await tester.pump();
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+
+      final invite = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(invite, startsWith('https://network.fa1.dev/join?network=net1'));
+      expect(invite.contains('#'), isFalse);
+      expect(find.byKey(const ValueKey('inviteNoPassword')), findsOneWidget);
+    });
+
+    testWidgets('CLI format wraps the channel invite into fa dap import', (
+      tester,
+    ) async {
+      await pump(tester, wallet: await buildWallet());
+      await tester.tap(find.text('CLI command'));
+      await tester.pump();
+
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload, startsWith("fa dap import 'wss://hub.fa1.dev/ws"));
+      expect(payload.endsWith("'"), isTrue);
+      expect(find.byKey(const ValueKey('inviteCliHint')), findsOneWidget);
+    });
+
+    testWidgets('env format: channel invite + agent name (no secrets to '
+        'fill in)', (tester) async {
+      await pump(tester, wallet: await buildWallet());
+      await tester.tap(find.text('Env (CI)'));
+      await tester.pump();
+
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload, startsWith("FA_CHANNEL_URL='wss://hub.fa1.dev/ws"));
+      // The invite IS the whole credential — no master secret, no
+      // provider vars: the runner's provider is its own fa config.
+      expect(payload.contains('FA_PROVIDER'), isFalse);
+      expect(payload.contains('MASTER_SECRET'), isFalse);
+      expect(payload, contains('FA_AGENT_NAME=general-agent fa'));
+      expect(find.byKey(const ValueKey('inviteEnvHint')), findsOneWidget);
+    });
+
+    testWidgets('env format on the network scope: the join link carries '
+        'the network id + password', (tester) async {
+      await pump(tester, wallet: await buildWallet(password: 'pw'));
+      await tester.tap(find.text('Whole network'));
+      await tester.pump();
+      await tester.tap(find.text('Env (CI)'));
+      await tester.pump();
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload.startsWith('fa dap import'), isFalse);
+      expect(
+        payload,
+        startsWith("FA_NETWORK_URL='https://network.fa1.dev/join?network=net1"),
+      );
+      // The password is split OUT of the URL into its own variable — CI
+      // keeps the link a plain var and masks the password as a secret.
+      expect(payload.contains('#pw='), isFalse);
+      expect(payload, contains("FA_NETWORK_PASSWORD='pw' "));
+      expect(payload.contains('FA_PROVIDER'), isFalse);
+      expect(payload.contains('MASTER_SECRET'), isFalse);
+      expect(payload, contains('FA_AGENT_NAME=fa-agent fa'));
+    });
+
+    testWidgets('CLI format on the network scope shares the plain link', (
+      tester,
+    ) async {
+      await pump(tester, wallet: await buildWallet(password: 'sekret42'));
+      await tester.tap(find.text('Whole network'));
+      await tester.pump();
+      await tester.tap(find.text('CLI command'));
+      await tester.pump();
+
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload, startsWith('https://network.fa1.dev/join?network=net1'));
+      expect(
+        find.byKey(const ValueKey('inviteNetworkCliHint')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('env format: per-variable rows copy individually', (
+      tester,
+    ) async {
+      await pump(tester, wallet: await buildWallet(password: 'pw'));
+      await tester.tap(find.text('Env (CI)'));
+      await tester.pump();
+
+      final invite = tester
+          .widget<Text>(find.byKey(const ValueKey('envRow:FA_CHANNEL_URL')))
+          .data!;
+      expect(invite, startsWith('FA_CHANNEL_URL=wss://hub.fa1.dev/ws'));
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('envRow:FA_AGENT_NAME')))
+            .data,
+        'FA_AGENT_NAME=general-agent',
+      );
+      expect(
+        find.byKey(const ValueKey('envRow:DAP_MASTER_SECRET')),
+        findsNothing,
+      );
+
+      final clipboard = FakeClipboard()..install(tester);
+      await tester.tap(find.byKey(const ValueKey('envCopy:FA_CHANNEL_URL')));
+      await tester.pump();
+      expect(clipboard.text, invite);
+
+      await tester.tap(find.byKey(const ValueKey('envCopy:FA_AGENT_NAME')));
+      await tester.pump();
+      expect(clipboard.text, 'FA_AGENT_NAME=general-agent');
+    });
+
+    testWidgets('env format on the network scope: URL row has no '
+        'password, the password is its own row', (tester) async {
+      await pump(tester, wallet: await buildWallet(password: 'pw'));
+      await tester.tap(find.text('Whole network'));
+      await tester.pump();
+      await tester.tap(find.text('Env (CI)'));
+      await tester.pump();
+
+      final row = tester
+          .widget<Text>(find.byKey(const ValueKey('envRow:FA_NETWORK_URL')))
+          .data!;
+      expect(row, 'FA_NETWORK_URL=https://network.fa1.dev/join?network=net1');
+      final passwordRow = tester
+          .widget<Text>(
+            find.byKey(const ValueKey('envRow:FA_NETWORK_PASSWORD')),
+          )
+          .data!;
+      expect(passwordRow, 'FA_NETWORK_PASSWORD=pw');
+
+      final clipboard = FakeClipboard()..install(tester);
+      await tester.tap(find.byKey(const ValueKey('envCopy:FA_NETWORK_URL')));
+      await tester.pump();
+      expect(clipboard.text, row);
+      await tester.ensureVisible(
+        find.byKey(const ValueKey('envCopy:FA_NETWORK_PASSWORD')),
+      );
+      await tester.pump();
+      await tester.tap(
+        find.byKey(const ValueKey('envCopy:FA_NETWORK_PASSWORD')),
+      );
+      await tester.pump();
+      expect(clipboard.text, passwordRow);
+    });
+
+    testWidgets('a network-scope dialog without a channel hides the scope '
+        'switch', (tester) async {
+      final wallet = await buildWallet(password: 'pw');
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          home: Scaffold(
+            body: AddAgentDialog(
+              wallet: wallet,
+              manager: await buildManager(wallet: wallet),
+              networkId: 'net1',
+              channel: null,
+              initialScope: AgentInviteScope.network,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.tap(find.text('Link (app)'));
+      await tester.pump();
+
+      expect(find.byKey(const ValueKey('inviteScope')), findsNothing);
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload, startsWith('https://network.fa1.dev/join?network=net1'));
+    });
+  });
+
+  group('dap format (enroll-based agent credentials)', () {
+    late ({String pub, String priv}) channelKeys;
+
+    setUp(() async {
+      channelKeys = await EnvelopeCodec.newX25519KeyPair();
+    });
+
+    /// A canned `POST /api/networks/net1/agents/enroll` 201 response.
+    const enrollBody =
+        '{"name":"general-agent","hubUrl":"wss://hub.fa1.dev/ws",'
+        '"clientSecret":"sk_enroll_123",'
+        '"enrolledAt":"2026-02-03T04:05:06Z",'
+        '"note":"store clientSecret now"}';
+
+    Future<KeyWallet> buildWallet() async {
+      final wallet = await KeyWallet.load(MemoryWalletBackend());
+      await wallet.createIfMissing(displayName: 'Me');
+      await wallet.addNetwork(networkId: 'net1', name: 'fa-team');
+      await wallet.addChannelKeys(
+        networkId: 'net1',
+        channel: 'c1',
+        pub: channelKeys.pub,
+        priv: channelKeys.priv,
+      );
+      return wallet;
+    }
+
+    Future<void> pumpDap(
+      WidgetTester tester, {
+      required KeyWallet wallet,
+      required NetworkSessionManager manager,
+    }) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          home: Scaffold(
+            body: AddAgentDialog(
+              wallet: wallet,
+              manager: manager,
+              networkId: 'net1',
+              channel: Channel(id: 'c1', networkId: 'net1', name: 'general'),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.tap(find.text('DAP'));
+      await tester.pumpAndSettle();
+    }
+
+    FilledButton enrollButton(WidgetTester tester) =>
+        tester.widget<FilledButton>(find.byKey(const ValueKey('enrollAgent')));
+
+    testWidgets('an invalid agent name shows the inline error and disables '
+        'enroll; the payload area shows the enroll note until then', (
+      tester,
+    ) async {
+      final wallet = await buildWallet();
+      final manager = await buildManager(wallet: wallet, jwt: 'jwt-1');
+      await pumpDap(tester, wallet: wallet, manager: manager);
+
+      // The prefilled suggestion is valid → enroll is enabled.
+      expect(enrollButton(tester).onPressed, isNotNull);
+      // No credential yet: the payload area explains enrollment instead.
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+            .data!
+            .contains('copy it now'),
+        isTrue,
+      );
+
+      final field = find.byKey(const ValueKey('agentNameField'));
+      await tester.ensureVisible(field);
+      await tester.pumpAndSettle();
+      await tester.enterText(field, 'Bad_Name!');
+      await tester.pumpAndSettle();
+      expect(find.text('3–64 chars: a-z, 0-9, hyphens'), findsOneWidget);
+      expect(enrollButton(tester).onPressed, isNull);
+
+      await tester.enterText(field, 'ops-bot-2');
+      await tester.pumpAndSettle();
+      expect(find.text('3–64 chars: a-z, 0-9, hyphens'), findsNothing);
+      expect(enrollButton(tester).onPressed, isNotNull);
+    });
+
+    testWidgets('successful enroll renders the one-time credential rows, '
+        'the combined payload, and row copy', (tester) async {
+      final clipboard = FakeClipboard()..install(tester);
+      final wallet = await buildWallet();
+      final http = FakeHttpClient();
+      http.respond(201, body: enrollBody);
+      final manager = await buildManager(
+        wallet: wallet,
+        httpClient: http,
+        jwt: 'jwt-1',
+      );
+      await pumpDap(tester, wallet: wallet, manager: manager);
+
+      final enroll = find.byKey(const ValueKey('enrollAgent'));
+      await tester.ensureVisible(enroll);
+      await tester.pumpAndSettle();
+      await tester.tap(enroll);
+      await tester.pumpAndSettle();
+
+      // The management call: JWT bearer + the agent name.
+      final req = http.requests.single;
+      expect(req.method, 'POST');
+      expect(req.url.path, '/api/networks/net1/agents/enrollments');
+      expect(req.headers['authorization'], 'Bearer jwt-1');
+      expect(jsonDecode(req.body), {'name': 'general-agent'});
+
+      // The one-time credential panel.
+      expect(find.byKey(const ValueKey('envRow:IMPORT')), findsOneWidget);
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('envRow:DAP_HUB_URL')))
+            .data,
+        'DAP_HUB_URL=wss://hub.fa1.dev/ws',
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('envRow:DAP_CLIENT_SECRET')),
+            )
+            .data,
+        'DAP_CLIENT_SECRET=sk_enroll_123',
+      );
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('envRow:DAP_AGENT_NAME')))
+            .data,
+        'DAP_AGENT_NAME=general-agent',
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('envRow:DAP_AGENT_INSTANCE')),
+            )
+            .data,
+        'DAP_AGENT_INSTANCE=4ee4ebd649acee94',
+      );
+      // The hub master secret is gone from this UI entirely.
+      expect(
+        find.byKey(const ValueKey('envRow:DAP_MASTER_SECRET')),
+        findsNothing,
+      );
+
+      // The combined payload: channel import first, then the DAP env.
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload, startsWith("fa dap import 'wss://hub.fa1.dev/ws"));
+      expect(payload, contains(' && DAP_HUB_URL=wss://hub.fa1.dev/ws'));
+      expect(payload, contains("DAP_CLIENT_SECRET='sk_enroll_123'"));
+      expect(payload, contains('DAP_AGENT_NAME=general-agent'));
+      expect(payload, contains('DAP_AGENT_INSTANCE=4ee4ebd649acee94'));
+      expect(payload, endsWith(' fa'));
+
+      // Row-level copy puts the bare key=value on the clipboard.
+      final secretCopy = find.byKey(
+        const ValueKey('envCopy:DAP_CLIENT_SECRET'),
+      );
+      await tester.ensureVisible(secretCopy);
+      await tester.pumpAndSettle();
+      await tester.tap(secretCopy);
+      await tester.pump();
+      expect(clipboard.text, 'DAP_CLIENT_SECRET=sk_enroll_123');
+    });
+
+    testWidgets('an enrollment failure surfaces the server message inline', (
+      tester,
+    ) async {
+      final wallet = await buildWallet();
+      final http = FakeHttpClient();
+      http.respond(
+        403,
+        body:
+            '{"error":{"code":"forbidden_by_class",'
+            '"message":"owner or admin only"}}',
+      );
+      final manager = await buildManager(
+        wallet: wallet,
+        httpClient: http,
+        jwt: 'jwt-1',
+      );
+      await pumpDap(tester, wallet: wallet, manager: manager);
+
+      final enroll = find.byKey(const ValueKey('enrollAgent'));
+      await tester.ensureVisible(enroll);
+      await tester.pumpAndSettle();
+      await tester.tap(enroll);
+      await tester.pumpAndSettle();
+
+      final error = tester
+          .widget<Text>(find.byKey(const ValueKey('enrollError')))
+          .data!;
+      expect(error, contains('owner or admin only'));
+      expect(
+        find.byKey(const ValueKey('envRow:DAP_CLIENT_SECRET')),
+        findsNothing,
+      );
+    });
+
+    testWidgets('a retired hub shows upgrade guidance without a legacy retry', (
+      tester,
+    ) async {
+      final wallet = await buildWallet();
+      final http = FakeHttpClient();
+      http.respond(
+        503,
+        body:
+            '{"error":{"code":"hub_unavailable",'
+            '"message":"hub rejected enroll_create: bad_frame unknown op '
+            'enroll_create: dap: unknown enrollment operation"}}',
+      );
+      final manager = await buildManager(
+        wallet: wallet,
+        httpClient: http,
+        jwt: 'jwt-1',
+      );
+      await pumpDap(tester, wallet: wallet, manager: manager);
+
+      final enroll = find.byKey(const ValueKey('enrollAgent'));
+      await tester.ensureVisible(enroll);
+      await tester.pumpAndSettle();
+      await tester.tap(enroll);
+      await tester.pumpAndSettle();
+
+      final error = tester
+          .widget<Text>(find.byKey(const ValueKey('enrollError')))
+          .data!;
+      expect(error, contains('does not support independent agent enrollment'));
+      expect(error, contains('Update the DAP hub'));
+      expect(error, contains('existing agent credentials were not changed'));
+      expect(error, isNot(contains('bad_frame')));
+      expect(error, isNot(contains('unknown op')));
+      expect(http.requests, hasLength(1));
+      expect(
+        http.requests.single.url.path,
+        '/api/networks/net1/agents/enrollments',
+      );
+      expect(
+        find.byKey(const ValueKey('envRow:DAP_CLIENT_SECRET')),
+        findsNothing,
+      );
+    });
+
+    testWidgets('without a sign-in the DAP tab shows the sign-in note', (
+      tester,
+    ) async {
+      final wallet = await buildWallet();
+      final manager = await buildManager(wallet: wallet); // no JWT
+      await pumpDap(tester, wallet: wallet, manager: manager);
+
+      expect(find.byKey(const ValueKey('enrollNeedSignIn')), findsOneWidget);
+      expect(find.byKey(const ValueKey('enrollAgent')), findsNothing);
+      expect(find.byKey(const ValueKey('agentNameField')), findsNothing);
+    });
+
+    testWidgets('network scope: no import row, the enrolled DAP vars stay', (
+      tester,
+    ) async {
+      final wallet = await buildWallet();
+      final http = FakeHttpClient();
+      http.respond(201, body: enrollBody);
+      final manager = await buildManager(
+        wallet: wallet,
+        httpClient: http,
+        jwt: 'jwt-1',
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          home: Scaffold(
+            body: AddAgentDialog(
+              wallet: wallet,
+              manager: manager,
+              networkId: 'net1',
+              channel: null,
+              initialScope: AgentInviteScope.network,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.tap(find.text('DAP'));
+      await tester.pumpAndSettle();
+
+      final enroll = find.byKey(const ValueKey('enrollAgent'));
+      await tester.ensureVisible(enroll);
+      await tester.pumpAndSettle();
+      await tester.tap(enroll);
+      await tester.pumpAndSettle();
+
+      expect(find.byKey(const ValueKey('envRow:IMPORT')), findsNothing);
+      expect(
+        find.byKey(const ValueKey('envRow:DAP_CLIENT_SECRET')),
+        findsOneWidget,
+      );
+      final payload = tester
+          .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+          .data!;
+      expect(payload, startsWith('DAP_HUB_URL='));
+      expect(payload, isNot(contains('fa dap import')));
+    });
+
+    group('network scope channel bundle', () {
+      /// Two keyed private channels (c1, c2) + one the wallet has no keys
+      /// for (c3) — the dialog must bundle an invite per keyed channel and
+      /// skip the keyless one.
+      const threeChannelsBody =
+          '[{"id":"c1","networkId":"net1","name":"general","public":false},'
+          '{"id":"c2","networkId":"net1","name":"random","public":false},'
+          '{"id":"c3","networkId":"net1","name":"vault","public":false}]';
+
+      /// A canned enroll response for the network-scope `fa-agent` name.
+      const networkEnrollBody =
+          '{"name":"fa-agent","hubUrl":"wss://hub.fa1.dev/ws",'
+          '"clientSecret":"sk_enroll_456",'
+          '"enrolledAt":"2026-02-03T04:05:06Z",'
+          '"note":"store clientSecret now"}';
+
+      /// A wallet + a session-seeded manager: the session knows c1/c2/c3
+      /// (the dialog's channel source), the wallet holds c1/c2 chankeys
+      /// unless [withChannelKeys] is false.
+      Future<
+        ({
+          KeyWallet wallet,
+          NetworkSessionManager manager,
+          NetworkSession session,
+        })
+      >
+      buildRig({bool withChannelKeys = true}) async {
+        final wallet = await KeyWallet.load(MemoryWalletBackend());
+        await wallet.createIfMissing(displayName: 'Me');
+        await wallet.addNetwork(networkId: 'net1', name: 'fa-team');
+        if (withChannelKeys) {
+          for (final channelId in ['c1', 'c2']) {
+            final keys = await EnvelopeCodec.newX25519KeyPair();
+            await wallet.addChannelKeys(
+              networkId: 'net1',
+              channel: channelId,
+              pub: keys.pub,
+              priv: keys.priv,
+            );
+          }
+        }
+        final sessionHttp = FakeHttpClient()
+          ..respond(200, body: threeChannelsBody) // start: channels
+          ..respond(200, body: membersBody); // start: members
+        final session = buildSession(
+          httpClient: sessionHttp,
+          connector: FakeWsConnector(),
+          wallet: wallet,
+        );
+        await session.start();
+        addTearDown(session.close);
+        final managerHttp = FakeHttpClient()
+          ..respond(201, body: networkEnrollBody);
+        final manager = await buildManager(
+          wallet: wallet,
+          httpClient: managerHttp,
+          jwt: 'jwt-1',
+        );
+        manager.sessions['net1'] = session;
+        addTearDown(manager.disconnectAll);
+        return (wallet: wallet, manager: manager, session: session);
+      }
+
+      Future<void> pumpNetwork(
+        WidgetTester tester, {
+        required KeyWallet wallet,
+        required NetworkSessionManager manager,
+      }) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            theme: buildFahTheme(),
+            home: Scaffold(
+              body: AddAgentDialog(
+                wallet: wallet,
+                manager: manager,
+                networkId: 'net1',
+                channel: null,
+                initialScope: AgentInviteScope.network,
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+      }
+
+      Future<void> enroll(WidgetTester tester) async {
+        final button = find.byKey(const ValueKey('enrollAgent'));
+        await tester.ensureVisible(button);
+        await tester.pumpAndSettle();
+        await tester.tap(button);
+        await tester.pumpAndSettle();
+      }
+
+      testWidgets('DAP after enroll: one IMPORT row per keyed channel, the '
+          'payload leads with the import bundle', (tester) async {
+        final rig = await buildRig();
+        await pumpNetwork(tester, wallet: rig.wallet, manager: rig.manager);
+        await tester.tap(find.text('DAP'));
+        await tester.pumpAndSettle();
+        await enroll(tester);
+
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c1')), findsOneWidget);
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c2')), findsOneWidget);
+        // c3 has no chankey in this wallet — no invite, no row.
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c3')), findsNothing);
+        expect(find.byKey(const ValueKey('inviteNoChannelKeys')), findsNothing);
+
+        final c1Row = tester
+            .widget<Text>(find.byKey(const ValueKey('envRow:IMPORT:c1')))
+            .data!;
+        expect(c1Row, startsWith("fa dap import 'wss://hub.fa1.dev/ws"));
+        expect(c1Row, contains('channel=c1'));
+
+        final payload = tester
+            .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+            .data!;
+        expect(payload, startsWith("fa dap import '"));
+        expect(payload, contains('channel=c1'));
+        expect(payload, contains('channel=c2'));
+        expect(payload, isNot(contains('channel=c3')));
+        expect(payload, contains(' && DAP_HUB_URL=wss://hub.fa1.dev/ws'));
+        expect(payload, contains("DAP_CLIENT_SECRET='sk_enroll_456'"));
+        expect(payload, contains('DAP_AGENT_NAME=fa-agent'));
+        expect(payload, contains('DAP_AGENT_INSTANCE=0f266ef261130bd4'));
+        expect(payload, endsWith(' fa'));
+        await rig.session.close();
+      });
+
+      testWidgets('a wallet with no channel keys shows the no-keys note and '
+          'the payload has no import', (tester) async {
+        final rig = await buildRig(withChannelKeys: false);
+        await pumpNetwork(tester, wallet: rig.wallet, manager: rig.manager);
+        await tester.tap(find.text('DAP'));
+        await tester.pumpAndSettle();
+        await enroll(tester);
+
+        expect(
+          find.byKey(const ValueKey('inviteNoChannelKeys')),
+          findsOneWidget,
+        );
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c1')), findsNothing);
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c2')), findsNothing);
+        final payload = tester
+            .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+            .data!;
+        expect(payload, isNot(contains('fa dap import')));
+        expect(payload, startsWith('DAP_HUB_URL='));
+        await rig.session.close();
+      });
+
+      testWidgets('the IMPORT row copy puts the exact fa dap import command '
+          'on the clipboard', (tester) async {
+        final clipboard = FakeClipboard()..install(tester);
+        final rig = await buildRig();
+        await pumpNetwork(tester, wallet: rig.wallet, manager: rig.manager);
+        await tester.tap(find.text('DAP'));
+        await tester.pumpAndSettle();
+        await enroll(tester);
+
+        final copy = find.byKey(const ValueKey('envCopy:IMPORT:c1'));
+        await tester.ensureVisible(copy);
+        await tester.pumpAndSettle();
+        await tester.tap(copy);
+        await tester.pump();
+
+        final expected = tester
+            .widget<Text>(find.byKey(const ValueKey('envRow:IMPORT:c1')))
+            .data!;
+        expect(clipboard.text, expected);
+        expect(clipboard.text, startsWith("fa dap import '"));
+        expect(clipboard.text, endsWith("'"));
+        expect(clipboard.text, contains('channel=c1'));
+        await rig.session.close();
+      });
+
+      testWidgets('Env (CI) on the network scope carries the same import '
+          'bundle before the FA_ vars', (tester) async {
+        final rig = await buildRig();
+        await pumpNetwork(tester, wallet: rig.wallet, manager: rig.manager);
+        await tester.tap(find.text('Env (CI)'));
+        await tester.pumpAndSettle();
+
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c1')), findsOneWidget);
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c2')), findsOneWidget);
+        expect(find.byKey(const ValueKey('envRow:IMPORT:c3')), findsNothing);
+        final payload = tester
+            .widget<Text>(find.byKey(const ValueKey('agentInvite')))
+            .data!;
+        expect(payload, startsWith("fa dap import '"));
+        expect(payload, contains(' && FA_NETWORK_URL='));
+        expect(payload, contains('FA_AGENT_NAME=fa-agent fa'));
+        await rig.session.close();
+      });
+    });
+  });
+}

@@ -1,0 +1,411 @@
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+AssistantMessage _assistant(String text) {
+  return AssistantMessage(
+    content: [TextContent(text: text)],
+    api: 'openai-completions',
+    provider: 'openrouter',
+    model: 'm1',
+    usage: Usage.zero,
+    stopReason: StopReason.stop,
+    timestamp: DateTime.utc(2026),
+  );
+}
+
+/// Fake summarizer: records prompts, replays scripted results.
+class _FakeSummarizer {
+  _FakeSummarizer(this.results);
+
+  final List<SummarizationResult> results;
+  final prompts = <String>[];
+
+  Future<SummarizationResult> call(SummarizationRequest request) async {
+    prompts.add(request.prompt);
+    return results.removeAt(0);
+  }
+}
+
+void main() {
+  late MemoryFileSystem fs;
+  late JsonlSessionRepo repo;
+
+  setUp(() {
+    fs = MemoryFileSystem();
+    repo = JsonlSessionRepo(fs: fs, sessionsRoot: '/sessions');
+  });
+
+  Future<Session> newSession() {
+    return repo.create(JsonlSessionCreateOptions(cwd: '/work'));
+  }
+
+  /// Settings with a tiny keep-recent budget so a handful of messages
+  /// triggers a cut.
+  const settings = CompactionSettings(
+    enabled: true,
+    reserveTokens: 16384,
+    keepRecentTokens: 150,
+  );
+
+  /// Appends four ~100-token messages: u1, a1, u2, a2.
+  Future<Session> sessionWithHistory() async {
+    final session = await newSession();
+    await session.appendMessage(UserMessage.text('u1${'a' * 400}'));
+    await session.appendMessage(_assistant('b' * 400));
+    await session.appendMessage(UserMessage.text('u2${'a' * 400}'));
+    await session.appendMessage(_assistant('b' * 400));
+    return session;
+  }
+
+  group('compactSession (full pipeline through a Session)', () {
+    test('appends a CompactionRecord and rebuilds context around it', () async {
+      final session = await sessionWithHistory();
+      final fake = _FakeSummarizer([
+        SummarizationResult.success('THE SUMMARY'),
+      ]);
+      final manager = CompactionManager(
+        summarize: fake.call,
+        settings: settings,
+      );
+
+      final record = await manager.compactSession(session);
+
+      expect(record, isNotNull);
+      expect(record!.summary, startsWith('THE SUMMARY'));
+      expect(record.tokensBefore, greaterThan(0));
+      // Budget 150 -> cut at u2; u1/a1 are summarized.
+      final u2Entry = await session.getEntry(record.firstKeptEntryId);
+      expect(u2Entry, isA<MessageRecord>());
+      expect((u2Entry! as MessageRecord).message.role, 'user');
+      expect(
+        ((u2Entry as MessageRecord).message as UserMessage).content,
+        startsWith('u2'),
+      );
+
+      // The compaction prompt contains the summarized region only.
+      expect(fake.prompts.single, contains('u1'));
+      expect(fake.prompts.single, isNot(contains('u2aaaa')));
+
+      // Context projection: summary user message, then the kept messages.
+      final messages = await session.buildContextMessages();
+      expect(messages, hasLength(3));
+      final summaryMessage = messages.first as UserMessage;
+      expect(summaryMessage.content, startsWith(compactionSummaryPrefix));
+      expect(summaryMessage.content, contains('THE SUMMARY'));
+      expect(messages[1].role, 'user');
+      expect(messages[2].role, 'assistant');
+
+      // The record survives a reload from disk.
+      final reopened = await repo.open(await session.getMetadata());
+      final branch = await reopened.getBranch();
+      expect(branch.whereType<CompactionRecord>(), hasLength(1));
+    });
+
+    test(
+      'summarization failure is failure-safe: history fully preserved',
+      () async {
+        final session = await sessionWithHistory();
+        final before = await session.getBranch();
+        final fake = _FakeSummarizer([
+          SummarizationResult.failure('provider exploded'),
+        ]);
+        final manager = CompactionManager(
+          summarize: fake.call,
+          settings: settings,
+        );
+
+        expect(
+          () => manager.compactSession(session),
+          throwsA(
+            isA<CompactionException>().having(
+              (e) => e.code,
+              'code',
+              CompactionErrorCode.summarizationFailed,
+            ),
+          ),
+        );
+
+        // No compaction record appended; the branch is byte-identical.
+        final after = await session.getBranch();
+        expect(after.map((e) => e.id), before.map((e) => e.id));
+        expect(after.whereType<CompactionRecord>(), isEmpty);
+        final messages = await session.buildContextMessages();
+        expect(messages, hasLength(4));
+      },
+    );
+    test(
+      'blank mock summary: the report omits the block (issue #578)',
+      () async {
+        final session = await sessionWithHistory();
+        final fake = _FakeSummarizer([SummarizationResult.success('   \n')]);
+        final manager = CompactionManager(
+          summarize: fake.call,
+          settings: settings,
+        );
+
+        final record = await manager.compactSession(session);
+        expect(record, isNotNull);
+
+        // The pass record carries the blank text exactly as _attempt surfaces
+        // it (`summary: record.summary`) — but the rendered report must show
+        // just the header/token/records lines, never an empty fenced block.
+        final pass = AutoCompactorPass(
+          pass: 1,
+          tokensBefore: record!.tokensBefore,
+          tokensAfter: record.tokensBefore - 100,
+          fallback: 'smol=test',
+          ok: true,
+          summary: record.summary,
+          hiddenRecords: 2,
+          summarizedMessages: 2,
+        );
+        final report = formatCompactionReport(
+          pass,
+          auto: true,
+          // gh-1636: the blank-summary contract lives on the detail block;
+          // the default report is now the one-line marker.
+          details: true,
+        ).join('\n');
+        expect(report, isNot(contains('summary:')));
+        expect(report, isNot(contains('```')));
+      },
+    );
+
+    test('empty session: nothing to compact', () async {
+      final session = await newSession();
+      final manager = CompactionManager(
+        summarize: (_) async => SummarizationResult.success('x'),
+        settings: settings,
+      );
+      expect(await manager.compactSession(session), isNull);
+    });
+
+    test(
+      // gh-2044 rework CI fix (core shard 1/4 + hostile-env reds): an
+      // empty summarizable region with a blank answer must NOT land as a
+      // junk CompactionRecord — the #729 chunked path folds zero chunks
+      // into '' without an LM call, the record made the transcript look
+      // compacted while nothing was folded (and bricked every later
+      // prepareCompaction via the leaf rule), and the classic pass ladder
+      // reported a hollow success through its no-work terminal while the
+      // context was still over the trigger. The refusal is the
+      // empty-REGION case only; a dialed blank answer over a real region
+      // keeps landing as a record (issue #578 contract, pinned above).
+      'empty summarizable region + blank answer: refused, history '
+      'preserved (gh-2044 CI regression)',
+      () async {
+        final session = await newSession();
+        // One ~10-token user message; keepRecent (150) covers the whole
+        // transcript, so findCutPoint keeps everything and the region to
+        // summarize is empty — the CI fixture's exact shape.
+        await session.appendMessage(UserMessage.text('a' * 40));
+        final before = await session.getBranch();
+        final fake = _FakeSummarizer([SummarizationResult.success('')]);
+        final manager = CompactionManager(
+          summarize: fake.call,
+          settings: settings,
+        );
+
+        await expectLater(
+          manager.compactSession(session),
+          throwsA(
+            isA<CompactionException>().having(
+              (e) => e.code,
+              'code',
+              CompactionErrorCode.invalidSession,
+            ),
+          ),
+        );
+
+        // No compaction record appended; the branch is byte-identical.
+        final after = await session.getBranch();
+        expect(after.map((e) => e.id), before.map((e) => e.id));
+        expect(after.whereType<CompactionRecord>(), isEmpty);
+      },
+    );
+
+    test('second compaction updates the previous summary', () async {
+      final session = await sessionWithHistory();
+      final fake = _FakeSummarizer([
+        SummarizationResult.success('FIRST'),
+        SummarizationResult.success('SECOND'),
+      ]);
+      final manager = CompactionManager(
+        summarize: fake.call,
+        settings: settings,
+      );
+
+      final first = await manager.compactSession(session);
+      expect(first, isNotNull);
+
+      // Grow history past the budget again.
+      await session.appendMessage(UserMessage.text('u3${'a' * 400}'));
+      await session.appendMessage(_assistant('b' * 400));
+
+      final second = await manager.compactSession(session);
+      expect(second, isNotNull);
+      expect(second!.summary, startsWith('SECOND'));
+
+      // The second prompt updates the first summary (pi iterative mode).
+      expect(fake.prompts[1], contains('<previous-checkpoint>'));
+      expect(fake.prompts[1], contains('FIRST'));
+
+      // Only the latest compaction projects into the context.
+      final messages = await session.buildContextMessages();
+      expect(messages.first, isA<UserMessage>());
+      expect((messages.first as UserMessage).content, contains('SECOND'));
+      // Only the latest compaction projects a summary. The folded FIRST
+      // checkpoint survives solely as a hidden-segments index row riding
+      // the SECOND summary (issue #266 F1a) — discoverable, not a
+      // standalone message.
+      final firstMentions = messages
+          .where(
+            (m) =>
+                m is UserMessage &&
+                m.content is String &&
+                (m.content as String).contains('FIRST'),
+          )
+          .toList();
+      expect(firstMentions, hasLength(1));
+      expect(firstMentions.single, same(messages.first));
+      expect(
+        (firstMentions.single as UserMessage).content as String,
+        matches(RegExp(r'\[\d+:hidden·legacy-ckpt·\d+·"FIRST')),
+      );
+    });
+
+    test('estimates tokens from provider usage when available', () async {
+      final session = await newSession();
+      await session.appendMessage(UserMessage.text('hi'));
+      await session.appendMessage(
+        AssistantMessage(
+          content: [const TextContent(text: 'hello')],
+          api: 'openai-completions',
+          provider: 'openrouter',
+          model: 'm1',
+          usage: const Usage(
+            input: 42000,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 42000,
+            cost: UsageCost(),
+          ),
+          stopReason: StopReason.stop,
+          timestamp: DateTime.utc(2026),
+        ),
+      );
+      await session.appendMessage(UserMessage.text('u${'a' * 400}'));
+      await session.appendMessage(_assistant('b' * 400));
+      final fake = _FakeSummarizer([SummarizationResult.success('S')]);
+      final manager = CompactionManager(
+        summarize: fake.call,
+        settings: settings,
+      );
+
+      final record = await manager.compactSession(session);
+      // tokensBefore = 42000 (usage) + trailing heuristic (101 + 100).
+      expect(record!.tokensBefore, 42201);
+    });
+  });
+
+  group('shouldCompact against a session', () {
+    test('composes estimateContextTokens with the model window', () async {
+      final session = await sessionWithHistory();
+      final tokens = estimateContextTokens(
+        await session.buildContextMessages(),
+      ).tokens;
+      // Each message is ~100 tokens (user messages have a 2-char prefix).
+      expect(tokens, 402);
+      expect(shouldCompact(tokens, 42000, defaultCompactionSettings), isFalse);
+      // 17000 - 16384 = 616; 402 stays below the reserve.
+      expect(shouldCompact(tokens, 17000, defaultCompactionSettings), isFalse);
+      // 16500 - 16384 = 116; 402 exceeds it.
+      expect(shouldCompact(tokens, 16500, defaultCompactionSettings), isTrue);
+    });
+  });
+
+  group('issue #1914 retry escalation', () {
+    // Keep-recent covers the whole transcript: the backward walk never
+    // reaches the budget, the cut falls back to the FIRST valid cut point,
+    // and the fold keeps essentially everything — the reporter's shape.
+    const keepAllSettings = CompactionSettings(
+      enabled: true,
+      reserveTokens: 100,
+      keepRecentTokens: 100000,
+    );
+
+    test(
+      'a fruitless retry cuts strictly newer than the failed boundary',
+      () async {
+        final session = await newSession();
+        await session.appendMessage(UserMessage.text('u1${'a' * 400}'));
+        await session.appendMessage(_assistant('b' * 400));
+        await session.appendMessage(UserMessage.text('u2${'a' * 400}'));
+        await session.appendMessage(_assistant('b' * 400));
+        final fake = _FakeSummarizer([
+          SummarizationResult.success('FIRST'),
+          SummarizationResult.success('SECOND'),
+        ]);
+        final manager = CompactionManager(
+          summarize: fake.call,
+          settings: keepAllSettings,
+        );
+
+        final first = await manager.compactSession(session);
+        expect(first, isNotNull);
+        final branch = await session.getBranch();
+        final firstKeptIndex = branch.indexWhere(
+          (entry) => entry.id == first!.firstKeptEntryId,
+        );
+        // The first fold keeps everything: its cut is the FIRST valid cut
+        // point (0 free), exactly the trace's identical-cut shape.
+        expect(firstKeptIndex, 0);
+
+        // Grow the leaf past the fold (the retry pass rides a non-compaction
+        // leaf) and compact again with the same parameters.
+        await session.appendMessage(UserMessage.text('u3${'a' * 400}'));
+        await session.appendMessage(_assistant('b' * 400));
+
+        final second = await manager.compactSession(session);
+        expect(second, isNotNull);
+        final branch2 = await session.getBranch();
+        final secondKeptIndex = branch2.indexWhere(
+          (entry) => entry.id == second!.firstKeptEntryId,
+        );
+        // The retry did NOT repeat the identical cut: it advanced strictly
+        // past the failed boundary, folding more history.
+        expect(secondKeptIndex, greaterThan(firstKeptIndex));
+        expect(second!.firstKeptEntryId, isNot(first!.firstKeptEntryId));
+        // The second prompt summarizes the newly-folded region.
+        expect(fake.prompts[1], contains('u1'));
+      },
+    );
+
+    test('a healthy iterative fold keeps the shipped cut parameters', () async {
+      final session = await sessionWithHistory();
+      final fake = _FakeSummarizer([
+        SummarizationResult.success('FIRST'),
+        SummarizationResult.success('SECOND'),
+      ]);
+      final manager = CompactionManager(
+        summarize: fake.call,
+        settings: settings,
+      );
+
+      final first = await manager.compactSession(session);
+      expect(first, isNotNull);
+      // Grow history past the budget again (the regrow-past-peak case).
+      await session.appendMessage(UserMessage.text('u3${'a' * 400}'));
+      await session.appendMessage(_assistant('b' * 400));
+
+      final second = await manager.compactSession(session);
+      expect(second, isNotNull);
+      // The natural cut moved to u3 on its own (keep-recent 150 crossed
+      // there) — no escalation: the summary is a plain history update, not
+      // a split-turn fallback, and it still folds real history.
+      expect(second!.summary, startsWith('SECOND'));
+      expect(fake.prompts[1], isNot(contains('No prior history')));
+    });
+  });
+}

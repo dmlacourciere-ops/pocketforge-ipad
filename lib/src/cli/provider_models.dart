@@ -1,0 +1,1861 @@
+/// The model-pick helpers of [AgentCli]: the two-step `/model` TUI menu
+/// (provider rows first, the chosen provider's models after), the
+/// cross-provider model cache, and the `/model`-command switch paths.
+/// Split out of `provider_commands.dart` to keep that file under the
+/// repo's 2800-line size gate. Same library (a `part of`).
+part of 'agent_cli.dart';
+
+/// Model-pick helpers split out of `provider_commands.dart` (file-size
+/// gate). Same library: the private extension members below are AgentCli's.
+extension on AgentCli {
+  // ------------------------------------------------------------- models
+
+  // _allProvidersModelCache and _allProvidersCacheRefreshed are fields on
+  // AgentCli (agent_cli.dart line 608-610); this part file accesses them
+  // directly because it's the same library.
+
+  bool get _modelCacheNeedsRefresh =>
+      !_allProvidersCacheRefreshed && _modelCacheFuture == null;
+
+  /// The persisted cross-provider model cache (null when the host has no
+  /// home directory — web, sandboxed tests). `{provider: {ids, fetchedAtMs}}`
+  /// entries power the instant /model picker at boot; the background
+  /// refresh rewrites it after every live fetch.
+  String? get _modelCacheDiskPath => config.homeDir?.isEmpty ?? true
+      ? null
+      : '${config.homeDir}/.fah/model_cache.json';
+
+  static const _modelCacheTtl = Duration(hours: 24);
+
+  /// Loads the persisted model cache into [_allProvidersModelCache]. Entries
+  /// younger than 24h are trusted for this session (no live refetch);
+  /// stale entries still render instantly but revalidate in background.
+  Future<void> _loadPersistedModelCache() async {
+    if (_modelCacheDiskLoaded) return;
+    _modelCacheDiskLoaded = true;
+    final path = _modelCacheDiskPath;
+    if (path == null) return;
+    final text = (await _env.readTextFile(path)).valueOrNull;
+    if (text == null || text.isEmpty) return;
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(text);
+    } on FormatException {
+      return;
+    }
+    if (decoded is! Map<String, dynamic>) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    decoded.forEach(
+      (provider, value) => _applyPersistedModelEntry(provider, value, now),
+    );
+  }
+
+  /// Applies one persisted-cache record: non-empty id lists seed the
+  /// in-memory cache (putIfAbsent — a live answer already in hand wins);
+  /// entries younger than 24h are trusted for this session.
+  void _applyPersistedModelEntry(String provider, Object? value, int now) {
+    if (value is! Map<String, dynamic>) return;
+    final ids = [
+      for (final id in (value['ids'] as List<dynamic>? ?? const []))
+        if (id is String && id.isNotEmpty) id,
+    ];
+    if (ids.isEmpty) return;
+    _allProvidersModelCache.putIfAbsent(provider, () => ids);
+    final fetchedAt = value['fetchedAtMs'];
+    final fresh =
+        fetchedAt is int && now - fetchedAt < _modelCacheTtl.inMilliseconds;
+    if (fresh) _modelCacheFresh.add(provider);
+  }
+
+  /// Persists the cross-provider model cache for the next process.
+  /// Best-effort: a failed write only costs boot-time freshness.
+  Future<void> _persistModelCache() async {
+    final path = _modelCacheDiskPath;
+    if (path == null) return;
+    try {
+      await _env.createDir('${config.homeDir}/.fah');
+      await _env.writeFile(
+        path,
+        jsonEncode({
+          for (final entry in _allProvidersModelCache.entries)
+            entry.key: {
+              'ids': entry.value,
+              'fetchedAtMs': DateTime.now().millisecondsSinceEpoch,
+            },
+        }),
+      );
+    } on Object {
+      // Best-effort persistence.
+    }
+  }
+
+  List<MenuItem> _buildModelMenu(String filter, int width) {
+    if (_modelCacheNeedsRefresh) {
+      unawaited(_refreshAllProvidersModelCache());
+    }
+    // Two-step pick when several providers are available: the provider
+    // list first, the chosen provider's models after. A single provider
+    // goes straight to its models (the old flat behavior).
+    final providers = _modelProviderNames();
+    if (providers.length > 1) {
+      return _providerMenuItems(providers, filter);
+    }
+    return _modelTableMenuItems(_crossProviderCandidates(filter), width);
+  }
+
+  /// The `/model` picker rows as a resolved table (issue #278): every
+  /// candidate gets its context window (endpoint report → remote catalog
+  /// → provider spec) and $/Mtok (remote catalog; `—` when the catalog
+  /// ships no number) from resolved sources, then
+  /// [buildModelPickerTable] lays out columns, marker and sorting.
+  List<MenuItem> _modelTableMenuItems(
+    List<(String, String)> entries,
+    int width,
+  ) {
+    if (entries.isEmpty) {
+      // A filter that matched nothing must surface the picker's
+      // no-matches hint, not a perpetual loading row — the placeholder is
+      // only honest while the first cache refresh is still in flight.
+      return _modelCacheNeedsRefresh
+          ? const [MenuItem(key: '', label: 'loading models...')]
+          : const [];
+    }
+    final current = _agent.state.model;
+    final rows = <ModelRowSpec>[
+      for (var i = 0; i < entries.length; i++)
+        ModelRowSpec(
+          provider: entries[i].$1,
+          modelId: entries[i].$2,
+          recency: i,
+          contextWindow: _resolvedContextWindow(entries[i].$1, entries[i].$2),
+          cost: _resolvedPricing(entries[i].$1, entries[i].$2),
+          isCurrent:
+              canonicalProviderName(entries[i].$1) ==
+                  canonicalProviderName(current.provider) &&
+              entries[i].$2 == current.id,
+        ),
+    ];
+    return buildModelPickerTable(rows, width);
+  }
+
+  /// The catalog kind a provider id resolves to (issue #772: the KIND,
+  /// never the name — the remote catalog keys by adapter kind), else a
+  /// saved registry entry's resolved kind, else null.
+  String? _catalogKindForProviderName(String name) {
+    final spec = resolveCliProviderSpec(name);
+    if (spec != null) return spec.kind;
+    final registry = config.customProviders;
+    for (final entry in registry?.entries ?? const <CustomProviderEntry>[]) {
+      if (entry.name == name) {
+        return resolveCliProviderSpec(entry.apiType)?.kind;
+      }
+    }
+    return null;
+  }
+
+  /// The resolved context window for [provider]/[modelId]: the active
+  /// provider's endpoint-reported window first (live values win), then the
+  /// remote catalog, then the provider spec default; null when nothing
+  /// resolves (renders `—`).
+  int? _resolvedContextWindow(String provider, String modelId) {
+    final activeProvider = _agent.state.model.provider;
+    if (provider == activeProvider || provider == _activeCustomName) {
+      final reported = _modelContextWindows[modelId];
+      if (reported != null) return reported;
+    }
+    final kind = _catalogKindForProviderName(provider);
+    final fromCatalog = remoteCatalogEnrichment
+        .cached
+        ?.providers[kind ?? '']
+        ?.contextWindows[modelId];
+    if (fromCatalog != null) return fromCatalog;
+    return catalogProvider(provider)?.contextWindow;
+  }
+
+  /// The resolved $/Mtok pricing for [provider]/[modelId], or null when
+  /// the catalog carries none (renders `—`, never 0.00 — E3).
+  ({double input, double output})? _resolvedPricing(
+    String provider,
+    String modelId,
+  ) {
+    final pricing = remoteCatalogEnrichment.pricingFor(
+      _catalogKindForProviderName(provider),
+      modelId,
+    );
+    return pricing == null
+        ? null
+        : (input: pricing.input, output: pricing.output);
+  }
+
+  /// The distinct provider names behind the cross-provider candidates, in
+  /// menu order: saved entries first, then env-keyed catalog providers,
+  /// the active provider last. One identity per auth domain (#706):
+  /// alias spellings (`chatgpt.com` saved entry vs the `chatgpt` catalog
+  /// provider) fold onto the FIRST name — the saved entry, the richer
+  /// switch target — so the picker never lists twin rows for one domain.
+  List<String> _modelProviderNames() {
+    final seen = <String>{};
+    return [
+      for (final (provider, _) in _crossProviderCandidates(''))
+        if (seen.add(canonicalProviderName(provider))) provider,
+    ];
+  }
+
+  /// The provider-step rows: one per provider, keyed `@<name>` (model rows
+  /// key as `provider|model`, so the prefixes never collide). The filter
+  /// matches the provider name OR any of its model ids — typing a model id
+  /// lands on the one provider that serves it.
+  List<MenuItem> _providerMenuItems(List<String> providers, String filter) {
+    final lower = filter.toLowerCase();
+    final currentProvider = _agent.state.model.provider;
+    final active = _activeCustomName;
+    // One current marker per auth domain (#706): the folded row matches
+    // via the entry name OR the domain — twin spellings no longer mark
+    // two rows current at once.
+    final currentId = canonicalProviderName(currentProvider);
+    return [
+      for (final name in providers)
+        if (_providerMatchesFilter(name, lower))
+          MenuItem(
+            key: '@$name',
+            label: name,
+            description:
+                '${_providerModelCount(name)} model(s)'
+                '${name == active || canonicalProviderName(name) == currentId ? ' · current' : ''}',
+          ),
+    ];
+  }
+
+  /// Whether [name] (or any of its domain-twin model ids) matches the
+  /// lowercase [filter]; an empty filter matches everything.
+  bool _providerMatchesFilter(String name, String lower) {
+    if (lower.isEmpty) return true;
+    if (name.toLowerCase().contains(lower)) return true;
+    final id = canonicalProviderName(name);
+    return _crossProviderCandidates('').any(
+      (e) =>
+          canonicalProviderName(e.$1) == id &&
+          e.$2.toLowerCase().contains(lower),
+    );
+  }
+
+  /// The number of cached models for [name] (>= 1 — candidates always
+  /// carry at least the entry's last-used model). Domain twins count
+  /// together: a folded row carries the union of its identities' models.
+  int _providerModelCount(String name) {
+    final id = canonicalProviderName(name);
+    return _crossProviderCandidates(
+      '',
+    ).where((e) => canonicalProviderName(e.$1) == id).length;
+  }
+
+  /// Step 2 of the two-step model pick: the chosen provider's model list
+  /// in a generic picker (`modelProvider`), each row keyed
+  /// `provider|model` — the selection routes back through
+  /// [_tuiSelectModel]'s cross-provider switch. Domain twins list as one
+  /// (#706): a folded row carries every identity of its auth domain.
+  void _openProviderModelPicker(String name) {
+    final id = canonicalProviderName(name);
+    final models = [
+      for (final entry in _crossProviderCandidates(''))
+        if (canonicalProviderName(entry.$1) == id) entry,
+    ];
+    if (models.isEmpty) return;
+    _tuiController?.openPicker(
+      'modelProvider',
+      'Models — $name',
+      _modelTableMenuItems(models, _tuiController?.termWidth ?? 80),
+    );
+  }
+
+  Future<void> _tuiSelectModel(String key) async {
+    // The provider step of the two-step model pick: `@<name>` rows open
+    // that provider's model list.
+    if (key.startsWith('@')) {
+      _openProviderModelPicker(key.substring(1));
+      return;
+    }
+    final pipe = key.indexOf('|');
+    if (pipe < 0) return _handleModelCommand(key);
+    await _switchCrossProviderModel(key);
+  }
+
+  /// Switches to the provider/model encoded as `provider|model`. A failing
+  /// switch (key store, SSO mint, dead endpoint) must surface as a notice,
+  /// never bubble into the picker command and take the TUI down.
+  ///
+  /// G1 (gh-178): the gate runs FIRST — a cross-provider pick moves the
+  /// whole triple or is refused up front (unknown provider E1, no target
+  /// key E3); the plain same-provider switch below is reached only when the
+  /// pick's provider identity IS the active one (or the flow above already
+  /// moved the triple onto it).
+  Future<void> _switchCrossProviderModel(String key) async {
+    final pipe = key.indexOf('|');
+    if (pipe < 0) return;
+    final providerName = key.substring(0, pipe);
+    final modelId = key.substring(pipe + 1);
+    final refusal = _crossProviderSwitchGate(providerName);
+    if (refusal != null) {
+      io.writeln(refusal.message);
+      return;
+    }
+    try {
+      await _maybeSwitchToSavedEntry(providerName);
+      if (!await _switchToEnvCatalogProvider(providerName, modelId)) {
+        // The pick's provider identity was resolved by the `|` key split
+        // (and the triple already moved onto it, or the pick rides the
+        // active one) — same-provider for the CURRENT triple.
+        await _switchModel(modelId, preResolvedSameProvider: true);
+      }
+    } on Object catch (e) {
+      io.writeln('error: model switch to $providerName/$modelId failed: $e');
+    }
+  }
+
+  /// The G1 up-front gate for a cross-provider pick (gh-178): null when
+  /// the whole-triple switch may proceed, else the refusal to print.
+  ///
+  /// - E1: the entry's provider no longer resolves (removed since the list
+  ///   was built) — no partial triple is applied.
+  /// - E3: legacy wiring bakes the key at switch time; when the TARGET
+  ///   provider's own family resolves nothing, the request would leave
+  ///   credential-less — refused with the target's `/key set` repair, the
+  ///   request never built. Roles mode resolves per chain entry at request
+  ///   time (skip notices name the right slot), so it is exempt.
+  ModelCoherenceRefusal? _crossProviderSwitchGate(String providerName) {
+    // The active identity's own rows are same-provider picks — the gate
+    // judges CROSS-provider targets only (the session-only explicit-token
+    // case resolves no store slot yet and must keep switching).
+    if (sameProviderIdentity(
+      providerName,
+      _agent.state.model.provider,
+      _activeCustomName,
+    )) {
+      return null;
+    }
+    final entry = config.customProviders?.find(providerName);
+    final spec = catalogProvider(providerName);
+    final resolvable = entry != null || spec != null;
+    final rolesMode = config.modelRolesResolver != null;
+    String? keySlot;
+    var keyResolved = true;
+    if (resolvable && !rolesMode) {
+      final targetSpec = entry?.spec ?? spec!;
+      final endpoint = entry?.baseUrl ?? spec!.defaultBaseUrl;
+      keySlot = entry?.keyName ?? CustomProviderRegistry.keyNameFor(endpoint);
+      // The key the switch itself will bind: a saved entry's OWN slot
+      // first (two entries can share one endpoint with separate slots —
+      // the shared-endpoint probe would find the OTHER entry's slot or
+      // none), then the spec's env/shared resolution for slot-less
+      // entries and catalog providers.
+      String? key;
+      if (entry != null) {
+        key = config.secureKeys == null
+            ? null
+            : (config.secureKeys?.available ?? false
+                  ? config.secureKeys?.read(keySlot)
+                  : null);
+      }
+      key ??= _providerKeyFor(targetSpec, endpoint);
+      keyResolved = key != null && key.isNotEmpty;
+    }
+    return crossProviderSwitchRefusal(
+      providerName: providerName,
+      targetResolvable: resolvable,
+      rolesMode: rolesMode,
+      targetKeyResolved: keyResolved,
+      targetKeySlot: keySlot,
+    );
+  }
+
+  /// Lands a cross-provider pick on an env-keyed CATALOG provider (no
+  /// saved registry entry): switches to the provider's catalog endpoint
+  /// (the key resolves env-first inside [_switchProvider]) with the
+  /// picked model id applied by that same switch. Returns false when
+  /// [providerName] is not such a provider or the pick is already served
+  /// (it is the active provider or a saved entry) — the caller then runs
+  /// the plain model switch. No second [_switchModel] after a catalog
+  /// switch: it would print the switch twice and re-pin the roles chain
+  /// on the new provider.
+  Future<bool> _switchToEnvCatalogProvider(
+    String providerName,
+    String modelId,
+  ) async {
+    final spec = catalogProvider(providerName);
+    if (spec == null) return false;
+    if (providerName == _agent.state.model.provider &&
+        _activeCustomName == null) {
+      return false;
+    }
+    if (_activeCustomName == providerName) return false;
+    await _switchProvider(spec, spec.defaultBaseUrl, modelId);
+    return true;
+  }
+
+  /// Lands a cross-provider model pick on its own endpoint: switches to
+  /// [providerName]'s saved entry unless it is already the active one.
+  Future<void> _maybeSwitchToSavedEntry(String providerName) async {
+    final entry = config.customProviders?.find(providerName);
+    if (entry != null && entry.name != _activeCustomName) {
+      await _switchToSavedProvider(entry);
+    }
+  }
+
+  /// Fetches model lists from ALL saved providers in the background and
+  /// populates [_allProvidersModelCache]. Also keeps the legacy
+  /// [_modelCache] (active provider only) in sync for context-window
+  /// detection.
+  Future<void> _refreshAllProvidersModelCache() async {
+    if (_modelCacheFuture != null) return;
+    final completer = Completer<void>();
+    _modelCacheFuture = completer.future;
+    try {
+      // A fresh cycle recomputes every reason (gh-1990) — stale fetch
+      // failures never outlive the refresh that produced them.
+      _providerModelFetchReasons.clear();
+      await _fetchAllSavedProviderModels();
+      // Also fetch the active catalog provider's live /models list (e.g.
+      // OpenRouter) so the model picker is never empty just because the user
+      // hasn't saved the provider as a custom entry.
+      final activeProvider = _agent.state.model.provider;
+      final activeSpec = catalogProvider(activeProvider);
+      if (activeSpec != null && !_modelCacheFresh.contains(activeProvider)) {
+        try {
+          final ids = await _fetchProviderModelIds(
+            activeSpec.name,
+            _agent.state.model.baseUrl,
+            _apiKey,
+            // The named failure rides to `/models` here too (gh-1990
+            // review round 2): an unsaved active Copilot's empty answer
+            // is never a silent seed fallback.
+            onCopilotReport: (report) =>
+                _noteProviderFetchReason(activeProvider, report),
+          );
+          _allProvidersModelCache[activeProvider] = ids.isEmpty
+              ? (knownModelPresets[activeProvider] ?? [_agent.state.model.id])
+              : ids;
+        } on Object {
+          _allProvidersModelCache[activeProvider] =
+              knownModelPresets[activeProvider] ?? [_agent.state.model.id];
+        }
+      }
+      // Always include the active provider's fallback list.
+      if (!_allProvidersModelCache.containsKey(activeProvider)) {
+        _allProvidersModelCache[activeProvider] =
+            knownModelPresets[activeProvider] ?? [_agent.state.model.id];
+      }
+      await _refreshEnvKeyedProviders(activeProvider);
+      _allProvidersCacheRefreshed = true;
+      _modelCacheFresh.addAll(_allProvidersModelCache.keys);
+      await _persistModelCache();
+      _tuiController?.sendModelsRefresh();
+    } finally {
+      _modelCacheFuture = null;
+      completer.complete();
+    }
+  }
+
+  /// Fetches model lists for the env-keyed catalog providers (a key in the
+  /// environment but no saved entry — the FA_PROVIDER_* / out-of-the-box
+  /// path). Split out of [_refreshAllProvidersModelCache] to keep its
+  /// cyclomatic complexity under the CRAP ratchet. The gh-1990 review
+  /// round 2 wiring adds the fetch-note report (the Copilot empty-answer
+  /// reason) — the cached ids themselves are unchanged.
+  Future<void> _refreshEnvKeyedProviders(String activeProvider) async {
+    // Env-keyed catalog providers: a provider whose key sits in the
+    // environment (ZAI_API_KEY, MINIMAX_API_KEY, ...) is usable out of
+    // the box even without a saved registry entry — fetch its live
+    // /models list so the picker shows the endpoint's realtime answer,
+    // seeding from the remote catalog + the catalog default when the
+    // endpoint won't talk to us. A provider with neither a live answer
+    // nor seeds stays hidden (never listed with zero models).
+    for (final spec in enabledProviders()) {
+      if (spec.name == activeProvider || _modelCacheFresh.contains(spec.name)) {
+        continue;
+      }
+      final envKey = _envKeyEntry(spec);
+      if (envKey == null) continue;
+      try {
+        final ids = await _fetchProviderModelIds(
+          spec.name,
+          spec.defaultBaseUrl,
+          envKey.$2,
+          // Same surface as the saved-entry path (gh-1990 review round
+          // 2): an env-keyed Copilot's empty answer names its branch.
+          onCopilotReport: (report) =>
+              _noteProviderFetchReason(spec.name, report),
+        );
+        if (ids.isNotEmpty) {
+          _allProvidersModelCache[spec.name] = ids;
+          continue;
+        }
+      } on Object {
+        // Dead endpoint — the seeds below keep the provider listed.
+      }
+      final seeds = _envCatalogSeedModels(spec);
+      if (seeds.isNotEmpty) _allProvidersModelCache[spec.name] = seeds;
+    }
+  }
+
+  /// Fetches every saved provider's model list in parallel (no-op without a
+  /// registry or entries).
+  Future<void> _fetchAllSavedProviderModels() async {
+    final registry = config.customProviders;
+    if (registry == null || registry.entries.isEmpty) return;
+    await Future.wait(registry.entries.map(_fetchProviderModels));
+  }
+
+  /// Fetches models for one saved provider entry and caches them.
+  Future<void> _fetchProviderModels(CustomProviderEntry entry) async {
+    try {
+      final cookieOrKey = _providerEntryToken(entry);
+      final ids = await _fetchIdsForProvider(entry, cookieOrKey);
+      _allProvidersModelCache[entry.name] = ids.isEmpty ? [entry.modelId] : ids;
+    } on Object {
+      // Dead endpoint — use the entry's last-known model.
+      _allProvidersModelCache[entry.name] = [entry.modelId];
+    }
+  }
+
+  /// Resolves the API token for a saved provider entry.
+  String _providerEntryToken(CustomProviderEntry entry) {
+    final keyName = entry.keyName;
+    final token = keyName != null ? config.secureKeys?.read(keyName) : null;
+    return token ?? '';
+  }
+
+  /// Fetches model ids for a provider entry, dispatching on endpoint kind.
+  Future<List<String>> _fetchIdsForProvider(
+    CustomProviderEntry entry,
+    String cookieOrKey,
+  ) async {
+    if (entry.baseUrl.contains('/code-assistant-api/')) {
+      // The saved entry's project scopes the list (issue #1941).
+      return fetchCodeMieModels(
+        entry.baseUrl,
+        cookieOrKey,
+        project: entry.project,
+      );
+    }
+    if (entry.spec.kind == 'dial') {
+      return fetchDialModels(entry.baseUrl, cookieOrKey);
+    }
+    if (entry.spec.kind == copilotDispatchHint) {
+      final (ids, report) = await _fetchCopilotModelsAndLimits(
+        entry.baseUrl,
+        apiKey: cookieOrKey,
+      );
+      // The named failure rides to `/models` (gh-1990) — an empty
+      // provider answer is never a silent hole in the list.
+      _noteProviderFetchReason(entry.name, report);
+      return ids;
+    }
+    if (entry.spec.kind == 'chatgpt-codex') {
+      // The Codex backend's /models — the list call codex-rs'
+      // models-manager makes (GET {base}/models under the account's
+      // OAuth blob). The bundled synced catalog answers when the
+      // endpoint can't, so the picker lists the full codex catalog
+      // instead of collapsing to the entry's one saved model (#1706).
+      final (ids, _, _) = await fetchModelsForEndpoint(
+        entry.baseUrl,
+        apiKey: cookieOrKey,
+        provider: chatgptCodexDispatchHint,
+      );
+      return ids;
+    }
+    return _fetchOpenAiShapeIds(entry, cookieOrKey);
+  }
+
+  /// The openai-completions branch of [_fetchIdsForProvider]. The
+  /// dispatch checks the entry's `spec.api` (not `spec.kind`) because
+  /// providers whose KIND is its own value (e.g. `minimax` — a
+  /// first-class provider so `--provider minimax` and the parity
+  /// guards treat it as such) still speak the openai-completions API
+  /// and DO answer `/v1/models`. Other api dialects (anthropic,
+  /// google) have no /models endpoint here and answer an empty list;
+  /// the chatgpt-codex kind is dispatched above.
+  Future<List<String>> _fetchOpenAiShapeIds(
+    CustomProviderEntry entry,
+    String cookieOrKey,
+  ) async {
+    if (entry.spec.api != _factoryProviderKind) return const [];
+    final override = config.modelsFetcher;
+    if (override != null) return override(entry.baseUrl, apiKey: cookieOrKey);
+    return _fetchOpenAiCompatibleModels(
+      entry.baseUrl,
+      apiKey: cookieOrKey,
+      client: modelFetchClient(entry.name),
+    );
+  }
+
+  /// Returns cross-provider model candidates as `(providerName, modelId)`
+  /// pairs, optionally filtered by a lowercase substring match on either
+  /// the provider name or the model id. The active provider is always
+  /// included, even when the registry has other saved providers.
+  List<(String, String)> _crossProviderCandidates([String filter = '']) {
+    final registryEntries = _collectRegistryCandidates();
+    final envCatalogEntries = _envKeyedCatalogCandidates();
+    final activeEntries = _activeProviderFallback();
+    // Domain-twin candidates fold (#706): `chatgpt.com|x` and `chatgpt|x`
+    // are one identity's model — the first (saved-entry) spelling wins,
+    // the active-catalog twin never doubles the row (and its 'current'
+    // marker lands on the folded row via the canonical compare).
+    final seen = <String>{};
+    final entries = <(String, String)>[
+      for (final e in [
+        ...registryEntries,
+        ...envCatalogEntries,
+        ...activeEntries,
+      ])
+        if (seen.add('${canonicalProviderName(e.$1)}|${e.$2}')) e,
+    ];
+    return _filterCandidates(entries, filter);
+  }
+
+  /// The catalog providers usable right now through an environment key
+  /// but with no saved registry entry that is not the active provider —
+  /// both are covered by the other candidate sources. This is what makes
+  /// an out-of-the-box provider (key set, nothing saved) visible in the
+  /// `/model` picker: the realtime `/models` cache when the fetch
+  /// answered, the remote-catalog seeds otherwise.
+  List<(String, String)> _envKeyedCatalogCandidates() {
+    final activeProvider = _agent.state.model.provider;
+    final savedNames = {
+      for (final entry
+          in config.customProviders?.entries ?? const <CustomProviderEntry>[])
+        entry.name,
+    };
+    return [
+      for (final spec in enabledProviders())
+        if (spec.name != activeProvider &&
+            !savedNames.contains(spec.name) &&
+            _envKeyEntry(spec) != null)
+          for (final modelId
+              in _allProvidersModelCache[spec.name] ??
+                  _envCatalogSeedModels(spec))
+            (spec.name, modelId),
+    ];
+  }
+
+  /// The offline seed ids for a catalog provider: the remote catalog's
+  /// chat fallback (deduped). Empty when the catalog ships nothing — such
+  /// a provider is never listed with zero models. No local default id is
+  /// merged: providers carry no default model by design.
+  List<String> _envCatalogSeedModels(ProviderSpec spec) {
+    final merged = <String>[
+      // The remote catalog keys by adapter KIND (issue #772).
+      ...remoteCatalogEnrichment.chatFallbackFor(spec.kind),
+    ];
+    final seen = <String>{};
+    return [
+      for (final id in merged)
+        if (id.isNotEmpty && seen.add(id)) id,
+    ];
+  }
+
+  /// Collects `(provider, model)` pairs from all saved custom providers.
+  /// When the live fetch for a saved entry is empty (no key, dead
+  /// endpoint) the picker still has to show *something* — the catalog
+  /// seed list is the data-driven fallback. The saved entry's
+  /// `modelId` is the last-resort seed when both the live fetch and
+  /// the catalog are empty for that provider.
+  List<(String, String)> _collectRegistryCandidates() {
+    final registry = config.customProviders;
+    if (registry == null) return const [];
+    return [
+      for (final entry in registry.entries)
+        for (final modelId in _registryEntryModels(entry))
+          (entry.name, modelId),
+    ];
+  }
+
+  /// The model ids used for one saved provider entry. Three sources,
+  /// deduped in priority order:
+  /// 1. Live-fetched ids from `_allProvidersModelCache` (the endpoint's
+  ///    `/v1/models` answer when it was willing to talk to us — even
+  ///    if the answer came back as a single-id last-resort seed).
+  /// 2. The bundled remote-catalog seed list for the entry's
+  ///    providerKind — fills gaps the live fetch couldn't answer
+  ///    (401, network down, providers whose /v1/models isn't paginated
+  ///    like `minimax` without a key).
+  /// 3. The entry's last-known `modelId` — always present as a
+  ///    last-resort seed so the picker never collapses to nothing.
+  List<String> _registryEntryModels(dynamic entry) {
+    final cached = _allProvidersModelCache[entry.name] ?? const <String>[];
+    final providerKind = _providerKindForEntry(entry);
+    final seed = remoteCatalogEnrichment.chatFallbackFor(providerKind);
+    final merged = <String>[
+      for (final id in cached)
+        if (id.isNotEmpty) id,
+      for (final id in seed)
+        if (id.isNotEmpty) id,
+      if (entry.modelId.isNotEmpty) entry.modelId,
+    ];
+    final seen = <String>{};
+    final unique = <String>[
+      for (final id in merged)
+        if (seen.add(id)) id,
+    ];
+    return unique;
+  }
+
+  /// The adapter KIND of a saved entry (issue #772): `apiType` (the
+  /// registry field the `provider` column maps to) resolves through the
+  /// catalog seam — name- or kind-shaped — to the kind the remote
+  /// catalog keys by.
+  String? _providerKindForEntry(dynamic entry) {
+    try {
+      final apiType = entry.apiType;
+      return apiType is String ? resolveCliProviderSpec(apiType)?.kind : null;
+    } on Object {
+      return null;
+    }
+  }
+
+  /// Fallback candidates from the active provider's known models. The
+  /// priority chain is:
+  /// 1. The cross-provider cache (preloaded / fetched models).
+  /// 2. The legacy active-provider cache (refreshed by `/v1/models`).
+  /// 3. The bundled `knownModelPresets` list (hardcoded, kept for providers
+  ///    that don't ship a remote catalog entry yet).
+  /// 4. The remote catalog's `contextWindows` keys — data-driven from
+  ///    `fa1.dev/models-catalog.json` (NOT hardcoded).
+  /// 5. The active model's id — the saved entry's last-used model.
+  List<(String, String)> _activeProviderFallback() {
+    final activeProvider = _agent.state.model.provider;
+    final activeName = _activeCustomName ?? activeProvider;
+    final List<String> known;
+    if (_allProvidersModelCache[activeName] != null) {
+      known = _allProvidersModelCache[activeName]!;
+    } else if (_modelCache.isNotEmpty) {
+      known = _modelCache;
+    } else {
+      final hardcoded = knownModelPresets[activeProvider];
+      final catalogSeeds = remoteCatalogEnrichment.chatFallbackFor(
+        resolveCliProviderSpec(activeProvider)?.kind,
+      );
+      if (hardcoded != null) {
+        known = hardcoded;
+      } else if (catalogSeeds.isNotEmpty) {
+        known = catalogSeeds;
+      } else {
+        known = [_agent.state.model.id];
+      }
+    }
+    return [for (final modelId in known) (activeProvider, modelId)];
+  }
+
+  /// Filters candidates by a lowercase substring, or returns all if empty.
+  List<(String, String)> _filterCandidates(
+    List<(String, String)> entries,
+    String filter,
+  ) {
+    if (filter.isEmpty) return entries;
+    final lower = filter.toLowerCase();
+    return entries
+        .where(
+          (e) =>
+              e.$1.toLowerCase().contains(lower) ||
+              e.$2.toLowerCase().contains(lower),
+        )
+        .toList();
+  }
+
+  /// refreshes the TUI picker if it is currently open. Failures are swallowed
+  /// so the UI keeps working with the hardcoded fallback list. When the
+  /// payload reports the active model's real context window, the model is
+  /// corrected (roles mode keeps the chain's configured window instead).
+  Future<void> _refreshModelCache() async {
+    if (_modelCacheFuture != null) return _modelCacheFuture!;
+    final completer = Completer<void>();
+    _modelCacheFuture = completer.future;
+    try {
+      final model = _agent.state.model;
+      // A disk-backed entry younger than 24h is trusted: the persisted ids
+      // already feed the picker, and the live /models round-trip is skipped
+      // (stale-while-revalidate keeps boot HTTP at zero for fresh caches).
+      if (_modelCacheFresh.contains(model.provider)) return;
+      if (model.api == _factoryProviderKind) {
+        final ids = await _fetchActiveProviderModels(model);
+        if (ids.isNotEmpty) {
+          _modelCache = ids;
+          _tuiController?.sendModelsRefresh();
+          // Endpoint-reported limits are authoritative EXCEPT where the
+          // roles chain pins explicit values: roles mode used to skip the
+          // detection entirely, so a chain entry riding the catalog
+          // default (e.g. the copilot 1M default for a 256k kimi model)
+          // never learned the real window and the compaction thresholds
+          // silently ran against the wrong number.
+          final pinned = _rolesPinnedLimits(model);
+          if (!pinned.window) {
+            if (_modelContextWindows.containsKey(model.id)) {
+              _applyDetectedContextWindow(model);
+            } else {
+              _noteUndetectedContextWindow(model);
+            }
+          }
+          if (!pinned.cap) _applyDetectedMaxTokens(model);
+        }
+      }
+    } on Object {
+      // Swallowed: the cache keeps the fallback list; the UI still works.
+      // (Tests inject [AgentCliConfig.modelsFetcher] for deterministic lists;
+      // a dead endpoint returning HTML instead of JSON is the normal case.)
+    } finally {
+      _modelCacheFuture = null;
+      completer.complete();
+    }
+  }
+
+  /// Fetches the active provider's model ids through the shared dispatch
+  /// ([_fetchProviderModelIds]): CodeMie `/llm_models`, DIAL deployments,
+  /// everything else OpenAI `/models`.
+  Future<List<String>> _fetchActiveProviderModels(Model model) {
+    // The SAME identity the stream bind used: for a custom entry the
+    // binding keys the ENTRY name, while `model.provider` carries the
+    // catalog spec name (buildCatalogModel(spec.name, …)) — keying the
+    // fetch on model.provider alone let a bound custom entry's /models
+    // refresh ride direct (PR #1927 round-2 review).
+    return _fetchProviderModelIds(
+      _activeCustomName ?? model.provider,
+      model.baseUrl,
+      _apiKey,
+    );
+  }
+
+  /// Whether the roles chain pins explicit limits for [model]: a chain
+  /// entry with a `contextWindow`/`maxTokens` in the `roles:` config means
+  /// the user set them deliberately and the endpoint-reported values must
+  /// not override them. Entries riding the catalog defaults (the common
+  /// case) report both flags false, so detection applies.
+  ({bool window, bool cap}) _rolesPinnedLimits(Model model) {
+    final resolver = config.modelRolesResolver;
+    if (resolver == null) return (window: false, cap: false);
+    final refs = resolver.config.chainFor(
+      defaultModelRole,
+      cwd: resolver.cwd,
+      homeDir: resolver.homeDir,
+    );
+    if (refs == null) return (window: false, cap: false);
+    for (final ref in refs) {
+      if (ref.modelId != model.id) continue;
+      return (window: ref.contextWindow != null, cap: ref.maxTokens != null);
+    }
+    return (window: false, cap: false);
+  }
+
+  /// Applies the endpoint-reported context window for [model] (called
+  /// from [_refreshModelCache]; [_rolesPinnedLimits] keeps user-pinned
+  /// `roles:` limits winning). A DIFFERING report rebuilds the model and
+  /// notes the swap; a CONFIRMING report (the well-catalogued common
+  /// case) leaves the model alone but still publishes the verification
+  /// into the shared registry — gh-1742 review round 1, comment 4: the
+  /// provider just verified the window, so the AC6 badge must not keep
+  /// marking it unverified.
+  void _applyDetectedContextWindow(Model model) {
+    final detected = _modelContextWindows[model.id];
+    if (detected == null) return;
+    if (detected != model.contextWindow) {
+      // Fire-and-forget: the boot's detection is not a settings flow —
+      // the /model-edit submit path is the one that contains callback
+      // throws into the error panel (gh-1787).
+      unawaited(
+        _replaceModelLimits(
+          contextWindow: detected,
+          // gh-1742 invariant 2: the detection publishes into the shared
+          // registry so children spawned afterwards ride the SERVED
+          // window, not the advertised one.
+          windowSource: ContextWindowSource.endpointReport,
+        ),
+      );
+      io.writeln(_style.dim('model context window: $detected (from endpoint)'));
+    } else {
+      contextWindowRegistry.publish(
+        model: model,
+        window: detected,
+        source: ContextWindowSource.endpointReport,
+      );
+    }
+  }
+
+  /// The explicit fallback when the endpoint answered `/models` but
+  /// reported NO context window for the active model: the carried value
+  /// (catalog default, or whatever a previous model left behind) is
+  /// UNVERIFIED — say so once per model id instead of silently letting
+  /// the ctx meter, the compaction threshold, and the over-window guard
+  /// all divide by a number nobody confirmed.
+  void _noteUndetectedContextWindow(Model model) {
+    if (!_undetectedWindowNoteIds.add(model.id)) return;
+    io.writeln(
+      _style.dim(
+        'model context window: ${model.contextWindow} (not reported by the '
+        'endpoint; carried default — /model-edit contextWindow <n> to '
+        'override)',
+      ),
+    );
+  }
+
+  /// Applies the endpoint-reported max-tokens cap for [model] when it
+  /// differs from the carried one (see [_applyDetectedContextWindow]).
+  void _applyDetectedMaxTokens(Model model) {
+    final detectedCap = _modelMaxTokens[model.id];
+    if (detectedCap != null && detectedCap != model.maxTokens) {
+      // Fire-and-forget (gh-1787): detection, not a settings flow.
+      unawaited(_replaceModelLimits(maxTokens: detectedCap));
+      io.writeln(_style.dim('model max tokens: $detectedCap (from endpoint)'));
+    }
+  }
+
+  /// [fetchDialModelsInfo] wrapper for [_refreshModelCache]: records the
+  /// `features.cache` deployment set (drives [DialOptions.cacheMarkersSupported])
+  /// and the endpoint-reported limits (context window / max output from
+  /// `limits`, the MAXIMUM values — never the `defaults`), and answers the
+  /// plain id list. [apiKey] overrides the session key (the settings flows
+  /// resolve the TARGET provider's key, not the active connection's).
+  Future<List<String>> _fetchDialModelsAndFeatures(
+    String baseUrl, {
+    String? apiKey,
+  }) async {
+    final (ids, cacheSupported, windows, maxTokens) = await fetchDialModelsInfo(
+      baseUrl,
+      apiKey ?? _apiKey,
+      client: modelFetchClient('dial'),
+    );
+    if (cacheSupported.isNotEmpty) _dialCacheModels = cacheSupported;
+    if (windows.isNotEmpty) _modelContextWindows = windows;
+    if (maxTokens.isNotEmpty) _modelMaxTokens = maxTokens;
+    return ids;
+  }
+
+  /// [fetchModelsForEndpoint] wrapper routing Copilot to its dialect (the
+  /// GitHub key is exchanged for the short-lived Copilot token first — a
+  /// raw Bearer GET would 401): records the endpoint-reported limits
+  /// (context window / max output from `capabilities.limits`) and answers
+  /// [fetchModelsForEndpointReport] wrapper routing Copilot to its dialect
+  /// (the GitHub key is exchanged for the short-lived Copilot token first —
+  /// a raw Bearer GET would 401): records the endpoint-reported limits
+  /// (context window / max output from `capabilities.limits`) and answers
+  /// the plain id list PLUS the report — the empty-answer reason (gh-1990)
+  /// rides to the callers that surface it (`/models`, the connect flow).
+  Future<(List<String>, ModelsFetchReport)> _fetchCopilotModelsAndLimits(
+    String baseUrl, {
+    String? apiKey,
+  }) async {
+    final report = await fetchModelsForEndpointReport(
+      baseUrl,
+      apiKey: apiKey ?? _apiKey,
+      provider: copilotDispatchHint,
+      client: modelFetchClient(copilotDispatchHint),
+    );
+    final (ids, windows, maxTokens) = report.info;
+    if (windows.isNotEmpty) _modelContextWindows = windows;
+    if (maxTokens.isNotEmpty) _modelMaxTokens = maxTokens;
+    return (ids, report);
+  }
+
+  /// Records [report]'s user-facing reason for [name] (gh-1990): the
+  /// empty-answer diagnostic (with its hint), or the partial-filter note.
+  /// A report with neither clears the entry's stored reason.
+  void _noteProviderFetchReason(String name, ModelsFetchReport report) {
+    // gh-1990 review (DRY): the canonical formatting rule — no
+    // hand-rolled `message — hint` join.
+    final reason = report.userFacingReason;
+    if (reason == null || reason.isEmpty) {
+      _providerModelFetchReasons.remove(name);
+    } else {
+      _providerModelFetchReasons[name] = reason;
+    }
+  }
+
+  /// The `/models` fetch-notes section (gh-1990): one line per provider
+  /// whose live answer named something — the failed branch (exchange /
+  /// HTTP / filter with the remediation hint) or the partial-filter
+  /// summary — so a provider's model list is never silent about why it
+  /// is (or isn't) what the endpoint serves.
+  void _printProviderFetchReasons() {
+    if (_providerModelFetchReasons.isEmpty) return;
+    io.writeln('fetch notes:');
+    final names = _providerModelFetchReasons.keys.toList()..sort();
+    for (final name in names) {
+      io.writeln('  $name: ${_providerModelFetchReasons[name]}');
+    }
+  }
+
+  Future<List<String>> _fetchOpenAiCompatibleModels(
+    String baseUrl, {
+    required String apiKey,
+    http.Client? client,
+  }) async {
+    final normalized = baseUrl.replaceAll(RegExp(r'/+$'), '');
+    final uri = Uri.parse('$normalized/models');
+    final headers = <String, String>{'Accept': 'application/json'};
+    if (apiKey.isNotEmpty) headers['Authorization'] = 'Bearer $apiKey';
+    try {
+      final request = http.Request('GET', uri)..headers.addAll(headers);
+      final response =
+          await (client == null
+                  ? http.get(uri, headers: headers)
+                  : client.send(request).then(http.Response.fromStream))
+              .timeout(const Duration(seconds: 15));
+      if (response.statusCode != 200) return const [];
+      final (ids, windows, maxTokens) = parseModelsResponse(response.body);
+      _modelContextWindows = windows;
+      _modelMaxTokens = maxTokens;
+      return ids;
+    } on Object {
+      return const [];
+    }
+  }
+
+  /// Lists the known models for the active provider, optionally filtered by
+  /// [filter]. The output is numbered so `/model N` can pick one. For
+  /// OpenAI-compatible endpoints the list is fetched live from `/v1/models`
+  /// and cached.
+  Future<void> _listModels(String filter) async {
+    if (_modelCacheNeedsRefresh) {
+      await _refreshAllProvidersModelCache();
+    }
+    final entries = _crossProviderCandidates(filter);
+    if (entries.isEmpty) return io.writeln('no models available');
+    io.writeln('models (provider/model):');
+    _printNumberedModels(entries);
+    _printProviderFetchReasons();
+    io.writeln('use /model <n> or /model <provider>/<id> to switch');
+  }
+
+  /// The numbered `(provider, model)` rows of the `/models` listing plus the
+  /// `_lastModelList` snapshot powering `/model <n>` — pairs, so each
+  /// numbered pick keeps its provider identity (gh-178 G1).
+  void _printNumberedModels(List<(String, String)> entries) {
+    for (var i = 0; i < entries.length; i++) {
+      io.writeln('  ${i + 1}) ${entries[i].$1}/${entries[i].$2}');
+    }
+    _lastModelList = List.of(entries);
+  }
+
+  /// Returns known model ids for the ACTIVE provider only (used by
+  /// `/model <id>` line-mode switches and the number picker). The TUI
+  /// picker uses [_crossProviderCandidates] instead for cross-provider.
+  List<String> _modelCandidates([String filter = '']) {
+    final provider = _agent.state.model.provider;
+    final activeName = _activeCustomName ?? provider;
+    final all =
+        _allProvidersModelCache[activeName] ??
+        _connectionModelFallbacks(provider);
+    if (filter.isEmpty) return all.toList();
+    final lower = filter.toLowerCase();
+    return all.where((id) => id.toLowerCase().contains(lower)).toList();
+  }
+
+  /// The active connection's model list when the cross-provider cache
+  /// misses: the session's fetched models, else the provider's presets
+  /// (else the live model id).
+  List<String> _connectionModelFallbacks(String provider) =>
+      _modelCache.isNotEmpty
+      ? _modelCache
+      : (knownModelPresets[provider] ?? [_agent.state.model.id]);
+
+  /// `/models [filter]` | `config` | `set <slot> <model> [baseUrl]` |
+  /// `remove <slot>` — a bare or filtered invocation lists the endpoint's
+  /// models; the `config`/`set`/`remove` subcommands show and manage the
+  /// media slot overrides of the `models:` config section (persisted by the
+  /// host).
+  Future<void> _handleModelsCommand(String rest) async {
+    final trimmed = rest.trim();
+    final split = trimmed.indexOf(RegExp(r'\s'));
+    final head = split < 0 ? trimmed : trimmed.substring(0, split);
+    final tail = split < 0 ? '' : trimmed.substring(split + 1).trim();
+    switch (head) {
+      case 'config':
+        _printModelsConfig();
+      case 'set':
+        _setModelsSlot(tail);
+      case 'remove':
+        _removeModelsSlot(tail);
+      default:
+        await _listModels(trimmed);
+    }
+  }
+
+  /// `/models config`: the effective models configuration — the main
+  /// connection, every media slot (override or main-connection fallback),
+  /// and the custom model definitions `/model <name>` can switch to.
+  void _printModelsConfig() {
+    final models = config.modelsConfig;
+    final current = _agent.state.model;
+    io.writeln(
+      'main connection: ${current.id} '
+      '(${current.provider} @ ${current.baseUrl})',
+    );
+    io.writeln('media slots (no override = main connection):');
+    for (final slot in mediaModelSlotIds) {
+      final override = models?.slots[slot];
+      if (override == null) {
+        io.writeln('  $slot: main connection');
+      } else {
+        final key = override.apiKeyName == null
+            ? ''
+            : ' · key: ${override.apiKeyName}';
+        io.writeln(
+          '  $slot: ${override.modelId} @ ${override.baseUrl} '
+          '(${override.providerKind})$key',
+        );
+      }
+    }
+    final custom = models?.custom ?? const <String, CustomModelDefinition>{};
+    if (custom.isEmpty) {
+      io.writeln(
+        'custom models: none (define under models.custom in '
+        '~/.fah/config.yaml)',
+      );
+    } else {
+      io.writeln('custom models (switch with /model <name>):');
+      for (final entry in custom.entries) {
+        final def = entry.value;
+        io.writeln(
+          '  ${entry.key}: ${def.model} (${def.provider} @ ${def.baseUrl})',
+        );
+      }
+    }
+    io.writeln(
+      _style.dim('persisted in the models: section of ~/.fah/config.yaml'),
+    );
+  }
+
+  /// `/models set <slot> <model> [baseUrl]`: pins one media slot to a model.
+  /// The base URL defaults to the main connection's endpoint; the provider
+  /// kind is always `openai-completions` (the media tools' wire format).
+  void _setModelsSlot(String args) {
+    final parts = args
+        .split(RegExp(r'\s+'))
+        .where((part) => part.isNotEmpty)
+        .toList();
+    if (parts.length < 2 || parts.length > 3) {
+      io.writeln('usage: /models set <slot> <model> [baseUrl]');
+      return;
+    }
+    final slot = parts[0];
+    if (!mediaModelSlotIds.contains(slot)) {
+      io.writeln(
+        'unknown slot: $slot (slots: ${mediaModelSlotIds.join(', ')})',
+      );
+      return;
+    }
+    final models = config.modelsConfig;
+    if (models == null) {
+      io.writeln('models config is unavailable on this host');
+      return;
+    }
+    final baseUrl = parts.length == 3 ? parts[2] : _agent.state.model.baseUrl;
+    models.setSlotOverride(
+      slot,
+      MediaSlotModelConfig(
+        providerKind: _factoryProviderKind,
+        baseUrl: baseUrl,
+        modelId: parts[1],
+      ),
+    );
+    io.writeln('slot $slot → ${parts[1]} @ $baseUrl (openai-completions)');
+    config.onModelsConfigChanged?.call();
+    // gh-1984 (review thread 5): the availability pass follows the live
+    // slot — a mid-session `/models set vision|transcription` must not
+    // leave /tools (or the tool registrations) contradicting the read
+    // auto-route until some unrelated rebuild happens to run.
+    unawaited(AgentCliTools(this).rebuildToolAvailability());
+  }
+
+  /// `/models remove <slot>`: drops a media slot override, returning the
+  /// slot to the main-connection fallback.
+  void _removeModelsSlot(String slot) {
+    if (slot.isEmpty) {
+      io.writeln('usage: /models remove <slot>');
+      return;
+    }
+    if (!mediaModelSlotIds.contains(slot)) {
+      io.writeln(
+        'unknown slot: $slot (slots: ${mediaModelSlotIds.join(', ')})',
+      );
+      return;
+    }
+    final models = config.modelsConfig;
+    if (models == null) {
+      io.writeln('models config is unavailable on this host');
+      return;
+    }
+    if (!models.removeSlotOverride(slot)) {
+      io.writeln('no override for slot $slot');
+      return;
+    }
+    io.writeln('slot $slot → main connection');
+    config.onModelsConfigChanged?.call();
+    // Same live-slot rule as `/models set` (gh-1984 review thread 5).
+    unawaited(AgentCliTools(this).rebuildToolAvailability());
+  }
+
+  Future<void> _handleModelCommand(String rest) async {
+    final trimmed = rest.trim();
+    if (trimmed == '?') {
+      await _listModels('');
+      return;
+    }
+    if (trimmed.isEmpty) {
+      // Bare `/model` in TUI mode opens the interactive picker; in line mode
+      // it prints the active model and the roles overview.
+      final controller = _tuiController;
+      if (controller != null) {
+        controller.openModelMenu();
+        return;
+      }
+      await _switchModel('');
+      return;
+    }
+    if (await _switchModelByNumber(trimmed)) return;
+    // A custom model definition from the models: config section resolves
+    // before plain model ids (its provider/endpoint/token limits come from
+    // the definition, not the current connection).
+    final custom = config.modelsConfig?.custom[trimmed];
+    if (custom != null) {
+      await _switchToCustomModel(trimmed, custom);
+      return;
+    }
+    // G1 switch gate (gh-178): resolve a `provider/model` form BEFORE the
+    // plain switch. A cross-provider prefix moves the WHOLE triple through
+    // the provider-switch flow; the same-provider reuse path below is for
+    // current-triple model ids only.
+    switch (parseTypedModelTarget(
+      trimmed,
+      activeProvider: _agent.state.model.provider,
+      activeCustomName: _activeCustomName,
+      activeModelIds: _modelCandidates('').toSet(),
+      isKnownProvider: _isKnownModelProvider,
+    )) {
+      case SameModelSwitch(:final modelId):
+        // The router resolved this id against the REAL resolver — the
+        // backstop's cache-evidence re-parse is skipped (it judges only
+        // unresolved shapes).
+        await _switchModel(modelId, preResolvedSameProvider: true);
+      case CrossProviderSwitch(:final provider, :final modelId):
+        await _switchCrossProviderModel('$provider|$modelId');
+      case RefusedSwitch(:final refusal):
+        io.writeln(refusal.message);
+    }
+  }
+
+  /// The `/model N` branch of [_handleModelCommand]: resolves a 1-based
+  /// number against the last listed models. Returns true when [trimmed] was
+  /// a number (handled — valid pick or invalid-selection message).
+  Future<bool> _switchModelByNumber(String trimmed) async {
+    final number = int.tryParse(trimmed);
+    if (number == null) return false;
+    await _switchModelOrReport(
+      number,
+      _lastModelList ?? _numberedListFallback(),
+    );
+    return true;
+  }
+
+  /// The numbered-list fallback when no `/models` listing ran yet: the
+  /// ACTIVE identity's own ids, each tagged with that identity (gh-178 G1
+  /// — a number is a `(provider, model)` row, never a bare id riding a
+  /// possibly-foreign triple).
+  List<(String, String)> _numberedListFallback() {
+    final identity = _activeModelIdentity;
+    return [for (final id in _modelCandidates('')) (identity, id)];
+  }
+
+  /// Switches to list entry [number] (1-based) or reports the range error.
+  Future<void> _switchModelOrReport(
+    int number,
+    List<(String, String)> entries,
+  ) async {
+    if (!_validModelNumber(number, entries.length)) {
+      io.writeln('invalid selection: $number (1-${entries.length})');
+      return;
+    }
+    await _applyModelEntryPick(entries[number - 1]);
+  }
+
+  /// G1 (gh-178): ONE entry point for every `(providerIdentity, modelId)`
+  /// pick — the numbered listing, the typed `provider/model` form, and the
+  /// TUI table rows. The active identity's entries take the plain
+  /// same-provider switch; anything else moves the WHOLE triple through
+  /// the cross-provider flow (or is refused there), never the same-provider
+  /// reuse path.
+  Future<void> _applyModelEntryPick((String, String) entry) async {
+    if (sameProviderIdentity(
+      entry.$1,
+      _agent.state.model.provider,
+      _activeCustomName,
+    )) {
+      // The identity check already judged this pick same-provider with the
+      // routing-layer predicate — skip the backstop's narrower re-parse.
+      await _switchModel(entry.$2, preResolvedSameProvider: true);
+      return;
+    }
+    await _switchCrossProviderModel('${entry.$1}|${entry.$2}');
+  }
+
+  /// The provider identity the active model belongs to: the active saved
+  /// entry's name, else the model's provider name.
+  String get _activeModelIdentity =>
+      _activeCustomName ?? _agent.state.model.provider;
+
+  /// Whether [name] resolves to a switchable provider identity: a saved
+  /// registry entry or a catalog record (E1's "known when listed" test).
+  bool _isKnownModelProvider(String name) =>
+      config.customProviders?.find(name) != null ||
+      catalogProvider(name) != null;
+
+  /// Whether [number] is a valid 1-based index into a list of [length].
+  bool _validModelNumber(int number, int length) =>
+      number >= 1 && number <= length;
+
+  /// `/model <name>` where [name] is a custom model definition from the
+  /// `models:` config section: switches provider, endpoint, and model in one
+  /// step. Roles mode pins the default chain; legacy mode rebuilds the
+  /// stream function like `/provider` (key resolves from the catalog env
+  /// names / secure store — never from the config file).
+  Future<void> _switchToCustomModel(
+    String name,
+    CustomModelDefinition def,
+  ) async {
+    // Resolve exactly as fromYaml validated (both identifiers, filter) —
+    // and never via a reachable `!` (issue #772 review).
+    final spec = resolveCliProviderSpec(def.provider, honorBuildFilter: true);
+    if (spec == null) {
+      io.writeln(_unknownProviderMessage(def.provider));
+      return;
+    }
+    final rolesResolver = config.modelRolesResolver;
+    if (rolesResolver != null) {
+      rolesResolver.setDefaultChain([
+        ModelRef(
+          provider: spec.name,
+          modelId: def.model,
+          baseUrl: def.baseUrl,
+          contextWindow: def.contextWindow,
+          maxTokens: def.maxTokens,
+          input: def.input,
+          // Keep the endpoint's scoped key on the pin (see _switchProvider).
+          apiKeyName:
+              _rolesKeyNameFor(spec.name, def.baseUrl) ??
+              _scopedKeyNameForNonDefault(spec.name, def.baseUrl),
+          authHeader: def.authHeader,
+        ),
+      ]);
+      rolesResolver.applyToAgent(_agent);
+      _streamFunction = _agent.streamFunction;
+      // Same invariant as _switchProvider: the session key field must name
+      // THIS endpoint's key, or a later /model switch re-seeds the pinned
+      // chain with the stale startup key.
+      _apiKey = _providerKeyFor(spec, def.baseUrl) ?? '';
+    } else {
+      final key = _providerKeyFor(spec, def.baseUrl) ?? '';
+      _providerKind = spec.kind;
+      _apiKey = key;
+      _explicitToken = false;
+      // The catalog identity binds the proxy gate — the PREVIOUSLY active
+      // custom entry's name must not leak into this lookup.
+      _streamFunction = _catalogStreamFunction(
+        spec.kind,
+        key,
+        providerName: spec.name,
+      );
+      _agent.streamFunction = _streamFunction;
+      final built = buildCatalogModel(
+        spec.name,
+        def.model,
+        baseUrl: def.baseUrl,
+        contextWindow: def.contextWindow,
+        maxTokens: def.maxTokens,
+        input: def.input,
+        authHeader: def.authHeader,
+      );
+      _agent.state.model = built;
+    }
+    _activeCustomName = null;
+    // The cached model list belongs to the previous provider/endpoint.
+    _modelCache = const [];
+    _modelContextWindows = const {};
+    _modelMaxTokens = const {};
+    _lastModelList = null;
+    unawaited(_refreshModelCache());
+    await _session?.appendModelChange(
+      provider: spec.name,
+      modelId: def.model,
+      // A LIVE switch records the pin too — a catalog pick unpins (the
+      // active name is null here) but keeps the serving endpoint
+      // (gh-1000 AC1, round-3 review).
+      baseUrl: def.baseUrl,
+      customProvider: _activeCustomName,
+    );
+    io.writeln('switched model to $name (${def.model} @ ${def.baseUrl})');
+    if (rolesResolver == null) {
+      io.writeln('  ${_providerKeyLine(spec, def.baseUrl, explicit: false)}');
+    }
+    await config.onModelChanged?.call(_agent.state.model);
+  }
+
+  /// Compact post-switch note: the role models that did NOT move with the
+  /// main one, so the user can go adjust them (/settings → Agent models)
+  /// when the combination no longer makes sense (a free main model paired
+  /// with a paid smol summarizer, a flash main with a flagship subagent).
+  void _printRoleModelsNote() {
+    final resolver = config.modelRolesResolver;
+    if (resolver == null) {
+      io.writeln(
+        _style.dim(
+          '  note: smol/subagent/memory roles inherit the main model — '
+          'pin them via /settings → Agent models',
+        ),
+      );
+      return;
+    }
+    String label(String role) {
+      final chain = resolver.config.chainFor(
+        role,
+        cwd: resolver.cwd,
+        homeDir: resolver.homeDir,
+      );
+      if (chain == null) return 'inherits main';
+      return chain.map((ref) => ref.modelId).join(' → ');
+    }
+
+    io.writeln(
+      _style.dim(
+        '  note: role models unchanged — smol (compaction): '
+        '${label(smolModelRole)} · subagent: ${label("subagent")} · '
+        'memory: ${label("memory")} — /settings → Agent models to adjust',
+      ),
+    );
+  }
+
+  Future<void> _switchModel(
+    String modelId, {
+    bool preResolvedSameProvider = false,
+  }) async {
+    final current = _agent.state.model;
+    final rolesResolver = config.modelRolesResolver;
+    if (modelId.isEmpty) {
+      io.writeln('model: ${current.id} (${current.api})');
+      if (rolesResolver != null) io.writeln(rolesResolver.describeRoles());
+      return;
+    }
+    // G1 backstop (gh-178): EVERY construction site below reuses the
+    // CURRENT triple (`provider: current.provider` / `baseUrl:
+    // current.baseUrl` / `authHeader: current.authHeader`) — that shape is
+    // valid ONLY for a same-provider pick. A cross-provider reference that
+    // reaches here (a flow the routing above should have caught) is
+    // refused loudly instead of silently producing the incident's mixed
+    // triple; the repair routes through the whole-triple flow.
+    //
+    // [preResolvedSameProvider] marks callers whose id the ROUTING LAYER
+    // already resolved same-provider with the real resolver (the
+    // parseTypedModelTarget SameModelSwitch plan, the entry-pick identity
+    // check, the cross-provider `provider|model` key split): the backstop
+    // is skipped for them. Its own predicate is cache-evidence-gated and
+    // NARROWER than the router's — re-parsing a resolved id here would
+    // veto legitimate picks (an active-identity head with a nested
+    // vendor-prefixed id the cold cache does not list resolves
+    // CrossProviderSwitch on cache evidence). Unresolved shapes — a
+    // future caller handing a raw id — are still judged.
+    if (!preResolvedSameProvider) {
+      final refusal = _backstopCrossProviderRefusal(modelId);
+      if (refusal != null) {
+        io.writeln(refusal);
+        return;
+      }
+    }
+    // An endpoint-reported window/cap beats the carried one (the catalog
+    // defaults) when the id is known to /models.
+    final window = _modelContextWindows[modelId] ?? current.contextWindow;
+    final cap = _modelMaxTokens[modelId] ?? current.maxTokens;
+    // Cookie-header auth (CodeMie SSO) can never ride a roles chain — the
+    // chain stream would send the cookie as Bearer. Keep the direct model
+    // set (the cookie stays in model.headers), mirroring
+    // [_switchCodeMieProvider]'s resolver bypass.
+    final cookieAuth = current.headers?.containsKey('cookie') ?? false;
+    if (rolesResolver != null && !cookieAuth) {
+      // Roles mode: pin the default role to the requested model id on the
+      // current provider (a single-entry chain for this session). The
+      // endpoint's scoped key name rides along (see _switchProvider).
+      final pinnedKeyName =
+          _rolesKeyNameFor(current.provider, current.baseUrl) ??
+          _scopedKeyNameForNonDefault(current.provider, current.baseUrl);
+      // Seed the resolver with the session's LIVE key material under the
+      // pinned name BEFORE resolving the chain: saved-entry keys (CodeMie
+      // JWT, typed custom keys) live in the secure store / session, never
+      // in the resolver's startup snapshot — an unseeded pin resolves
+      // nothing and chainFor throws "no usable chain entry: set
+      // OPENAI_API_KEY", which aborts the switch and leaves the status
+      // line on the old model.
+      if (pinnedKeyName != null) {
+        if (_apiKey.isNotEmpty) {
+          rolesResolver.addSecret(pinnedKeyName, _apiKey);
+        } else {
+          _seedEnvKeyStack(rolesResolver, pinnedKeyName);
+        }
+      }
+      rolesResolver.setDefaultChain([
+        ModelRef(
+          provider: current.provider,
+          modelId: modelId,
+          baseUrl: current.baseUrl,
+          contextWindow: window,
+          maxTokens: cap,
+          apiKeyName: pinnedKeyName,
+          // A saved entry's authHeader must survive /model switches
+          // (issue #964) — the pin rebuilds the model.
+          authHeader: current.authHeader,
+          // Same for the CodeMie project (issue #1941): the JWT path
+          // (no cookie header) rides the roles chain, and a header-less
+          // pin bills the DEFAULT project.
+          project: current.codeMieProject,
+        ),
+      ]);
+      rolesResolver.applyToAgent(_agent);
+      _streamFunction = _agent.streamFunction;
+      await _session?.appendModelChange(
+        provider: current.provider,
+        modelId: modelId,
+        // A LIVE /model switch records the pin too: the restore must
+        // re-bind to THIS endpoint and entry, not the (shared, drifting)
+        // per-folder state (gh-1000 AC1, round-3 review).
+        baseUrl: current.baseUrl,
+        customProvider: _activeCustomName,
+      );
+      io.writeln('switched model to $modelId');
+      _printRoleModelsNote();
+      // _recordCustomModel persists via its own onModelChanged (the
+      // per-provider model memory write must survive restarts even when
+      // nothing else changed).
+      await _recordCustomModel(modelId);
+      return;
+    }
+    _agent.state.model = Model(
+      id: modelId,
+      name: modelId,
+      api: current.api,
+      provider: current.provider,
+      baseUrl: current.baseUrl,
+      reasoning: current.reasoning,
+      // The endpoint exposes no modality metadata — recompute from the
+      // shared vision heuristic instead of carrying the previous model's
+      // modalities (a text-only pick would otherwise keep claiming image
+      // support, and vice versa).
+      input: inputModalitiesFor(modelId),
+      cost: current.cost,
+      contextWindow: window,
+      maxTokens: cap,
+      headers: current.headers,
+      compat: current.compat,
+      authHeader: current.authHeader,
+      maxImages: catalogMaxImages[modelId],
+    );
+    await _session?.appendModelChange(
+      provider: current.provider,
+      modelId: modelId,
+      // A LIVE /model switch records the pin too (gh-1000 AC1, round-3
+      // review).
+      baseUrl: current.baseUrl,
+      customProvider: _activeCustomName,
+    );
+    io.writeln('switched model to $modelId');
+    _printRoleModelsNote();
+    // _recordCustomModel ALWAYS notifies the host (not just with an active
+    // custom entry) — the single onModelChanged fire for this switch.
+    await _recordCustomModel(modelId);
+  }
+
+  /// The G1 backstop verdict (gh-178) for an id reaching [_switchModel]
+  /// UNRESOLVED — no [preResolvedSameProvider] caller vouches for it: null
+  /// when the same-provider reuse shape may apply, the refusal message
+  /// when the shape is a cross-provider reference. Kept as its own
+  /// dispatcher so the switch lives in one cohesive, directly testable
+  /// place (the CRAP ratchet: CC-12 in one body measures above the 12.0
+  /// line at any less-than-perfect coverage).
+  ///
+  /// The predicate is cache-evidence-gated and NARROWER than the router's
+  /// (see the [parseTypedModelTarget] kdoc): with no model list for the
+  /// active endpoint there is nothing to distinguish a cross-provider
+  /// reference from a vendor-prefixed id that endpoint serves (OpenRouter's
+  /// `openai/gpt-4o`), and the coherent legacy pasthrough wins. The
+  /// routing paths above use the real resolver.
+  ///
+  /// The `RefusedSwitch` arm exists for the sealed-class exhaustiveness
+  /// check only — [parseTypedModelTarget] currently never constructs one —
+  /// so it stays a straight passthrough of the carried refusal.
+  String? _backstopCrossProviderRefusal(String modelId) {
+    final current = _agent.state.model;
+    final activeCandidates = _modelCandidates('');
+    switch (parseTypedModelTarget(
+      modelId,
+      activeProvider: current.provider,
+      activeCustomName: _activeCustomName,
+      activeModelIds: activeCandidates.toSet(),
+      isKnownProvider: activeCandidates.isNotEmpty
+          ? _isKnownModelProvider
+          : (_) => false,
+    )) {
+      case SameModelSwitch():
+        return null;
+      case CrossProviderSwitch():
+        return const ModelCoherenceRefusal(
+          problem:
+              '"/model" reuse cannot carry a cross-provider pick — '
+              'model ids never ride a foreign provider/endpoint/key '
+              'triple',
+          fields: ['provider', 'baseUrl', 'key'],
+          repair:
+              '/model <provider>/<id> resolves the whole triple, or '
+              '/provider <provider> first',
+        ).message;
+      case RefusedSwitch(:final refusal):
+        return refusal.message;
+    }
+  }
+
+  /// `/model-edit [contextWindow|maxTokens <n>]`: shows or overrides the
+  /// active model's token limits for this session (persist per chain via
+  /// roles yaml `contextWindow:`/`maxTokens:`). Bare in TUI mode is the
+  /// ALIAS into the Model capabilities flow, pre-focused on the current
+  /// model (issue #1515 — the standalone Model parameters surface is
+  /// retired); line mode keeps the limits print.
+  Future<void> _handleModelEdit(String rest) async {
+    final args = _splitCommandArgs(rest);
+    if (args.isNotEmpty) return _applyModelEditArg(args);
+    final current = _agent.state.model;
+    if (_useTui && _tuiController != null) {
+      await _editModelCapsOverride(current.provider, current.id);
+    } else {
+      _printModelLimits();
+    }
+  }
+
+  /// Splits a command's rest into non-empty whitespace-separated tokens.
+  List<String> _splitCommandArgs(String rest) => rest
+      .trim()
+      .split(RegExp(r'\s+'))
+      .where((part) => part.isNotEmpty)
+      .toList();
+
+  /// Bare `/model-edit`: the active model's token limits and the setter
+  /// usage hint. gh-1426 (AC8): the RESOLVED capability triple is visible
+  /// here — thinking level, the omit flag, and the override provenance
+  /// (`models.overrides` pin vs catalog default).
+  void _printModelLimits() {
+    final current = _agent.state.model;
+    io.writeln(
+      'model ${current.id}: contextWindow ${current.contextWindow} · '
+      'maxTokens ${current.maxTokens}',
+    );
+    final caps = <String>[
+      'thinking ${current.thinkingLevel ?? 'off'}',
+      if (current.compat?.omitMaxOutputTokens ?? false) 'omit max-output field',
+    ];
+    io.writeln('capabilities: ${caps.join(' · ')}');
+    final pinned = modelCapabilityOverrides?.lookup(
+      current.provider,
+      current.id,
+    );
+    io.writeln(
+      _style.dim(
+        pinned == null
+            ? 'caps source: catalog defaults '
+                  '(pin with /settings → Model capabilities)'
+            : 'caps source: models.overrides pin '
+                  '(${_capabilitySummary(pinned)})',
+      ),
+    );
+    // The resolver's loud notes (E1 divergence, E3 gate, E4 catalog miss)
+    // belong next to the resolved triple — a pin the resolver dropped or
+    // overrode is never silent on the status surface (gh-1426 rework).
+    for (final note in current.capabilityNotes) {
+      io.writeln(_style.dim('note: $note'));
+    }
+    io.writeln(
+      _style.dim('set with /model-edit <contextWindow|maxTokens> <n>'),
+    );
+    // The merge note (issue #1515): the standalone interactive editor and
+    // the hub's "Model parameters" row are retired — the Model
+    // capabilities flow is the one editing surface (presets + custom
+    // input + effective values with source layers live there).
+    io.writeln(
+      _style.dim(
+        'interactive editing: /settings → Model capabilities '
+        '(the Model parameters surface merged there)',
+      ),
+    );
+  }
+
+  /// `/model-edit <contextWindow|maxTokens> <n>`: validates the value and
+  /// applies the override.
+  Future<void> _applyModelEditArg(List<String> args) async {
+    final value = args.length == 2 ? int.tryParse(args[1]) : null;
+    if (args.length != 2 || value == null || value <= 0) {
+      io.writeln('usage: /model-edit <contextWindow|maxTokens> <n>');
+      return;
+    }
+    await _applyModelLimitEdit(args[0], value);
+  }
+
+  /// Applies a validated `/model-edit` limit override by field name.
+  Future<void> _applyModelLimitEdit(String field, int value) async {
+    switch (field) {
+      case 'contextWindow':
+        await _replaceModelLimits(
+          contextWindow: value,
+          windowSource: ContextWindowSource.userPin,
+        );
+        io.writeln('model context window set to $value');
+      case 'maxTokens':
+        await _replaceModelLimits(maxTokens: value);
+        io.writeln('model max tokens set to $value');
+      default:
+        io.writeln('usage: /model-edit <contextWindow|maxTokens> <n>');
+    }
+  }
+
+  /// Rebuilds the active model with new token limits, preserving every
+  /// other field (endpoint detection and `/model-edit`). The copy rides
+  /// [Model.copyWith] — the one field list (gh-1742 review round 1,
+  /// comment 5) — so the recent fields (thinkingLevel, capabilityNotes,
+  /// the scoped watchdogs) survive the swap.
+  ///
+  /// The host callback is AWAITED, not unawaited (gh-1787 E1): a detached
+  /// callback's throw can only hit the zone (a raw stack in the
+  /// transcript); awaited, it propagates to the caller — the `/model-edit`
+  /// submit path contains it into the clean error panel, while the boot's
+  /// endpoint-detection callers keep the fire-and-forget semantics with
+  /// an explicit `unawaited`.
+  Future<void> _replaceModelLimits({
+    int? contextWindow,
+    int? maxTokens,
+    ContextWindowSource? windowSource,
+  }) async {
+    final current = _agent.state.model;
+    _agent.state.model = current.copyWith(
+      contextWindow: contextWindow,
+      maxTokens: maxTokens,
+    );
+    // gh-1742 invariant 2: a window write publishes into the shared
+    // registry (endpoint report or user pin — the pin wins by publish
+    // order), so main, children, and the meter resolve ONE window per
+    // model identity.
+    if (contextWindow != null && windowSource != null) {
+      contextWindowRegistry.publish(
+        model: _agent.state.model,
+        window: contextWindow,
+        source: windowSource,
+      );
+    }
+    await config.onModelChanged?.call(_agent.state.model);
+  }
+}
+
+/// Known model ids shown by `/models` and the `/model` picker. Maps the
+/// provider name stored on the active [Model] to a short, useful subset.
+/// The table itself lives in `model_presets.dart` (gh-1596 AC6: shared
+/// with the installer generator, which renders the wizard's model menus
+/// from the same source).
+
+/// Formats a token count as a compact preset label (`4K`, `16K`, `1M`).
+String formatTokenPreset(int tokens) {
+  if (tokens >= 1048576 && tokens % 1048576 == 0) {
+    return '${tokens ~/ 1048576}M';
+  }
+  if (tokens >= 1024 && tokens % 1024 == 0) {
+    return '${tokens ~/ 1024}K';
+  }
+  return '$tokens';
+}
+
+/// Parses a compact preset label (`4K`, `16K`, `1M`) back to tokens.
+int parseTokenPreset(String label) {
+  final trimmed = label.trim();
+  final match = RegExp(
+    r'^(\d+)([KM])?$',
+    caseSensitive: false,
+  ).firstMatch(trimmed);
+  if (match == null) return int.tryParse(trimmed) ?? 0;
+  final base = int.parse(match.group(1)!);
+  final suffix = match.group(2)?.toUpperCase();
+  return switch (suffix) {
+    'K' => base * 1024,
+    'M' => base * 1048576,
+    _ => base,
+  };
+}
+
+/// Parses a `(empty = X):` or `(empty keeps 'X'):` hint from [question],
+/// returning `X` so the TUI prompt can show it as the default value, or
+/// null when no default hint is present.
+String? extractDefaultValue(String question) {
+  final match = RegExp(r'\(empty\s*=\s*(.+?)\)').firstMatch(question);
+  if (match != null) return match.group(1)!.trim();
+  final keeps = RegExp(r"\(empty\s*keeps\s*'(.+?)'\)").firstMatch(question);
+  if (keeps != null) return keeps.group(1)!.trim();
+  return null;
+}
+
+/// Testable core of the TUI key-set flow: prompts for name (when [name] is
+/// null) and a masked value through [prompt], validates, saves to [keys],
+/// and reports the outcome through [onResult]. The freshly saved key is
+/// handed to [onSaved] for immediate provider pickup.
+Future<void> interactiveKeySet({
+  required String? name,
+  required SecureKeyCache keys,
+  required void Function(String name, String value)? onSecretStored,
+  required Future<TuiPromptAnswer?> Function(TuiPromptSpec) prompt,
+  required void Function(String message) onResult,
+  required void Function(String name, String value) onSaved,
+}) async {
+  final keyNamePattern = RegExp(r'^[A-Za-z0-9_]+$');
+  final keyName = await promptTextTui(
+    prompt,
+    name,
+    header: 'Key',
+    question: 'Key name (UPPER_SNAKE or [A-Za-z0-9_]+):',
+  );
+  if (keyName == null) return;
+  if (!keyNamePattern.hasMatch(keyName)) {
+    onResult('invalid key name: $keyName');
+    return;
+  }
+  final value = await promptTextTui(
+    prompt,
+    null,
+    header: 'Key',
+    question: 'Value for $keyName:',
+    secret: true,
+  );
+  if (value == null || value.isEmpty) {
+    onResult('cancelled');
+    return;
+  }
+  if (!await keys.save(keyName, value)) {
+    onResult('could not save $keyName');
+    return;
+  }
+  onSecretStored?.call(keyName, value);
+  onResult('saved $keyName to ${keys.label}');
+  onSaved(keyName, value);
+}
+
+/// Opens a [TextPromptSpec] through [prompt] and returns the trimmed text
+/// answer. Returns [initial] as-is when provided (no prompt needed), or
+/// null on cancel/unexpected result.
+Future<String?> promptTextTui(
+  Future<TuiPromptAnswer?> Function(TuiPromptSpec) prompt,
+  String? initial, {
+  required String header,
+  required String question,
+  bool secret = false,
+}) async {
+  if (initial != null) return initial;
+  final result = await prompt(
+    TextPromptSpec(header: header, question: question, secret: secret),
+  );
+  if (result == null || result is! TextPromptAnswer) return null;
+  return result.value.trim();
+}

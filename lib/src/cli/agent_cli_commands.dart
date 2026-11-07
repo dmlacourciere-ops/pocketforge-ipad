@@ -1,0 +1,1166 @@
+part of 'agent_cli.dart';
+
+// Slash-command dispatch: routes a `/command [args]` line to the family
+// that owns it (info/basic, model+provider, session switching, mode and
+// approval) or to the unknown-command fallback (plugin commands, prompt
+// templates, skill aliases, filesystem paths).
+
+/// Whitespace splitter for command lines (hoisted: `_handleCommand` runs
+/// per submitted line).
+final _commandWhitespace = RegExp(r'\s+');
+
+/// A leading `/word/` or `~/` — the shape of an absolute file path typed at
+/// the prompt (hoisted: evaluated per submitted line).
+final _leadingPathLike = RegExp(r'^/[^/\s]*\/');
+
+/// The async info-command table: command name → handler. Each entry owns
+/// one `/command` arm. `/mcp` lives here too (the basic handler is
+/// synchronous and cannot host its async `reload` branch), as does
+/// `/browser` (run via the bridge handle, then print).
+final _infoCommandHandlers = <String, Future<void> Function(AgentCli, String)>{
+  '/mcp': (cli, rest) async => cli._mcpSlash(rest),
+  '/queue': (cli, rest) async => cli._queueSlash(rest),
+  '/providers': (cli, rest) async => cli._providersSlash(rest),
+  '/skills': (cli, rest) async => cli._skillsSlash(rest),
+  '/tools': (cli, rest) async => cli._toolsSlash(rest),
+  '/cube': (cli, rest) async => cli._handleCubeCommand(rest),
+  '/memory': (cli, rest) async => cli._handleMemoryCommand(rest),
+  '/redact': (cli, rest) async => cli._handleRedactCommand(rest),
+  '/theme': (cli, rest) async => cli._themeSlash(rest),
+  '/trajectory': (cli, rest) async => cli._handleTrajectoryCommand(rest),
+  '/import': (cli, rest) async => cli._handleImportCommand(rest),
+  '/usage': (cli, rest) async => cli._handleUsageCommand(rest),
+  '/images': (cli, rest) async => cli._printImagesSurface(),
+  '/mail': (cli, rest) async => cli.handleMailCommand(rest),
+  '/reply': (cli, rest) async => cli.handleReplyCommand(rest),
+  '/agents': (cli, rest) async => cli.handleAgentsCommand(rest),
+  '/browser': (cli, rest) async => cli._browserSlash(rest),
+  '/a2a': (cli, rest) async => cli._printA2aStatus(),
+  '/terminal-setup': (cli, rest) async => cli._printTerminalSetup(),
+  '/ext': (cli, rest) async => cli._extSlash(rest),
+  '/jsr': (cli, rest) async => cli._jsrSlash(rest),
+  '/power': (cli, rest) async => cli._powerSlash(),
+  '/quota': (cli, rest) async => cli._quotaSlash(rest),
+  '/timer': (cli, rest) async => cli._handleTimerCommand(rest),
+  // Hidden (issue #735): not in the slash menu — a diagnostics dump of
+  // the live tty's termios state for steering-freeze triage.
+  '/termios': (cli, rest) async => cli._printTermiosDump(),
+  '/restart': (cli, rest) async => cli.restartRunForTest(),
+};
+
+/// Slash-command dispatch on [AgentCli].
+extension SlashCommandDispatch on AgentCli {
+  Future<void> _handleCommand(
+    String trimmed, {
+    List<TuiImageAttachment> images = const [],
+  }) async {
+    final command = trimmed.split(_commandWhitespace).first;
+    final rest = trimmed.substring(command.length).trim();
+    if (await _handleInfoCommand(command, rest)) return;
+    if (await _handleModelProviderCommand(command, rest)) return;
+    if (await _handleSessionSwitchCommand(command, rest)) return;
+    if (await _handleModeCommand(command, rest)) return;
+    await _handleUnknownCommand(trimmed, command, rest, images: images);
+  }
+
+  /// Info commands without a TUI picker variant. Returns whether [command]
+  /// was handled.
+  Future<bool> _handleInfoCommand(String command, String rest) async {
+    if (_handleInfoCommandBasic(command, rest)) return true;
+    final handler = _infoCommandHandlers[command];
+    if (handler != null) {
+      await handler(this, rest);
+      return true;
+    }
+    return _handleInfoCommandSession(command, rest);
+  }
+
+  /// The `/mcp` arm: `reload` re-reads the config; a plain `/mcp` just
+  /// prints the status.
+  Future<void> _mcpSlash(String rest) async {
+    if (rest == 'reload') {
+      await _reloadMcpConfig(this);
+    } else {
+      _printMcpStatus();
+    }
+  }
+
+  /// `/queue [clear]` — clear the TUI composer's queued messages (issue
+  /// #275). The queue strip itself is always visible above the composer;
+  /// this arm exists so the queue is manageable from line mode too, and
+  /// bare `/queue` just points there. Line mode has no queue.
+  Future<void> _queueSlash(String rest) async {
+    if (rest.trim() != 'clear') {
+      io.writeln(
+        'Queued messages render above the input while a run streams; '
+        '/queue clear empties the queue.',
+      );
+      return;
+    }
+    final controller = _tuiController;
+    if (controller == null) {
+      io.writeln('No interactive TUI session — nothing is queued.');
+      return;
+    }
+    controller.clearQueue();
+    io.writeln('Queued messages cleared.');
+  }
+
+  /// The `/browser` arm: run the command and print its lines.
+  Future<void> _browserSlash(String rest) async {
+    List<String> lines;
+    try {
+      lines = await runBrowserCommand(config.browserBridgeHandle, rest);
+    } on Object catch (error) {
+      lines = ['bridge: $error'];
+    }
+    _writelnAll(lines);
+  }
+
+  /// Writes [lines] one per line — the shared tail of the slash arms
+  /// that render pre-formatted output.
+  void _writelnAll(Iterable<String> lines) {
+    for (final line in lines) {
+      io.writeln(line);
+    }
+  }
+
+  /// The session's sleep-prevention controller (issues #325/#326) — null
+  /// when no runner was injected. Exposed so wiring tests can assert the
+  /// acquire/release lifecycle without spawning a real helper.
+  @visibleForTesting
+  PowerAssertionController? get powerAssertionsForTesting => _powerAssertions;
+
+  /// Session-open hook for the sleep-prevention assertion (#326):
+  /// acquires only in the explicit `power.hold: session` mode — the
+  /// DEFAULT is per-run (see [runPowerAssertionsStarted]), so an idle
+  /// agent never pins the machine awake. No-op without an injected
+  /// runner (tests, web).
+  @visibleForTesting
+  Future<void> acquirePowerAssertions() async =>
+      await _powerAssertions?.onSessionOpened();
+
+  /// Releases the sleep-prevention assertion (idempotent,
+  /// warn-not-crash) — both modes: the per-run mode's safety net for an
+  /// exit mid-run, the session mode's regular release.
+  @visibleForTesting
+  Future<void> releasePowerAssertions() async =>
+      await _powerAssertions?.onSessionClosed();
+
+  /// Run-start hook (#326): the per-run hold acquires here, fire-and-
+  /// forget — sleep prevention must never delay the first streamed byte.
+  @visibleForTesting
+  void runPowerAssertionsStarted() => _powerAssertions?.onRunStarted();
+
+  /// Run-settle hook (#326): the per-run hold releases once the run has
+  /// fully settled (post-run compaction included).
+  @visibleForTesting
+  Future<void> runPowerAssertionsSettled() async =>
+      await _powerAssertions?.onRunSettled();
+
+  /// Dispatches one input line through the normal pipeline. Editor-flow
+  /// unit tests drive slash commands through this instead of spawning a
+  /// full [AgentCli.run] loop.
+  @visibleForTesting
+  Future<void> handleLineForTest(String line) => _handleLine(line);
+
+  /// `/power`: the configured `power.sleepPrevention` level, the
+  /// `power.hold` lifecycle, and whether the assertion is held right
+  /// now.
+  Future<void> _powerSlash() async {
+    final controller = _powerAssertions;
+    if (controller == null) {
+      io.writeln(
+        'sleepPrevention=${config.powerSleepPrevention.value} '
+        'hold=${config.powerSleepPreventionHold.value} held=no '
+        '(no runner on this host)',
+      );
+    } else {
+      io.writeln(controller.status().toString());
+    }
+    io.writeln(
+      'configure: power.sleepPrevention: off|idle|display|system, '
+      'power.hold: per-run|session (~/.fah/config.yaml, defaults '
+      'idle + per-run)',
+    );
+  }
+
+  /// `/quota [refresh]` (issue #823): the non-blocking provider-quota
+  /// table. Every render is cache-only ([ProviderQuotaService.peek]) — a
+  /// cold row shows `…` while the peek kick fetches in the background (E1);
+  /// `refresh` awaits one coalesced fetch per configured provider (E6)
+  /// before re-rendering. Capability-less providers (no adapter) render
+  /// `unknown (reason)`, never an error.
+  Future<void> _quotaSlash(String rest) async {
+    final arg = rest.trim();
+    if (arg.isNotEmpty && arg != 'refresh') {
+      io.writeln('usage: /quota [refresh]');
+      return;
+    }
+    final service = quotaService;
+    if (arg == 'refresh') {
+      // Parallel with per-provider isolation: refresh() never throws — every
+      // failure resolves to a cached `unknown` (E3, one attempt) — so one
+      // dead endpoint can neither stall the others nor wedge the command
+      // (and each fetch is bounded by the service's fetchTimeout).
+      await Future.wait<void>([
+        for (final id in _configuredQuotaProviders) service.refresh(id),
+      ]);
+    }
+    // E5: prune entries for providers that left the config since the last
+    // render — the cache never outlives the configuration that seeded it.
+    service.retainOnly(_configuredQuotaProviders.toSet());
+    _printQuotaTable(service);
+  }
+
+  /// The configured provider ids with a quota surface: catalog providers
+  /// whose credential resolves (env or secure store) plus saved CodeMie
+  /// SSO entries (cookie auth has no env key — the entry IS the config).
+  List<String> get _configuredQuotaProviders => [
+    for (final spec in enabledProviders())
+      if (_quotaConfigured(spec)) spec.name,
+  ];
+
+  bool _quotaConfigured(ProviderSpec spec) {
+    if (spec.name == 'codemie') {
+      final registry = config.customProviders;
+      if (registry != null &&
+          registry.entries.any(
+            (entry) => entry.baseUrl.contains('/code-assistant-api/'),
+          )) {
+        return true;
+      }
+    }
+    return _providerKeyFor(spec, spec.defaultBaseUrl) != null;
+  }
+
+  /// Rebinds a boot-built queue runtime with the live quota feed
+  /// (issue #823): the boot constructs the runtime before the CLI — and
+  /// therefore before the service — exists. No-op without a queue, so
+  /// legacy boots stay byte-identical. The rebuild is SILENT on the
+  /// warning channel (gh-1781 AC2): it re-resolves the exact queue the
+  /// boot already rendered, so re-printing the skip/binding lines would
+  /// double every warning on every queue boot. A user-initiated queue
+  /// EDIT keeps its own loud reload (see [_rebuildProviderQueueRuntime]).
+  Future<void> attachProviderQueueQuotaFeed() async {
+    if (config.providersQueueRuntime != null) {
+      await _rebuildProviderQueueRuntime(warn: false);
+    }
+  }
+
+  /// The session's quota service, built on first use — no IO at rest: the
+  /// adapters resolve credentials lazily and fetch only when a surface
+  /// peeks or refreshes. Tests inject the http client through
+  /// [AgentCliConfig.quotaHttpClient]; production shares the keep-alive
+  /// provider client.
+  ProviderQuotaService get quotaService =>
+      _quotaService ??= ProviderQuotaService(
+        adapters: {
+          'openrouter': OpenRouterQuotaAdapter(
+            // OQ2 (issue #1921): a bound provider's quota requests honor
+            // the same proxy gate as its chat traffic.
+            client:
+                config.quotaHttpClient ??
+                proxiedProviderClient('openrouter') ??
+                sharedProviderHttpClient(),
+            resolveApiKey: () async {
+              final spec = providerCatalog['openrouter']!;
+              return _providerKeyFor(spec, spec.defaultBaseUrl);
+            },
+          ),
+          'codemie': CodeMieQuotaAdapter(
+            client:
+                config.quotaHttpClient ??
+                proxiedProviderClient('codemie') ??
+                sharedProviderHttpClient(),
+            // OQ1 lean (b): no pinned limits endpoint — the adapter stays
+            // dark until the endpoint is confirmed, and renders its reason.
+            resolveSessionCookie: _resolveCodeMieSessionCookie,
+            // The selected project scopes the fetch too (issue #1941) —
+            // display and billing must name the same project.
+            resolveProject: _resolveCodeMieProject,
+          ),
+        },
+        // DIAL-class endpoints carry no per-key billing surface.
+        unmeteredProviders: {
+          for (final spec in enabledProviders())
+            if (spec.kind == 'dial') spec.name,
+        },
+        ttl: config.quotaTtl ?? const Duration(minutes: 15),
+      );
+
+  Future<String?> _resolveCodeMieSessionCookie() async {
+    final registry = config.customProviders;
+    final entry = registry?.entries
+        .where((e) => e.baseUrl.contains('/code-assistant-api/'))
+        .firstOrNull;
+    return entry == null ? null : _resolveCodeMieCookie(entry.keyName);
+  }
+
+  /// The CodeMie project of the saved entry serving the LIVE model's
+  /// endpoint (issue #1941): the quota fetch must name the SAME project
+  /// the model requests bill — resolved through the ONE resolver
+  /// ([projectHeaderForBaseUrl]), never a first-match-with-project scan
+  /// that can name a different account's pick.
+  String? _resolveCodeMieProject() => projectHeaderForBaseUrl(
+    config.customProviders?.entries ?? const [],
+    _agent.state.model.baseUrl,
+  );
+
+  /// The `/quota` table (AC4): one row per configured provider, rendered
+  /// cache-only. Cold rows show `…`; unknown rows carry the adapter's
+  /// one-line reason; unmetered rows are silent about billing they lack.
+  void _printQuotaTable(ProviderQuotaService service) {
+    final ids = _configuredQuotaProviders;
+    if (ids.isEmpty) {
+      io.writeln('no quota-reporting providers configured');
+      return;
+    }
+    final now = DateTime.now().toUtc();
+    io.writeln(
+      '${'provider'.padRight(12)}${'used/limit'.padRight(20)}'
+      '${'unit'.padRight(10)}${'reset'.padRight(8)}updated',
+    );
+    for (final id in ids) {
+      final result = service.peek(id);
+      final quota = result?.quota;
+      final row = StringBuffer(id.padRight(12));
+      if (result == null) {
+        row.write('…'); // cold — the peek kick fetches in the background
+      } else if (quota == null) {
+        row.write('unknown (${result.reason})');
+      } else if (quota.isUnmetered) {
+        row.write('unmetered');
+      } else {
+        final unit = switch (quota.unit) {
+          QuotaUnit.currencyUsd => 'usd',
+          QuotaUnit.requests => 'requests',
+          QuotaUnit.tokens => 'tokens',
+          QuotaUnit.unmetered => '',
+        };
+        row
+          ..write(formatQuotaUsedLimit(quota).padRight(20))
+          ..write(unit.padRight(10))
+          ..write(formatQuotaReset(quota.resetsAt, now).padRight(8))
+          ..write(_quotaAge(quota.updatedAt, now));
+      }
+      io.writeln(row.toString());
+    }
+  }
+
+  /// Coarse age bucket for the `updated` column (`now` / `5m` / `3h` / `2d`).
+  String _quotaAge(DateTime updated, DateTime now) {
+    final delta = now.difference(updated);
+    if (delta.inMinutes < 1) return 'now';
+    if (delta.inHours < 1) return '${delta.inMinutes}m';
+    if (delta.inDays < 1) return '${delta.inHours}h';
+    return '${delta.inDays}d';
+  }
+
+  /// `/exit`, `/help`, `/stats`, `/tasks`, `/transcript`.
+  bool _handleInfoCommandBasic(String command, String rest) {
+    switch (command) {
+      case '/exit':
+        io.writeln('bye');
+        _exited = true;
+      case '/help':
+        _printHelp(filter: rest);
+      case '/stats':
+        _printStats();
+      case '/tasks':
+        _listTaskJobs(rest);
+      case '/transcript':
+        _handleTranscriptCommand(rest);
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  /// `/transcript expand all|none` (gh-1933 interaction): the collapsed
+  /// thinking/detail rows respond — `all` renders the persisted detail
+  /// under every collapsed row (rows emitted after the switch, and the
+  /// replay on the next resume), `none` restores the collapsed default.
+  /// Bare `/transcript` reports the current state. Review thread
+  /// PRRT_kwDOTXdlLc6w5WG8: outside the TUI chrome face nothing observable
+  /// responds to the flag (line mode streams thinking per-delta or never;
+  /// the line-mode replay renders thinking never), so the mutating arms
+  /// say so instead of confirming a silent no-op — and leave the render
+  /// state alone.
+  void _handleTranscriptCommand(String rest) {
+    final arg = rest.trim().toLowerCase();
+    switch (arg) {
+      case 'expand all' || 'expand none' || 'collapse':
+        if (!_useTui || !tuiChromeEnabled) {
+          io.writeln(
+            'transcript expand only affects the TUI chrome transcript',
+          );
+          return;
+        }
+        final expanded = arg == 'expand all';
+        transcriptExpandDetails = expanded;
+        io.writeln(
+          expanded
+              ? 'transcript: expanded — collapsed rows render their '
+                    'persisted detail (thinking text) until '
+                    '`/transcript expand none`'
+              : 'transcript: collapsed (default)',
+        );
+      case 'expand' || '':
+        io.writeln(
+          'transcript rows are ${transcriptExpandDetails ? 'expanded' : 'collapsed'} — '
+          'usage: /transcript expand all|none',
+        );
+      default:
+        io.writeln('usage: /transcript expand all|none');
+    }
+  }
+
+  /// `/timer [<duration|epoch-ms>|clear]` — the live session deadline
+  /// setter (gh-1556). Bare `/timer` shows the current value; a duration
+  /// (`25m`, `90s`, `1h30m`) or an absolute epoch-ms timestamp arms (or
+  /// re-arms, resetting the one-shot notice latches) the SAME single clock
+  /// the env var and `--timer`/`--deadline` wrote at boot; `/timer clear`
+  /// disarms it and every consumer falls back to today's byte-for-byte
+  /// behavior. An invalid spec is a clear user-facing error — never a
+  /// silently wrong deadline.
+  Future<void> _handleTimerCommand(String rest) async {
+    final arg = rest.trim();
+    if (arg.isEmpty) {
+      final line = _deadline.budgetLine();
+      io.writeln(
+        line == null
+            ? 'no deadline set (/timer 25m arms one)'
+            : 'deadline armed — $line',
+      );
+      return;
+    }
+    if (arg == 'clear') {
+      _deadline.clear();
+      io.writeln('deadline cleared');
+      return;
+    }
+    try {
+      _deadline.setFromSpec(arg);
+    } on FormatException catch (error) {
+      io.writeln('invalid /timer value: ${error.message}');
+      return;
+    }
+    io.writeln('deadline set — ${_deadline.budgetLine()}');
+  }
+
+  /// `/a2a` — Phase 5a status: per-server connecting/connected/failed.
+  void _printA2aStatus() {
+    for (final line in formatA2aStatusLines(_a2aManager)) {
+      io.writeln(line);
+    }
+  }
+
+  /// `/terminal-setup` — per-terminal Shift+Enter newline guidance
+  /// (issue #36): what already works, what needs a one-line terminal
+  /// config, and the fallback keys that work everywhere.
+  void _printTerminalSetup() {
+    final env = config.envVarValue;
+    for (final line in terminalSetupLines(env ?? (name) => null)) {
+      io.writeln(line);
+    }
+  }
+
+  /// `/termios` (hidden, issue #735): dumps the live tty's `stty -a` —
+  /// after a Ctrl+S freeze this shows in one keystroke whether a child
+  /// left `ixon`/`ixany` on. Null dump = no tty to inspect.
+  Future<void> _printTermiosDump() async {
+    final dump = await _termiosGuard.dumpSettings();
+    io.writeln(dump ?? 'no tty available (stty missing or no /dev/tty)');
+  }
+
+  /// `/images` (issue #1889 R3): the registry/cap/drop detail surface —
+  /// the shared projection ([imageSurfaceLines]) both hosts render.
+  void _printImagesSurface() {
+    for (final line in imageSurfaceLines(
+      lastReport: imageDropUx.lastReport,
+      config: imageRegistryConfig,
+      modelId: config.model.id,
+    )) {
+      io.writeln(line);
+    }
+  }
+
+  /// `/memory [maintain]` — Phase 2 memory surface: stats by default,
+  /// `maintain` runs the consolidation pipeline now.
+  Future<void> _handleMemoryCommand(String rest) async {
+    final sub = rest.split(_commandWhitespace).first.trim();
+    if (sub == 'maintain') {
+      await _runMemoryMaintain();
+      return;
+    }
+    await _printMemoryStats();
+  }
+
+  /// The `/memory maintain` branch: runs maintenance with the running-guard
+  /// feedback.
+  Future<void> _runMemoryMaintain() async {
+    io.writeln('maintaining memory (levels + consolidation)…');
+    final started = await _memory.maintain();
+    if (!started) {
+      io.writeln('maintenance already running — skipped');
+      return;
+    }
+    io.writeln('memory maintenance complete');
+  }
+
+  /// The bare `/memory` branch: entry counts per type + last maintenance.
+  Future<void> _printMemoryStats() async {
+    for (final line in formatMemoryStatsLines(
+      await _memory.list(limit: 500),
+      await _memory.lastMaintenanceAt(),
+      await _memory.maintenanceDue(),
+    )) {
+      io.writeln(line);
+    }
+  }
+
+  /// `/redact [on|off|block on|block off|stats|layers]` — layered secret
+  /// redaction status and runtime toggles (issue #24). The logic is the
+  /// pure [handleRedactCommand]; this only prints and installs the
+  /// returned config.
+  Future<void> _handleRedactCommand(String rest) async {
+    final outcome = handleRedactCommand(
+      config.redactionPipeline,
+      rest.split(_commandWhitespace).where((part) => part.isNotEmpty).toList(),
+    );
+    _writelnAll(outcome.lines);
+    final newConfig = outcome.newConfig;
+    if (newConfig != null) {
+      config.redactionPipeline?.config = newConfig;
+    }
+  }
+
+  /// `/allow`, `/reset`, `/compact`.
+  Future<bool> _handleInfoCommandSession(String command, String rest) async {
+    switch (command) {
+      case '/allow':
+        _handleAllow(rest);
+      case '/reset':
+        _agent.reset();
+        _checkpoints.clear();
+        _ttsr?.reset();
+        // The image-drop latch is run-lifetime state (issue #1889 R4): a
+        // brand-new session re-latches from its first request.
+        imageDropUx.reset();
+        _session = await _createSession();
+        _notifyPluginSessionReady();
+        // /reset is an in-process switch to a brand-new session — herdr
+        // must re-report it, or every later report (release included)
+        // carries the stale pre-reset id (#1483 review).
+        _herdrSessionSwitched();
+        _syncMailboxPrefix();
+        // Re-claim ownership for the new session (#428).
+        await _releaseSessionLease();
+        await _claimSessionLease();
+        await _printViewerBannerIfAny();
+        _persistedCount = 0;
+        io.writeln('new session started');
+      case '/compact':
+        // `/compact` is a manual override — always run the compactor even
+        // when the auto-trigger threshold isn't crossed. The user is
+        // asking for it explicitly, so we honour the request.
+        await _runManualCompact();
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  /// Model and provider commands. Returns whether [command] was handled.
+  Future<bool> _handleModelProviderCommand(String command, String rest) async {
+    switch (command) {
+      case '/model':
+        await _handleModelCommand(rest);
+      case '/models':
+        await _handleModelsCommand(rest);
+      case '/model-edit':
+        await _handleModelEdit(rest);
+      case '/provider':
+        await _providerSlash(rest);
+      case '/key':
+        await _handleKeyCommand(rest);
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  /// `/provider`: a bare command opens the TUI picker; anything else goes to
+  /// the provider command handler.
+  Future<void> _providerSlash(String rest) async {
+    if (rest.isEmpty && _useTui && _tuiController != null) {
+      _openProviderPicker();
+    } else {
+      await _handleProviderCommand(rest);
+    }
+  }
+
+  /// Session switching/naming commands. Returns whether [command] was
+  /// handled.
+  Future<bool> _handleSessionSwitchCommand(String command, String rest) async {
+    switch (command) {
+      case '/sessions':
+        // In the TUI a bare /sessions opens the picker (same as /models);
+        // with an argument or in line mode it prints the list.
+        await _sessionsSlash(rest);
+      case '/session':
+        await _handleSessionCommand(rest);
+      case '/session-new':
+        await _namedSessionSlash(rest, 'session-new', _createNamedSession);
+      case '/rename-session':
+        await _namedSessionSlash(rest, 'rename-session', _renameSession);
+      case '/resume':
+        await _resumeLastSession();
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  /// Mode and approval commands. Returns whether [command] was handled.
+  Future<bool> _handleModeCommand(String command, String rest) async {
+    switch (command) {
+      case '/mode':
+        await _modeSlash(rest);
+      case '/approval':
+        _approvalSlash(rest);
+      case '/settings':
+        await _settingsSlash(rest);
+      case '/update':
+        await _updateSlash();
+      case '/code' || '/architect' || '/review':
+        await _switchMode(command.substring(1));
+      default:
+        return false;
+    }
+    return true;
+  }
+
+  /// `/mode`: a bare command opens the TUI picker; anything else goes to the
+  /// mode handler.
+  Future<void> _modeSlash(String rest) async {
+    if (rest.isEmpty && _useTui && _tuiController != null) {
+      _openModePicker();
+    } else {
+      await _handleMode(rest);
+    }
+  }
+
+  /// The update command: settles an active run first (a binary swap must
+  /// never happen under a streaming turn), then delegates to the
+  /// host-injected engine closure — bin owns the self-update engine and
+  /// lib stays dart:io-free, so the applied path exits inside the closure
+  /// after the successor spawn.
+  Future<void> _updateSlash() async {
+    await _settled;
+    // Queued drafts survive the restart: they run to completion now (the
+    // same post-submit drain the composer uses), so the successor resumes
+    // a fully-recorded session.
+    final controller = _tuiController;
+    if (controller != null) await _drainTuiQueue(controller);
+    final update = config.updateCommand;
+    if (update == null) {
+      io.writeln('update: unavailable in this host');
+      return;
+    }
+    await update(await _updateSessionId());
+  }
+
+  /// The live session id for the `/update` restart: the session NAME when
+  /// one was written (resumable by name), else the raw id — the same
+  /// resolution the exit hint uses, minus the persisted-count gate (an
+  /// untouched session still restarts as itself).
+  Future<String?> _updateSessionId() async {
+    final session = _session;
+    if (session == null) return null;
+    var name = await session.getSessionName();
+    final metadata = await session.getMetadata();
+    if (name == null) {
+      final repo = _repo;
+      if (repo is JsonlSessionRepo) {
+        try {
+          name = await repo.sessionNameQuick(metadata);
+        } on Object {
+          name = null; // unreadable file: degrade to the id
+        }
+      }
+    }
+    return name ?? metadata.id;
+  }
+
+  /// `/approval`: a bare command opens the TUI picker; anything else sets
+  /// the approval mode.
+  void _approvalSlash(String rest) {
+    if (rest.isEmpty && _useTui && _tuiController != null) {
+      _openApprovalPicker();
+    } else {
+      _handleApprovalMode(rest);
+    }
+  }
+
+  /// Anything that is not a builtin command: a plugin slash command, a
+  /// prompt template, a menu filter, or simply unknown.
+  Future<void> _handleUnknownCommand(
+    String trimmed,
+    String command,
+    String rest, {
+    List<TuiImageAttachment> images = const [],
+  }) async {
+    final handler =
+        _pluginSlashCommands[command] ?? _ext.slashCommands[command];
+    if (handler != null) {
+      await handler(rest.split(RegExp(r'\s+')));
+      return;
+    }
+    final expanded = expandPromptTemplate(trimmed, _templates);
+    if (expanded != trimmed) {
+      _startRun(expanded);
+      return;
+    }
+    // Claude/Copilot-style slash alias: `/<skill-name> [args]` invokes the
+    // skill directly (user-invocable skills only).
+    final alias = _skills
+        .where(
+          (s) =>
+              s.userInvocable &&
+              s.name.toLowerCase() == command.substring(1).toLowerCase(),
+        )
+        .firstOrNull;
+    if (alias != null) {
+      await _runSkillCommand('${alias.name}${rest.isEmpty ? '' : ' $rest'}');
+      return;
+    }
+    if (trimmed.startsWith('/') && trimmed.length > 1) {
+      await _handlePathLikeInput(trimmed, images: images);
+      return;
+    }
+    io.writeln('unknown command: $command (try /help)');
+  }
+
+  /// A string starting with `/` followed by no spaces and containing at
+  /// least one more `/` is a filesystem path (absolute or `~/...`), never a
+  /// slash command. A bare single-token path that does not exist keeps the
+  /// load hint — it cannot be attached. Multi-word input is a message that
+  /// starts with a path (issue #1152): it takes the shared message tail
+  /// ([AgentCli._sendUserMessage] — viewer routing #428, per-turn grant
+  /// reset, clipboard images), never a refusal. Bare existing files never
+  /// reach here: `_dispatchInput` routes them to the tail before the
+  /// command tables.
+  Future<void> _handlePathLikeInput(
+    String trimmed, {
+    List<TuiImageAttachment> images = const [],
+  }) async {
+    // Broad token check is safe in this fallback: known single-segment
+    // commands (`/model gpt`) were already handled by the tables above.
+    final token = leadingPathLikeToken(trimmed);
+    if (token != null && trimmed.length > token.length) {
+      await _sendUserMessage(trimmed, images);
+      return;
+    }
+    if (!_leadingPathLike.hasMatch(trimmed) && !trimmed.startsWith('~/')) {
+      _printHelp(filter: trimmed.substring(1));
+      return;
+    }
+    io.writeln(
+      'looks like a filesystem path, not a command — '
+      'paste the contents (e.g. `cat ${trimmed.split(' ').first}`), '
+      'or use `@${trimmed.split(' ').first}` to load it as context.',
+    );
+  }
+
+  Future<void> _handleMode(String rest) async {
+    if (rest.isEmpty) {
+      io.writeln('mode: ${_currentMode.name}');
+      io.writeln('modes: ${(_modes.keys.toList()..sort()).join(', ')}');
+      return;
+    }
+    await _switchMode(rest);
+  }
+}
+
+/// Builds the session's sleep-prevention controller (issues #325/#326)
+/// from the host-injected runner + configured level + hold lifecycle; a
+/// null runner (tests, web) means no assertions — power is
+/// host-best-effort.
+PowerAssertionController? sessionPowerAssertions(
+  AgentCliConfig config,
+  void Function(String message) onWarn,
+) => config.powerRunner == null
+    ? null
+    : PowerAssertionController(
+        runner: config.powerRunner!,
+        level: config.powerSleepPrevention,
+        hold: config.powerSleepPreventionHold,
+        onWarn: onWarn,
+      );
+
+extension ProviderQueueEditor on AgentCli {
+  /// `/providers` — the provider-queue editor (issue #418). Line mode:
+  ///
+  ///     /providers                                        queue + health
+  ///     /providers queue add <kind> <model> <apiKeyEnv> [baseUrl]
+  ///     /providers queue remove <index>
+  ///     /providers queue move <from> <to>
+  ///     /providers queue test <index>
+  ///
+  /// Writes go to the PROJECT `.fah/config.yaml` `providersQueue:` section
+  /// (surgical upsert, validated with the real parser before the write).
+  /// A winning FA_PROVIDERS_QUEUE env scope cannot be rewritten — the
+  /// command says so instead of pretending. Edits go live at the next turn
+  /// boundary: the runtime is rebuilt from the boot scopes after a write.
+  Future<void> _providersSlash(String rest) async {
+    final parts = rest.trim().split(RegExp(r'\s+'))
+      ..removeWhere((p) => p.isEmpty);
+    final sub = parts.isEmpty || parts.first != 'queue'
+        ? ''
+        : (parts.length == 1 ? '' : parts[1]);
+    switch (sub) {
+      case '':
+        _printProviderQueue();
+      case 'add':
+        await _providerQueueAddRest(parts);
+      case 'remove':
+        await _providerQueueRemoveRest(parts);
+      case 'move':
+        await _providerQueueMoveRest(parts);
+      case 'test':
+        await _providerQueueTestRest(parts);
+      default:
+        _providersUsage();
+    }
+  }
+
+  void _providersUsage() {
+    io.writeln(
+      'usage: /providers queue [add <kind> <model> <apiKeyEnv> [baseUrl] | '
+      'remove <n> | move <from> <to> | test <n>]',
+    );
+  }
+
+  Future<void> _providerQueueAddRest(List<String> parts) async {
+    if (parts.length < 4) {
+      _providersUsage();
+      return;
+    }
+    await _providerQueueAdd(
+      parts[2],
+      parts[3],
+      parts.length >= 5 ? parts[4] : null,
+      parts.length >= 6 ? parts[5] : null,
+    );
+  }
+
+  Future<void> _providerQueueRemoveRest(List<String> parts) async {
+    if (parts.length != 3) {
+      _providersUsage();
+      return;
+    }
+    await _providerQueueEdit(
+      (entries) => providerQueueRemoveAt(entries, int.parse(parts[2])),
+    );
+  }
+
+  Future<void> _providerQueueMoveRest(List<String> parts) async {
+    if (parts.length != 4) {
+      _providersUsage();
+      return;
+    }
+    await _providerQueueEdit(
+      (entries) =>
+          providerQueueMove(entries, int.parse(parts[2]), int.parse(parts[3])),
+    );
+  }
+
+  Future<void> _providerQueueTestRest(List<String> parts) async {
+    if (parts.length != 3) {
+      _providersUsage();
+      return;
+    }
+    await _providerQueueTest(int.parse(parts[2]));
+  }
+
+  /// The live queue with per-entry health badges (current / healthy /
+  /// cooldown ETA / dead + lastError).
+  void _printProviderQueue() {
+    final runtime = config.providersQueueRuntime;
+    if (runtime == null) {
+      io.writeln(
+        'no provider queue set — FA_PROVIDERS_QUEUE env, or `providersQueue:` '
+        'in project/user yaml (issue #418)',
+      );
+      return;
+    }
+    for (final row in renderProviderQueueRows(
+      entries: runtime.entries,
+      state: runtime.state,
+      now: DateTime.now(),
+    )) {
+      io.writeln(row);
+    }
+  }
+
+  /// Appends an entry (validated like the parsers) and persists.
+  Future<void> _providerQueueAdd(
+    String kind,
+    String model,
+    String? apiKeyEnv,
+    String? baseUrl,
+  ) async {
+    final ProviderQueueEntry entry;
+    try {
+      entry = ProviderQueueEntry(
+        providerType: kind,
+        model: model,
+        apiKeyEnv: apiKeyEnv,
+        baseUrl: baseUrl,
+      );
+    } on ArgumentError catch (error) {
+      io.writeln('/providers queue add refused: ${error.message}');
+      return;
+    }
+    await _providerQueueEdit((entries) => providerQueueAdd(entries, entry));
+  }
+
+  /// Runs [edit] on the live entries, persists the new list into the
+  /// project config (validated upsert), and rebuilds the runtime — the
+  /// edit is live from the next turn.
+  Future<void> _providerQueueEdit(
+    List<ProviderQueueEntry> Function(List<ProviderQueueEntry>) edit,
+  ) async {
+    final runtime = config.providersQueueRuntime;
+    if (runtime == null) {
+      io.writeln('no provider queue to edit — add the first entry first');
+      return;
+    }
+    final List<ProviderQueueEntry> next;
+    try {
+      next = edit(runtime.entries);
+    } on Object catch (error) {
+      io.writeln('not applied: $error');
+      return;
+    }
+    await _persistProviderQueue(next);
+  }
+
+  /// Validates the edited queue against the winning scope's file and
+  /// persists it there: editing a project-defined queue never silently
+  /// creates a shadowing user file, and vice versa (env wins are refused
+  /// by [_queuePersistPath]).
+  Future<void> _persistProviderQueue(List<ProviderQueueEntry> next) async {
+    final path = await _queuePersistPath();
+    if (path == null) return;
+    final body = const JsonEncoder.withIndent(
+      '  ',
+    ).convert([for (final entry in next) entry.toJson()]);
+    final source = await _readQueueYaml(path);
+    final edited = upsertYamlPath(source, const [
+      'providersQueue',
+    ], configLeafLines(body, depth: 0));
+    // Never persist a file the next boot would reject.
+    try {
+      parseProviderQueueYaml(loadYaml(edited)['providersQueue'], source: path);
+    } on Object catch (error) {
+      _queueEditFail('not saved: $error');
+      return;
+    }
+    if (await config.env.writeFile(path, edited) is Err) {
+      _queueEditFail('could not write $path');
+      return;
+    }
+    await _rebuildProviderQueueRuntime();
+    io.writeln(
+      'providersQueue updated (${next.length} entries) → $path — '
+      'live from the next turn',
+    );
+  }
+
+  /// The queue file the edit must land in, or null when the edit is
+  /// refused (an FA_PROVIDERS_QUEUE env queue is not file-backed).
+  Future<String?> _queuePersistPath() async {
+    // Same env view the boot resolved through (issue #675): the config's
+    // queue env when the host injected one, else the process environment.
+    final scope = resolveProviderQueueAtBoot(
+      projectDir: config.env.cwd,
+      homeDir: config.homeDir ?? config.env.cwd,
+      env: config.providerQueueEnv,
+    );
+    if (scope.scope == ProviderQueueScope.env) {
+      io.writeln(
+        'FA_PROVIDERS_QUEUE env wins over any file queue — edit the env '
+        'value or unset it; nothing written',
+      );
+      return null;
+    }
+    return switch (scope.scope) {
+      ProviderQueueScope.project => '${config.env.cwd}/.fah/config.yaml',
+      ProviderQueueScope.user =>
+        '${config.homeDir ?? config.env.cwd}/.fah/config.yaml',
+      // Refused above; exhaustiveness keeps the switch total.
+      ProviderQueueScope.env => throw StateError('env scope unreachable'),
+    };
+  }
+
+  /// The queue file's current YAML body; '' when not created yet.
+  Future<String> _readQueueYaml(String path) async =>
+      switch (await config.env.readTextFile(path)) {
+        Ok(:final value) => value,
+        Err(:final error) when error.code == FileErrorCode.notFound => '',
+        Err(:final error) => _queueEditFail('cannot read $path: $error'),
+      };
+
+  String _queueEditFail(String message) {
+    io.writeln(message);
+    return message;
+  }
+
+  /// Rebuilds the queue runtime from the boot scopes after an edit so the
+  /// next run resolves through the fresh queue (turn-boundary liveness).
+  /// [warn] keeps the rebuild's skip/binding warnings loud — true for a
+  /// user-initiated edit (the reload is the only channel those lines
+  /// reach), false for the boot-time quota-feed rebind (the boot already
+  /// rendered the same lines; gh-1781 AC2 prints them once).
+  Future<void> _rebuildProviderQueueRuntime({bool warn = true}) async {
+    try {
+      final queue = resolveProviderQueueAtBoot(
+        projectDir: config.env.cwd,
+        homeDir: config.homeDir ?? config.env.cwd,
+        env: config.providerQueueEnv,
+      );
+      config.providersQueueRuntime = queue.entries.isEmpty
+          ? null
+          : ProviderQueueRuntime.build(
+              queue,
+              secrets: _queueSecrets(queue.entries),
+              quotaFeed: quotaService,
+              // gh-1624 (review r2): the reloaded queue's unverified
+              // binding mismatches say themselves, like at boot.
+              onBindingWarning: warn ? io.writeln : null,
+            );
+    } on ConfigException catch (error) {
+      io.writeln('queue reload failed: ${error.message}');
+    }
+  }
+
+  /// Secrets for [entries]: the injected env lookup first (tests, embedders),
+  /// then the secure-key cache. The names come from [queueEntryKeyNames]
+  /// (gh-1781 review r1 — one ladder: `apiKeyEnv`, `refreshTokenEnv`, and
+  /// the default ChatGPT slot for a `chatgpt-codex` entry with no
+  /// `apiKeyEnv`, issue #1704). The map also carries each base name's
+  /// ROTATION STACK (`NAME_2`, `NAME_3`, …) swept from the same enumerable
+  /// env view the queue scope re-resolves through
+  /// ([AgentCliConfig.providerQueueEnv] — bin hands `Platform.environment`,
+  /// the view the boot swept): the lookup cannot enumerate names, and
+  /// without the stack entries [collectQueueSecrets]'s sweep never fired on
+  /// the rebuild path, silently dropping boot-built multi-key `ApiKeyRing`s
+  /// to single keys (gh-1781 review r1). A null lookup keeps the old
+  /// behavior — [collectQueueSecrets] sweeps the process environment itself.
+  Map<String, String> _queueSecrets(List<ProviderQueueEntry> entries) {
+    final lookup = config.envVarValue;
+    final env = lookup == null
+        ? null
+        : _queueSecretsEnv(entries, lookup, config.providerQueueEnv);
+    return collectQueueSecrets(
+      entries,
+      config.secureKeys ?? _secureKeysMissing,
+      env: env,
+    );
+  }
+
+  /// The env map the rebuild hands to [collectQueueSecrets]: every
+  /// referenced base name through [lookup], plus each base name's rotation
+  /// stack swept from the enumerable [view] (null = nothing to sweep).
+  /// [collectQueueSecrets] re-filters the stack shape (`^NAME_\d+$`,
+  /// non-empty values) exactly like the boot sweep does.
+  Map<String, String> _queueSecretsEnv(
+    List<ProviderQueueEntry> entries,
+    String? Function(String name) lookup,
+    Map<String, String>? view,
+  ) {
+    final names = {
+      for (final entry in entries) ...queueEntryKeyNames([entry]),
+    };
+    final env = {for (final name in names) name: lookup(name) ?? ''};
+    if (view == null) return env;
+    final stackSuffix = RegExp(r'_(\d+)$');
+    for (final candidate in view.entries) {
+      if (candidate.value.isEmpty || !stackSuffix.hasMatch(candidate.key)) {
+        continue;
+      }
+      final base = candidate.key.substring(0, candidate.key.lastIndexOf('_'));
+      if (names.contains(base)) env[candidate.key] = candidate.value;
+    }
+    return env;
+  }
+
+  /// No secure store on this host: the env is the only key source (the
+  /// chain builder reports missing keys per entry).
+  SecureKeyCache get _secureKeysMissing => SecureKeyCache(null);
+
+  /// Runs a one-shot probe against entry [index]: a real minimal request
+  /// through the entry's own adapter. Prints the outcome, never advances
+  /// the cursor (the probe bypasses the queue state entirely).
+  Future<void> _providerQueueTest(int index) async {
+    final runtime = config.providersQueueRuntime;
+    if (runtime == null || index < 0 || index >= runtime.entries.length) {
+      io.writeln('no such queue entry: $index');
+      return;
+    }
+    final entry = runtime.entries[index];
+    final secrets = _queueSecrets([entry]);
+    try {
+      // gh-1624 (review r2): the probe's chain rebuild surfaces the
+      // entry's unverified binding warnings before the probe itself.
+      final warnings = <String>[];
+      final chain = buildProviderQueueChain(
+        [entry],
+        secrets: secrets,
+        warnings: warnings,
+      );
+      for (final warning in warnings) {
+        io.writeln(warning);
+      }
+      final probe = chain.single;
+      final stream = probe.streamForKey(probe.keyRing.currentCredential.value)(
+        probe.model,
+        Context(
+          messages: [UserMessage.text('ping', timestamp: DateTime.now())],
+        ),
+      );
+      final sw = Stopwatch()..start();
+      Object? firstError;
+      await for (final event in stream) {
+        if (event is TextDeltaEvent || event is DoneEvent) break;
+        if (event is ErrorEvent) {
+          firstError = event.error.errorMessage;
+          break;
+        }
+      }
+      sw.stop();
+      if (firstError != null) {
+        io.writeln('${entry.label}: FAILED — $firstError');
+      } else {
+        io.writeln('${entry.label}: ok (${sw.elapsedMilliseconds}ms)');
+      }
+    } on ConfigException catch (error) {
+      io.writeln('${entry.label}: cannot probe — ${error.message}');
+    }
+  }
+
+  /// The settings-hub row description for the provider queue: a compact
+  /// summary of what the next turn resolves through.
+  String _providersQueueStatusLabel() {
+    final runtime = config.providersQueueRuntime;
+    final entries = runtime?.entries;
+    if (entries == null || entries.isEmpty) return 'not set';
+    final current = runtime!.state.currentIndex;
+    return '${entries.length} '
+        '${entries.length == 1 ? 'entry' : 'entries'}, '
+        'current: ${entries[current].model}';
+  }
+}

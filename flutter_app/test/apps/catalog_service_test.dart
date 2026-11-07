@@ -1,0 +1,743 @@
+library;
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart';
+import 'package:crypto/crypto.dart';
+import 'package:fa/apps/catalog_service.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+
+/// Builds a fake release asset server: catalog.json plus per-widget zips
+/// laid out `<id>/<file>` exactly like the publish workflow produces.
+///
+/// Zip builds are PINNED to a fixed mod time (issue #943): archive 4.x
+/// initializes `ArchiveFile.lastModTime` to `DateTime.now()` at first
+/// access, and zip stores DOS time at 2-second granularity — a fixture
+/// re-encoded across a tick boundary produced different bytes than the
+/// sealed probe, so the catalog's sha256 no longer matched the served zip
+/// (the hosted-runner-only flake, gh-938/#944). With the time pinned,
+/// every build of the same fixture is byte-identical — the sealed probe
+/// and the download path both re-run [zipOf], whose every entry carries
+/// the pinned time — so no platform skip is needed, and the Linux-only
+/// runtime skip #950 introduced (kept in #954) is dropped here.
+const _pinnedZipModTime = 315532800; // 1980-01-01T00:00:00Z (DOS epoch floor)
+
+http.Client fakeServer(Map<String, dynamic> catalog) {
+  Uint8List zipOf(String id) {
+    final archive = Archive();
+    final files = {
+      '$id/manifest.json': utf8.encode('{"id":"$id"}'),
+      '$id/widget.js': utf8.encode('(function(){})();'),
+      if ((catalog['widgets'] as List).any(
+        (w) => w['id'] == id && w['icon'] != null,
+      ))
+        '$id/icon.svg': utf8.encode('<svg/>'),
+    };
+    final sorted = files.keys.toList()..sort();
+    for (final name in sorted) {
+      final data = files[name]!;
+      archive.addFile(
+        ArchiveFile(name, data.length, data)
+          ..lastModTime = _pinnedZipModTime,
+      );
+    }
+    return Uint8List.fromList(ZipEncoder().encode(archive));
+  }
+
+  return MockClient((request) async {
+    final name = request.url.pathSegments.last;
+    if (name == 'catalog.json') {
+      return http.Response(jsonEncode(catalog), 200);
+    }
+    for (final w in catalog['widgets'] as List) {
+      if ('${w['id']}-${w['version']}.zip' == name) {
+        return http.Response.bytes(zipOf(w['id'] as String), 200);
+      }
+    }
+    return http.Response('not found', 404);
+  });
+}
+
+Map<String, dynamic> goodCatalog() => {
+  'schemaVersion': 1,
+  'generatedAt': '2026-08-26T21:18:21Z',
+  'sourceRepo': 'https://github.com/IstiN/fa_widgets',
+  'widgets': [
+    {
+      'id': 'calculator',
+      'name': 'Calculator',
+      'version': '1.2.0',
+      'description': 'Scientific calculator',
+      'author': 'Fa',
+      'tags': ['productivity'],
+      'permissions': {'network': false, 'allowedCommands': <String>[]},
+      'minRuntime': '0.4.79',
+      'icon': 'icon.svg',
+      'zip': {'file': 'calculator-1.2.0.zip', 'sha256': '', 'sizeBytes': 100},
+      // EXTERNAL-kind widget: sources live in the origin repo pinned by
+      // sha, NOT under fa_widgets/widgets/<id>/ — the web install path
+      // must use these URLs verbatim.
+      'preview': {
+        'manifest':
+            'https://raw.githubusercontent.com/IstiN/flutter_js_widget_runtime/'
+            'db4e6dd4369c1ba8bb6325633d09187cc382f786/'
+            'example/widgets/calculator/manifest.json',
+        'js':
+            'https://raw.githubusercontent.com/IstiN/flutter_js_widget_runtime/'
+            'db4e6dd4369c1ba8bb6325633d09187cc382f786/'
+            'example/widgets/calculator/widget.js',
+      },
+    },
+    {
+      'id': 'focus-timer',
+      'name': 'Focus Timer',
+      'version': '1.0.0',
+      'description': 'Pomodoro timer',
+      'tags': ['productivity', 'timer'],
+      'permissions': {'network': false, 'allowedCommands': <String>[]},
+      'minRuntime': '0.4.79',
+      'icon': null,
+      'zip': {'file': 'focus-timer-1.0.0.zip', 'sha256': '', 'sizeBytes': 50},
+      'preview': {
+        'manifest':
+            '${kDefaultWidgetsRawBaseUrl}widgets/focus-timer/manifest.json',
+        'js': '${kDefaultWidgetsRawBaseUrl}widgets/focus-timer/widget.js',
+      },
+    },
+  ],
+};
+
+/// Fills every zip.sha256 with the hash of what [server] would serve —
+/// round-trips the fixture through a throwaway service instance.
+Future<Map<String, dynamic>> sealedCatalog(Map<String, dynamic> catalog) async {
+  final sealed = jsonDecode(jsonEncode(catalog)) as Map<String, dynamic>;
+  for (final w in sealed['widgets'] as List) {
+    final probe = await _captureZip(w['id'] as String);
+    (w['zip'] as Map<String, dynamic>)['sha256'] = sha256
+        .convert(probe)
+        .toString();
+    (w['zip'] as Map<String, dynamic>)['sizeBytes'] = probe.length;
+  }
+  return sealed;
+}
+
+final List<Uint8List> captured = [];
+Future<Uint8List> _captureZip(String id) async {
+  // Rebuild deterministically via a one-off client hit.
+  final client = fakeServer(goodCatalog());
+  final response = await client.get(
+    catalogAssetUri(kDefaultWidgetsBaseUrl, 'calculator-1.2.0.zip'),
+  );
+  if (id != 'calculator') return response.bodyBytes;
+  captured.clear();
+  captured.add(response.bodyBytes);
+  return response.bodyBytes;
+}
+
+void main() {
+  // No platform skip: the zip mod-time pin (issue #943) makes the
+  // sealed-probe vs download bytes identical by construction — what
+  // #950 routed around with a Linux-only runtime skip and #954 kept
+  // as per-test `skip: Platform.isLinux ? … : null`. With the pin the
+  // premise is gone, so those clauses are dropped here too.
+
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('catalog asset URL construction', () {
+    test('catalog fetch hits exactly one slash before catalog.json', () async {
+      final env = MemoryExecutionEnv();
+      Uri? requested;
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          requested = request.url;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+      );
+      await service.fetchCatalog();
+      expect(
+        requested.toString(),
+        'https://github.com/IstiN/fa_widgets/releases/latest/download/'
+        'catalog.json',
+        reason: 'the historical bug produced `download//catalog.json` '
+            '(double slash) by appending "/catalog.json" to a base that '
+            'already ends with "download/"',
+      );
+    });
+
+    test('custom base joins with exactly one slash either way', () {
+      expect(
+        catalogAssetUri('https://example.com/assets', 'catalog.json')
+            .toString(),
+        'https://example.com/assets/catalog.json',
+      );
+      expect(
+        catalogAssetUri('https://example.com/assets/', 'catalog.json')
+            .toString(),
+        'https://example.com/assets/catalog.json',
+      );
+      expect(
+        catalogAssetUri('https://example.com/assets/', '/catalog.json')
+            .toString(),
+        'https://example.com/assets/catalog.json',
+      );
+      expect(
+        catalogAssetUri('https://example.com/assets//', '//catalog.json')
+            .toString(),
+        'https://example.com/assets/catalog.json',
+      );
+    });
+
+    test('widget zip downloadUrl carries no double slash', () {
+      final entry = CatalogEntry.fromJson(
+        Map<String, dynamic>.from(goodCatalog()['widgets'][0] as Map),
+      );
+      expect(
+        entry.downloadUrl.toString(),
+        'https://github.com/IstiN/fa_widgets/releases/latest/download/'
+        'calculator-1.2.0.zip',
+      );
+      expect(entry.downloadUrl.path, isNot(contains('//')));
+    });
+
+    test('custom base without trailing slash still fetches the catalog', () async {
+      final env = MemoryExecutionEnv();
+      Uri? requested;
+      final service = CatalogService(
+        env,
+        baseUrl: Uri.parse('https://example.com/assets'),
+        httpClient: MockClient((request) async {
+          requested = request.url;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+      );
+      await service.fetchCatalog();
+      expect(
+        requested.toString(),
+        'https://example.com/assets/catalog.json',
+      );
+    });
+  });
+
+  group('CatalogEntry.fromJson platforms', () {
+    Map<String, dynamic> base() =>
+        Map<String, dynamic>.from(goodCatalog()['widgets'][0] as Map);
+
+    test('parses declared platforms', () {
+      final json = base()..['platforms'] = ['ios', 'macos'];
+      expect(CatalogEntry.fromJson(json).platforms, ['ios', 'macos']);
+    });
+
+    test('absent platforms default to empty', () {
+      expect(CatalogEntry.fromJson(base()).platforms, isEmpty);
+    });
+
+    test('null or non-list platforms are treated as absent', () {
+      expect(
+        CatalogEntry.fromJson(base()..['platforms'] = null).platforms,
+        isEmpty,
+      );
+      expect(
+        CatalogEntry.fromJson(base()..['platforms'] = 'ios').platforms,
+        isEmpty,
+      );
+    });
+
+    test('non-string items are dropped', () {
+      final json = base()..['platforms'] = ['ios', 42, null, 'macos'];
+      expect(CatalogEntry.fromJson(json).platforms, ['ios', 'macos']);
+    });
+  });
+
+  group('CatalogService.fetchCatalog', () {
+    test('parses entries and stamps freshness', () async {
+      final env = MemoryExecutionEnv();
+      var hits = 0;
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          hits++;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+        clock: () => DateTime.utc(2026, 8, 26, 12),
+      );
+      final result = await service.fetchCatalog();
+      expect(result.stale, isFalse);
+      expect(hits, 1);
+      expect(result.entries.map((e) => e.id).toList(), [
+        'calculator',
+        'focus-timer',
+      ]);
+      final calc = result.entries.first;
+      expect(calc.name, 'Calculator');
+      expect(calc.version, '1.2.0');
+      expect(calc.iconFile, 'icon.svg');
+      expect(calc.zipFile, 'calculator-1.2.0.zip');
+      expect(calc.network, isFalse);
+    });
+
+    test('non-ASCII descriptions survive a charset-less response', () async {
+      // GitHub release assets / raw URLs send no charset, so http's
+      // `response.body` would latin1-decode the UTF-8 bytes into mojibake
+      // ("→" → "â\x86\x92"). The service must decode the BYTES as UTF-8.
+      final catalog = goodCatalog();
+      (catalog['widgets'] as List)[0]['description'] = 'Dodge → steer · Таймер';
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          return http.Response.bytes(utf8.encode(jsonEncode(catalog)), 200);
+        }),
+      );
+      final result = await service.fetchCatalog();
+      final calc = result.entries.firstWhere((e) => e.id == 'calculator');
+      expect(calc.description, 'Dodge → steer · Таймер');
+    });
+
+    test('TTL cache serves the second fetch without a network hit', () async {
+      final env = MemoryExecutionEnv();
+      var hits = 0;
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          hits++;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+        clock: () => DateTime.utc(2026, 8, 26, 12),
+      );
+      await service.fetchCatalog();
+      final second = await service.fetchCatalog();
+      expect(hits, 1, reason: 'within TTL the cache answers');
+      expect(second.stale, isFalse);
+      expect(second.entries, hasLength(2));
+      expect(
+        (await env.exists(CatalogService.cacheFile)).valueOrNull,
+        isTrue,
+        reason: 'cache persisted into apps/',
+      );
+    });
+
+    test('force bypasses the TTL', () async {
+      final env = MemoryExecutionEnv();
+      var hits = 0;
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          hits++;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+      );
+      await service.fetchCatalog();
+      await service.fetchCatalog(force: true);
+      expect(hits, 2);
+    });
+
+    test('network failure falls back to the stale cache', () async {
+      final env = MemoryExecutionEnv();
+      var failNow = false;
+      late CatalogService service;
+      service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          if (failNow) return http.Response('boom', 500);
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+        clock: () => DateTime.utc(2026, 8, 26, 12),
+      );
+      await service.fetchCatalog();
+      failNow = true;
+      final fallback = await service.fetchCatalog(force: true);
+      expect(fallback.stale, isTrue);
+      expect(fallback.error, isNotNull);
+      expect(fallback.entries, hasLength(2));
+    });
+
+    test('no cache and no network rethrows', () async {
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          return http.Response('boom', 503);
+        }),
+      );
+      await expectLater(service.fetchCatalog(), throwsA(isA<CatalogError>()));
+    });
+
+    test('corrupt cache payload is ignored, not fatal', () async {
+      final env = MemoryExecutionEnv();
+      await env.writeFile(CatalogService.cacheFile, '{not json');
+      var hits = 0;
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          hits++;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+      );
+      final result = await service.fetchCatalog();
+      expect(hits, 1);
+      expect(result.entries, hasLength(2));
+    });
+  });
+
+  group('CatalogService.downloadWidget', () {
+    test('unpacks the single-root archive into relative paths', () async {
+      final sealed = await sealedCatalog(goodCatalog());
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(env, httpClient: fakeServer(sealed));
+      final files = await service.downloadWidget(
+        CatalogEntry.fromJson(sealed['widgets'][0] as Map<String, dynamic>),
+      );
+      expect(files.keys.toList()..sort(), [
+        'icon.svg',
+        'manifest.json',
+        'widget.js',
+      ]);
+      expect(utf8.decode(files['manifest.json']!), contains('"calculator"'));
+    });
+
+    test('sha mismatch aborts before any unpacking', () async {
+      final catalog = goodCatalog();
+      (((catalog['widgets'] as List)[0] as Map<String, dynamic>)['zip']
+              as Map<String, dynamic>)['sha256'] =
+          'deadbeef';
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(env, httpClient: fakeServer(catalog));
+      await expectLater(
+        service.downloadWidget(
+          CatalogEntry.fromJson(catalog['widgets'][0] as Map<String, dynamic>),
+        ),
+        throwsA(
+          isA<CatalogError>().having((e) => '$e', 'text', contains('sha256')),
+        ),
+      );
+    });
+
+    test(
+      'healing download refetches a stale catalog and retries once',
+      () async {
+        // The stale cache references bytes A; the "republish" replaced the
+        // same-named asset with bytes B and an updated catalog hash.
+        Uint8List zipBytes(String marker) {
+          final archive = Archive();
+          final manifest = utf8.encode('{"id":"w"}');
+          final js = utf8.encode('/* $marker */');
+          archive.addFile(
+            ArchiveFile('w/manifest.json', manifest.length, manifest),
+          );
+          archive.addFile(ArchiveFile('w/widget.js', js.length, js));
+          return Uint8List.fromList(ZipEncoder().encode(archive));
+        }
+
+        final bytesB = zipBytes('b');
+        final hashA = sha256.convert(zipBytes('a')).toString();
+        final hashB = sha256.convert(bytesB).toString();
+        var catalogCalls = 0;
+        Map<String, dynamic> catalogFor(String hash) => {
+          'widgets': [
+            {
+              'id': 'w',
+              'name': 'W',
+              'version': '1.0.0',
+              'permissions': {'network': false, 'allowedCommands': []},
+              'zip': {
+                'file': 'w-1.0.0.zip',
+                'sha256': hash,
+                'sizeBytes': bytesB.length,
+              },
+            },
+          ],
+        };
+        final client = MockClient((request) async {
+          final name = request.url.pathSegments.last;
+          if (name == 'catalog.json') {
+            catalogCalls++;
+            return http.Response(
+              jsonEncode(catalogFor(catalogCalls == 1 ? hashA : hashB)),
+              200,
+            );
+          }
+          if (name == 'w-1.0.0.zip') return http.Response.bytes(bytesB, 200);
+          return http.Response('nf', 404);
+        });
+        final env = MemoryExecutionEnv();
+        final service = CatalogService(env, httpClient: client);
+        final stale = await service.fetchCatalog(); // caches the hashA entry
+        final files = await service.downloadWidgetHealing(stale.entries.single);
+        expect(utf8.decode(files['widget.js']!), '/* b */');
+        expect(catalogCalls, 2); // one stale fetch + one forced refetch
+      },
+    );
+
+    test('path escape / foreign roots are rejected', () async {
+      Uint8List evilZip(String entryName) {
+        final archive = Archive()
+          ..addFile(ArchiveFile(entryName, 3, utf8.encode('bad')));
+        return Uint8List.fromList(ZipEncoder().encode(archive));
+      }
+
+      for (final evil in ['../evil.js', '/abs/evil.js', 'other/evil.js']) {
+        final bytes = evilZip(evil);
+        final catalog = goodCatalog();
+        final zip =
+            (catalog['widgets'][0] as Map)['zip'] as Map<String, dynamic>;
+        zip['sha256'] = sha256.convert(bytes).toString();
+        zip['sizeBytes'] = bytes.length;
+        final env = MemoryExecutionEnv();
+        final service = CatalogService(
+          env,
+          httpClient: MockClient((request) async {
+            return http.Response.bytes(bytes, 200);
+          }),
+        );
+        await expectLater(
+          service.downloadWidget(
+            CatalogEntry.fromJson(
+              Map<String, dynamic>.from(
+                catalog['widgets'][0] as Map<dynamic, dynamic>,
+              ),
+            ),
+          ),
+          throwsA(isA<CatalogError>()),
+          reason: 'entry $evil must be rejected',
+        );
+      }
+    });
+
+    test('HTTP failure surfaces as CatalogError', () async {
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(
+        env,
+        httpClient: MockClient((request) async {
+          return http.Response('nope', 404);
+        }),
+      );
+      await expectLater(
+        service.downloadWidget(
+          CatalogEntry.fromJson(
+            Map<String, dynamic>.from(goodCatalog()['widgets'][0] as Map),
+          ),
+        ),
+        throwsA(isA<CatalogError>()),
+      );
+    });
+  });
+
+  group('web platform policy', () {
+    // release-assets.githubusercontent.com sends NO CORS headers, so
+    // BrowserClient dies with `ClientException: Load failed` on the release
+    // URLs; raw.githubusercontent.com sends `access-control-allow-origin: *`.
+    CatalogEntry calcEntry([Map<String, dynamic>? overrides]) {
+      final json =
+          Map<String, dynamic>.from(goodCatalog()['widgets'][0] as Map);
+      overrides?.forEach((key, value) => json[key] = value);
+      return CatalogEntry.fromJson(json);
+    }
+
+    MockClient rawSourceServer(
+      List<String> requested, {
+      String manifest = '{"id":"calculator"}',
+      String widgetJs = '(function(){})();',
+      int manifestStatus = 200,
+      int widgetJsStatus = 200,
+    }) {
+      return MockClient((request) async {
+        requested.add(request.url.toString());
+        final path = request.url.path;
+        if (path.endsWith('/manifest.json')) {
+          return http.Response(manifest, manifestStatus);
+        }
+        if (path.endsWith('/widget.js')) {
+          return http.Response(widgetJs, widgetJsStatus);
+        }
+        if (path.endsWith('/icon.svg')) return http.Response('<svg/>', 200);
+        return http.Response('nf', 404);
+      });
+    }
+
+    test('web fetches the catalog from the CORS-friendly raw mirror',
+        () async {
+      final env = MemoryExecutionEnv();
+      Uri? requested;
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: MockClient((request) async {
+          requested = request.url;
+          return http.Response(jsonEncode(goodCatalog()), 200);
+        }),
+      );
+      await service.fetchCatalog();
+      expect(
+        requested.toString(),
+        'https://raw.githubusercontent.com/IstiN/fa_widgets/main/catalog.json',
+      );
+    });
+
+    test('web installs from the catalog preview URLs, never the zip',
+        () async {
+      final env = MemoryExecutionEnv();
+      final requested = <String>[];
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: rawSourceServer(requested),
+      );
+      final files = await service.downloadWidget(calcEntry());
+      final preview = calcEntry();
+      expect(requested, [
+        // preview URLs used VERBATIM — EXTERNAL widgets have no sources
+        // under fa_widgets/widgets/<id>/ to reconstruct from.
+        preview.previewManifestUrl,
+        preview.previewJsUrl,
+        // the icon is always mirrored into fa_widgets itself
+        '${kDefaultWidgetsRawBaseUrl}widgets/calculator/icon.svg',
+      ]);
+      expect(files.keys.toList()..sort(), [
+        'icon.svg',
+        'manifest.json',
+        'widget.js',
+      ]);
+      expect(utf8.decode(files['widget.js']!), '(function(){})();');
+    });
+
+    test('web icon URL collapses redundant slashes', () async {
+      final env = MemoryExecutionEnv();
+      final requested = <String>[];
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        rawBaseUrl: Uri.parse('https://example.com/raw//'),
+        httpClient: rawSourceServer(requested),
+      );
+      await service.downloadWidget(calcEntry());
+      expect(
+        requested.last,
+        'https://example.com/raw/widgets/calculator/icon.svg',
+      );
+    });
+
+    test('web fails loudly when the catalog entry lacks preview URLs',
+        () async {
+      final env = MemoryExecutionEnv();
+      final requested = <String>[];
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: rawSourceServer(requested),
+      );
+      await expectLater(
+        service.downloadWidget(calcEntry({'preview': null})),
+        throwsA(
+          isA<CatalogError>().having(
+            (e) => '$e',
+            'text',
+            allOf(contains('calculator'), contains('preview')),
+          ),
+        ),
+      );
+      expect(requested, isEmpty);
+    });
+
+    test('web skips the icon fetch when the entry declares none', () async {
+      final env = MemoryExecutionEnv();
+      final requested = <String>[];
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: rawSourceServer(requested),
+      );
+      final entry = CatalogEntry.fromJson(
+        Map<String, dynamic>.from(goodCatalog()['widgets'][1] as Map),
+      );
+      final files = await service.downloadWidget(entry);
+      expect(requested, [entry.previewManifestUrl, entry.previewJsUrl]);
+      expect(files.keys.toList()..sort(), ['manifest.json', 'widget.js']);
+    });
+
+    test('web fails loudly on malformed manifest content', () async {
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: rawSourceServer(<String>[], manifest: 'not json'),
+      );
+      await expectLater(
+        service.downloadWidget(calcEntry()),
+        throwsA(
+          isA<CatalogError>().having(
+            (e) => '$e',
+            'text',
+            allOf(contains('calculator'), contains('manifest')),
+          ),
+        ),
+      );
+    });
+
+    test('web surfaces a missing source file as CatalogError', () async {
+      final env = MemoryExecutionEnv();
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: rawSourceServer(<String>[], widgetJsStatus: 404),
+      );
+      await expectLater(
+        service.downloadWidget(calcEntry()),
+        throwsA(
+          isA<CatalogError>().having(
+            (e) => '$e',
+            'text',
+            allOf(contains('calculator'), contains('404')),
+          ),
+        ),
+      );
+    });
+
+    test('web rejects an unsafe widget id before any request', () async {
+      final env = MemoryExecutionEnv();
+      final requested = <String>[];
+      final service = CatalogService(
+        env,
+        isWeb: true,
+        httpClient: rawSourceServer(requested),
+      );
+      await expectLater(
+        service.downloadWidget(calcEntry({'id': '../evil'})),
+        throwsA(isA<CatalogError>()),
+      );
+      expect(requested, isEmpty);
+    });
+
+    test('explicit isWeb:false keeps the release zip flow byte-identical',
+        () async {
+      final sealed = await sealedCatalog(goodCatalog());
+      final env = MemoryExecutionEnv();
+      final requested = <String>[];
+      final delegate = fakeServer(sealed);
+      final service = CatalogService(
+        env,
+        isWeb: false,
+        httpClient: MockClient((request) async {
+          requested.add(request.url.toString());
+          return delegate.get(request.url, headers: request.headers);
+        }),
+      );
+      final files = await service.downloadWidget(
+        CatalogEntry.fromJson(sealed['widgets'][0] as Map<String, dynamic>),
+      );
+      expect(
+        requested.single,
+        '${kDefaultWidgetsBaseUrl}calculator-1.2.0.zip',
+      );
+      expect(files.keys.toList()..sort(), [
+        'icon.svg',
+        'manifest.json',
+        'widget.js',
+      ]);
+    });
+  });
+}

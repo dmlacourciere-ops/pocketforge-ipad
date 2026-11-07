@@ -1,0 +1,1686 @@
+{
+  "@@locale": "en",
+  "@appTitle": {
+    "description": "Application title shown in the window title bar."
+  },
+  "appTitle": "Fa",
+  "approvalAllowOnce": "Allow once",
+  "approvalAllowToolTitle": "Allow {tool}?",
+  "approvalAlwaysAllow": "Always allow",
+  "approvalDeny": "Deny",
+  "attachedEmpty": "No messages yet — say something below",
+  "attachedToCli": "attached to fa cli",
+  "sendToCli": "Message the fa cli session…",
+  "sessionFolderPersonal": "Personal",
+  "sessionInfoNameLabel": "Session name",
+  "newSessionFolderTitle": "New session — folder",
+  "newSessionCurrentFolder": "Current folder ({folder})",
+  "@newSessionCurrentFolder": {
+    "placeholders": {
+      "folder": {}
+    }
+  },
+  "approvalModeAlwaysAsk": "Always ask",
+  "approvalModeAlwaysAskHint": "Every tool call asks for approval.",
+  "approvalModeTitle": "Tool approvals",
+  "approvalModeWrite": "Write",
+  "approvalModeWriteHint": "File reads run freely; writes, edits and shell commands ask for approval.",
+  "approvalModeYolo": "YOLO",
+  "approvalModeYoloHint": "All tools run without asking (destructive shell commands still ask).",
+  "approvalTierLabel": "Tier: {tier}",
+  "appsAskFaAbout": "Ask Fa about {name}",
+  "appsAskFaHint": "e.g. make the buttons bigger and purple",
+  "appsAskFaSubtitle": "Fa gets your message, the app state and a screenshot.",
+  "appsAskFaTooltip": "Ask Fa about this app",
+  "appsChatEmptyHint": "Nothing here yet — ask Fa about this app.",
+  "appsCollapseChatTooltip": "Collapse chat",
+  "appsDismissReplyTooltip": "Dismiss",
+  "appsEmptyState": "No apps yet. Ask Fa to build one —\nit will land in the apps/ folder.",
+  "appsFaStatusThinking": "thinking…",
+  "appsFaStatusWorking": "Fa is working…",
+  "appsFaStatusWriting": "writing…",
+  "appsFollowUpHint": "Follow up…",
+  "appsGridTitle": "Apps",
+  "appsHideAppsTooltip": "Hide apps",
+  "appsLoadError": "Failed to load apps: {error}",
+  "widgetsCatalogInstallFailed": "Install failed: {error}",
+  "widgetsCatalogNotInstalled": "Widget is not installed yet.",
+  "widgetsCatalogOffline": "Offline — showing the last known catalog.",
+  "widgetsCatalogLoadFailed": "Could not load the widgets catalog.\n{error}",
+  "@widgetsCatalogLoadFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "@widgetsCatalogInstallFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "widgetsCatalogFilterAll": "All",
+  "@widgetsCatalogFilterAll": {},
+  "widgetsCatalogRetry": "Retry",
+  "appsOpenChatTooltip": "Open chat",
+  "appsOpenFullChatTooltip": "Open full chat",
+  "appsOpenTrajectoryTooltip": "Open trajectory",
+  "appsPermissionCalendar": "Calendar",
+  "appsPermissionCalendarDesc": "jsr.fa.calendar — read your system calendar events",
+  "appsPermissionContacts": "Contacts",
+  "appsPermissionContactsDesc": "jsr.fa.contacts — address book (coming soon)",
+  "appsPermissionHealth": "Health",
+  "appsPermissionHealthDesc": "jsr.fa.health — health data (coming soon)",
+  "appsPermissionHomekit": "HomeKit",
+  "appsPermissionHomekitDesc": "jsr.fa.homekit — smart home devices (coming soon)",
+  "appsPermissionKeys": "Host keys",
+  "appsPermissionKeysDesc": "jsr.fa.keys — read the API keys saved in Fa and request new ones",
+  "appsPermissionTheme": "Theme packs",
+  "appsPermissionThemeDesc": "jsr.fa.theme — list theme packs and apply one (the user confirms every apply)",
+  "appsPermissionLlm": "LLM",
+  "appsPermissionLlmDesc": "jsr.fa.llm — let the app ask the connected model",
+  "appsPermissionMedia": "Media",
+  "appsPermissionMediaDesc": "jsr.fa.media — generate images, speech, and music",
+  "appsPermissionMicrophone": "Microphone",
+  "appsPermissionMicrophoneDesc": "jsr.fa.asr — record audio and transcribe speech",
+  "appsPermissionNetwork": "Network",
+  "appsPermissionNetworkDesc": "jsr.fetchJson — let the app call HTTP APIs",
+  "appsPermissionNotifications": "Notifications",
+  "appsPermissionNotificationsDesc": "jsr.fa.notify — schedule local notifications",
+  "appsPermissionsDone": "Done",
+  "appsPermissionsTitle": "{name} permissions",
+  "appsPermissionsTooltip": "App permissions",
+  "appsCloseTooltip": "Close app",
+  "appsRefreshTooltip": "Refresh",
+  "appsReloadTooltip": "Reload app",
+  "appsSendToFa": "Send to Fa",
+  "appsSendTooltip": "Send",
+  "appsShowAppsTooltip": "Show apps",
+  "appsStartError": "Failed to start {name}:\n{error}",
+  "appsStopTooltip": "Stop",
+  "askAnswerAction": "Answer",
+  "askBack": "Back",
+  "askCancel": "Cancel",
+  "askNext": "Next",
+  "askOtherLabel": "Other (type your own)",
+  "askQuestionProgress": "Question {index} of {total}",
+  "askQuestionTitle": "Question",
+  "askRecommended": "Recommended",
+  "askYourAnswerLabel": "Your answer",
+  "cacheBrowserSubtitle": "On-device model weights cached in your browser. Deleting frees space; a model re-downloads on next use.",
+  "cacheDeleteTitle": "Delete {name}?",
+  "cacheDeleteTooltip": "Delete {name}",
+  "cacheDeleteWeightsBrowser": "Removes the downloaded weights ({size}) from the browser cache. The model downloads again the next time you use it.",
+  "cacheEntryCached": "{size} · {bytes} cached",
+  "cacheNoModels": "No models downloaded yet.",
+  "cacheNoticeDeleteFailed": "Failed to delete {name}: {error}",
+  "cacheNoticeDeleted": "Deleted {name}.",
+  "cacheNoticeLoadedModel": "{name} was the loaded model — it downloads again on next use.",
+  "chatAbortTooltip": "Abort",
+  "chatAttachError": "Could not attach {name}: {error}",
+  "chatAttachFile": "Attach file",
+  "chatAttachNoName": "Could not attach \"{name}\": no usable file name.",
+  "chatAttachTooltip": "Attach",
+  "chatCamera": "Camera",
+  "chatCollapse": "Collapse",
+  "chatCopiedToClipboard": "Session copied to clipboard",
+  "chatCopySessionTooltip": "Copy session",
+  "chatFilesTooltip": "Files",
+  "chatGallery": "Gallery",
+  "chatInputHint": "Type a message",
+  "chatMicDenied": "Microphone access was denied. Enable it in the system privacy settings (Privacy & Security → Microphone), then try again.",
+  "chatMicError": "Voice input failed: {error}",
+  "chatMicStopTooltip": "Stop recording",
+  "chatMicTooltip": "Voice input",
+  "chatModelSwitchTooltip": "Switch model",
+  "chatRemoveAttachment": "Remove attachment",
+  "chatSendError": "Could not send: {error}",
+  "chatSendTooltip": "Send",
+  "chatSessionsTooltip": "Sessions & model",
+  "chatSettingsTooltip": "Connection settings",
+  "chatShowAll": "Show all ({count})",
+  "chatUploadFailed": "Upload failed: {error}",
+  "commonCancel": "Cancel",
+  "commonDelete": "Delete",
+  "filePreviewCannotRead": "Cannot read file",
+  "filePreviewCannotStat": "Cannot stat file",
+  "filePreviewDecodeError": "Could not decode image",
+  "filePreviewLoadError": "Could not load file",
+  "filePreviewNoPreview": "No preview available",
+  "filePreviewEdit": "Edit",
+  "filePreviewSave": "Save",
+  "filePreviewSaved": "Saved",
+  "filePreviewSaveError": "Save failed",
+  "filePreviewTabPreview": "Preview",
+  "filePreviewTabSource": "Source",
+  "filePreviewTooLarge": "File too large to preview",
+  "filePreviewTruncated": "Showing the first {size} — truncated",
+  "filesBackTooltip": "Back to files",
+  "filesEmptyFileName": "(empty file name)",
+  "filesEmptyFolder": "Empty folder",
+  "filesFolderAccessDenied": "Could not get access to that folder.",
+  "filesFolderPickerError": "Could not open folder picker: {error}",
+  "filesICloudSyncDone": "Synced {files} files ({size}) — last sync {when}",
+  "filesICloudSyncFailed": "iCloud sync failed: {error}",
+  "filesICloudSyncTooltip": "Sync sessions and apps with iCloud",
+  "filesICloudSyncUnavailable": "iCloud sync is unavailable — enable iCloud Drive for Fa in Settings → Apple ID → iCloud",
+  "filesListFolderError": "Could not list folder",
+  "filesMountUnavailableTooltip": "Previously used folder is unavailable: {path} — tap to pick again",
+  "filesOpenFolderError": "Could not open folder",
+  "filesOpenProjectFolderTooltip": "Open project folder…",
+  "filesPanelTitle": "Files",
+  "filesRefreshTooltip": "Refresh",
+  "filesRetryButton": "Retry",
+  "filesUnmountTooltip": "Unmount {path}",
+  "filesUpTooltip": "Up",
+  "filesUploadFailed": "Upload failed: {error}",
+  "filesUploadFailures": ", {count} failed: {names}",
+  "filesUploadSummary": "{uploaded, plural, =1{Uploaded 1 file} other{Uploaded {uploaded} files}}{failures}",
+  "filesUploadTooltip": "Upload files here",
+  "keysAddButton": "Add key",
+  "keysAddDialogTitle": "Add key",
+  "keysAddNameDuplicate": "A key with this name already exists.",
+  "keysAddNameHint": "GITHUB_TOKEN",
+  "keysAddNameInvalid": "Use A–Z, 0–9 and underscores, starting with a letter.",
+  "keysAddNameLabel": "Name",
+  "keysDeleteBody": "The saved value is removed from this device. A value from the .env file, if any, applies again.",
+  "keysDeleteTitle": "Delete {name}?",
+  "keysSectionNote": "Values are never displayed. Saved keys persist on this device; session keys are gone on reload.",
+  "keysSectionTitle": "Keys",
+  "keysSetButton": "Set",
+  "keysSetDialogTitle": "Set {name}",
+  "keysSourceEnv": "env file",
+  "keysSourceNone": "not set",
+  "keysSourceProviderSession": "provider key · this session",
+  "keysSourceSaved": "saved",
+  "keysValueHint": "Paste the key value",
+  "keysValueLabel": "Value",
+  "launcherChatActionsTooltip": "Chat actions",
+  "faEntryHintTooltip": "Tap: continue the active chat · Hold: new chat",
+  "launcherChatEmptyHint": "Nothing here yet — ask Fa anything.",
+  "launcherDissolveFolder": "Remove folder",
+  "launcherFolderDefaultName": "Folder",
+  "launcherFolderNameHint": "Folder name",
+  "launcherOpenApp": "Open",
+  "@launcherOpenApp": {},
+  "launcherOpenAppError": "Could not open the app: {error}",
+  "launcherRenameFolderTooltip": "Rename folder",
+  "launcherRestoreDemoApp": "Restore reference version",
+  "launcherRestoreDemoAppDone": "App code restored (your data was kept)",
+  "launcherRemoveWidget": "Remove widget",
+  "@launcherRemoveWidget": {},
+  "launcherRemoveWidgetTitle": "Remove {name}?",
+  "@launcherRemoveWidgetTitle": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "launcherRemoveWidgetBody": "The widget files are deleted; its saved data (storage.json) is kept, so reinstalling restores its state.",
+  "@launcherRemoveWidgetBody": {},
+  "launcherSearchHint": "Search widgets…",
+  "@launcherSearchHint": {},
+  "launcherTabWidgets": "Widgets",
+  "@launcherTabWidgets": {},
+  "launcherLoadUnpacked": "Load unpacked",
+  "@launcherLoadUnpacked": {},
+  "unpackedLoadTitle": "Load unpacked widget",
+  "@unpackedLoadTitle": {},
+  "unpackedLoadIdLine": "id: {id}",
+  "@unpackedLoadIdLine": {
+    "placeholders": {
+      "id": {}
+    }
+  },
+  "unpackedLoadNetworkNote": "This widget declares network access — it can fetch from the network (jsr.fetchJson).",
+  "@unpackedLoadNetworkNote": {},
+  "unpackedLoadCommandsNote": "Shell commands it may run (jsr.exec): {commands}",
+  "@unpackedLoadCommandsNote": {
+    "placeholders": {
+      "commands": {}
+    }
+  },
+  "unpackedLoadReplaceNote": "A widget with this id already exists ({source}, v{version}). Replacing overwrites its code; the saved data (storage.json) is kept.",
+  "@unpackedLoadReplaceNote": {
+    "placeholders": {
+      "source": {},
+      "version": {}
+    }
+  },
+  "unpackedLoadConfirm": "Load",
+  "@unpackedLoadConfirm": {},
+  "unpackedLoadReplaceConfirm": "Replace",
+  "@unpackedLoadReplaceConfirm": {},
+  "unpackedLoadErrorTitle": "Widget was not loaded",
+  "@unpackedLoadErrorTitle": {},
+  "unpackedLoadDone": "{name} loaded from the folder",
+  "@unpackedLoadDone": {
+    "placeholders": {
+      "name": {}
+    }
+  },
+  "unpackedLoadFailed": "Load failed: {error}",
+  "@unpackedLoadFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "unpackedSourceChip": "unpacked",
+  "@unpackedSourceChip": {},
+  "unpackedSourceBadgeTooltip": "Loaded from a local folder (unpacked)",
+  "@unpackedSourceBadgeTooltip": {},
+  "unpackedSourceCatalog": "installed from the catalog",
+  "@unpackedSourceCatalog": {},
+  "unpackedSourceUnpacked": "loaded from a local folder",
+  "@unpackedSourceUnpacked": {},
+  "unpackedSourceAgent": "created by the agent",
+  "@unpackedSourceAgent": {},
+  "unpackedSourceUnknown": "installed from an unknown source ({source})",
+  "@unpackedSourceUnknown": {
+    "placeholders": {
+      "source": {}
+    }
+  },
+  "settingsResetApps": "Reset apps",
+  "@settingsResetApps": {},
+  "settingsResetAppsHint": "Restore the widget apps to their initial state",
+  "@settingsResetAppsHint": {},
+  "settingsResetAppsConfirmTitle": "Reset all apps?",
+  "@settingsResetAppsConfirmTitle": {},
+  "settingsResetAppsConfirmBody": "This deletes EVERY widget you downloaded from the catalog or created here, together with ALL its data (saved state, settings, storage). The apps grid returns to a clean slate — re-download anything from Get widgets. This cannot be undone.",
+  "@settingsResetAppsConfirmBody": {},
+  "settingsResetAppsDone": "Apps reset — {count} widget(s) removed",
+  "@settingsResetAppsDone": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appsCatalogCreatedByMe": "Created by me",
+  "@appsCatalogCreatedByMe": {},
+  "commonError": "Something went wrong",
+  "@commonError": {},
+  "launcherTabGetWidgets": "Get widgets",
+  "@launcherTabGetWidgets": {},
+  "launcherRestoreDemoAppFailed": "Could not restore the app",
+  "launcherSeedErrorCopy": "Copy error",
+  "launcherSeedErrorHint": "Send this error to Fa — it can fix the app.",
+  "launcherSeedErrorTitle": "App failed to install",
+  "launcherManifestErrorTitle": "App failed to load",
+  "appsManifestErrorLabel": "Manifest error",
+  "launcherTileSizeIcon": "Icon (1×1)",
+  "launcherTileSizeLarge": "Large (4×4)",
+  "launcherTileSizeMedium": "Medium (4×2)",
+  "launcherTileSizeReset": "Reset to default",
+  "launcherTileSizeSmall": "Small (2×2)",
+  "launcherTileSizeTall": "Tall (1×2)",
+  "launcherTileSizeWide": "Wide (2×1)",
+  "launcherTileSizeColumn": "Column (1×3)",
+  "launcherTileSizeRow": "Row (3×1)",
+  "mediaFileMissing": "Media file not found",
+  "mediaModelsApiKeyNameHelper": "Name of a saved key (see Keys) — never the key itself. Empty reuses the main connection's key.",
+  "mediaModelsApiKeyNameLabel": "API key name (optional)",
+  "mediaModelsCapabilitiesNote": "This endpoint's models suggest support for:",
+  "mediaModelsClearButton": "Clear",
+  "mediaModelsEditTitle": "Edit {slot}",
+  "mediaModelsFallbackSummary": "Same as main connection",
+  "mediaModelsMainConnection": "Main connection",
+  "mediaModelsOverrideSummary": "{modelId} · {host}",
+  "mediaModelsSectionNote": "Image, audio, video and transcription calls use the main connection unless a slot overrides it.",
+  "mediaModelsSectionTitle": "Media models",
+  "mediaModelsSlotAudioTts": "Text-to-speech",
+  "mediaModelsSlotImageGeneration": "Image generation",
+  "mediaModelsSlotMusicGeneration": "Music generation",
+  "mediaModelsSlotTranscription": "Transcription",
+  "mediaModelsSlotVideoGeneration": "Video generation",
+  "mediaModelsSlotVision": "Vision (image reading)",
+  "mediaMuteTooltip": "Mute",
+  "mediaPauseTooltip": "Pause",
+  "mediaPlayTooltip": "Play",
+  "mediaUnmuteTooltip": "Unmute",
+  "mediaVideoUnsupportedWeb": "Video playback is not supported in the web build",
+  "modelPresetBudgetDescription": "Cheapest solid combo for every day — fast chat plus all media on OpenRouter",
+  "modelPresetBudgetName": "Budget optimal",
+  "modelPresetQualityDescription": "Top-tier chat plus flagship image generation — the strongest combo on OpenRouter",
+  "modelPresetQualityName": "Quality",
+  "modelPresetsApplied": "Applied",
+  "modelPresetsChatLabel": "Chat",
+  "modelPresetsKeyMissing": "This preset needs an API key for {provider}.",
+  "modelPresetsSectionTitle": "Model presets",
+  "modelPresetsSetKey": "Set key",
+  "onboardingAiDisclaimer": "Answers come from third-party AI providers you connect. AI can be wrong or incomplete — always verify important information.",
+  "onboardingAiDisclaimerTitle": "AI can make mistakes",
+  "onboardingFeatureApps": "Builds real mini-apps with live widgets right on your home grid",
+  "onboardingFeatureAutomation": "Automates your calendar, reminders and smart home",
+  "onboardingFeatureMedia": "Generates images, music and video on demand",
+  "onboardingGetStarted": "Get started",
+  "onboardingModelsBody": "One tap applies a full combo — chat plus image, music and video models. You can change everything later in Settings.",
+  "onboardingModelsSetUpLater": "Set up later",
+  "onboardingModelsTitle": "Pick your models",
+  "onboardingNext": "Continue",
+  "onboardingPermissionCalendar": "Calendar",
+  "onboardingPermissionCalendarDesc": "Event planning",
+  "onboardingPermissionContacts": "Contacts",
+  "onboardingPermissionContactsDesc": "Call and message actions",
+  "onboardingPermissionHealth": "Health",
+  "onboardingPermissionHealthDesc": "Activity summaries",
+  "onboardingPermissionHome": "Home",
+  "onboardingPermissionHomeDesc": "Smart home control",
+  "onboardingPermissionMicrophone": "Microphone",
+  "onboardingPermissionMicrophoneDesc": "Voice input",
+  "onboardingPermissionNotifications": "Notifications",
+  "onboardingPermissionNotificationsDesc": "Reminders and alerts",
+  "onboardingPermissionsBody": "All of these are optional — core chat works without any of them. Fa asks only in context, when a feature actually needs it, and you can change your mind anytime in the system Settings.",
+  "onboardingPermissionsTitle": "Permissions, on your terms",
+  "onboardingPrivacyKeysDesc": "API keys live in the platform Keychain (iOS/macOS) or the local secure store — never in chat logs.",
+  "onboardingPrivacyKeysTitle": "Keys stay locked away",
+  "onboardingPrivacyOnDeviceDesc": "Your conversations and files stay on this device.",
+  "onboardingPrivacyOnDeviceTitle": "Chats and files stay on device",
+  "onboardingPrivacyPolicyLink": "Privacy policy",
+  "onboardingPrivacyProvidersDesc": "Content is sent only to the AI providers you explicitly connect.",
+  "onboardingPrivacyProvidersTitle": "You choose the providers",
+  "onboardingPrivacyTitle": "Your data stays yours",
+  "onboardingSkip": "Skip",
+  "onboardingWelcomeBody": "Chat with an AI agent that does real work, not just talk.",
+  "onboardingWelcomeTitle": "Meet Fa",
+  "quickStartCachedLabel": "{size} · {bytes} cached",
+  "quickStartLoading": "Loading model…",
+  "quickStartSubtitle": "Already on this device — one tap, no API key needed.",
+  "quickStartTitle": "Downloaded models",
+  "quickStartUse": "Use",
+  "secretRequestInvalidName": "Use UPPER_SNAKE: A–Z, 0–9, _, starting with a letter",
+  "secretRequestNameLabel": "Key name",
+  "secretRequestNotNow": "Not now",
+  "secretRequestSave": "Save",
+  "secretRequestTitle": "Fa needs a key",
+  "secretRequestValueLabel": "Key value",
+  "settingsAddProvider": "Add provider",
+  "settingsApiKeyHint": "Paste your provider key",
+  "settingsApiKeyLabel": "API key",
+  "settingsApiKeyLocalHelper": "Leave empty for local servers (llama.cpp, Ollama, LM Studio)",
+  "settingsApiKeyOptionalLabel": "API key (optional)",
+  "settingsApiKeyRequired": "API key is required",
+  "settingsApplyButton": "Apply",
+  "settingsBaseUrlHelper": "OpenAI-compatible endpoint",
+  "settingsBaseUrlLabel": "Base URL",
+  "settingsBaseUrlRequired": "Base URL is required",
+  "settingsCliOnlyTitle": "CLI-only settings",
+  "settingsCliOnlyLead": "These settings live in the CLI and its config file — this app cannot host them:",
+  "settingsCliOnlyMcpServers": "MCP servers",
+  "settingsCliOnlyTtsrRules": "Stream rules (TTSR)",
+  "settingsCliOnlyCubeSandbox": "Cube sandbox",
+  "settingsCliOnlyPromptOverrides": "Prompt overrides",
+  "settingsCliOnlyAgentMode": "Agent mode",
+  "settingsCliOnlyMemoryStores": "Memory stores",
+  "settingsCancelButton": "Cancel",
+  "settingsCoderBadge": "coder",
+  "settingsCorsNoteCustom": "Any OpenAI-compatible endpoint. The provider must allow browser (CORS) requests — api.anthropic.com does not, so reach Anthropic models via OpenRouter instead.",
+  "settingsCopyDebugLogs": "Copy debug logs",
+  "settingsSendTestCrashReport": "Send test crash report",
+  "settingsTestCrashReportNoFirebase": "Crashlytics not initialized on this device",
+  "settingsTestCrashReportSent": "Test report sent — check the Firebase console in a few minutes",
+  "settingsDebugLogsCopied": "Debug logs copied to clipboard",
+  "settingsCorsNoteOllama": "Calls go straight from your browser to ollama.com, which currently does not send CORS headers — browser calls fail. Use OpenRouter here, or pick Ollama from the mobile/desktop app instead.",
+  "settingsDefaultChatModelTitle": "Default chat model",
+  "settingsDapAddConnection": "Add connection",
+  "settingsDapAgentIdLabel": "Agent id",
+  "settingsDapAgentNameLabel": "Agent name",
+  "settingsDapPasswordLabel": "Hub password",
+  "@settingsDapPasswordLabel": {
+    "description": "The hub password field on the connection editor"
+  },
+  "settingsDapChannelsEmpty": "No channels yet — channels appear here once the agent joins one (dap_invite / dap_connect).",
+  "settingsDapChannelsTitle": "Channels",
+  "settingsDapEditConnection": "Edit connection",
+  "settingsDapMakeActive": "Make active",
+  "settingsDapActiveChip": "Active",
+  "settingsDapSavedTitle": "Saved connections",
+  "settingsDapSavedHint": "Bookmarked hubs. Tap one to make it the hub this agent is online on — the switch is live.",
+  "settingsDapRemoveSaved": "Remove",
+  "settingsDapEnvNote": "DAP_HUB_URL or DAP_AGENT_NAME is set in the environment — env overrides the saved connection.",
+  "settingsDapHubHint": "Let Fa agents find and message each other",
+  "settingsDapHubIntro": "A hub is where your Fa agents meet — the CLI, this app, and the browser extension. Connect once and this agent becomes reachable by name: others can find it and send it messages.",
+  "settingsAgentNetworkJoin": "Join as agent",
+  "settingsAgentNetworkJoinHint": "Your agent joins the hub as a live, addressable member — CLI peers and other apps reach it by DM.",
+  "settingsAgentNetworkUrl": "Hub URL",
+  "settingsAgentNetworkToken": "Pairing token",
+  "settingsAgentNetworkName": "Agent name",
+  "settingsAgentNetworkSave": "Save",
+  "settingsAgentNetworkConnected": "Connected",
+  "settingsAgentNetworkConnecting": "Connecting…",
+  "settingsAgentNetworkOffline": "Offline",
+  "settingsAgentNetworkPeers": "Peers",
+  "settingsAgentNetworkNoPeers": "No peers visible yet",
+  "settingsAgentNetworkDmHint": "Message a peer…",
+  "settingsAgentNetworkSend": "Send DM",
+  "settingsAgentNetworkUnsupported": "Agent network membership is not available on this platform.",
+  "settingsAgentNetworkSaved": "Agent network settings saved",
+  "settingsDapIdentityTitle": "How other agents see you",
+  "settingsDapIdentityHint": "The name is how other agents address you. The id is derived from this device’s key.",
+  "settingsDapInboundTitle": "Incoming messages",
+  "settingsDapInboundHint": "Where messages from other agents land",
+  "settingsDapInboundDedicated": "A dedicated agent session (recommended)",
+  "settingsDapInboundCurrent": "Whichever session is open",
+  "settingsDapInboundNamed": "A session you pick",
+  "settingsDapInboundBadgeTooltip": "This session receives messages from other agents",
+  "settingsDapHubTitle": "Agent network",
+  "settingsDapNameHint": "alice",
+  "settingsDapPasswordHint": "Leave empty to keep the current one",
+  "@settingsDapPasswordHint": {
+    "description": "Helper text: an empty password field keeps the stored one"
+  },
+  "settingsDapProbeButton": "Check connection",
+  "settingsDapStatusConnected": "Connected",
+  "settingsDapStatusOffline": "Unreachable",
+  "settingsDapStatusUnknown": "Not checked",
+  "settingsDapUnsupported": "DAP hub is not supported on this platform.",
+  "settingsDapUrlHint": "hub.example.com or ws://hub.example.com/ws",
+  "settingsDapUrlLabel": "Hub URL",
+  "settingsDapUrlRequired": "Hub URL is required",
+  "settingsDapLoadFailed": "Could not read the DAP config on this machine.",
+  "settingsDapSaveFailed": "Could not save the DAP connection — check the hub URL.",
+  "settingsDeleteButton": "Delete",
+  "settingsDeleteProviderBody": "The provider is removed from the picker. The current connection is not affected.",
+  "settingsDeleteProviderTitle": "Delete {name}?",
+  "settingsDownloadingWeights": "Downloading model weights…",
+  "settingsEditButton": "Edit",
+  "settingsEditProviderTitle": "Edit provider",
+  "settingsEditorKeyNote": "Name, URL and model are saved; the key is kept in memory for this session only — never persisted.",
+  "settingsEditorKeyNoteSecure": "Name, URL and model are saved; the key is stored in the device's secure key store (Keychain/Keystore) while it's available.",
+  "settingsEditorKeepKeyNote": "A key is saved for this provider — leave the field empty to keep it.",
+  "settingsKeyNoteCustom": "The provider definition (name, URL, model) is saved — no secrets. The API key stays in memory for this session only and is gone on reload.",
+  "settingsKeyNoteCustomSecure": "The provider definition (name, URL, model) is saved — no secrets. Saved keys are stored in the device's secure key store (Keychain/Keystore) while it's available; an unsaved key stays in memory for this session only.",
+  "settingsKeyNoteHosted": "In-memory only: your key is never persisted and is gone on reload. Calls go straight from your browser to the provider — nothing is proxied or stored.",
+  "settingsKeyNoteHostedSecure": "Saved keys are stored in the device's secure key store (Keychain/Keystore) while it's available; a key only typed into the form stays in memory for this session. Calls go straight from the app to the provider — nothing is proxied.",
+  "settingsLoadingModel": "Loading model…",
+  "settingsModelIdLabel": "Model id",
+  "settingsModelIdOptionalLabel": "Model id (optional)",
+  "settingsModelIdRequired": "Model id is required",
+  "settingsModelsFetching": "Fetching models from the endpoint…",
+  "settingsModelsGroupTitle": "Models",
+  "settingsNameRequired": "Name is required",
+  "settingsOnDeviceModelLabel": "On-device model",
+  "settingsPickModelTitle": "Choose model",
+  "settingsPickProviderTitle": "Choose provider",
+  "settingsPresetCustom": "Custom",
+  "settingsPresetOllama": "Ollama",
+  "settingsPresetOpenrouter": "OpenRouter",
+  "settingsPresetTransformersJs": "On-device (transformers.js)",
+  "settingsPresetWebllm": "On-device (WebLLM)",
+  "settingsProviderLabel": "Provider",
+  "settingsProviderModelSummary": "{model} · {provider}",
+  "settingsProviderNameHint": "My provider",
+  "settingsProviderNameLabel": "Name",
+  "settingsProvidersSectionTitle": "Providers",
+  "settingsSaveButton": "Save",
+  "settingsStaleModelCache": "The previously used model ({model}) was removed from the cache — pick a model to download it again.",
+  "settingsSkillsAccess": "Skills access",
+  "settingsSkillsAccessHint": "Reuse skills Claude, Copilot or Codex left in the project folder (.claude, .github, .codex)",
+  "settingsSkillsToggles": "Built-in skills",
+  "settingsSkillsTogglesHint": "Enable or disable the skills that ship with Fa",
+  "skillsAccessAsk": "Ask",
+  "skillsAccessAllowed": "Allowed",
+  "skillsAccessDenied": "Denied",
+  "skillsAccessDialogTitle": "Reuse existing agent skills?",
+  "skillsAccessDialogBody": "This project may contain skills from Claude, Copilot or Codex (.claude, .github, .codex folders) — instructions other tools placed on this machine. Fa can reuse them for your tasks.",
+  "skillsAccessAllow": "Allow",
+  "skillsAccessNotNow": "Not now",
+  "settingsThemeDark": "Dark",
+  "settingsThemeLabel": "Theme",
+  "settingsChatTextLabel": "Chat text size",
+  "settingsImagePreviewsLabel": "High-quality image previews",
+  "settingsImagePreviewsHelper": "Decode chat image previews at full resolution. Off keeps the faster 600px downscale.",
+  "settingsThemeLight": "Light",
+  "settingsThemeSystem": "System",
+  "settingsStartChat": "Start chat",
+  "settingsTitle": "Settings",
+  "settingsToolsBadge": "tools via prompt",
+  "settingsTransformersJsNote": "Runs fully offline after download · needs WebGPU (Chrome/Edge/newer Safari) · weights download once from HuggingFace (public repo, no token) and are cached in your browser",
+  "settingsVisionBadge": "vision",
+  "settingsWebllmNote": "Runs fully offline after download · needs WebGPU (Chrome/Edge/newer Safari) · weights ~0.5-4 GB cached in your browser",
+  "taskModelSameAsMain": "Same as main",
+  "taskModelSave": "Save",
+  "taskModelSectionTitle": "Task models",
+  "taskModelSmolDescription": "For summaries and subagents",
+  "taskModelSmolTitle": "Quick model",
+  "taskModelUseMain": "Use main model",
+  "setupAppBarTitle": "Connect to Fa",
+  "sidebarAllApps": "All apps ({count})",
+  "sidebarAppsHeader": "Apps",
+  "sidebarCancel": "Cancel",
+  "sidebarDelete": "Delete",
+  "sidebarDeleteUnavailable": "Delete unavailable — session lives in the host app",
+  "sidebarDeletePersistedContent": "Session {id}",
+  "sidebarDeleteSessionContent": "This removes the saved session permanently.",
+  "sidebarDeleteSessionFailed": "Could not delete session: {error}",
+  "sidebarDeleteSessionTitle": "Delete session?",
+  "sidebarDeleteSessionTooltip": "Delete session",
+  "sidebarLoadSessionsError": "Could not load sessions",
+  "sidebarModelHeader": "Model",
+  "sidebarNewSessionTooltip": "New session",
+  "sidebarNoActiveSession": "No active session",
+  "sidebarNoModel": "no model",
+  "sidebarNoSessions": "No sessions yet",
+  "sidebarOnThisDevice": "On this device",
+  "sidebarOpenAppsGridTooltip": "Open apps grid",
+  "sidebarProviderAnthropic": "Anthropic",
+  "sidebarProviderGoogle": "Google",
+  "sidebarProviderOnDeviceWebllm": "On-device (WebLLM)",
+  "sidebarProviderOpenaiCompatible": "OpenAI-compatible API",
+  "sidebarRefreshAppsTooltip": "Refresh apps",
+  "sidebarRefreshSessionsTooltip": "Refresh sessions",
+  "sidebarRenameClear": "Clear",
+  "sidebarRenameDialogTitle": "Rename session",
+  "sidebarRenameHint": "An empty name restores the default one.",
+  "sidebarRenameNameLabel": "Name",
+  "sidebarRenameSessionTooltip": "Rename session",
+  "sidebarRetry": "Retry",
+  "sidebarSessionTitle": "session {id}",
+  "sidebarSearchHint": "Search sessions",
+  "sidebarSearchClearTooltip": "Clear search",
+  "sidebarSearchNoMatches": "No sessions match \"{query}\"",
+  "@sidebarSearchNoMatches": {
+    "placeholders": {
+      "query": {}
+    }
+  },
+  "sidebarSessionsHeader": "Sessions",
+  "sidebarSubagentSessionCount": "{count, plural, =1{1 agent} other{{count} agents}}",
+  "@sidebarSubagentSessionCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "sidebarSubagentTitle": "subagent {id}",
+  "@sidebarSubagentTitle": {
+    "placeholders": {
+      "id": {
+        "type": "String"
+      }
+    }
+  },
+  "tjsCacheTitle": "Downloaded models (transformers.js)",
+  "tjsCacheWebOnly": "On-device (transformers.js) models are available in the web build only.",
+  "uploadTooLarge": "Upload is too large: {total} exceeds the {max} per-batch limit.",
+  "webllmCacheManagedByOs": "On-device models are managed by the OS/app storage on this platform.",
+  "webllmCacheTitle": "Downloaded models",
+  "settingsVisionLabel": "Supports images (vision)",
+  "settingsIconsPerRow": "Icons per row",
+  "settingsIconsPerRowHint": "Home grid columns; Auto is 4 on phone, 6 on wide screens",
+  "settingsIconsPerRowAuto": "Auto",
+  "settingsShowOnboarding": "Show welcome tour",
+  "chatSteerTooltip": "Send now (interrupt)",
+  "bootstrapSessionStartError": "Could not start a session: {error}",
+  "bootstrapRetry": "Retry",
+  "workspaceDialogTitle": "Session",
+  "workspaceDialogChangeFolder": "Change folder…",
+  "workspaceDialogClearFolder": "Use Personal folder",
+  "workspaceDialogClose": "Close",
+  "workspaceDialogCurrentFolder": "Session folder",
+  "workspaceDialogHostPath": "Host path",
+  "workspaceDialogMountHint": "Files at /project/... in the agent map to this folder on your Mac.",
+  "workspaceDialogUnsupported": "Project folders are only available on macOS right now.",
+  "workspaceDialogPersonal": "Personal (no folder mounted)",
+  "workspaceDialogMailbox": "Your mailbox",
+  "workspaceDialogMailboxHint": "Other Fa agents can message this session at this address.",
+  "workspaceDialogMailboxCopy": "Copy",
+  "workspaceDialogMailboxCopied": "Mailbox address copied",
+  "workspaceDialogRestrictTools": "Restrict tools to this folder",
+  "workspaceDialogRestrictToolsHint": "Disable anything that would read or write outside the mounted folder. Off-project attempts will be blocked (and a dialog will ask you to approve them once that flow is wired up).",
+  "toolsAvailabilityTitle": "Tools",
+  "toolsAvailabilityHint": "Turn tools off or on for Fa — applies immediately, no restart.",
+  "settingsRedaction": "Secret redaction",
+  "settingsRedactionHint": "Mask API keys and secrets in everything Fa sends or stores. Applies immediately, no restart.",
+  "toolsAvailabilityUnavailable": "Unavailable: {reason}",
+  "githubAccountSection": "GitHub account",
+  "githubAccountHint": "Connect GitHub to publish your widgets to the fa_widgets catalog.",
+  "githubConnect": "Connect GitHub",
+  "githubDisconnect": "Disconnect",
+  "githubDisconnectConfirm": "PRs already opened stay on GitHub — only status polling stops.",
+  "githubTokenHint": "GitHub token with public_repo scope",
+  "githubConnectTokenTab": "Token",
+  "githubConnectDeviceTab": "Device code",
+  "githubConnectDeviceInstructions": "Enter this code at github.com/login/device — it lets Fa create public widget repos under your account.",
+  "githubCopyCode": "Copy code",
+  "githubOpenDevicePage": "Open github.com/login/device",
+  "githubConnectValidating": "Validating…",
+  "myPublications": "My publications",
+  "publicationsEmpty": "Nothing published yet.",
+  "publicationsRefresh": "Refresh",
+  "publicationsOffline": "Offline — showing last known states.",
+  "publicationStateOpen": "Open",
+  "publicationStatePublished": "Published",
+  "publicationStateRejected": "Rejected",
+  "publicationStateUnknown": "Unknown",
+  "widgetStatusNotPublished": "Not published",
+  "widgetStatusValidating": "Validating…",
+  "widgetStatusInvalid": "Invalid",
+  "widgetStatusFailed": "Publish failed",
+  "widgetStatusErrors": "Validator errors:",
+  "widgetStatusOpenRun": "Open CI run",
+  "widgetDetailVersion": "Version",
+  "widgetDetailAuthor": "Author",
+  "publicationSubmittedAt": "Submitted {date}",
+  "@publicationSubmittedAt": {
+    "placeholders": {
+      "date": {}
+    }
+  },
+  "publicationComments": "{count, plural, =1{1 comment}other{{count} comments}}",
+  "@publicationComments": {
+    "placeholders": {
+      "count": {}
+    }
+  },
+  "publishWidgetTitle": "Publish “{name}”",
+  "@publishWidgetTitle": {
+    "placeholders": {
+      "name": {}
+    }
+  },
+  "publishPreflightFailed": "Fix these issues before publishing:",
+  "publishRepoNameLabel": "Repository name",
+  "publishButton": "Publish",
+  "publishInProgress": "Publishing…",
+  "publishSuccess": "Pull request opened:",
+  "publishDone": "Done",
+  "launcherPublishWidget": "Publish…",
+  "@launcherPublishWidget": {
+    "description": "Tile-menu action that opens the widget publish sheet (issue #35)"
+  },
+  "githubTokenNoRepoScope": "This token cannot create repositories — publishing needs repo rights. Use a classic PAT with the public_repo scope (or a fine-grained PAT with All repositories + Administration + Contents read/write). The Device code login often yields a token without repo rights.",
+  "@githubTokenNoRepoScope": {
+    "description": "Shown when a connected GitHub token lacks repository rights"
+  },
+  "githubDeviceFallbackWarn": "Heads-up: this device login uses the public Copilot Plugin app, whose tokens GitHub limits to identity-only — they cannot publish. To publish via device code, register your own GitHub OAuth App (Settings → Developer settings → OAuth Apps, set the Authorization callback URL to https://fa1.dev/oauth/callback) and save its client id in Settings → Keys as github_oauth_client_id, or rebuild the app with --dart-define=FA_GITHUB_CLIENT_ID=<id>. Until then, connect with a classic PAT (public_repo) on the Token tab.",
+  "@githubDeviceFallbackWarn": {
+    "description": "Warning shown on the device-flow tab when only the fallback Copilot plugin client id is available"
+  },
+  "githubConnectWebTab": "Browser",
+  "@githubConnectWebTab": {
+    "description": "Connect-sheet tab running the GitHub OAuth web flow through the fa1.dev callback page"
+  },
+  "githubBrowserHint": "Opens github.com in your browser. After \"Authorize\" the fa1.dev callback page shows a one-time code — paste it below. Needs your own OAuth App: its client id in Keys as github_oauth_client_id and its secret as github_oauth_client_secret.",
+  "@githubBrowserHint": {
+    "description": "Instructions shown on the Browser (OAuth web flow) tab"
+  },
+  "githubBrowserOpen": "Open GitHub again",
+  "@githubBrowserOpen": {
+    "description": "Re-opens the github.com authorize page on the Browser tab"
+  },
+  "githubBrowserCodeHint": "One-time code from fa1.dev",
+  "@githubBrowserCodeHint": {
+    "description": "Hint of the one-time-code field on the Browser tab"
+  },
+  "sessionDrivenElsewhere": "Driven by {host} (pid {pid}) — you are viewing. Your messages are delivered to the live agent.",
+  "@sessionDrivenElsewhere": {
+    "description": "Viewer notice when a live ownership lease blocks opening a session for drive (#428)",
+    "placeholders": {
+      "host": {
+        "type": "String"
+      },
+      "pid": {
+        "type": "int"
+      }
+    }
+  },
+  "sessionTooLargeTitle": "Session ({size} MB) is over the instant-open budget and couldn't be opened safely.",
+  "@sessionTooLargeTitle": {
+    "description": "Fallback when an over-budget session cannot open windowed — the full open is refused (issue #381)",
+    "placeholders": {
+      "size": {
+        "type": "String"
+      }
+    }
+  },
+  "sessionMintFailed": "Couldn't create a new session.",
+  "@sessionMintFailed": {
+    "description": "Fa-entry long-press mint failure: the new session could not be created — logged and surfaced as a snack, the active session is kept (issue #864, review #1144 follow-up)"
+  },
+  "sessionBootSkippedOversize": "Resumed a fresh session — “{name}” ({size} MB) is over the instant-open budget.",
+  "@sessionBootSkippedOversize": {
+    "description": "Boot notice when the last-active session is over the instant-open budget and was not resumed (issue #381); the action opens it windowed",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "size": {
+        "type": "String"
+      }
+    }
+  },
+  "sessionBootSkippedOpen": "Open windowed",
+  "@sessionBootSkippedOpen": {
+    "description": "Action on the boot oversize notice: opens the skipped session through the windowed loader"
+  },
+  "dynamicMessagesButtonTooltip": "Dynamic messages",
+  "@dynamicMessagesButtonTooltip": {
+    "description": "Top-bar button listing the session's dynamic messages (issue #102)"
+  },
+  "dynamicMessagesSheetTitle": "Dynamic messages",
+  "@dynamicMessagesSheetTitle": {
+    "description": "Title of the dynamic-messages list sheet (issue #102 AC5)"
+  },
+  "dynamicMessagesLive": "live",
+  "@dynamicMessagesLive": {
+    "description": "Badge marking a dynamic message with a running engine (issue #102)"
+  },
+  "dynamicMessagesEventCount": "{count, plural, =1{1 event} other{{count} events}}",
+  "@dynamicMessagesEventCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    },
+    "description": "Event back-channel count in the dynamic-messages list (issue #102 AC5)"
+  },
+  "dynamicMessagesSaved": "Saved to your apps as “{appId}”",
+  "@dynamicMessagesSaved": {
+    "placeholders": {
+      "appId": {
+        "type": "String"
+      }
+    },
+    "description": "Snack bar after a dynamic message is graduated into an installed app (issue #102 AC7)"
+  },
+  "dynamicMessagesSaveFailed": "Could not save this dynamic message as an app.",
+  "@dynamicMessagesSaveFailed": {
+    "description": "Snack bar when graduating a dynamic message fails (issue #102 AC7)"
+  },
+  "dynamicTileSaveAsApp": "Save as app",
+  "@dynamicTileSaveAsApp": {
+    "description": "Tile affordance graduating a dynamic message into an installed app (issue #102 AC7)"
+  },
+  "dynamicTilePermissions": "Permissions",
+  "@dynamicTilePermissions": {
+    "description": "Tile affordance opening the app permission dialog for a dynamic message (issue #102)"
+  },
+  "dynamicTileError": "Widget error",
+  "@dynamicTileError": {
+    "description": "Title of the expandable error tile for a failed dynamic message (issue #102 AC9)"
+  },
+  "dynamicTileOverflow": "This widget is wider than the chat viewport — content on the right is clipped. The agent has been asked to rebuild it to fit.",
+  "@dynamicTileOverflow": {
+    "description": "Overflow strip (error colors) on the dynamic-message tile once the canvas detected a viewport overflow (issue #692 C)"
+  },
+  "dynamicTileRetry": "Retry",
+  "@dynamicTileRetry": {
+    "description": "Retry button on the dynamic-message error tile (issue #102 AC9)"
+  },
+  "dynamicTileMenu": "More actions",
+  "@dynamicTileMenu": {
+    "description": "Overflow (⋮) menu on the dynamic-message tile title bar (issue #378)"
+  },
+  "dynamicTileOpenAsApp": "Open as app (without saving)",
+  "@dynamicTileOpenAsApp": {
+    "description": "Ephemeral full-screen launch of a dynamic message; nothing is installed (issue #378)"
+  },
+  "dynamicTileOpenUnavailable": "Widget can't start — boot failed. Retry it in the chat first.",
+  "@dynamicTileOpenUnavailable": {
+    "description": "Reason shown when the ephemeral open action is disabled for a failed widget (issue #378 E1)"
+  },
+  "themeConsentTitle": "Apply theme pack?",
+  "themeConsentBody": "{app} wants to apply the theme pack \"{pack}\".",
+  "@themeConsentBody": {
+    "placeholders": {
+      "app": {
+        "type": "String"
+      },
+      "pack": {
+        "type": "String"
+      }
+    }
+  },
+  "themeConsentContrast": "Warning: some color pairs in this pack are below WCAG AA contrast (4.5:1).",
+  "themeConsentApply": "Apply",
+  "themeConsentDeny": "Keep current",
+  "themePacksTitle": "Theme packs",
+  "themePacksSubtitle": "Install a .zip with theme.json, switch the active pack, or remove one",
+  "themePackDefault": "Default Fa look",
+  "themePackImport": "Import theme pack",
+  "themePackDelete": "Remove",
+  "themePackActiveChip": "active",
+  "themePackWallpaperChip": "wallpaper",
+  "themePackImported": "Theme pack \"{name}\" installed",
+  "@themePackImported": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsCompactionLabel": "Compaction",
+  "@settingsCompactionLabel": {
+    "description": "Title of the Settings compaction-engine section (issue #287)"
+  },
+  "settingsCompactionHelper": "How the context is compacted when it nears the model's window. Applies at the next compaction.",
+  "@settingsCompactionHelper": {
+    "description": "One-line explainer under the compaction section title (issue #287)"
+  },
+  "settingsCompactionStructured": "Structured (recommended)",
+  "@settingsCompactionStructured": {
+    "description": "Picker item: the structured 2.0 engine (issue #287)"
+  },
+  "settingsCompactionStructuredHint": "Hides consumed records in place, expandable on demand — requires a configured model for the judge pass.",
+  "@settingsCompactionStructuredHint": {
+    "description": "Tradeoff copy for the structured engine (issue #287, E1: no health-check claim)"
+  },
+  "settingsCompactionClassic": "Classic (legacy 1.0)",
+  "@settingsCompactionClassic": {
+    "description": "Picker item: the classic 1.0 engine, the supported rollback (issue #287)"
+  },
+  "settingsCompactionClassicHint": "Lossy prefix summary — zero extra model calls.",
+  "@settingsCompactionClassicHint": {
+    "description": "Tradeoff copy for the classic engine (issue #287)"
+  },
+  "settingsCompactionSourceProject": "effective from the project .fah/config.yaml",
+  "@settingsCompactionSourceProject": {
+    "description": "Source-layer caption when the project config wins (issue #287 AC2)"
+  },
+  "settingsCompactionSourceUser": "effective from the user ~/.fah/config.yaml",
+  "@settingsCompactionSourceUser": {
+    "description": "Source-layer caption when the user config wins (issue #287 AC2)"
+  },
+  "settingsCompactionSourceFallback": "structured default — no compaction setting in any config",
+  "@settingsCompactionSourceFallback": {
+    "description": "Source-layer caption when no config states a choice (issue #287 AC2)"
+  },
+  "settingsCompactionWebNote": "Not configurable on the web — there is no config file here, so the structured engine applies.",
+  "@settingsCompactionWebNote": {
+    "description": "Note shown instead of the picker on the web stub (issue #287 AC5)"
+  },
+  "settingsCompactionSaved": "Saved to {file} — applies at the next compaction.",
+  "@settingsCompactionSaved": {
+    "placeholders": {
+      "file": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsCompactionSaveFailed": "Could not save the compaction engine: {error}",
+  "@settingsCompactionSaveFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsCompactionDocs": "Compaction docs",
+  "@settingsCompactionDocs": {
+    "description": "Link to the compaction documentation from the settings section (issue #287)"
+  },
+  "settingsQueueTitle": "Provider queue",
+  "@settingsQueueTitle": {
+    "description": "Title of the Settings provider-queue section (issue #418)"
+  },
+  "settingsQueueHelper": "An ordered chain of providers: when the current provider dies (quota, auth, network, timeout, malformed stream, 5xx, bad finish), the next takes over and the winner sticks for the session. Applies from the next run.",
+  "@settingsQueueHelper": {
+    "description": "Explainer under the queue section title (issue #418)"
+  },
+  "settingsQueueEmpty": "No provider queue — the single provider/model boot applies. Add an entry to build the chain.",
+  "@settingsQueueEmpty": {
+    "description": "Empty-state caption (issue #418)"
+  },
+  "settingsQueueScopeEnv": "effective from the FA_PROVIDERS_QUEUE environment variable — edit the env to change it (read-only here)",
+  "@settingsQueueScopeEnv": {
+    "description": "Env-wins caption; the env scope is read-only (issue #418)"
+  },
+  "settingsQueueUnsupported": "Not configurable on the web — there is no config file or environment here.",
+  "@settingsQueueUnsupported": {
+    "description": "Web stub note (issue #418)"
+  },
+  "settingsQueueAdd": "Add entry",
+  "@settingsQueueAdd": {
+    "description": "Button adding a queue entry (issue #418)"
+  },
+  "settingsQueueAddTitle": "Add queue entry",
+  "@settingsQueueAddTitle": {
+    "description": "Title of the queue provider/model picker (issue #418, two-step flow #693)"
+  },
+  "settingsQueueMoveUp": "Move up",
+  "@settingsQueueMoveUp": {
+    "description": "Reorder tooltip (issue #418)"
+  },
+  "settingsQueueMoveDown": "Move down",
+  "@settingsQueueMoveDown": {
+    "description": "Reorder tooltip (issue #418)"
+  },
+  "settingsQueueRemove": "Remove",
+  "@settingsQueueRemove": {
+    "description": "Remove tooltip (issue #418)"
+  },
+  "settingsQueueSaved": "Queue saved to {file} — applies from the next run.",
+  "@settingsQueueSaved": {
+    "placeholders": {
+      "file": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsQueueSaveFailed": "Could not save the queue: {error}",
+  "@settingsQueueSaveFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "themePackImportFailed": "Theme pack rejected",
+  "settingsMobileAutomation": "Device automation",
+  "@settingsMobileAutomation": {
+    "description": "Settings tile opening the device-automation consent screen"
+  },
+  "mobileConsentTitle": "Device automation",
+  "@mobileConsentTitle": {
+    "description": "Title of the device-automation consent screen"
+  },
+  "mobileConsentWhat": "Enabling this lets the Fa accessibility service read the screen content and perform taps and typing on your behalf, so Fa can drive apps and settings for you.",
+  "@mobileConsentWhat": {
+    "description": "Consent body: what the accessibility service enables"
+  },
+  "mobileConsentOffByDefault": "The service is off by default — nothing runs until you turn it on here.",
+  "@mobileConsentOffByDefault": {
+    "description": "Consent body: default state"
+  },
+  "mobileConsentDisableHint": "You can disable it any time with one tap in Fa settings.",
+  "@mobileConsentDisableHint": {
+    "description": "Consent body: one-tap disable promise"
+  },
+  "mobileConsentPrivacy": "Your data stays on the device: only the messages you exchange are sent inline to the model you configured.",
+  "@mobileConsentPrivacy": {
+    "description": "Consent body: data-leave-device scope"
+  },
+  "mobileConsentEnable": "Enable — open system settings",
+  "@mobileConsentEnable": {
+    "description": "Button sending the user to system accessibility settings"
+  },
+  "mobileConsentDisable": "Disable",
+  "@mobileConsentDisable": {
+    "description": "One-tap disable button"
+  },
+  "mobileConsentStatusOn": "Accessibility service: on",
+  "@mobileConsentStatusOn": {
+    "description": "Status row when the service is enabled"
+  },
+  "mobileConsentStatusOff": "Accessibility service: off",
+  "@mobileConsentStatusOff": {
+    "description": "Status row when the service is disabled"
+  },
+  "mobileConsentStoreUnavailable": "Device automation is not available in this build of Fa.",
+  "@mobileConsentStoreUnavailable": {
+    "description": "Defensive message on store builds, where the consent surface never appears"
+  },
+  "storeBannerTitle": "Get Fa on the App Store",
+  "@storeBannerTitle": {
+    "description": "In-app Get banner: title"
+  },
+  "storeBannerBody": "The App Store release is paid — it funds development. The TestFlight beta is free forever.",
+  "@storeBannerBody": {
+    "description": "In-app Get banner: paid vs free-forever-beta messaging"
+  },
+  "storeBannerAndroidSoon": "Android: coming soon",
+  "@storeBannerAndroidSoon": {
+    "description": "In-app Get banner: the Android slot while links.play is unset"
+  },
+  "storeBannerCta": "Open the App Store",
+  "@storeBannerCta": {
+    "description": "In-app Get banner: the primary CTA button"
+  },
+  "storeBannerBeta": "or join the free TestFlight beta",
+  "@storeBannerBeta": {
+    "description": "In-app Get banner: the secondary beta link"
+  },
+  "storeBannerDismiss": "Hide banner",
+  "@storeBannerDismiss": {
+    "description": "In-app Get banner: dismiss tooltip/label"
+  },
+  "networkModeLocal": "Local",
+  "@networkModeLocal": {
+    "description": "Network-mode chip: the local (classic) mode segment"
+  },
+  "networkModeNetwork": "Network",
+  "@networkModeNetwork": {
+    "description": "Network-mode chip: the network mode segment"
+  },
+  "networkWelcomeTitle": "Welcome to Fa networks",
+  "@networkWelcomeTitle": {
+    "description": "Network mode welcome title (wide empty state)"
+  },
+  "networkWelcomeBody": "Join an existing network or create your own — channels and showcases open here.",
+  "@networkWelcomeBody": {
+    "description": "Network mode welcome body (wide empty state)"
+  },
+  "networkNeedsPasswordTitle": "This network needs your password",
+  "@networkNeedsPasswordTitle": {
+    "description": "Selected membership synced from the account without a stored password"
+  },
+  "networkNeedsPasswordBody": "Account sync listed this network, but its password is stored only after you join once. Enter it to open the network.",
+  "@networkNeedsPasswordBody": {
+    "description": "Body under networkNeedsPasswordTitle; the join button follows"
+  },
+  "networkNetworksTitle": "Networks",
+  "@networkNetworksTitle": {
+    "description": "Network picker header / sidebar title"
+  },
+  "networkBackTooltip": "Back",
+  "@networkBackTooltip": {
+    "description": "Network home back button tooltip"
+  },
+  "networkSearchHint": "Search networks",
+  "@networkSearchHint": {
+    "description": "Network search field hint"
+  },
+  "networkSignInTitle": "Sign in",
+  "@networkSignInTitle": {
+    "description": "Sign-in dialog title, button and sidebar row"
+  },
+  "networkSignInHelper": "Sign in with your ai-native.cloud account to create and manage networks.",
+  "@networkSignInHelper": {
+    "description": "Sign-in dialog helper note"
+  },
+  "networkSignInWithProvider": "Continue with {provider}",
+  "@networkSignInWithProvider": {
+    "description": "Sign-in dialog OAuth provider button",
+    "placeholders": {
+      "provider": {}
+    }
+  },
+  "networkSignInWaiting": "Complete the sign-in in your browser…",
+  "@networkSignInWaiting": {
+    "description": "Sign-in dialog note while the browser OAuth flow is open"
+  },
+  "networkSignInDeveloperSection": "Developer (local only)",
+  "@networkSignInDeveloperSection": {
+    "description": "Sign-in dialog collapsed section with the dev-login form"
+  },
+  "networkSignInMobileNote": "Provider sign-in is unavailable here until the fa:// redirect is allowlisted on the server — only the developer login below works for now.",
+  "@networkSignInMobileNote": {
+    "description": "Sign-in dialog note on iOS/Android replacing the provider buttons"
+  },
+  "networkSessionExpired": "Session expired — sign in again.",
+  "@networkSessionExpired": {
+    "description": "Sidebar account row note when the stored tokens can no longer be refreshed"
+  },
+  "networkLoginLabel": "Login",
+  "@networkLoginLabel": {
+    "description": "Sign-in dialog login field label"
+  },
+  "networkSignOut": "Sign out",
+  "@networkSignOut": {
+    "description": "Sidebar account row: sign-out action"
+  },
+  "networkAccountFallback": "Account",
+  "@networkAccountFallback": {
+    "description": "Sidebar account row label when the login is unknown"
+  },
+  "networkPublicSection": "Public networks",
+  "@networkPublicSection": {
+    "description": "Sidebar section label for the public-networks directory"
+  },
+  "networkPublicMembers": "{count} members",
+  "@networkPublicMembers": {
+    "description": "Public directory row: member count",
+    "placeholders": {
+      "count": {}
+    }
+  },
+  "networkEmptyTitle": "No networks yet",
+  "@networkEmptyTitle": {
+    "description": "Empty state when the wallet has no memberships"
+  },
+  "networkJoinFirst": "Join your first network",
+  "@networkJoinFirst": {
+    "description": "Empty state CTA"
+  },
+  "networkNoMatches": "No matches",
+  "@networkNoMatches": {
+    "description": "Search with no matching memberships"
+  },
+  "networkCreateNetwork": "Create a network",
+  "@networkCreateNetwork": {
+    "description": "Create-network button and dialog title"
+  },
+  "networkNameLabel": "Name",
+  "@networkNameLabel": {
+    "description": "Name field label (create network/channel dialogs)"
+  },
+  "networkPasswordLabel": "Password",
+  "@networkPasswordLabel": {
+    "description": "Password field label"
+  },
+  "networkCreate": "Create",
+  "@networkCreate": {
+    "description": "Create dialog confirm button"
+  },
+  "networkJoinTitle": "Join a network",
+  "@networkJoinTitle": {
+    "description": "Join sheet title and join-button tooltip"
+  },
+  "networkQuickSwitcherTitle": "Quick switch",
+  "@networkQuickSwitcherTitle": {
+    "description": "⌘K quick-switcher dialog title"
+  },
+  "networkJoinLinkLabel": "Join link",
+  "@networkJoinLinkLabel": {
+    "description": "Join sheet: join link field label"
+  },
+  "networkJoinFill": "Fill",
+  "@networkJoinFill": {
+    "description": "Join sheet: fill form from pasted link"
+  },
+  "networkIdLabel": "Network id or name",
+  "@networkIdLabel": {
+    "description": "Join sheet: network id-or-name field label"
+  },
+  "networkDisplayNameLabel": "Display name",
+  "@networkDisplayNameLabel": {
+    "description": "Display name field label"
+  },
+  "networkDisplayNameLocked": "Display name locked to your account.",
+  "@networkDisplayNameLocked": {
+    "description": "Join sheet note when a JWT pins the display name"
+  },
+  "networkJoinRequired": "Network id or name and password are required.",
+  "@networkJoinRequired": {
+    "description": "Join sheet validation error"
+  },
+  "networkJoinInvalidCredentials": "Invalid credentials — {message}",
+  "@networkJoinInvalidCredentials": {
+    "description": "Join sheet error when the server rejects the credentials",
+    "placeholders": {
+      "message": {}
+    }
+  },
+  "networkJoinRetryAfter": " Try again in {seconds}s.",
+  "@networkJoinRetryAfter": {
+    "description": "Rate-limit suffix appended to the join error",
+    "placeholders": {
+      "seconds": {}
+    }
+  },
+  "networkJoin": "Join",
+  "@networkJoin": {
+    "description": "Join sheet confirm button"
+  },
+  "networkSelectChannel": "Select a channel",
+  "@networkSelectChannel": {
+    "description": "Empty chat pane placeholder"
+  },
+  "networkReconnecting": "Reconnecting — messages will send when back.",
+  "@networkReconnecting": {
+    "description": "Offline banner above the channel chat"
+  },
+  "networkReconnectNow": "Reconnect now",
+  "@networkReconnectNow": {
+    "description": "Tooltip for the manual reconnect button in the offline banner"
+  },
+  "networkMessageHint": "Message {channel}",
+  "@networkMessageHint": {
+    "description": "Channel composer input hint",
+    "placeholders": {
+      "channel": {}
+    }
+  },
+  "networkNewChannel": "New channel",
+  "@networkNewChannel": {
+    "description": "Create-channel button tooltip and dialog title"
+  },
+  "networkOnlineCount": "{count} online",
+  "@networkOnlineCount": {
+    "description": "Live member count under the network name",
+    "placeholders": {
+      "count": {}
+    }
+  },
+  "networkRosterTitle": "Members",
+  "@networkRosterTitle": {
+    "description": "Roster bottom-sheet title and online-counter tooltip"
+  },
+  "networkRosterLoading": "Loading members…",
+  "@networkRosterLoading": {
+    "description": "Roster sheet state before the network session is ready"
+  },
+  "networkRosterEmpty": "No members yet.",
+  "@networkRosterEmpty": {
+    "description": "Roster sheet empty state"
+  },
+  "networkPresenceOnline": "Online",
+  "@networkPresenceOnline": {
+    "description": "Roster presence label for a live member"
+  },
+  "networkPresenceOffline": "Offline",
+  "@networkPresenceOffline": {
+    "description": "Roster presence label for an offline member"
+  },
+  "networkPresenceBusy": "Busy",
+  "@networkPresenceBusy": {
+    "description": "Roster presence label for a busy member"
+  },
+  "networkMemberOwner": "Owner",
+  "@networkMemberOwner": {
+    "description": "Roster member class: owner"
+  },
+  "networkMemberAdmin": "Admin",
+  "@networkMemberAdmin": {
+    "description": "Roster member class: admin"
+  },
+  "networkMemberMember": "Member",
+  "@networkMemberMember": {
+    "description": "Roster member class: regular member"
+  },
+  "networkMemberGuest": "Guest",
+  "@networkMemberGuest": {
+    "description": "Roster member class: guest"
+  },
+  "networkMemberAgent": "Agent",
+  "@networkMemberAgent": {
+    "description": "Roster member class: agent"
+  },
+  "networkMemberUnknown": "Unknown",
+  "@networkMemberUnknown": {
+    "description": "Roster fallback for an unrecognized member class"
+  },
+  "networkAccessWholeNetwork": "Whole network",
+  "@networkAccessWholeNetwork": {
+    "description": "Roster access badge for network-wide access"
+  },
+  "networkAccessChannels": "{count, plural, =1{1 channel} other{{count} channels}}",
+  "@networkAccessChannels": {
+    "description": "Roster access badge for a channel-scoped member outside channel context",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "networkAccessThisChannelOnly": "This channel only",
+  "@networkAccessThisChannelOnly": {
+    "description": "Roster access badge when only the currently open channel is accessible"
+  },
+  "networkAccessThisChannelAndOthers": "{count, plural, =1{This channel + 1 other channel} other{This channel + {count} other channels}}",
+  "@networkAccessThisChannelAndOthers": {
+    "description": "Roster access badge when the open channel and other channels are accessible",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "networkAccessOtherChannels": "{count, plural, =1{1 other channel} other{{count} other channels}}",
+  "@networkAccessOtherChannels": {
+    "description": "Roster access badge when accessible channels exclude the open channel",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "networkDropAgent": "Drop agent…",
+  "@networkDropAgent": {
+    "description": "Roster action that removes an agent from the network"
+  },
+  "networkDropAgentTitle": "Drop this agent?",
+  "@networkDropAgentTitle": {
+    "description": "Drop-agent confirmation title"
+  },
+  "networkDropAgentBody": "\"{displayName}\" will be removed from this network and lose access. This cannot be undone.",
+  "@networkDropAgentBody": {
+    "description": "Drop-agent confirmation body naming the selected agent",
+    "placeholders": {
+      "displayName": {
+        "type": "String"
+      }
+    }
+  },
+  "networkDropAgentConfirm": "Drop agent",
+  "@networkDropAgentConfirm": {
+    "description": "Destructive drop-agent confirmation button"
+  },
+  "networkChannelsSection": "Channels",
+  "@networkChannelsSection": {
+    "description": "Channel rail section header: regular (private) channels"
+  },
+  "networkShowcasesSection": "Showcases",
+  "@networkShowcasesSection": {
+    "description": "Channel rail section header: public showcases"
+  },
+  "networkShowcaseReadOnly": "Read-only preview — tap to join the network and write.",
+  "@networkShowcaseReadOnly": {
+    "description": "Composer replacement in the anonymous showcase"
+  },
+  "networkShowcaseMemberReadOnly": "Only the owner and admins can post in this showcase.",
+  "@networkShowcaseMemberReadOnly": {
+    "description": "Composer replacement for a joined guest or member viewing a public showcase"
+  },
+  "networkConnecting": "Connecting…",
+  "@networkConnecting": {
+    "description": "Channel rail placeholder while the session connects"
+  },
+  "networkNoChannels": "No channels",
+  "@networkNoChannels": {
+    "description": "Channel rail empty state"
+  },
+  "networkChannelOptions": "Channel options",
+  "@networkChannelOptions": {
+    "description": "Channel overflow menu tooltip"
+  },
+  "networkRenameChannel": "Rename channel…",
+  "@networkRenameChannel": {
+    "description": "Channel overflow menu item for renaming"
+  },
+  "networkRenameChannelTitle": "Rename channel",
+  "@networkRenameChannelTitle": {
+    "description": "Rename-channel dialog title"
+  },
+  "networkRename": "Rename",
+  "@networkRename": {
+    "description": "Rename-channel dialog confirm button"
+  },
+  "networkChannelNameRequired": "Channel name cannot be empty.",
+  "@networkChannelNameRequired": {
+    "description": "Rename-channel validation error"
+  },
+  "networkDeleteChannel": "Delete channel…",
+  "@networkDeleteChannel": {
+    "description": "Channel overflow menu item for deleting"
+  },
+  "networkDeleteChannelTitle": "Delete this channel?",
+  "@networkDeleteChannelTitle": {
+    "description": "Delete-channel confirmation title"
+  },
+  "networkDeleteChannelBody": "The channel and all its messages are deleted for everyone. This cannot be undone.",
+  "@networkDeleteChannelBody": {
+    "description": "Delete-channel confirmation body"
+  },
+  "networkChannelDeleted": "Channel deleted",
+  "@networkChannelDeleted": {
+    "description": "Snackbar after a channel was deleted"
+  },
+  "networkAddAgent": "Add agent…",
+  "@networkAddAgent": {
+    "description": "Channel overflow menu item opening the agent invite"
+  },
+  "networkShowcasePublic": "Showcase (public)",
+  "@networkShowcasePublic": {
+    "description": "Create-channel dialog: public toggle"
+  },
+  "networkAddAgentTitle": "Add an agent",
+  "@networkAddAgentTitle": {
+    "description": "Agent invite dialog title"
+  },
+  "networkAddAgentWarning": "Share out-of-band — anyone with this string can read the channel.",
+  "@networkAddAgentWarning": {
+    "description": "Agent invite dialog security warning"
+  },
+  "networkAddAgentNoKeys": "No keys for this channel on this device.",
+  "@networkAddAgentNoKeys": {
+    "description": "Agent invite placeholder when the wallet holds no channel keys"
+  },
+  "networkAddAgentNoChannelKeys": "No channel keys in this wallet — the agent will see channels only after a key invite",
+  "@networkAddAgentNoChannelKeys": {
+    "description": "Network-scope agent invite note when the wallet can produce no channel invites to bundle"
+  },
+  "networkChannelKeyMissing": "This device needs the private channel key to read and write.",
+  "@networkChannelKeyMissing": {
+    "description": "Composer replacement when a joined private channel has no key in this device's wallet"
+  },
+  "networkChannelKeyImport": "Import channel key",
+  "@networkChannelKeyImport": {
+    "description": "Button and dialog title for importing a private channel key invite"
+  },
+  "networkChannelKeyInviteLabel": "Channel key invite",
+  "@networkChannelKeyInviteLabel": {
+    "description": "Input label for the private channel invite carrying its keypair"
+  },
+  "networkChannelKeyImportHint": "Paste the private-channel invite from a device that already has the key.",
+  "@networkChannelKeyImportHint": {
+    "description": "Helper text explaining where to obtain a channel key invite"
+  },
+  "networkChannelKeyWrongChannel": "This invite is for a different channel.",
+  "@networkChannelKeyWrongChannel": {
+    "description": "Validation error when the invite channel id differs from the open channel"
+  },
+  "networkChannelKeyWrongHub": "This invite is for a different hub.",
+  "@networkChannelKeyWrongHub": {
+    "description": "Validation error when the invite targets another hub deployment than the connected session"
+  },
+  "networkChannelKeyMismatch": "The invite public and private keys do not match.",
+  "@networkChannelKeyMismatch": {
+    "description": "Validation error for an inconsistent X25519 channel keypair"
+  },
+  "networkChannelKeyImportFailed": "The channel key could not be imported. Try again.",
+  "@networkChannelKeyImportFailed": {
+    "description": "Generic safe channel-key import failure"
+  },
+  "networkAddAgentScopeChannel": "This channel",
+  "@networkAddAgentScopeChannel": {
+    "description": "Agent invite scope segment: channel-only access"
+  },
+  "networkAddAgentScopeNetwork": "Whole network",
+  "@networkAddAgentScopeNetwork": {
+    "description": "Agent invite scope segment: full network membership"
+  },
+  "networkAddAgentFormatLink": "Link (app)",
+  "@networkAddAgentFormatLink": {
+    "description": "Agent invite format segment: bare link for apps"
+  },
+  "networkAddAgentFormatCli": "CLI command",
+  "@networkAddAgentFormatCli": {
+    "description": "Agent invite format segment: ready fa CLI one-liner"
+  },
+  "networkAddAgentFormatEnv": "Env (CI)",
+  "@networkAddAgentFormatEnv": {
+    "description": "Agent invite format segment: env-var launch line for CI runners"
+  },
+  "networkAddAgentFormatDap": "DAP",
+  "@networkAddAgentFormatDap": {
+    "description": "Agent invite format segment: pure-DAP client env (self-hosted DAP hub)"
+  },
+  "networkAddAgentDapHint": "Copy this block and paste it into the fa chat (CLI, macOS, iOS or web) — the agent joins the channel automatically.",
+  "@networkAddAgentDapHint": {
+    "description": "Agent invite helper under the DAP format explaining how to paste the enrollment block into fa chat"
+  },
+  "dapEnrollmentJoined": "Joined DAP channel #{channel}. Channel mail now reaches this agent.",
+  "@dapEnrollmentJoined": {
+    "description": "Snack bar after a pasted DAP enrollment joined successfully",
+    "placeholders": {
+      "channel": {
+        "type": "String"
+      }
+    }
+  },
+  "dapEnrollmentJoinedPlaintext": "Joined DAP channel #{channel}. Channel mail now reaches this agent. Storage warning: the invite private key and hub credential are stored UNENCRYPTED (plaintext) in this app's sandbox (IndexedDB on web).",
+  "@dapEnrollmentJoinedPlaintext": {
+    "description": "Snack bar after a pasted DAP enrollment joined on a platform without Keychain/Keystore; discloses the unencrypted fallback",
+    "placeholders": {
+      "channel": {
+        "type": "String"
+      }
+    }
+  },
+  "dapEnrollmentFailed": "Couldn't join DAP channel #{channel}. Check the invite and hub connection, then try again.",
+  "@dapEnrollmentFailed": {
+    "description": "Snack bar after a pasted DAP enrollment failed; never includes credential or raw transport error",
+    "placeholders": {
+      "channel": {
+        "type": "String"
+      }
+    }
+  },
+  "dapEnrollmentUnsupported": "DAP join is not supported on this platform — use a native app or the fa CLI.",
+  "@dapEnrollmentUnsupported": {
+    "description": "Snack bar for a recognized DAP enrollment paste on an unsupported platform"
+  },
+  "networkAddAgentEnroll": "Enroll agent",
+  "@networkAddAgentEnroll": {
+    "description": "Agent invite: button that enrolls the typed agent name against the fa_network backend (DAP format)"
+  },
+  "networkAddAgentEnrollHint": "Enrollment creates an independent, revocable credential, so agents with the same name can connect simultaneously. The secret is shown ONCE: copy it now.",
+  "@networkAddAgentEnrollHint": {
+    "description": "Agent invite note under the pure-DAP format explaining the one-time secret and independent same-name enrollment"
+  },
+  "networkAddAgentEnrollNeedSignIn": "Sign in to the network to enroll agents",
+  "@networkAddAgentEnrollNeedSignIn": {
+    "description": "Agent invite note shown on the DAP format when there is no signed-in network account"
+  },
+  "networkAddAgentNameInvalid": "3–64 chars: a-z, 0-9, hyphens",
+  "@networkAddAgentNameInvalid": {
+    "description": "Agent invite inline error for an invalid agent name on the DAP format"
+  },
+  "networkAddAgentEnvHint": "Env vars for a CI runner (GitHub Actions) — the link already carries the network id + password (or the channel keys); nothing else to fill in. Reserved for the upcoming CLI network mode — desktop and mobile agents use the link.",
+  "@networkAddAgentEnvHint": {
+    "description": "Agent invite note under the env format"
+  },
+  "networkAddAgentNetworkHint": "The agent joins as a full member and sees every channel in the network.",
+  "@networkAddAgentNetworkHint": {
+    "description": "Agent invite hint for the network scope"
+  },
+  "networkAddAgentNetworkNoPassword": "The network password is not on this device — the link will ask for it.",
+  "@networkAddAgentNetworkNoPassword": {
+    "description": "Agent invite note when the join link carries no password"
+  },
+  "networkAddAgentCliHint": "The command works against hubs with direct DAP access (e.g. the local stand); CLI join for production fa_network is coming.",
+  "@networkAddAgentCliHint": {
+    "description": "Agent invite note under the CLI format (channel scope)"
+  },
+  "networkAddAgentNetworkCliHint": "CLI network join is not shipped yet — share the link for now.",
+  "@networkAddAgentNetworkCliHint": {
+    "description": "Agent invite note under the CLI format (network scope)"
+  },
+  "networkInviteCopied": "Invite copied to clipboard.",
+  "@networkInviteCopied": {
+    "description": "Snack after copying the agent invite"
+  },
+  "networkCopy": "Copy",
+  "@networkCopy": {
+    "description": "Copy invite button"
+  },
+  "networkClose": "Close",
+  "@networkClose": {
+    "description": "Close dialog button"
+  },
+  "networkWalletTooltip": "Wallet",
+  "@networkWalletTooltip": {
+    "description": "Wallet overflow menu tooltip"
+  },
+  "networkWalletExport": "Export wallet",
+  "@networkWalletExport": {
+    "description": "Wallet menu item and export dialog title"
+  },
+  "networkWalletImport": "Import wallet",
+  "@networkWalletImport": {
+    "description": "Wallet menu item and import dialog title"
+  },
+  "networkWalletExported": "Wallet exported — JSON copied to clipboard.",
+  "@networkWalletExported": {
+    "description": "Snack after a successful wallet export"
+  },
+  "networkWalletExportFailed": "Export failed: {error}",
+  "@networkWalletExportFailed": {
+    "description": "Error snack after a failed wallet export",
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "networkWalletImported": "Wallet imported.",
+  "@networkWalletImported": {
+    "description": "Snack after a successful wallet import"
+  },
+  "networkPassphraseLabel": "Passphrase",
+  "@networkPassphraseLabel": {
+    "description": "Passphrase field label"
+  },
+  "networkPassphraseRepeatLabel": "Repeat passphrase",
+  "@networkPassphraseRepeatLabel": {
+    "description": "Second passphrase field label"
+  },
+  "networkPassphraseEmpty": "Passphrase must not be empty.",
+  "@networkPassphraseEmpty": {
+    "description": "Export dialog validation error"
+  },
+  "networkPassphraseMismatch": "Passphrases do not match.",
+  "@networkPassphraseMismatch": {
+    "description": "Export dialog validation error"
+  },
+  "networkExport": "Export",
+  "@networkExport": {
+    "description": "Export dialog confirm button"
+  },
+  "networkImport": "Import",
+  "@networkImport": {
+    "description": "Import dialog confirm button"
+  },
+  "networkWalletJsonLabel": "Exported wallet JSON",
+  "@networkWalletJsonLabel": {
+    "description": "Import dialog: JSON paste field label"
+  },
+  "networkWalletImportWarning": "Importing replaces the wallet on this device.",
+  "@networkWalletImportWarning": {
+    "description": "Import dialog warning note"
+  },
+  "networkNameHint": "A display name — becomes a lowercase slug",
+  "@networkNameHint": {
+    "description": "Network name helper text (server rule)"
+  },
+  "networkPasswordHint": "8–128 characters",
+  "@networkPasswordHint": {
+    "description": "Network password helper text (server rule)"
+  },
+  "networkNameInvalid": "Needs 3–64 chars after slugifying (letters, digits, hyphens)",
+  "@networkNameInvalid": {
+    "description": "Network name validation error"
+  },
+  "networkPasswordInvalid": "Password must be 8–128 characters",
+  "@networkPasswordInvalid": {
+    "description": "Network password validation error"
+  },
+  "networkListPublic": "List in the public directory",
+  "@networkListPublic": {
+    "description": "Create-network dialog checkbox — publish the network in the public catalog"
+  },
+  "networkDelete": "Delete network…",
+  "@networkDelete": {
+    "description": "Network row menu item (owner only)"
+  },
+  "networkDeleteTitle": "Delete this network?",
+  "@networkDeleteTitle": {
+    "description": "Delete-network confirmation title"
+  },
+  "networkDeleteBody": "The network, its channels and all messages are deleted for everyone. This cannot be undone.",
+  "@networkDeleteBody": {
+    "description": "Delete-network confirmation body"
+  },
+  "networkDeleted": "Network deleted",
+  "@networkDeleted": {
+    "description": "Snackbar after a network was deleted"
+  },
+  "networkSlugPreview": "Will be created as: {slug}",
+  "@networkSlugPreview": {
+    "description": "Live slug preview under the network name field",
+    "placeholders": {
+      "slug": {}
+    }
+  },
+  "networkSignInToCreate": "Sign in to create a network",
+  "@networkSignInToCreate": {
+    "description": "Snackbar when create is attempted without a JWT"
+  },
+  "networkShowcaseUnavailable": "This network is not publicly available",
+  "@networkShowcaseUnavailable": {
+    "description": "Anonymous showcase: generic 404 (non-public or unknown network)"
+  },
+  "networkShowcaseReadOnlyBadge": "read-only",
+  "@networkShowcaseReadOnlyBadge": {
+    "description": "Badge in the showcase header"
+  },
+  "networkBackToNetworks": "Back to networks",
+  "@networkBackToNetworks": {
+    "description": "Showcase back-button tooltip"
+  },
+  "networkAddAgentPublicHint": "Anyone with this link can read the channel — it is public. Agents join keyless.",
+  "@networkAddAgentPublicHint": {
+    "description": "Agent invite dialog hint for public (keyless) channels"
+  }
+}

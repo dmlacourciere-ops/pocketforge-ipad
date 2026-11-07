@@ -1,0 +1,589 @@
+import 'dart:async';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+import 'agent_cli_test_support.dart' show FakeSecureKeyStore;
+
+AssistantMessage _msg(
+  String modelId, {
+  String text = '',
+  StopReason stop = StopReason.stop,
+  String? error,
+}) {
+  return AssistantMessage(
+    content: text.isEmpty ? const [] : [TextContent(text: text)],
+    api: 'anthropic-messages',
+    provider: 'anthropic',
+    model: modelId,
+    usage: Usage.zero,
+    stopReason: stop,
+    errorMessage: error,
+    timestamp: DateTime.utc(2026),
+  );
+}
+
+List<AssistantMessageEvent> _textTurn(String modelId, String text) {
+  final empty = _msg(modelId);
+  final full = _msg(modelId, text: text);
+  return [
+    StartEvent(partial: empty),
+    TextStartEvent(contentIndex: 0, partial: empty),
+    TextDeltaEvent(contentIndex: 0, delta: text, partial: full),
+    DoneEvent(reason: StopReason.stop, message: full),
+  ];
+}
+
+List<AssistantMessageEvent> _rateLimitTurn(String modelId) {
+  return [
+    StartEvent(partial: _msg(modelId)),
+    ErrorEvent(
+      reason: StopReason.error,
+      error: _msg(modelId, stop: StopReason.error, error: '429: rate limited'),
+    ),
+  ];
+}
+
+/// Scripted `streamFactory` for the resolver: turns per model id.
+class _RolesFactory {
+  final Map<String, List<List<AssistantMessageEvent>>> scripts;
+  final calls = <String>[];
+  final contexts = <Context>[];
+
+  _RolesFactory(this.scripts);
+
+  StreamFunction call(String kind, String apiKey) {
+    return (model, context, {cancelToken}) {
+      calls.add(model.id);
+      contexts.add(context);
+      final queue = scripts[model.id];
+      if (queue == null || queue.isEmpty) {
+        throw StateError('no scripted turn for ${model.id}');
+      }
+      final stream = AssistantMessageEventStream();
+      for (final event in queue.removeAt(0)) {
+        stream.push(event);
+      }
+      stream.end();
+      return stream;
+    };
+  }
+}
+
+class _FakeCliIO implements CliIO {
+  @override
+  int columns = 80;
+
+  @override
+  int rows = 24;
+
+  final _lines = StreamController<String>();
+  final _interrupts = StreamController<void>.broadcast();
+  final _keys = StreamController<KeyEvent>.broadcast();
+  final out = StringBuffer();
+
+  @override
+  bool isInteractive = true;
+  @override
+  Stream<KeyEvent> get keys => _keys.stream;
+
+  @override
+  bool get supportsRawMode => false;
+
+  @override
+  Stream<String> get lines => _lines.stream;
+
+  @override
+  Stream<void> get interrupts => _interrupts.stream;
+
+  @override
+  void write(String text) => out.write(text);
+
+  @override
+  void writeln(String text) => out.write('$text\n');
+
+  void sendLine(String line) => _lines.add(line);
+
+  Future<void> close() async {
+    unawaited(_lines.close());
+    await _interrupts.close();
+  }
+}
+
+Future<void> _waitFor(bool Function() condition, {String? reason}) async {
+  for (var i = 0; i < 400; i++) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  fail('timed out waiting: ${reason ?? 'condition'}');
+}
+
+const _placeholderModel = Model(
+  id: 'placeholder',
+  api: 'test-api',
+  provider: 'test-provider',
+  baseUrl: 'https://example.test',
+  contextWindow: 100000,
+  maxTokens: 4096,
+);
+
+void main() {
+  late MemoryExecutionEnv env;
+  late _FakeCliIO io;
+
+  setUp(() {
+    env = MemoryExecutionEnv(cwd: '/work');
+    io = _FakeCliIO();
+  });
+
+  tearDown(() => io.close());
+
+  ModelRolesResolver resolverFor(
+    _RolesFactory factory,
+    Map<String, List<ModelRef>> roles,
+  ) {
+    return ModelRolesResolver(
+      config: ModelRolesConfig(
+        roles: roles,
+        retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+      ),
+      secrets: const {'ANTHROPIC_API_KEY': 'test-key'},
+      streamFactory: factory.call,
+    );
+  }
+
+  AgentCli cliFor(
+    ModelRolesResolver resolver, {
+    CompactionEngine? compactionEngine,
+  }) {
+    return AgentCli(
+      config: AgentCliConfig(
+        model: _placeholderModel,
+        apiKey: 'unused',
+        env: env,
+        sessionRoot: '/sessions',
+        modelRolesResolver: resolver,
+        compactionEngine: compactionEngine,
+      ),
+      io: io,
+    );
+  }
+
+  test('banner key status follows the resolved role provider', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'ok')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final cli = AgentCli(
+      config: AgentCliConfig(
+        model: _placeholderModel,
+        apiKey: 'unused',
+        env: env,
+        sessionRoot: '/sessions',
+        modelRolesResolver: resolver,
+        envVarIsSet: (_) => false,
+      ),
+      io: io,
+    );
+    final run = cli.run();
+
+    await _waitFor(() => io.out.toString().contains('[Model]'));
+    io.sendLine('/exit');
+    await run;
+
+    final output = io.out.toString();
+    // The resolved provider is anthropic; the flag provider kind
+    // (openai-completions) must not leak into the key status.
+    expect(output, contains('claude-a (anthropic-messages)'));
+    expect(output, contains('endpoint: https://api.anthropic.com'));
+    expect(output, contains('key: no key set (want ANTHROPIC_API_KEY)'));
+  });
+
+  test(
+    '/model shows the roles overview with the active chain position',
+    () async {
+      final factory = _RolesFactory({
+        'claude-a': [_rateLimitTurn('claude-a')],
+        'claude-b': [_textTurn('claude-b', 'backup took over')],
+      });
+      final resolver = resolverFor(factory, const {
+        'default': [
+          ModelRef(provider: 'anthropic', modelId: 'claude-a'),
+          ModelRef(provider: 'anthropic', modelId: 'claude-b'),
+        ],
+        'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+      });
+      final cli = cliFor(resolver);
+      final run = cli.run();
+
+      io.sendLine('/model');
+      await _waitFor(
+        () => io.out.toString().contains('anthropic/claude-smol'),
+        reason: 'roles overview printed',
+      );
+      io.sendLine('go');
+      await _waitFor(() => factory.calls.length == 2 && !cli.isBusy);
+      io.sendLine('/model');
+      await _waitFor(() => io.out.toString().contains('* anthropic/claude-b'));
+      io.sendLine('/exit');
+      await run;
+
+      final output = io.out.toString();
+      expect(output, contains('default:'));
+      expect(output, contains('smol:'));
+      // The fallback note was rendered during the run (no silent degrade).
+      expect(
+        output,
+        contains(
+          '[roles] rate limited on anthropic/claude-a — '
+          'falling back to anthropic/claude-b',
+        ),
+      );
+      expect(output, contains('backup took over'));
+      expect(factory.calls, ['claude-a', 'claude-b']);
+    },
+  );
+
+  test('/model <id> pins the default chain for the session', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'a')],
+      'pinned-model': [_textTurn('pinned-model', 'pinned answer')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final cli = cliFor(resolver);
+    final run = cli.run();
+
+    io.sendLine('/model pinned-model');
+    await _waitFor(
+      () => io.out.toString().contains('switched model to pinned-model'),
+    );
+    io.sendLine('go');
+    await _waitFor(() => factory.calls.isNotEmpty && !cli.isBusy);
+    io.sendLine('/exit');
+    await run;
+
+    expect(factory.calls, ['pinned-model']);
+    expect(io.out.toString(), contains('pinned answer'));
+  });
+
+  test('compaction summarizes through the smol role', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'answer')],
+      'claude-smol': [_textTurn('claude-smol', 'SMOL SUMMARY')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+      'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+    });
+    // Issue #287: the smol-role summarizer ride is the classic rollback
+    // engine's flow — pin it (structured's judge/checkpoint rides smol
+    // too, but only once the transcript is over pressure).
+    final cli = cliFor(resolver, compactionEngine: CompactionEngine.classic);
+    final run = cli.run();
+
+    io.sendLine('q');
+    await _waitFor(() => factory.calls.length == 1 && !cli.isBusy);
+    io.sendLine('/compact');
+    await _waitFor(
+      () => factory.calls.length == 2,
+      reason: 'summarizer called',
+    );
+    await _waitFor(() => io.out.toString().contains('● compacted'));
+    io.sendLine('/exit');
+    await run;
+
+    // The summary call went to the smol model, not the default chain.
+    expect(factory.calls, ['claude-a', 'claude-smol']);
+    expect(
+      factory.contexts.last.systemPrompt,
+      contains('context checkpoint assistant'),
+    );
+  });
+
+  test('a resolver without a default role keeps the legacy wiring', () async {
+    final factory = _RolesFactory({
+      'claude-smol': [_textTurn('claude-smol', 'SMOL SUMMARY')],
+    });
+    final resolver = resolverFor(factory, const {
+      'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+    });
+    final legacyTurns = <List<AssistantMessageEvent>>[
+      _textTurn('placeholder', 'legacy answer'),
+    ];
+    final legacyCalls = <String>[];
+    AssistantMessageEventStream legacyStream(
+      Model model,
+      Context context, {
+      CancelToken? cancelToken,
+    }) {
+      legacyCalls.add(model.id);
+      final stream = AssistantMessageEventStream();
+      for (final event in legacyTurns.removeAt(0)) {
+        stream.push(event);
+      }
+      stream.end();
+      return stream;
+    }
+
+    final cli = AgentCli(
+      config: AgentCliConfig(
+        model: _placeholderModel,
+        apiKey: 'unused',
+        env: env,
+        sessionRoot: '/sessions',
+        modelRolesResolver: resolver,
+        // Issue #287: pins the classic rollback's smol summarizer wiring.
+        compactionEngine: CompactionEngine.classic,
+      ),
+      io: io,
+      streamFunction: legacyStream,
+    );
+    final run = cli.run();
+
+    io.sendLine('q');
+    await _waitFor(() => legacyCalls.isNotEmpty && !cli.isBusy);
+    io.sendLine('/compact');
+    await _waitFor(() => factory.calls.isNotEmpty, reason: 'smol summarizer');
+    await _waitFor(() => io.out.toString().contains('● compacted'));
+    io.sendLine('/exit');
+    await run;
+
+    // User turns used the injected legacy stream; compaction used smol.
+    expect(legacyCalls, ['placeholder']);
+    expect(factory.calls, ['claude-smol']);
+  });
+
+  test('/provider pins the default chain to the new endpoint', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'proxied answer')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final cli = cliFor(resolver);
+    final run = cli.run();
+
+    io.sendLine('/provider anthropic http://proxy.test:1');
+    await _waitFor(
+      () => io.out.toString().contains('switched provider to anthropic'),
+    );
+    io.sendLine('go');
+    await _waitFor(() => factory.calls.isNotEmpty && !cli.isBusy);
+    io.sendLine('/exit');
+    await run;
+
+    final output = io.out.toString();
+    expect(
+      output,
+      contains(
+        'switched provider to anthropic '
+        '(endpoint: http://proxy.test:1)',
+      ),
+    );
+    expect(output, contains('model unchanged: claude-a'));
+    expect(cli.agent.state.model.baseUrl, 'http://proxy.test:1');
+    expect(factory.calls, ['claude-a']);
+    expect(output, contains('proxied answer'));
+  });
+
+  test('/provider with an explicit token in roles mode threads it through '
+      'the resolver', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'a'), _textTurn('claude-a', 'b')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final cli = cliFor(resolver);
+    final run = cli.run();
+
+    // The typed token joins the resolver's secrets and the pinned default
+    // chain references it by NAME — the switch succeeds.
+    io.sendLine('/provider anthropic http://proxy.test:1 some-token');
+    await _waitFor(
+      () => io.out.toString().contains('switched provider to anthropic'),
+    );
+    io.sendLine('go');
+    await _waitFor(() => factory.calls.isNotEmpty && !cli.isBusy);
+    io.sendLine('/exit');
+    await run;
+
+    final output = io.out.toString();
+    expect(output, isNot(contains('explicit tokens are not supported')));
+    expect(cli.agent.state.model.baseUrl, 'http://proxy.test:1');
+    final chain = resolver.config.roles['default']!;
+    expect(chain.first.baseUrl, 'http://proxy.test:1');
+    // The key rides under the ENDPOINT-scoped name (never the catalog env
+    // name — a kimi key must not shadow KIMI_API_KEY, and vice versa).
+    expect(chain.first.apiKeyName, 'FA_KEY_PROXY_TEST_1');
+    expect(output, isNot(contains('some-token')));
+  });
+
+  test('/provider without a token preserves the scoped key name on the '
+      'pinned chain (the "key reset itself" regression)', () async {
+    final factory = _RolesFactory({
+      'placeholder': [_textTurn('placeholder', 'ok')],
+    });
+    final usedKeys = <String>[];
+    StreamFunction recordingFactory(String kind, String apiKey) {
+      usedKeys.add(apiKey);
+      return factory.call(kind, apiKey);
+    }
+
+    // The user's setup: the default chain points at a kimi endpoint with a
+    // provider-scoped store key.
+    final resolver = ModelRolesResolver(
+      config: ModelRolesConfig(
+        roles: const {
+          'default': [
+            ModelRef(
+              provider: 'openai',
+              modelId: 'kimi-for-coding',
+              baseUrl: 'https://api.kimi.com/coding/v1',
+              apiKeyName: 'FA_KEY_API_KIMI_COM_KIMI_IRA1',
+            ),
+          ],
+        },
+        retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+      ),
+      secrets: const {'FA_KEY_API_KIMI_COM_KIMI_IRA1': 'kimi-key'},
+      streamFactory: recordingFactory,
+    );
+    final cli = cliFor(resolver);
+    final run = cli.run();
+
+    // A provider switch WITHOUT a token (keep-current semantics) must not
+    // drop the scoped key name — before the fix the pin lost apiKeyName and
+    // the next turn fell back to the stale catalog env key (401).
+    io.sendLine('/provider openai https://api.kimi.com/coding/v1');
+    await _waitFor(
+      () => io.out.toString().contains('switched provider to openai'),
+    );
+    io.sendLine('go');
+    await _waitFor(() => factory.calls.isNotEmpty && !cli.isBusy);
+    io.sendLine('/exit');
+    await run;
+
+    final chain = resolver.config.roles['default']!;
+    expect(chain.first.apiKeyName, 'FA_KEY_API_KIMI_COM_KIMI_IRA1');
+    expect(usedKeys, ['kimi-key']);
+  });
+
+  test('/provider reports a clean error when no key resolves', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'a')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final cli = cliFor(resolver);
+    final run = cli.run();
+
+    // GOOGLE_API_KEY is absent from the resolver's secrets snapshot.
+    io.sendLine('/provider google');
+    await _waitFor(() => io.out.toString().contains('cannot switch provider'));
+    io.sendLine('/exit');
+    await run;
+
+    expect(io.out.toString(), contains('GOOGLE_API_KEY'));
+  });
+
+  test('/provider custom in roles mode still asks for the key', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'proxied answer')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final cli = cliFor(resolver);
+    final run = cli.run();
+
+    io.sendLine('/provider custom');
+    await _waitFor(() => io.out.toString().contains('type a number:'));
+    io.sendLine('2');
+    await _waitFor(() => io.out.toString().contains('base URL (empty ='));
+    io.sendLine('http://127.0.0.1:1');
+    await _waitFor(() => io.out.toString().contains('provider name (empty ='));
+    io.sendLine('');
+    // Roles mode notes the env fallback but STILL asks; an empty answer
+    // resolves from the environment.
+    await _waitFor(
+      () => io.out.toString().contains('roles mode: an empty key resolves'),
+    );
+    await _waitFor(
+      () => io.out.toString().contains('API key (empty for none):'),
+    );
+    io.sendLine('');
+    await _waitFor(() => io.out.toString().contains('model id (empty keeps'));
+    io.sendLine('claude-a');
+    await _waitFor(
+      () => io.out.toString().contains('switched provider to anthropic'),
+    );
+    io.sendLine('go');
+    await _waitFor(() => factory.calls.isNotEmpty && !cli.isBusy);
+    io.sendLine('/exit');
+    await run;
+
+    final output = io.out.toString();
+    expect(output, contains('API key (empty for none):'));
+    expect(cli.agent.state.model.baseUrl, 'http://127.0.0.1:1');
+    expect(factory.calls, ['claude-a']);
+    expect(output, contains('proxied answer'));
+  });
+
+  test('/provider custom in roles mode stores a typed key', () async {
+    final factory = _RolesFactory({
+      'claude-a': [_textTurn('claude-a', 'proxied answer')],
+    });
+    final resolver = resolverFor(factory, const {
+      'default': [ModelRef(provider: 'anthropic', modelId: 'claude-a')],
+    });
+    final registry = CustomProviderRegistry([]);
+    final store = FakeSecureKeyStore();
+    final cache = SecureKeyCache(store);
+    await cache.probe();
+    final cli = AgentCli(
+      config: AgentCliConfig(
+        model: _placeholderModel,
+        apiKey: 'unused',
+        env: env,
+        sessionRoot: '/sessions',
+        modelRolesResolver: resolver,
+        customProviders: registry,
+        secureKeys: cache,
+        envVarValue: (_) => null,
+      ),
+      io: io,
+    );
+    final run = cli.run();
+
+    io.sendLine('/provider custom');
+    await _waitFor(() => io.out.toString().contains('type a number:'));
+    io.sendLine('2'); // anthropic-like
+    await _waitFor(() => io.out.toString().contains('base URL (empty ='));
+    io.sendLine('http://127.0.0.1:1');
+    await _waitFor(() => io.out.toString().contains('provider name (empty ='));
+    io.sendLine('my-proxy');
+    await _waitFor(
+      () => io.out.toString().contains('API key (empty for none):'),
+    );
+    io.sendLine('sk-typed-in-roles-mode');
+    await _waitFor(() => io.out.toString().contains('model id (empty keeps'));
+    io.sendLine('claude-a');
+    await _waitFor(
+      () => io.out.toString().contains('switched provider to anthropic'),
+    );
+    io.sendLine('/exit');
+    await run;
+
+    // The typed key landed in the secure store under the entry's key name.
+    final entry = registry.find('my-proxy')!;
+    expect(entry.keyName, isNotNull);
+    expect(store.map[entry.keyName], 'sk-typed-in-roles-mode');
+    expect(io.out.toString(), isNot(contains('sk-typed-in-roles-mode')));
+  });
+}

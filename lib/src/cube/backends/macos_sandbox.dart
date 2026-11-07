@@ -1,0 +1,232 @@
+/// macOS sandbox-exec backend: generates an SBPL profile from a cube spec
+/// and wraps commands in `sandbox-exec -f <profile>`.
+///
+/// The generated policy mirrors [CubeSpec]: the workspace is writable,
+/// `ro` mounts are readable but not writable, `deny` mounts vanish, and
+/// the network is fully denied unless the spec allows it. Unless a mount
+/// grants root-level access, writes outside the workspace and `rw` mounts
+/// are denied blanket-wide (`2>/dev/null` and the stdio fd aliases stay
+/// writable), and specs that do not grant root reads get a curated read
+/// deny set (system config, user homes). The wrapped command runs under
+/// `/usr/bin/env -i` — the clean-environment ceiling: inherited host
+/// variables are gone, only the PATH/HOME/TMPDIR trio plus the cube's
+/// injected vars are present.
+library;
+
+import '../config/cube_spec.dart';
+import '../config/fs_policy.dart';
+import 'cube_backend.dart';
+
+/// The macOS backend: SBPL profile generation plus `sandbox-exec` wrapping.
+final class MacOsSandboxBackend
+    implements CubeSandboxBackend, CubeProfileStaging {
+  /// Creates the backend bound to a run's context. The defaults exist for
+  /// bare display/backends-picked-outside-a-run; kernel execution always
+  /// passes the real workspace, tmpdir and injected env.
+  const MacOsSandboxBackend({
+    this.workspaceRoot = '/workspace',
+    this.tmpdir = '/tmp',
+    this.envVars = const {},
+  });
+
+  /// The real writable root (the env cwd) — `HOME` inside the sandbox.
+  final String workspaceRoot;
+
+  /// Writable scratch directory handed to the child as `TMPDIR`.
+  final String tmpdir;
+
+  /// The cube's injected environment variables (hidden vars excluded).
+  final Map<String, String> envVars;
+
+  @override
+  bool get enforces => true;
+
+  @override
+  String wrapCommand(
+    String command, {
+    required String profilePath,
+    Map<String, String> env = const {},
+  }) {
+    final prefix = cubeEnvPrefix(
+      workspaceRoot: workspaceRoot,
+      tmpdir: tmpdir,
+      envVars: {...envVars, ...env},
+    );
+    return 'sandbox-exec -f ${shellQuote(profilePath)} '
+        '/usr/bin/env -i $prefix /bin/bash -c ${shellQuote(command)}';
+  }
+
+  @override
+  String buildProfile(CubeSpec spec, {required String workspaceRoot}) =>
+      buildSandboxProfile(spec, workspaceRoot: workspaceRoot);
+
+  @override
+  String describe() =>
+      'macOS sandbox-exec (SBPL profile + clean env -i; kernel enforcement '
+      'active in backend: kernel mode)';
+
+  /// Renders [spec] as an SBPL profile.
+  ///
+  /// [workspaceRoot] overrides the spec's workspace as the writable subpath
+  /// (the CLI passes the real process cwd; the cube's `/workspace` is
+  /// realized as the env cwd).
+  ///
+  /// The kernel matches SBPL patterns against the RESOLVED path: macOS
+  /// firmware symlinks (`/etc`, `/tmp`, `/var` → `/private/...`) make a
+  /// symlink-form pattern silently match nothing, so every confined path is
+  /// emitted in BOTH forms. The shape stays allow-default + explicit denies
+  /// — a catch-all `(deny file-read*)` aborts exec — and per-path rules
+  /// always use `file-read*`/`file-write*` with `subpath` (the
+  /// `file-read-data`/`literal` single-file forms do not hold).
+  String buildSandboxProfile(CubeSpec spec, {String? workspaceRoot}) {
+    final workspace = workspaceRoot ?? spec.filesystem.workspace;
+    final mounts = spec.filesystem.mounts;
+    final buffer = StringBuffer('(version 1)\n(allow default)\n');
+    if (!mounts.any(_rootWritesEverywhere)) _denyBlanketWrites(buffer);
+    if (!mounts.any(_rootReadsEverywhere)) {
+      _curatedReadDenies(buffer, workspace);
+    }
+    _allowWorkspaceWrites(buffer, workspace);
+    for (final mount in _deepestLast(mounts)) {
+      _mountRules(buffer, mount);
+    }
+    buffer.writeln(
+      spec.network.allowsAnyNetwork ? '(allow network*)' : '(deny network*)',
+    );
+    return buffer.toString();
+  }
+}
+
+/// Whether a root-level mount makes reads broad by design (L2's `ro /`
+/// reads everywhere).
+bool _rootReadsEverywhere(CubeMount mount) =>
+    mount.path == '/' && mount.access != CubePathAccess.deny;
+
+/// Whether a root-level mount makes writes broad by design (L3's `rw /`
+/// writes everywhere).
+bool _rootWritesEverywhere(CubeMount mount) =>
+    mount.path == '/' && mount.access == CubePathAccess.readWrite;
+
+/// The blanket write deny for profiles without a root-level `rw` mount,
+/// with the persistence-free sinks kept writable: `2>/dev/null` and the
+/// stdio fd aliases must keep working inside the sandbox.
+void _denyBlanketWrites(StringBuffer buffer) {
+  buffer.writeln('(deny file-write*)');
+  buffer
+    ..writeln('(allow file-write* (subpath "/dev/null"))')
+    ..writeln('(allow file-write* (subpath "/dev/fd"))');
+}
+
+/// The curated read confinement for profiles without a root-level read:
+/// deny the high-value disclosure targets (system config, every user home)
+/// while keeping exec viable — a blanket `(deny file-read*)` aborts exec,
+/// since the payload and dyld must read /bin/bash and /usr/lib/….
+/// The workspace may live under /Users: re-allow it over the deny.
+void _curatedReadDenies(StringBuffer buffer, String workspace) {
+  for (final path in [
+    ..._resolvedVariants('/etc'),
+    ..._resolvedVariants('/Users'),
+  ]) {
+    buffer.writeln('(deny file-read* (subpath "$path"))');
+  }
+  for (final path in _resolvedVariants(workspace)) {
+    buffer.writeln('(allow file-read* (subpath "$path"))');
+  }
+}
+
+/// The workspace write allows (the default-allow profile needs the
+/// explicit subpath form over the blanket deny).
+void _allowWorkspaceWrites(StringBuffer buffer, String workspace) {
+  for (final path in _resolvedVariants(workspace)) {
+    buffer.writeln('(allow file-write* (subpath "$path"))');
+  }
+}
+
+/// Mounts re-ordered deepest-path-LAST (stable), for the emission loop.
+///
+/// P1 makes rule order load-bearing within the mount block too: the kernel
+/// applies the LAST matching rule per operation class, while the Dart guard
+/// resolves mounts longest-prefix-wins — emitting the list verbatim let a
+/// broad `ro`/`rw` parent declared after a `deny` child land its allows
+/// last, kernel-re-allowing the child the guard denies (the `[deny ~/.ssh,
+/// rw ~]` shape from the PR #718 review). Ascending path length restores
+/// parity: a proper prefix is always shorter, so every ancestor emits
+/// before its descendant and the most specific mount is the last match.
+/// Ties break by original index (List.sort is NOT stable): equal paths
+/// keep profile order, which the ro+rw twin mounts rely on — the rw twin
+/// must stay after its ro twin so its allows win per class (E2).
+List<CubeMount> _deepestLast(List<CubeMount> mounts) {
+  final indexed = [for (var i = 0; i < mounts.length; i++) (i, mounts[i])];
+  int byDeepestLast((int, CubeMount) a, (int, CubeMount) b) {
+    final byLength = a.$2.path.length.compareTo(b.$2.path.length);
+    return byLength != 0 ? byLength : a.$1.compareTo(b.$1);
+  }
+
+  indexed.sort(byDeepestLast);
+  return [for (final (_, mount) in indexed) mount];
+}
+
+/// Per-mount SBPL rules, emitted in both resolved spellings.
+///
+/// P1 (ordering): within an operation class (`file-read*`/`file-write*`) the
+/// kernel applies the LAST matching rule — not the most specific one
+/// (observed on l1-dev: the curated `(deny file-read* (subpath "/Users"))`
+/// beat subpath allows until a LATER allow re-allowed the path; Apple's
+/// shipped docs do not cover conflict resolution — sandbox(7) documents the
+/// facility only — so this ordering is pinned empirically by the profile
+/// tests and the live macOS legs). Rule order is therefore load-bearing:
+/// these mount rules are emitted AFTER `_curatedReadDenies` so an `ro`/`rw`
+/// mount under a denied prefix re-allows it, and WITHIN the mount block the
+/// `_deepestLast` order decides — the deeper (longest) path emits last and
+/// wins per class, matching the guard's longest-prefix resolution; the
+/// ro+rw twin mounts in l1-dev rely on the index tiebreak keeping the rw
+/// twin after its ro twin.
+///
+/// A `readWrite` mount is read-write in the kernel as in the Dart guard: it
+/// emits BOTH allows. Emitting only the write allow made rw mounts kernel-
+/// unreadable under a read-denied prefix while the Dart fs guard kept
+/// granting reads — file tools passed, wrapped shells got `Operation not
+/// permitted` (issue #709).
+void _mountRules(StringBuffer buffer, CubeMount mount) {
+  for (final path in _resolvedVariants(mount.path)) {
+    switch (mount.access) {
+      case CubePathAccess.readOnly:
+        buffer
+          ..writeln('(allow file-read* (subpath "$path"))')
+          ..writeln('(deny file-write* (subpath "$path"))');
+      case CubePathAccess.deny:
+        buffer
+          ..writeln('(deny file-read* (subpath "$path"))')
+          ..writeln('(deny file-write* (subpath "$path"))');
+      case CubePathAccess.readWrite:
+        buffer
+          ..writeln('(allow file-read* (subpath "$path"))')
+          ..writeln('(allow file-write* (subpath "$path"))');
+    }
+  }
+}
+
+/// Both SBPL spellings for [path]: itself plus the `/private`-resolved form
+/// when it lives under one of the firmware symlink roots. An already
+/// canonical path maps to itself only.
+///
+/// P2 (literal-path matching + symlink-node traversal): SBPL filters match
+/// the LITERAL path of an operation. Opening `/etc/ssl/cert.pem` must first
+/// read the `/etc` symlink NODE, and a subpath filter on `/etc/ssl` does not
+/// match that node — only the `/private/etc/...` spelling bypasses the
+/// symlink entirely. These variants therefore cover the firmware-symlink
+/// TARGETS, but they cannot and do not cover the symlink node itself: reads
+/// through the `/etc` spelling stay denied (and `realpath`-style walks that
+/// stat each ancestor die on the first denied component, even under an
+/// allowed subpath). Auto-allowing `/etc` readability would be a security
+/// decision, not an emission bug — out of scope for #709, which is why git
+/// over https keeps needing `GIT_SSL_CAINFO=/private/etc/ssl/cert.pem`.
+List<String> _resolvedVariants(String path) {
+  const roots = ['/etc', '/tmp', '/var'];
+  for (final root in roots) {
+    if (path == root || path.startsWith('$root/')) {
+      return [path, '/private$path'];
+    }
+  }
+  return [path];
+}

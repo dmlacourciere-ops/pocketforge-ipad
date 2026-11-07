@@ -1,0 +1,1855 @@
+/// Command-line parsing for the `fah` executable (`bin/fah.dart`), extracted
+/// as a pure, testable function: the executable maps the result to
+/// usage/version output or an exit code, tests assert on it directly.
+///
+/// Two invocation shapes:
+///
+/// - interactive REPL: no prompt arguments (`fah --model ...`);
+/// - headless: a prompt via `-p`/`--prompt <text>` or positional arguments
+///   (`fah "summarize the changelog"` — multiple positionals join with
+///   spaces, like claude/pi). A positional that names an existing file is
+///   resolved as the prompt source by `resolveHeadlessPrompt` (see
+///   `headless_prompt.dart`, exported from `lib/io.dart`).
+library;
+
+import '../compaction/compaction_engine.dart';
+import '../config/config_service.dart';
+import '../exceptions.dart';
+import '../import/harness_adapter.dart';
+import '../redact/redaction_types.dart';
+import '../session_deadline.dart';
+import '../tools/availability.dart';
+
+/// The provider kinds accepted by `--provider`. Static — the set of every
+/// headless-capable catalog kind; a build filtered through the
+/// `FA_PROVIDERS` dart-define rejects the filtered kinds at resolution
+/// time (buildCliDefaultModel resolves through the filtered
+/// [catalogProvider]).
+const cliProviderKinds = {
+  'openai-completions',
+  'anthropic',
+  'google',
+  'dial',
+  'minimax',
+  'zai',
+  'aiin',
+  'copilot',
+};
+
+/// Invalid command line: the executable prints [message] plus a usage hint
+/// to stderr and exits with code 64 (EX_USAGE).
+final class CliArgsException implements Exception {
+  /// Creates a [CliArgsException].
+  const CliArgsException(this.message);
+
+  /// The human-readable error.
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// The outcome of parsing the `fah` argument list.
+sealed class CliArgsResult {
+  const CliArgsResult._();
+}
+
+/// `--help`/`-h` was passed: print usage and exit 0.
+final class CliArgsHelp extends CliArgsResult {
+  /// Creates a [CliArgsHelp].
+  const CliArgsHelp() : super._();
+}
+
+/// `--version` was passed: print the version and exit 0. [output] carries
+/// `--output json` (issue #155): machine-readable version + HEP version.
+final class CliArgsVersion extends CliArgsResult {
+  /// Creates a [CliArgsVersion].
+  const CliArgsVersion({this.output}) : super._();
+
+  /// `--output <mode>` when combined with `--version` ('json').
+  final String? output;
+}
+
+/// A parsed run configuration (interactive or headless).
+final class CliArgs extends CliArgsResult {
+  /// Creates a [CliArgs].
+  const CliArgs({
+    this.model,
+    this.provider = 'openai-completions',
+    this.providerExplicit = false,
+    this.baseUrl,
+    this.systemPrompt,
+    this.systemPromptFile,
+    this.visionModel,
+    this.visionBaseUrl,
+    this.transcribeModel,
+    this.transcribeBaseUrl,
+    this.plugins = const [],
+    this.promptTemplateDirs = const [],
+    this.mode,
+    this.cwd,
+    this.sessionRoot,
+    this.session,
+    this.prompt,
+    this.promptFile,
+    this.cubeName,
+    this.cubeConfigPath,
+    this.tools,
+    this.compactionEngine,
+    this.logFile,
+    this.redact,
+    this.trajectory,
+    this.config,
+    this.providerCmd,
+    this.ext,
+    this.jsr,
+    this.sessionList,
+    this.importCmd,
+    this.positionals = const [],
+    this.output,
+    this.outputFormat,
+    this.attachments = const [],
+    this.waitForJobs = false,
+    this.piMode = false,
+    this.ompMode = false,
+    this.debugSecrets = false,
+    this.noFormat = false,
+    this.streamThinking = false,
+    this.noStreamThinking = false,
+    this.timer,
+    this.deadline,
+  }) : super._();
+
+  /// `--model <id>`.
+  final String? model;
+
+  /// `--provider <kind>` (default: openai-completions, via OpenRouter).
+  final String provider;
+
+  /// Whether `--provider` was passed explicitly. When false, the executable
+  /// prefers the saved `provider:` from `~/.fah/config.yaml` (the persisted
+  /// `/provider` switch) over the openai-completions default.
+  final bool providerExplicit;
+
+  /// `--base-url <url>`.
+  final String? baseUrl;
+
+  /// `--system-prompt <text>`: a per-invocation system prompt override, used
+  /// verbatim. Wins over the config `prompts:` section and the built-in mode
+  /// prompts. Mutually exclusive with [systemPromptFile].
+  final String? systemPrompt;
+
+  /// `--system-prompt-file <path>`: a per-invocation system prompt override
+  /// read from a Markdown file. Mutually exclusive with [systemPrompt].
+  final String? systemPromptFile;
+
+  /// `--vision-model <id>`.
+  final String? visionModel;
+
+  /// `--vision-base-url <url>`.
+  final String? visionBaseUrl;
+
+  /// `--transcribe-model <id>`.
+  final String? transcribeModel;
+
+  /// `--transcribe-base-url <url>`.
+  final String? transcribeBaseUrl;
+
+  /// `--plugin <name>` (repeatable).
+  final List<String> plugins;
+
+  /// `--prompt-template-dir <path>` (repeatable).
+  final List<String> promptTemplateDirs;
+
+  /// `--mode <name>` (code | architect | review).
+  final String? mode;
+
+  /// `--cwd <dir>`.
+  final String? cwd;
+
+  /// `--session-root <dir>`.
+  final String? sessionRoot;
+
+  /// `--session <name>`.
+  ///
+  /// Resume the named session for the current working directory if it exists,
+  /// otherwise create a new session with that name. Applies to both the
+  /// interactive REPL and headless mode.
+  final String? session;
+
+  /// `--cube <name>`: apply the cube sandbox profile
+  /// `<cwd>/.fah/cubes/<name>.yaml` for this run. Wins over the `cube:`
+  /// config section; `--cube-config` beats it.
+  final String? cubeName;
+
+  /// `--cube-config <path>`: apply the cube sandbox profile from an
+  /// explicit manifest path (highest cube precedence).
+  final String? cubeConfigPath;
+
+  /// `--tools <id>=on|off,...`: the runtime availability scope, parsed
+  /// eagerly so a malformed token fails as a usage error instead of a
+  /// startup config error. Wins over the `FA_TOOLS` env twin; both stack
+  /// over the config scopes at resolution.
+  final ToolsConfig? tools;
+
+  /// `--compaction-engine <classic|structured>`: the RUNTIME scope of the
+  /// engine selector (issue #148) — wins over the project and global
+  /// `compaction:` sections, this invocation only.
+  final CompactionEngine? compactionEngine;
+
+  /// `--log-file <path>`: tee every line the CLI prints (assistant text,
+  /// tool trace, diagnostics) to [path] as it is produced, so a run nested
+  /// inside a parent CLI's output capture leaves a readable, `tail -f`-able
+  /// trace file behind. The file is truncated on start. The `FA_LOG_FILE`
+  /// env var is the twin default when the flag is absent (flag wins).
+  final String? logFile;
+
+  /// The `redact:` section of the saved CLI config (layered secret
+  /// redaction); null = absent, defaults apply at pipeline assembly.
+  final RedactionConfig? redact;
+
+  /// The `-p`/`--prompt` headless prompt, used verbatim (no file
+  /// resolution). Mutually exclusive with [promptFile] and [positionals].
+  final String? prompt;
+
+  /// `--prompt-file <path>` (alias `-f`): read the file as UTF-8 text and
+  /// send it verbatim as the headless prompt — never further resolved.
+  /// Mutually exclusive with [prompt] and [positionals]. The path is
+  /// resolved by the executable's IO layer; a missing/unreadable file is a
+  /// usage error ([CliArgsException] from `resolveHeadlessPrompt`).
+  final String? promptFile;
+
+  /// Positional arguments: the headless prompt source. Joined with spaces,
+  /// or resolved as a file by `resolveHeadlessPrompt` when the first one
+  /// names an existing file. Empty for interactive REPL mode.
+  final List<String> positionals;
+
+  /// The `fa trajectory <verb>` subcommand, when the invocation routed to
+  /// the trajectory reader instead of a prompt run.
+  final TrajectoryCliCommand? trajectory;
+
+  /// The `fa config <verb>` subcommand (e.g. `export-providers`), when
+  /// the invocation routed to the headless config manager instead of a
+  /// prompt run.
+  final ConfigCliCommand? config;
+
+  /// The `fa provider` subcommand (issue #1704: `provider export NAME
+  /// [--check]`), when the invocation routed to the headless credential
+  /// exporter instead of a prompt run.
+  final ProviderCliCommand? providerCmd;
+
+  /// The `fa ext <verb>` subcommand, when the invocation routed to the JS
+  /// extension manager instead of a prompt run.
+  final ExtCliCommand? ext;
+
+  /// The `fa jsr <verb>` subcommand (gh-1033), when the invocation routed
+  /// to the jsr widget CLI pass-through instead of a prompt run.
+  final JsrCliCommand? jsr;
+
+  /// The `fa session <verb>` subcommand (issue #198 / gh-1073): routed to
+  /// the session lister/repairer instead of a prompt run.
+  final SessionCliCommand? sessionList;
+
+  /// `fa import` (issue #1562): cross-harness session import — routed to
+  /// the importer instead of a prompt run, before any provider wiring.
+  final ImportCliCommand? importCmd;
+
+  /// `--output <mode>` (issue #155): 'events' (HEP v1 JSONL on stdout) or
+  /// 'events=full' (full tool arguments). 'json' only rides `--version`.
+  final String? output;
+
+  /// `--output-format <format>` (issue #695): `text` (default) or
+  /// `stream-json` — NDJSON agent events on stdout for headless runs (pi
+  /// `--mode json` / claude-code stream-json parity). `--mode json` is an
+  /// exact alias. Null = text (the flag was absent).
+  final String? outputFormat;
+
+  /// `--attach <path>` (repeatable, issue #155): files attached to the
+  /// first user message of a headless run as image content blocks.
+  final List<String> attachments;
+
+  /// `--wait-for-jobs` (issue #450): headless opt-in — keep the process
+  /// alive until every detached background job settles or an armed timer
+  /// delivers (bounded by the `waiting.waitCeilingMinutes` config, default
+  /// 30). Without it a headless run prints the detach summary and exits.
+  final bool waitForJobs;
+
+  /// `--pi`: the pi benchmark mode (issue #679) — 4-tool surface (read,
+  /// write, edit, bash), bare prompt. Wins over `FA_PI_MODE` and the
+  /// config `agent.mode` (AC3: flag > env > config).
+  final bool piMode;
+
+  /// `--omp` (issue #680): boot the omp load-mode preset — the curated
+  /// essential tool set in the schema, everything else discoverable.
+  /// Wins over the `FA_AGENT_MODE` env twin and the `agent.mode` config
+  /// (flag > env > config).
+  final bool ompMode;
+
+  /// `--debug-secrets` (gh-1059): log every secure-store preload read —
+  /// `found` / `absent` / `error: <diagnostic>` — so a degraded keychain
+  /// boot is diagnosable instead of silently keyless. Same effect as the
+  /// truthy `FA_DEBUG_KEYS` env var.
+  final bool debugSecrets;
+
+  /// `--no-format`: render assistant markdown raw (byte-identical
+  /// passthrough) even on a color TTY (issue #774). Same effect as the
+  /// `FA_NO_FORMAT` env var.
+  final bool noFormat;
+
+  /// `--stream-thinking` (gh-1198): the opt-in live thinking stream for
+  /// this run — line-mode/headless runs print thinking deltas dimmed,
+  /// live, like the TUI. Wins over the `output.streamThinking` config
+  /// for the run; the config default keeps the byte-identical legacy
+  /// output.
+  final bool streamThinking;
+
+  /// `--no-stream-thinking` (gh-1433): the thinking-scoped silence escape
+  /// hatch — on the log face (headless runs, which stream thinking by
+  /// default since gh-1433) it restores legacy thinking silence for the
+  /// run. Cannot combine with `--stream-thinking`.
+  final bool noStreamThinking;
+
+  /// `--timer <duration>` (gh-1556): arm the session deadline
+  /// `duration` from boot (`25m`, `90s`, `1h30m`). Sets the SAME single
+  /// session clock the host env var and `/timer` write; wins over the
+  /// `FA_DEADLINE_EPOCH_MS` env. Alias of [deadline].
+  final String? timer;
+
+  /// `--deadline <duration|epoch-ms>` (gh-1556): arm the session deadline
+  /// from a duration (`25m`, `90s`, `1h30m`) or an absolute epoch-ms
+  /// timestamp. Sets the SAME single session clock the host env var and
+  /// `/timer` write; wins over the env. Alias of [timer].
+  final String? deadline;
+
+  /// Whether this invocation runs a single headless prompt instead of the
+  /// interactive REPL.
+  bool get isHeadless =>
+      prompt != null || promptFile != null || positionals.isNotEmpty;
+}
+
+/// Parses the `fah` argument list.
+///
+/// Throws [CliArgsException] on unknown flags, missing flag values, an
+/// unknown provider, `--system-prompt` combined with `--system-prompt-file`,
+/// `-p`/`--prompt` combined with positional arguments, or `--prompt-file`
+/// combined with either.
+/// Subcommands intercepted BEFORE prompt parsing — their verb words are
+/// never prompts. Each parser takes the words after the subcommand name.
+const Map<String, CliArgsResult Function(List<String>)> _cliSubcommands = {
+  'trajectory': _parseTrajectoryArgs,
+  'config': _parseConfigArgs,
+  'provider': _parseProviderArgs,
+  'ext': _parseExtArgs,
+  'jsr': _parseJsrArgs,
+  'session': _parseSessionArgs,
+  'import': _parseImportArgs,
+};
+
+/// Applies the no-value boolean flags (`--wait-for-jobs`, `--pi`,
+/// `--omp`, `--debug-secrets`, `--no-format`, `--stream-thinking`,
+/// `--no-stream-thinking`) to [values]; returns false when [arg] is none
+/// of them (the caller falls through to the value-flag table).
+bool _applyBooleanFlag(_CliArgValues values, String arg) {
+  if (arg == '--wait-for-jobs') {
+    values.waitForJobs = true;
+    return true;
+  }
+  if (arg == '--pi') {
+    values.piMode = true;
+    return true;
+  }
+  if (arg == '--omp') {
+    values.ompMode = true;
+    return true;
+  }
+  if (arg == '--debug-secrets') {
+    values.debugSecrets = true;
+    return true;
+  }
+  if (arg == '--no-format') {
+    values.noFormat = true;
+    return true;
+  }
+  if (arg == '--stream-thinking') {
+    values.streamThinking = true;
+    return true;
+  }
+  if (arg == '--no-stream-thinking') {
+    values.noStreamThinking = true;
+    return true;
+  }
+  return false;
+}
+
+/// The effective gh-1198 thinking-stream setting for a run: the
+/// `--stream-thinking` flag wins over the `output.streamThinking` config
+/// for the run; the config default (false) keeps the byte-identical
+/// legacy output. The flag is opt-in only, so "wins" is an inclusive OR.
+/// (Since gh-1433 the LOG face streams thinking by default — the
+/// `--no-stream-thinking` hatch silences it there — so this setting now
+/// decides the INTERACTIVE line-mode face only.)
+bool resolveStreamThinking({required bool flag, required bool configValue}) =>
+    flag || configValue;
+
+CliArgsResult parseCliArgs(List<String> args) {
+  final subcommand = args.isEmpty ? null : _cliSubcommands[args.first];
+  if (subcommand != null) {
+    return subcommand(args.sublist(1));
+  }
+  final values = _CliArgValues();
+  for (var i = 0; i < args.length; i++) {
+    final arg = args[i];
+    if (const {'--help', '-h'}.contains(arg)) return const CliArgsHelp();
+    if (arg == '--version') return CliArgsVersion(output: _prescanOutput(args));
+    if (_applyBooleanFlag(values, arg)) continue;
+    final flag = _valueFlags[arg];
+    if (flag != null) {
+      final (canonical, apply) = flag;
+      if (i + 1 >= args.length) {
+        throw CliArgsException('$canonical requires a value');
+      }
+      apply(values, args[i + 1]);
+      i++;
+      continue;
+    }
+    // Anything not flag-like is a positional prompt fragment; unknown
+    // `-...` arguments stay an error.
+    if (arg.startsWith('-')) {
+      throw CliArgsException('unknown argument: $arg');
+    }
+    values.positionals.add(arg);
+  }
+  return values.finish();
+}
+
+/// The `fa trajectory` subcommand: a read-only trajectory view over a
+/// stored session.
+///
+/// [positionals] carry the verb's operands: the record number for
+/// `inspect` (validated at parse time), then the optional session id; the
+/// other verbs take only the optional session id.
+final class TrajectoryCliCommand {
+  /// Creates a [TrajectoryCliCommand].
+  const TrajectoryCliCommand({
+    required this.verb,
+    this.positionals = const [],
+    this.json = false,
+    this.at,
+    this.format = 'atif',
+    this.output,
+  });
+
+  /// One of [trajectoryVerbs].
+  final String verb;
+
+  /// The verb's positional operands (record number / session id).
+  final List<String> positionals;
+
+  /// `--json`: one compact JSON record per line.
+  final bool json;
+
+  /// `--format` (export only): the export format — 'atif' is the only
+  /// supported value today (gh-1681 Gap 2).
+  final String format;
+
+  /// `--output <path>` (export only): where the export is written;
+  /// stdout when null.
+  final String? output;
+
+  /// `--at N` (view only): the snapshot as it stood at record N.
+  final int? at;
+}
+
+/// The verbs accepted by `fa trajectory`.
+const trajectoryVerbs = {'view', 'tail', 'cost', 'inspect', 'export'};
+
+/// Parses the `trajectory` subcommand operands (everything after the
+/// `trajectory` word). Unknown verbs and flags are usage errors so a typo
+/// never becomes a prompt sent to a model.
+CliArgsResult _parseTrajectoryArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw const CliArgsException(
+      'usage: fa trajectory <view|tail|cost|inspect|export> [sessionId] '
+      '[--json] [--at N] [--format atif] [--output path]',
+    );
+  }
+  final verb = args.first;
+  if (!trajectoryVerbs.contains(verb)) {
+    throw CliArgsException(
+      'unknown trajectory verb: $verb '
+      '(expected view|tail|cost|inspect|export)',
+    );
+  }
+  final operands = _parseTrajectoryOperands(args);
+  _validateTrajectoryVerb(
+    verb,
+    operands.positionals,
+    operands.at,
+    operands.json,
+    operands.format,
+    operands.formatSet,
+    operands.output,
+  );
+  return CliArgs(
+    cwd: operands.cwd,
+    sessionRoot: operands.sessionRoot,
+    trajectory: TrajectoryCliCommand(
+      verb: verb,
+      positionals: operands.positionals,
+      json: operands.json,
+      at: operands.at,
+      format: operands.format,
+      output: operands.output,
+    ),
+  );
+}
+
+/// The operands collected while walking a trajectory subcommand's
+/// arguments: positional words plus the recognized flags. A class, not a
+/// record — 8 fields exceeded the record_size cap (issue #1997).
+final class _TrajectoryOperands {
+  const _TrajectoryOperands({
+    required this.positionals,
+    required this.json,
+    required this.at,
+    required this.cwd,
+    required this.sessionRoot,
+    required this.format,
+    required this.formatSet,
+    required this.output,
+  });
+
+  final List<String> positionals;
+  final bool json;
+  final int? at;
+  final String? cwd;
+  final String? sessionRoot;
+  final String format;
+  final bool formatSet;
+  final String? output;
+}
+
+/// Walks the arguments after the verb, collecting positionals and the
+/// `--json`/`--at`/`--cwd`/`--session-root`/`--format`/`--output` flags.
+_TrajectoryOperands _parseTrajectoryOperands(List<String> args) {
+  final positionals = <String>[];
+  var json = false;
+  int? at;
+  String? cwd;
+  String? sessionRoot;
+  var format = 'atif';
+  var formatSet = false;
+  String? output;
+  for (var i = 1; i < args.length; i++) {
+    final arg = args[i];
+    switch (arg) {
+      case '--json':
+        json = true;
+      case '--cwd' || '--session-root':
+        final value = _pathFlagValue(args, arg, i);
+        if (arg == '--cwd') {
+          cwd = value;
+        } else {
+          sessionRoot = value;
+        }
+        i++;
+      case '--at':
+        at = _atFlagValue(args, i);
+        i++;
+      case '--format' || '--output':
+        final value = _pathFlagValue(args, arg, i);
+        if (arg == '--format') {
+          format = value;
+          formatSet = true;
+        } else {
+          output = value;
+        }
+        i++;
+      default:
+        _addTrajectoryPositional(positionals, arg);
+    }
+  }
+  return _TrajectoryOperands(
+    positionals: positionals,
+    json: json,
+    at: at,
+    cwd: cwd,
+    sessionRoot: sessionRoot,
+    format: format,
+    formatSet: formatSet,
+    output: output,
+  );
+}
+
+/// Appends [arg] to [positionals], rejecting unknown flags and a third
+/// operand (trajectory verbs take at most two).
+void _addTrajectoryPositional(List<String> positionals, String arg) {
+  if (arg.startsWith('-')) {
+    throw CliArgsException('unknown argument: $arg');
+  }
+  if (positionals.length >= 2) {
+    throw CliArgsException('unexpected argument: $arg');
+  }
+  positionals.add(arg);
+}
+
+/// The value following a `--cwd`/`--session-root` flag at index [i].
+String _pathFlagValue(List<String> args, String arg, int i) {
+  if (i + 1 >= args.length) {
+    throw CliArgsException('$arg requires a value');
+  }
+  return args[i + 1];
+}
+
+/// The record number following `--at` at index [i].
+int _atFlagValue(List<String> args, int i) {
+  if (i + 1 >= args.length) {
+    throw const CliArgsException('--at requires a record number');
+  }
+  final at = int.tryParse(args[i + 1]);
+  if (at == null) {
+    throw const CliArgsException('--at requires a record number');
+  }
+  return at;
+}
+
+/// Rejects verb/operand mismatches: `inspect` needs a numeric record
+/// number, `--at` applies to `view` only, and the export-only flags
+/// (`--format`/`--output`) plus the view-only `--json` are verb-gated so
+/// a flag typo never silently does the wrong thing on another verb.
+void _validateTrajectoryVerb(
+  String verb,
+  List<String> positionals,
+  int? at,
+  bool json,
+  String format,
+  bool formatSet,
+  String? output,
+) {
+  if (verb == 'inspect') {
+    if (positionals.isEmpty) {
+      throw const CliArgsException(
+        'usage: fa trajectory inspect <recordNumber> [sessionId]',
+      );
+    }
+    if (int.tryParse(positionals.first) == null) {
+      throw const CliArgsException(
+        'trajectory inspect requires a record number',
+      );
+    }
+  }
+  if (at != null && verb != 'view') {
+    throw const CliArgsException('--at only applies to fa trajectory view');
+  }
+  if (verb == 'export') {
+    if (format != 'atif') {
+      throw CliArgsException(
+        'unsupported trajectory export format: $format (only atif)',
+      );
+    }
+    if (json) {
+      throw const CliArgsException(
+        '--json does not apply to fa trajectory export (the ATIF document '
+        'is already JSON)',
+      );
+    }
+    return;
+  }
+  if (formatSet || output != null) {
+    throw CliArgsException(
+      '--format/--output only apply to fa trajectory export (got verb '
+      '$verb)',
+    );
+  }
+}
+
+/// The `fa config` subcommand: headless config management.
+///
+/// `export-providers` writes the saved custom providers (+ their keys,
+/// resolved from the environment / secure store) to a passphrase-
+/// encrypted `.fahx` file — the fallback tier when the bridge pairing is
+/// not available (issue #34 item 3).
+///
+/// `check` / `path` / `get` / `set` operate on the user + project config
+/// pair directly (issue #29): the headless equivalents of the interactive
+/// settings flows, used by the fa-self-config skill.
+final class ConfigCliCommand {
+  /// Creates a [ConfigCliCommand].
+  const ConfigCliCommand({
+    required this.verb,
+    this.out,
+    this.passphraseStdin = false,
+    this.key,
+    this.value,
+    this.scope,
+  });
+
+  /// One of [configVerbs].
+  final String verb;
+
+  /// `--out <file>`: the `.fahx` target (default `providers.fahx` in the
+  /// working directory).
+  final String? out;
+
+  /// `--passphrase-stdin`: read the passphrase from one stdin line
+  /// instead of the double prompt (headless).
+  final bool passphraseStdin;
+
+  /// `fa config get|set <key>` — the dotted config key (`memory.projectPath`).
+  final String? key;
+
+  /// `fa config set <key> <value>` — the raw value text.
+  final String? value;
+
+  /// `--project` / `--global` on `set`: force the target file. Null lets
+  /// the service resolve by cwd (project file wins when present).
+  final ConfigScope? scope;
+}
+
+/// The verbs accepted by `fa config`.
+const configVerbs = {'export-providers', 'check', 'path', 'get', 'set'};
+
+const _configUsage =
+    'usage: fa config check\n'
+    '       fa config path\n'
+    '       fa config get <dotted.key>\n'
+    '       fa config set <dotted.key> <value> [--project|--global]\n'
+    '       fa config export-providers [--out <file.fahx>] [--passphrase-stdin]';
+
+/// Parses the `config` subcommand operands (everything after the `config`
+/// word). Unknown verbs and flags are usage errors so a typo never
+/// becomes a prompt sent to a model.
+///
+/// Split into operand-walk + arity-check helpers to stay under the repo's
+/// CRAP ratchet (crap4dart threshold 12), mirroring [_parseExtArgs].
+CliArgsResult _parseConfigArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw const CliArgsException(_configUsage);
+  }
+  final verb = args.first;
+  if (!configVerbs.contains(verb)) {
+    throw CliArgsException(
+      'unknown config verb: $verb '
+      '(expected one of ${configVerbs.join('|')})\n$_configUsage',
+    );
+  }
+  final operands = _parseConfigOperands(args);
+  _validateConfigVerb(verb, operands);
+  return CliArgs(
+    config: ConfigCliCommand(
+      verb: verb,
+      out: operands.out,
+      passphraseStdin: operands.passphraseStdin,
+      key: operands.positionals.isEmpty ? null : operands.positionals.first,
+      value: operands.positionals.length > 1 ? operands.positionals[1] : null,
+      scope: operands.scope,
+    ),
+  );
+}
+
+/// The operands collected while walking a config subcommand's arguments.
+typedef _ConfigOperands = ({
+  List<String> positionals,
+  String? out,
+  bool passphraseStdin,
+  ConfigScope? scope,
+});
+
+/// Walks the arguments after the verb, collecting positionals and the
+/// config flags (`--out`, `--passphrase-stdin`, `--project`, `--global`).
+_ConfigOperands _parseConfigOperands(List<String> args) {
+  String? out;
+  var passphraseStdin = false;
+  ConfigScope? scope;
+  final positionals = <String>[];
+  for (var i = 1; i < args.length; i++) {
+    final arg = args[i];
+    switch (arg) {
+      case '--out':
+        if (i + 1 >= args.length) {
+          throw const CliArgsException('--out requires a value');
+        }
+        out = args[++i];
+      case '--passphrase-stdin':
+        passphraseStdin = true;
+      case '--project':
+        scope = ConfigScope.project;
+      case '--global':
+        scope = ConfigScope.global;
+      default:
+        if (arg.startsWith('-')) {
+          throw CliArgsException('unknown argument: $arg\n$_configUsage');
+        }
+        positionals.add(arg);
+    }
+  }
+  return (
+    positionals: positionals,
+    out: out,
+    passphraseStdin: passphraseStdin,
+    scope: scope,
+  );
+}
+
+/// Rejects verb/operand mismatches: arity per verb, then flag ownership.
+void _validateConfigVerb(String verb, _ConfigOperands operands) {
+  _validateConfigArity(verb, operands.positionals.length);
+  _validateConfigFlagOwnership(verb, operands);
+}
+
+/// `get` needs one key, `set` a key and a value, the other verbs none.
+void _validateConfigArity(String verb, int count) {
+  final wants = verb == 'get' || verb == 'set' ? count : 0;
+  if (verb == 'get' && wants != 1) {
+    throw CliArgsException(
+      'fa config get requires exactly one key\n$_configUsage',
+    );
+  }
+  if (verb == 'set' && wants != 2) {
+    throw CliArgsException(
+      'fa config set requires a key and a value\n$_configUsage',
+    );
+  }
+  if ((verb == 'check' || verb == 'path' || verb == 'export-providers') &&
+      count != 0) {
+    throw CliArgsException('fa config $verb takes no operands\n$_configUsage');
+  }
+}
+
+/// `--out`/`--passphrase-stdin` belong to `export-providers`;
+/// `--project`/`--global` to `set`.
+void _validateConfigFlagOwnership(String verb, _ConfigOperands operands) {
+  if (verb != 'export-providers' &&
+      (operands.out != null || operands.passphraseStdin)) {
+    throw CliArgsException(
+      '--out/--passphrase-stdin only apply to export-providers\n$_configUsage',
+    );
+  }
+  if (verb != 'set' && operands.scope != null) {
+    throw CliArgsException(
+      '--project/--global only apply to set\n$_configUsage',
+    );
+  }
+}
+
+/// The `fa provider` subcommand (issue #1704): headless ChatGPT/Codex
+/// credential export. `export <name>` resolves the saved login's OAuth
+/// blob from its secure-store slot, refreshes it when stale, and prints
+/// the shell `export` lines external tools eval; `--check` reports
+/// credential health and prints no secrets.
+final class ProviderCliCommand {
+  /// Creates a [ProviderCliCommand].
+  const ProviderCliCommand({required this.verb, this.name, this.check = false});
+
+  /// One of [providerVerbs].
+  final String verb;
+
+  /// The saved provider entry name (the export target).
+  final String? name;
+
+  /// `--check`: report credential health, never a secret.
+  final bool check;
+}
+
+/// The verbs accepted by `fa provider`.
+const providerVerbs = {'export'};
+
+const _providerUsage =
+    'usage: fa provider export <name> [--check]\n'
+    '       export the saved ChatGPT/Codex login <name> as shell export\n'
+    '       lines (OPENAI_API_KEY + OPENAI_BASE_URL); --check reports\n'
+    '       credential health without printing any secret';
+
+/// The operands collected while walking a provider subcommand's arguments.
+typedef _ProviderOperands = ({String? name, bool check});
+
+/// Walks the arguments after the verb, collecting the positional provider
+/// name and the `--check` flag. Unknown flags are usage errors so a typo
+/// never becomes a prompt sent to a model; zero or several names surface
+/// as `(name: null)` for the caller's arity error.
+_ProviderOperands _parseProviderOperands(List<String> args) {
+  var check = false;
+  final positionals = <String>[];
+  for (final arg in args) {
+    if (arg == '--check') {
+      check = true;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw CliArgsException('unknown argument: $arg\n$_providerUsage');
+    }
+    positionals.add(arg);
+  }
+  return (
+    name: positionals.length == 1 ? positionals.single : null,
+    check: check,
+  );
+}
+
+/// Parses the `provider` subcommand operands. Unknown verbs and flags are
+/// usage errors so a typo never becomes a prompt sent to a model.
+CliArgsResult _parseProviderArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw CliArgsException(_providerUsage);
+  }
+  final verb = args.first;
+  if (!providerVerbs.contains(verb)) {
+    throw CliArgsException(
+      'unknown provider verb: $verb '
+      '(expected one of ${providerVerbs.join('|')})\n$_providerUsage',
+    );
+  }
+  final operands = _parseProviderOperands(args.skip(1).toList());
+  if (operands.name == null) {
+    throw CliArgsException(
+      'fa provider export requires exactly one provider name\n'
+      '$_providerUsage',
+    );
+  }
+  return CliArgs(
+    providerCmd: ProviderCliCommand(
+      verb: verb,
+      name: operands.name,
+      check: operands.check,
+    ),
+  );
+}
+
+/// The `fa ext` subcommand: headless management of JS extensions.
+///
+/// [sources] carry the `install` operands (`./path`, `/abs`, `path.zip`,
+/// `gh:owner/repo`, `https://github.com/owner/repo`, `catalog:<id>`, or a
+/// bare catalog id); [name] is the operand of `remove`/`update`/`audit`/
+/// `enable`/`disable`.
+final class ExtCliCommand {
+  /// Creates an [ExtCliCommand].
+  const ExtCliCommand({
+    required this.verb,
+    this.json = false,
+    this.sources = const [],
+    this.pin,
+    this.trust = false,
+    this.bundled = false,
+    this.bundledName,
+    this.strict = false,
+    this.name,
+  });
+
+  /// One of [extVerbs].
+  final String verb;
+
+  /// `--json`: machine-readable rows (one JSON object per line).
+  final bool json;
+
+  /// `install` source operands.
+  final List<String> sources;
+
+  /// `--pin <sha256>`: only install content hashing to this value.
+  final String? pin;
+
+  /// `--trust`: grant first-install trust without a prompt.
+  final bool trust;
+
+  /// `--bundled` was passed (with or without a name).
+  final bool bundled;
+
+  /// `--bundled <name>`: install one bundled extension; bare `--bundled`
+  /// means all of them.
+  final String? bundledName;
+
+  /// `--strict`: a denied trust decision exits 1 instead of 0.
+  final bool strict;
+
+  /// The verb's name operand (`remove`/`update`/`audit`/`enable`/`disable`).
+  final String? name;
+}
+
+/// The verbs accepted by `fa ext`.
+const extVerbs = {
+  'list',
+  'install',
+  'remove',
+  'update',
+  'audit',
+  'enable',
+  'disable',
+};
+
+const _extUsage =
+    'usage: fa ext <list|install|remove|update|audit|enable|disable> '
+    '[--json]\n'
+    '       fa ext install <source...> | --bundled [name] '
+    '[--pin <sha256>] [--trust] [--strict]';
+
+/// Parses the `ext` subcommand operands (everything after the `ext` word).
+/// Unknown verbs and flags are usage errors so a typo never becomes a
+/// prompt sent to a model.
+CliArgsResult _parseExtArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw const CliArgsException(_extUsage);
+  }
+  final verb = args.first;
+  if (!extVerbs.contains(verb)) {
+    throw CliArgsException(
+      'unknown ext verb: $verb '
+      '(expected one of ${extVerbs.join('|')})\n$_extUsage',
+    );
+  }
+  final operands = _parseExtOperands(verb, args);
+  _validateExtVerb(verb, operands);
+  return CliArgs(
+    ext: ExtCliCommand(
+      verb: verb,
+      json: operands.json,
+      sources: operands.positionals,
+      pin: operands.pin,
+      trust: operands.trust,
+      bundled: operands.bundled,
+      bundledName: operands.bundledName,
+      strict: operands.strict,
+      name: verb == 'install' || operands.positionals.isEmpty
+          ? null
+          : operands.positionals.single,
+    ),
+  );
+}
+
+/// The operands collected while walking an ext subcommand's arguments.
+/// A class, not a record — 7 fields exceeded the record_size cap
+/// (issue #1997).
+final class _ExtOperands {
+  const _ExtOperands({
+    required this.positionals,
+    required this.json,
+    required this.pin,
+    required this.trust,
+    required this.bundled,
+    required this.bundledName,
+    required this.strict,
+  });
+
+  final List<String> positionals;
+  final bool json;
+  final String? pin;
+  final bool trust;
+  final bool bundled;
+  final String? bundledName;
+  final bool strict;
+}
+
+/// Walks the arguments after the verb, collecting positionals and the
+/// ext flags. `--bundled` takes an OPTIONAL value: a following word that
+/// is not flag-like names the bundled extension.
+_ExtOperands _parseExtOperands(String verb, List<String> args) {
+  final operands = _ExtOperandSink();
+  for (var i = 1; i < args.length; i++) {
+    final arg = args[i];
+    if (_isExtFlag(arg)) {
+      i = operands.applyFlag(verb, arg, args, i);
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      throw CliArgsException('unknown argument: $arg');
+    }
+    operands.positionals.add(arg);
+  }
+  return operands.freeze();
+}
+
+bool _isExtFlag(String arg) =>
+    const ['--json', '--pin', '--trust', '--bundled', '--strict'].contains(arg);
+
+/// Mutable accumulator for [ _parseExtOperands]; `applyFlag` consumes one
+/// flag (plus its optional value) and returns the index to resume from.
+final class _ExtOperandSink {
+  final positionals = <String>[];
+  var json = false;
+  String? pin;
+  var trust = false;
+  var bundled = false;
+  String? bundledName;
+  var strict = false;
+
+  int applyFlag(String verb, String arg, List<String> args, int i) {
+    if (arg == '--json') {
+      json = true;
+      return i;
+    }
+    return _applyInstallFlag(verb, arg, args, i);
+  }
+
+  /// The install-only flags; on any other verb they are rejected.
+  int _applyInstallFlag(String verb, String arg, List<String> args, int i) {
+    if (verb != 'install') {
+      throw CliArgsException('$arg only applies to fa ext install');
+    }
+    switch (arg) {
+      case '--pin':
+        if (i + 1 >= args.length) {
+          throw const CliArgsException('--pin requires a sha256 value');
+        }
+        pin = args[++i];
+      case '--trust':
+        trust = true;
+      case '--bundled':
+        bundled = true;
+        if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+          bundledName = args[++i];
+        }
+      case '--strict':
+        strict = true;
+      default:
+        break;
+    }
+    return i;
+  }
+
+  _ExtOperands freeze() => _ExtOperands(
+    positionals: positionals,
+    json: json,
+    pin: pin,
+    trust: trust,
+    bundled: bundled,
+    bundledName: bundledName,
+    strict: strict,
+  );
+}
+
+/// Rejects verb/operand mismatches: `install` needs a source or `--bundled`,
+/// `remove`/`enable`/`disable` need exactly one name, and `list` takes no
+/// operands.
+void _validateExtVerb(String verb, _ExtOperands operands) {
+  final names = operands.positionals;
+  switch (verb) {
+    case 'install':
+      _requireExtInstallSource(names, operands.bundled);
+    case 'remove' || 'enable' || 'disable':
+      _requireExactlyOne(verb, names);
+    case 'update' || 'audit':
+      _requireAtMostOne(verb, names);
+    case 'list':
+      _requireNone(names);
+  }
+}
+
+/// `fa ext install` takes at least one source, or `--bundled` with an
+/// optional name.
+void _requireExtInstallSource(List<String> names, bool bundled) {
+  if (names.isEmpty && !bundled) {
+    throw const CliArgsException(
+      'usage: fa ext install <source...> | --bundled [name]',
+    );
+  }
+}
+
+void _requireExactlyOne(String verb, List<String> names) {
+  if (names.length != 1) {
+    throw CliArgsException('usage: fa ext $verb <name>');
+  }
+}
+
+void _requireAtMostOne(String verb, List<String> names) {
+  if (names.length > 1) {
+    throw CliArgsException('usage: fa ext $verb [name]');
+  }
+}
+
+void _requireNone(List<String> names) {
+  if (names.isNotEmpty) {
+    throw const CliArgsException('usage: fa ext list [--json]');
+  }
+}
+
+/// The `fa jsr <verb>` subcommand (gh-1033): a pass-through to the
+/// `js_widget_runtime` package's own agent CLI (`bin/jsr_widget.dart`).
+/// The harness only resolves the package root and execs the child — zero
+/// widget logic lives here (invariant I1), and everything after the verb
+/// rides [args] VERBATIM (invariant I2): the flag surface is owned by the
+/// jsr CLI and may drift without a fah release.
+final class JsrCliCommand {
+  /// Creates a [JsrCliCommand].
+  const JsrCliCommand({required this.verb, this.args = const []});
+
+  /// One of [jsrVerbs], forwarded as the child's first argument.
+  final String verb;
+
+  /// Everything after the verb, forwarded untouched.
+  final List<String> args;
+}
+
+/// The verbs accepted by `fa jsr`.
+const jsrVerbs = {'widget:test', 'widget:screenshot'};
+
+/// The jsr flag matrix — the single source of truth for the flag surface
+/// documentation: `fa jsr` usage errors, the REPL `/jsr` usage, and the
+/// `fa --help` docs reference this. The surface itself is owned by the
+/// jsr CLI and may drift without a fah release; when it does, this line
+/// is the only one to update (invariant I1).
+const String jsrUsage =
+    'usage: fa jsr <widget:test|widget:screenshot> <path> [flags...]\n'
+    '       fa jsr widget:test <path> [--event ID]... '
+    '[--expect-state JSON] [--seed-storage JSON] [--json]\n'
+    '       fa jsr widget:screenshot <path> [--out png] [--width N] '
+    '[--height N] [--theme name] [--scale S] [--freeze-clock]';
+
+/// Parses the `jsr` subcommand operands (everything after the `jsr` word).
+/// Unknown verbs are usage errors so a typo never becomes a prompt sent to
+/// a model; unknown FLAGS are deliberately NOT validated — they belong to
+/// the jsr CLI's surface and are forwarded verbatim.
+CliArgsResult _parseJsrArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw const CliArgsException(jsrUsage);
+  }
+  final verb = args.first;
+  if (!jsrVerbs.contains(verb)) {
+    throw CliArgsException(
+      'unknown jsr verb: $verb '
+      '(expected one of ${jsrVerbs.join('|')})\n$jsrUsage',
+    );
+  }
+  final rest = args.sublist(1);
+  final hasPathOperand = rest.any((arg) => !arg.startsWith('-'));
+  if (!hasPathOperand) {
+    throw CliArgsException('fa jsr $verb requires a widget path\n$jsrUsage');
+  }
+  return CliArgs(
+    jsr: JsrCliCommand(verb: verb, args: List.unmodifiable(rest)),
+  );
+}
+
+/// A value-taking CLI flag: its canonical name (for error messages, so
+/// `-p` reports as `--prompt`) and the setter applying it to [_CliArgValues].
+typedef _ValueFlag = (String, void Function(_CliArgValues, String));
+
+/// Every flag that consumes the next argument as its value.
+const _valueFlags = <String, _ValueFlag>{
+  '--model': ('--model', _setModel),
+  '--provider': ('--provider', _setProvider),
+  '--base-url': ('--base-url', _setBaseUrl),
+  '--system-prompt': ('--system-prompt', _setSystemPrompt),
+  '--system-prompt-file': ('--system-prompt-file', _setSystemPromptFile),
+  '--vision-model': ('--vision-model', _setVisionModel),
+  '--vision-base-url': ('--vision-base-url', _setVisionBaseUrl),
+  '--transcribe-model': ('--transcribe-model', _setTranscribeModel),
+  '--transcribe-base-url': ('--transcribe-base-url', _setTranscribeBaseUrl),
+  '--plugin': ('--plugin', _addPlugin),
+  '--prompt-template-dir': ('--prompt-template-dir', _addPromptTemplateDir),
+  '--mode': ('--mode', _setMode),
+  '--cwd': ('--cwd', _setCwd),
+  '--session-root': ('--session-root', _setSessionRoot),
+  '--session': ('--session', _setSession),
+  '--cube': ('--cube', _setCubeName),
+  '--cube-config': ('--cube-config', _setCubeConfigPath),
+  '-p': ('--prompt', _setPrompt),
+  '--prompt': ('--prompt', _setPrompt),
+  '-f': ('--prompt-file', _setPromptFile),
+  '--prompt-file': ('--prompt-file', _setPromptFile),
+  '--tools': ('--tools', _setTools),
+  '--compaction-engine': ('--compaction-engine', _setCompactionEngine),
+  '--log-file': ('--log-file', _setLogFile),
+  '--output': ('--output', _setOutput),
+  '--output-format': ('--output-format', _setOutputFormat),
+  '--attach': ('--attach', _addAttachment),
+  '--timer': ('--timer', _setTimer),
+  '--deadline': ('--deadline', _setDeadline),
+};
+
+void _setOutput(_CliArgValues v, String value) {
+  _validateOutputMode(value);
+  v.output = value;
+}
+
+void _setOutputFormat(_CliArgValues v, String value) {
+  if (!_outputFormats.contains(value)) {
+    throw CliArgsException(
+      'unknown --output-format: $value (expected text or stream-json)',
+    );
+  }
+  v.outputFormat = value;
+}
+
+const _outputFormats = {'text', 'stream-json'};
+
+void _addAttachment(_CliArgValues v, String value) => v.attachments.add(value);
+
+const _outputModes = {'events', 'events=full', 'json'};
+
+void _validateOutputMode(String value) {
+  if (!_outputModes.contains(value)) {
+    throw CliArgsException(
+      'unknown --output mode: $value '
+      '(expected events, events=full or json)',
+    );
+  }
+}
+
+/// The `--output` value anywhere in the arg list, for the `--version`
+/// early return (flag order must not matter: `--version --output json`
+/// and `--output json --version` both carry it).
+String? _prescanOutput(List<String> args) {
+  for (var i = 0; i < args.length; i++) {
+    if (args[i] == '--output') {
+      if (i + 1 >= args.length) {
+        throw const CliArgsException('--output requires a value');
+      }
+      _validateOutputMode(args[i + 1]);
+      return args[i + 1];
+    }
+  }
+  return null;
+}
+
+void _setModel(_CliArgValues v, String value) => v.model = value;
+void _setProvider(_CliArgValues v, String value) {
+  v.provider = value;
+  v.providerExplicit = true;
+}
+
+void _setBaseUrl(_CliArgValues v, String value) => v.baseUrl = value;
+void _setSystemPrompt(_CliArgValues v, String value) => v.systemPrompt = value;
+void _setSystemPromptFile(_CliArgValues v, String value) =>
+    v.systemPromptFile = value;
+void _setVisionModel(_CliArgValues v, String value) => v.visionModel = value;
+void _setVisionBaseUrl(_CliArgValues v, String value) =>
+    v.visionBaseUrl = value;
+void _setTranscribeModel(_CliArgValues v, String value) =>
+    v.transcribeModel = value;
+void _setTranscribeBaseUrl(_CliArgValues v, String value) =>
+    v.transcribeBaseUrl = value;
+void _addPlugin(_CliArgValues v, String value) => v.plugins.add(value);
+void _addPromptTemplateDir(_CliArgValues v, String value) =>
+    v.promptTemplateDirs.add(value);
+void _setMode(_CliArgValues v, String value) {
+  // `--mode json` (issue #695): the pi-parity alias for
+  // `--output-format stream-json` — it selects the output format, never
+  // the agent mode, so the saved mode still applies.
+  if (value == 'json') {
+    v.outputFormat = 'stream-json';
+    return;
+  }
+  v.mode = value;
+}
+
+void _setCwd(_CliArgValues v, String value) => v.cwd = value;
+void _setSessionRoot(_CliArgValues v, String value) => v.sessionRoot = value;
+void _setSession(_CliArgValues v, String value) => v.session = value;
+void _setCubeName(_CliArgValues v, String value) => v.cubeName = value;
+void _setCubeConfigPath(_CliArgValues v, String value) =>
+    v.cubeConfigPath = value;
+void _setTools(_CliArgValues v, String value) {
+  try {
+    v.tools = parseToolsSpec(value);
+  } on ConfigException catch (error) {
+    throw CliArgsException('invalid --tools spec: ${error.message}');
+  }
+}
+
+void _setCompactionEngine(_CliArgValues v, String value) {
+  try {
+    v.compactionEngine = CompactionEngine.tryParse(
+      value,
+      label: '--compaction-engine',
+    );
+  } on ConfigException catch (error) {
+    throw CliArgsException(error.message);
+  }
+}
+
+void _setLogFile(_CliArgValues v, String value) => v.logFile = value;
+void _setPrompt(_CliArgValues v, String value) => v.prompt = value;
+void _setPromptFile(_CliArgValues v, String value) => v.promptFile = value;
+void _setTimer(_CliArgValues v, String value) => v.timer = value;
+void _setDeadline(_CliArgValues v, String value) => v.deadline = value;
+
+/// The `--timer`/`--deadline` shape check (gh-1556): the flag value is the
+/// user's own words, so a malformed spec fails HERE as a usage error —
+/// never booting with a silently wrong deadline. (Past-epoch checks ride
+/// the application-time clock in `SessionDeadline.setFromSpec`.)
+void _validateDeadlineFlag(String? flag, String canonical) {
+  if (flag == null) return;
+  try {
+    parseDeadlineSpec(flag);
+  } on FormatException catch (error) {
+    throw CliArgsException('invalid $canonical value: ${error.message}');
+  }
+}
+
+/// Accumulates flag values while [parseCliArgs] walks the argument list,
+/// then validates the combinations and builds the [CliArgs].
+final class _CliArgValues {
+  String? model;
+  String provider = 'openai-completions';
+  bool providerExplicit = false;
+  String? baseUrl;
+  String? systemPrompt;
+  String? systemPromptFile;
+  String? visionModel;
+  String? visionBaseUrl;
+  String? transcribeModel;
+  String? transcribeBaseUrl;
+  final plugins = <String>[];
+  bool waitForJobs = false;
+  bool piMode = false;
+  bool ompMode = false;
+  bool debugSecrets = false;
+  bool noFormat = false;
+  bool streamThinking = false;
+  bool noStreamThinking = false;
+  final promptTemplateDirs = <String>[];
+  String? mode;
+  String? cwd;
+  String? sessionRoot;
+  String? session;
+  String? cubeName;
+  String? cubeConfigPath;
+  ToolsConfig? tools;
+  CompactionEngine? compactionEngine;
+  RedactionConfig? redact;
+  String? prompt;
+  String? promptFile;
+  String? timer;
+  String? deadline;
+  String? logFile;
+  String? output;
+  String? outputFormat;
+  final attachments = <String>[];
+  final positionals = <String>[];
+
+  /// Validates flag combinations and builds the resulting [CliArgs].
+  CliArgs finish() {
+    if (!cliProviderKinds.contains(provider)) {
+      throw CliArgsException('unknown provider: $provider');
+    }
+    if (systemPrompt != null && systemPromptFile != null) {
+      throw CliArgsException(
+        'cannot combine --system-prompt and --system-prompt-file',
+      );
+    }
+    _validatePromptFlags();
+    if (streamThinking && noStreamThinking) {
+      throw const CliArgsException(
+        'cannot combine --stream-thinking and --no-stream-thinking',
+      );
+    }
+    _validateDeadlineFlags();
+    _validateBackendModeFlags();
+    return CliArgs(
+      model: model,
+      provider: provider,
+      providerExplicit: providerExplicit,
+      baseUrl: baseUrl,
+      systemPrompt: systemPrompt,
+      systemPromptFile: systemPromptFile,
+      visionModel: visionModel,
+      visionBaseUrl: visionBaseUrl,
+      transcribeModel: transcribeModel,
+      transcribeBaseUrl: transcribeBaseUrl,
+      plugins: plugins,
+      promptTemplateDirs: promptTemplateDirs,
+      mode: mode,
+      cwd: cwd,
+      sessionRoot: sessionRoot,
+      session: session,
+      cubeName: cubeName,
+      cubeConfigPath: cubeConfigPath,
+      tools: tools,
+      compactionEngine: compactionEngine,
+      redact: redact,
+      promptFile: promptFile,
+      logFile: logFile,
+      prompt: prompt,
+      positionals: positionals,
+      output: output,
+      outputFormat: outputFormat,
+      waitForJobs: waitForJobs,
+      piMode: piMode,
+      ompMode: ompMode,
+      debugSecrets: debugSecrets,
+      noFormat: noFormat,
+      streamThinking: streamThinking,
+      noStreamThinking: noStreamThinking,
+      timer: timer,
+      deadline: deadline,
+      attachments: List.unmodifiable(attachments),
+    );
+  }
+
+  /// Prompt-source combination validation, split out of [finish] to keep
+  /// its complexity under the repo's CRAP gate (same rationale as
+  /// [_validateDeadlineFlags]): at most one prompt source may be set —
+  /// `-p/--prompt`, `--prompt-file`, or positional prompt arguments.
+  void _validatePromptFlags() {
+    if (prompt != null && positionals.isNotEmpty) {
+      throw CliArgsException(
+        'cannot combine -p/--prompt with positional prompt arguments',
+      );
+    }
+    if (promptFile != null && prompt != null) {
+      throw CliArgsException('cannot combine --prompt-file with -p/--prompt');
+    }
+    if (promptFile != null && positionals.isNotEmpty) {
+      throw CliArgsException(
+        'cannot combine --prompt-file with positional prompt arguments',
+      );
+    }
+  }
+
+  /// gh-1556 deadline-flag validation, split out of [finish] to keep its
+  /// complexity under the repo's CRAP gate (same rationale as
+  /// [_validateBackendModeFlags]): `--timer` and `--deadline` set the
+  /// same clock, so they cannot combine; each spec's shape is validated
+  /// here (the past-epoch check rides the application-time clock in
+  /// `SessionDeadline.setFromSpec`).
+  void _validateDeadlineFlags() {
+    if (timer != null && deadline != null) {
+      throw const CliArgsException(
+        'cannot combine --timer and --deadline (they set the same clock)',
+      );
+    }
+    _validateDeadlineFlag(timer, '--timer');
+    _validateDeadlineFlag(deadline, '--deadline');
+  }
+
+  /// Backend agent mode flag validation (issue #155), split out of
+  /// [finish] to keep its complexity under the repo's CRAP gate:
+  /// `--output json` only pairs with `--version`; `--attach` needs a
+  /// prompt to attach to. Stream-json validation (issue #695): the
+  /// stream needs a headless run, and stdout cannot have two owners.
+  void _validateBackendModeFlags() {
+    if (output == 'json') {
+      throw const CliArgsException(
+        '--output json applies to --version only '
+        '(use --version --output json)',
+      );
+    }
+    final hasPrompt =
+        prompt != null || promptFile != null || positionals.isNotEmpty;
+    if (!hasPrompt && attachments.isNotEmpty) {
+      throw const CliArgsException(
+        '--attach applies to headless runs (-p/--prompt or a positional '
+        'prompt)',
+      );
+    }
+    if (outputFormat == 'stream-json') {
+      if (!hasPrompt) {
+        throw const CliArgsException(
+          '--output-format stream-json (or --mode json) applies to headless '
+          'runs: pass -p/--prompt, --prompt-file or a positional prompt',
+        );
+      }
+      if (output != null) {
+        throw const CliArgsException(
+          'cannot combine --output with --output-format stream-json: '
+          'stdout can carry only one structured stream',
+        );
+      }
+    }
+  }
+}
+
+/// The `fa session` subcommand (issue #198): tree-grouped session listing;
+/// gh-1073 adds the `repair` verb for bloated ledger surgery.
+///
+/// `list` prints every session in the shared root — the tree view (children
+/// nested under their parent) by default, the legacy flat list under
+/// `--flat`; `--json` emits one NDJSON row per session with the additive
+/// `agent`/`parent` fields for scripts. `repair <sessionId|path>` rewrites
+/// a bloated session file dropping the append-only custom ledgers
+/// (`--dry-run` counts only).
+final class SessionCliCommand {
+  /// Creates a [SessionCliCommand].
+  const SessionCliCommand({
+    required this.verb,
+    this.json = false,
+    this.flat = false,
+    this.repairTarget,
+    this.dryRun = false,
+  });
+
+  /// The subcommand verb (`list` or `repair`).
+  final String verb;
+
+  /// `--json`: NDJSON rows instead of the rendered tree.
+  final bool json;
+
+  /// `--flat`: the legacy flat listing, no nesting.
+  final bool flat;
+
+  /// `repair <sessionId|path>`: the session id, session name, or a direct
+  /// `.jsonl` path to repair.
+  final String? repairTarget;
+
+  /// `repair --dry-run`: count what would be dropped, write nothing.
+  final bool dryRun;
+}
+
+const String _sessionUsage =
+    'usage: fa session list [--json] [--flat]\n'
+    '       fa session repair <sessionId|path> [--dry-run]'
+    '\n'
+    '       fa session info [<sessionId>] [--json]\n'
+    '       fa session clean [--dry-run]';
+
+const Set<String> sessionVerbs = {'list', 'repair', 'clean', 'info'};
+
+CliArgsResult _parseSessionArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw const CliArgsException(_sessionUsage);
+  }
+  final verb = args.first;
+  if (!sessionVerbs.contains(verb)) {
+    throw CliArgsException(
+      'unknown session verb: $verb '
+      '(expected ${sessionVerbs.join('|')})\n$_sessionUsage',
+    );
+  }
+  final (:json, :flat, :dryRun, :repairTarget) = _parseSessionVerbArgs(
+    verb,
+    args,
+  );
+  if (verb == 'repair' && repairTarget == null) {
+    throw CliArgsException(
+      'session repair needs a session id or a .jsonl path\n$_sessionUsage',
+    );
+  }
+  return CliArgs(
+    sessionList: SessionCliCommand(
+      verb: verb,
+      json: json,
+      flat: flat,
+      repairTarget: repairTarget,
+      dryRun: dryRun,
+    ),
+  );
+}
+
+/// Whether [arg] is the positional target of `fa session repair` or
+/// `fa session info` (the optional session id): the first non-flag
+/// operand (a later one stays a usage error). Split out of
+/// [_parseSessionVerbArgs] to keep it under the CRAP ratchet.
+bool _isSessionRepairTarget(String verb, String arg, String? current) =>
+    (verb == 'repair' || verb == 'info') &&
+    current == null &&
+    !arg.startsWith('-');
+
+/// The flags and operands after `fa session <verb>`: `--json`/`--flat`
+/// for `list`, `--json` and the optional session id for `info`,
+/// `--dry-run` and the single repair target for `repair`. Anything else
+/// is a usage error. Split out of [_parseSessionArgs] so each piece
+/// stays under the CRAP ratchet.
+({bool json, bool flat, bool dryRun, String? repairTarget})
+_parseSessionVerbArgs(String verb, List<String> args) {
+  var json = false;
+  var flat = false;
+  var dryRun = false;
+  String? repairTarget;
+  for (var i = 1; i < args.length; i++) {
+    switch (args[i]) {
+      case '--json' when verb == 'list' || verb == 'info':
+        json = true;
+      case '--flat' when verb == 'list':
+        flat = true;
+      case '--dry-run' when verb == 'repair' || verb == 'clean':
+        dryRun = true;
+      default:
+        if (_isSessionRepairTarget(verb, args[i], repairTarget)) {
+          repairTarget = args[i];
+          continue;
+        }
+        throw CliArgsException('unknown argument: ${args[i]}\n$_sessionUsage');
+    }
+  }
+  return (json: json, flat: flat, dryRun: dryRun, repairTarget: repairTarget);
+}
+
+/// The `fa import` subcommand (issue #1562): cross-harness session import.
+///
+/// `--harness` names the foreign store (omp|kimi|opencode|claude);
+/// exactly one of `--all` / `--session=<id|prefix>` selects the targets.
+/// Discovery is scoped to the current folder; no provider/model/key is
+/// ever built for this verb.
+final class ImportCliCommand {
+  /// Creates [ImportCliCommand].
+  const ImportCliCommand({
+    required this.harness,
+    this.all = false,
+    this.session,
+  });
+
+  /// The foreign harness (`omp`, `kimi`, `opencode`, `claude`).
+  final String harness;
+
+  /// `--all`: every discovered current-folder session.
+  final bool all;
+
+  /// `--session <id|prefix>`: one session, exact id or unambiguous prefix.
+  final String? session;
+}
+
+const String _importUsage =
+    'usage: fa import --harness=<omp|kimi|opencode|claude> '
+    '(--all | --session=<id|prefix>) [--session-root=<path>] [--cwd=<path>]';
+
+/// The harness names `--harness` accepts (the identical CLI/TUI surface;
+/// kimi/opencode parse but report their pending format spike at run time).
+/// Single source of truth: the import layer's registry.
+final Set<String> importHarnessNames = Set.unmodifiable({
+  for (final harness in importHarnessRegistry) harness.id,
+});
+
+/// Parses the `import` subcommand operands. Unknown flags and a missing or
+/// conflicting selector are usage errors so a typo never becomes a prompt
+/// sent to a model (GOAL F7).
+CliArgsResult _parseImportArgs(List<String> args) {
+  if (args.contains('--help') || args.contains('-h')) {
+    return const CliArgsHelp();
+  }
+  if (args.isEmpty) {
+    throw const CliArgsException(_importUsage);
+  }
+  final operands = _parseImportOperands(args);
+  return CliArgs(
+    cwd: operands.cwd,
+    sessionRoot: operands.sessionRoot,
+    importCmd: ImportCliCommand(
+      harness: _importHarnessValue(operands),
+      all: operands.all,
+      session: operands.session,
+    ),
+  );
+}
+
+/// The `--harness` value with the unknown-name check (usage error via
+/// [CliArgsException], GOAL exit table row 1).
+String _importHarnessValue(_ImportOperands operands) {
+  final harness = operands.harness;
+  if (harness == null) {
+    throw CliArgsException('--harness requires a value\n$_importUsage');
+  }
+  if (!importHarnessNames.contains(harness)) {
+    throw CliArgsException(
+      'unknown harness: $harness '
+      '(expected one of ${importHarnessNames.join('|')})\n$_importUsage',
+    );
+  }
+  return harness;
+}
+
+/// The operands collected while walking an `fa import` argument list.
+class _ImportOperands {
+  String? harness;
+  bool all = false;
+  String? session;
+  String? cwd;
+  String? sessionRoot;
+}
+
+/// Walks the arguments after `import`, collecting the flags (both the
+/// space-separated and `--flag=value` forms). Split out of
+/// [_parseImportArgs] for the CRAP ratchet.
+_ImportOperands _parseImportOperands(List<String> args) {
+  final operands = _ImportOperands();
+  for (var i = 0; i < args.length; i++) {
+    final arg = args[i];
+    if (arg == '--all') {
+      operands.all = true;
+      continue;
+    }
+    final (name, value) = _matchImportFlag(arg);
+    if (name == null) {
+      throw CliArgsException('unknown argument: $arg\n$_importUsage');
+    }
+    if (value == null) {
+      _applyImportFlag(operands, name, _flagValue(name, args, i + 1));
+      i++;
+    } else {
+      _applyImportFlag(operands, name, value);
+    }
+  }
+  _validateImportOperands(operands);
+  return operands;
+}
+
+/// Matches [arg] against the `fa import` flags in both the
+/// space-separated and `--flag=value` forms; `(null, null)` when the
+/// argument is not a known flag.
+(String?, String?) _matchImportFlag(String arg) {
+  for (final flag in const [
+    '--harness',
+    '--session-root',
+    '--cwd',
+    '--session',
+  ]) {
+    if (arg == flag || arg.startsWith('$flag=')) {
+      final value = arg.length > flag.length && arg[flag.length] == '='
+          ? arg.substring(flag.length + 1)
+          : null;
+      return (flag, value);
+    }
+  }
+  return (null, null);
+}
+
+/// The value of a space-separated flag, refusing to run off the end of
+/// the argument list.
+String _flagValue(String name, List<String> args, int index) {
+  if (index >= args.length) {
+    throw CliArgsException('$name requires a value\n$_importUsage');
+  }
+  return args[index];
+}
+
+/// Lands one flag's value on the operand it names.
+void _applyImportFlag(_ImportOperands operands, String name, String value) {
+  switch (name) {
+    case '--harness':
+      operands.harness = value;
+    case '--session':
+      operands.session = value;
+    case '--session-root':
+      operands.sessionRoot = value;
+    case '--cwd':
+      operands.cwd = value;
+  }
+}
+
+/// The selector rule: exactly one of `--all` / `--session` (GOAL UX
+/// contract). Split out of the operand walk for the CRAP ratchet.
+void _validateImportOperands(_ImportOperands operands) {
+  if (!operands.all && operands.session == null) {
+    throw CliArgsException(
+      'fa import needs exactly one of --all or --session\n$_importUsage',
+    );
+  }
+  if (operands.all && operands.session != null) {
+    throw CliArgsException(
+      'fa import takes exactly one of --all or --session, not both\n'
+      '$_importUsage',
+    );
+  }
+  // `--session=` (empty value) would become a match-everything prefix —
+  // a typo, not a wildcard. Usage error (GOAL F7).
+  if (operands.session != null && operands.session!.trim().isEmpty) {
+    throw CliArgsException(
+      '--session requires a non-empty id or prefix\n$_importUsage',
+    );
+  }
+}

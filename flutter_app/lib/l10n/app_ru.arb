@@ -1,0 +1,1152 @@
+{
+  "@@locale": "ru",
+  "appTitle": "Fa",
+  "approvalAllowOnce": "Разрешить один раз",
+  "approvalAllowToolTitle": "Разрешить {tool}?",
+  "approvalAlwaysAllow": "Всегда разрешать",
+  "approvalDeny": "Запретить",
+  "attachedEmpty": "Сообщений пока нет — напишите ниже",
+  "attachedToCli": "подключено к fa cli",
+  "sendToCli": "Сообщение в сессию fa cli…",
+  "sessionFolderPersonal": "Личное",
+  "sessionInfoNameLabel": "Имя сессии",
+  "newSessionFolderTitle": "Новая сессия — папка",
+  "newSessionCurrentFolder": "Текущая папка ({folder})",
+  "@newSessionCurrentFolder": {
+    "placeholders": {
+      "folder": {}
+    }
+  },
+  "approvalModeAlwaysAsk": "Всегда спрашивать",
+  "approvalModeAlwaysAskHint": "Каждый вызов инструмента требует разрешения.",
+  "approvalModeTitle": "Разрешения инструментов",
+  "approvalModeWrite": "Запись",
+  "approvalModeWriteHint": "Чтение файлов выполняется свободно; запись, правки и команды оболочки требуют разрешения.",
+  "approvalModeYolo": "YOLO",
+  "approvalModeYoloHint": "Все инструменты запускаются без запроса (разрушительные команды оболочки всё равно спрашивают).",
+  "approvalTierLabel": "Уровень: {tier}",
+  "appsAskFaAbout": "Спросить Fa о {name}",
+  "appsAskFaHint": "например: сделай кнопки больше и фиолетовыми",
+  "appsAskFaSubtitle": "Fa получит ваше сообщение, состояние приложения и скриншот.",
+  "appsAskFaTooltip": "Спросить Fa об этом приложении",
+  "appsChatEmptyHint": "Пока пусто — спросите Fa об этом приложении.",
+  "appsCollapseChatTooltip": "Свернуть чат",
+  "appsDismissReplyTooltip": "Скрыть",
+  "appsEmptyState": "Пока нет приложений. Попросите Fa создать одно —\nоно появится в папке apps/.",
+  "appsFaStatusThinking": "думает…",
+  "appsFaStatusWorking": "Fa работает…",
+  "appsFaStatusWriting": "пишет…",
+  "appsFollowUpHint": "Уточнить…",
+  "appsGridTitle": "Приложения",
+  "appsHideAppsTooltip": "Скрыть приложения",
+  "appsLoadError": "Не удалось загрузить приложения: {error}",
+  "widgetsCatalogInstallFailed": "Не удалось установить: {error}",
+  "widgetsCatalogOffline": "Офлайн — показан последний известный каталог.",
+  "widgetsCatalogNotInstalled": "Виджет ещё не установлен.",
+  "widgetsCatalogLoadFailed": "Не удалось загрузить каталог виджетов.\n{error}",
+  "@widgetsCatalogLoadFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "@widgetsCatalogInstallFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "widgetsCatalogFilterAll": "Все",
+  "@widgetsCatalogFilterAll": {},
+  "widgetsCatalogRetry": "Повторить",
+  "appsOpenChatTooltip": "Открыть чат",
+  "appsOpenFullChatTooltip": "Открыть полный чат",
+  "appsOpenTrajectoryTooltip": "Открыть траекторию",
+  "appsPermissionCalendar": "Календарь",
+  "appsPermissionCalendarDesc": "jsr.fa.calendar — чтение событий системного календаря",
+  "appsPermissionContacts": "Контакты",
+  "appsPermissionContactsDesc": "jsr.fa.contacts — адресная книга (скоро)",
+  "appsPermissionHealth": "Здоровье",
+  "appsPermissionHealthDesc": "jsr.fa.health — данные о здоровье (скоро)",
+  "appsPermissionHomekit": "HomeKit",
+  "appsPermissionHomekitDesc": "jsr.fa.homekit — устройства умного дома (скоро)",
+  "appsPermissionKeys": "Ключи хоста",
+  "appsPermissionKeysDesc": "jsr.fa.keys — доступ к API-ключам, сохранённым в Fa, и запрос новых",
+  "appsPermissionTheme": "Темы оформления",
+  "appsPermissionThemeDesc": "jsr.fa.theme — список тем и применение (каждый запрос подтверждается пользователем)",
+  "appsPermissionLlm": "LLM",
+  "appsPermissionLlmDesc": "jsr.fa.llm — разрешить приложению обращаться к подключённой модели",
+  "appsPermissionMedia": "Медиа",
+  "appsPermissionMediaDesc": "jsr.fa.media — генерация изображений, речи и музыки",
+  "appsPermissionMicrophone": "Микрофон",
+  "appsPermissionMicrophoneDesc": "jsr.fa.asr — запись аудио и распознавание речи",
+  "appsPermissionNetwork": "Сеть",
+  "appsPermissionNetworkDesc": "jsr.fetchJson — разрешить приложению вызывать HTTP API",
+  "appsPermissionNotifications": "Уведомления",
+  "appsPermissionNotificationsDesc": "jsr.fa.notify — локальные уведомления",
+  "appsPermissionsDone": "Готово",
+  "appsPermissionsTitle": "Разрешения {name}",
+  "appsPermissionsTooltip": "Разрешения приложения",
+  "appsCloseTooltip": "Закрыть приложение",
+  "appsRefreshTooltip": "Обновить",
+  "appsReloadTooltip": "Перезагрузить приложение",
+  "appsSendToFa": "Отправить Fa",
+  "appsSendTooltip": "Отправить",
+  "appsShowAppsTooltip": "Показать приложения",
+  "appsStartError": "Не удалось запустить {name}:\n{error}",
+  "appsStopTooltip": "Остановить",
+  "askAnswerAction": "Ответить",
+  "askBack": "Назад",
+  "askCancel": "Отмена",
+  "askNext": "Далее",
+  "askOtherLabel": "Другое (введите свой вариант)",
+  "askQuestionProgress": "Вопрос {index} из {total}",
+  "askQuestionTitle": "Вопрос",
+  "askRecommended": "Рекомендуется",
+  "askYourAnswerLabel": "Ваш ответ",
+  "cacheBrowserSubtitle": "Веса on-device моделей хранятся в кэше браузера. Удаление освобождает место; модель скачается снова при следующем использовании.",
+  "cacheDeleteTitle": "Удалить {name}?",
+  "cacheDeleteTooltip": "Удалить {name}",
+  "cacheDeleteWeightsBrowser": "Удаляет скачанные веса ({size}) из кэша браузера. Модель скачается снова при следующем использовании.",
+  "cacheEntryCached": "{size} · в кэше {bytes}",
+  "cacheNoModels": "Модели ещё не загружены.",
+  "cacheNoticeDeleteFailed": "Не удалось удалить {name}: {error}",
+  "cacheNoticeDeleted": "{name} удалена.",
+  "cacheNoticeLoadedModel": "{name} была загружена — она скачается снова при следующем использовании.",
+  "chatAbortTooltip": "Прервать",
+  "chatAttachError": "Не удалось прикрепить {name}: {error}",
+  "chatAttachFile": "Прикрепить файл",
+  "chatAttachNoName": "Не удалось прикрепить «{name}»: нет подходящего имени файла.",
+  "chatAttachTooltip": "Прикрепить",
+  "chatCamera": "Камера",
+  "chatCollapse": "Свернуть",
+  "chatCopiedToClipboard": "Сессия скопирована в буфер обмена",
+  "chatCopySessionTooltip": "Копировать сессию",
+  "chatFilesTooltip": "Файлы",
+  "chatGallery": "Галерея",
+  "chatInputHint": "Введите сообщение",
+  "chatMicDenied": "Доступ к микрофону запрещён. Разрешите его в системных настройках конфиденциальности (Конфиденциальность и безопасность → Микрофон) и попробуйте снова.",
+  "chatMicError": "Ошибка голосового ввода: {error}",
+  "chatMicStopTooltip": "Остановить запись",
+  "chatMicTooltip": "Голосовой ввод",
+  "chatModelSwitchTooltip": "Сменить модель",
+  "chatRemoveAttachment": "Удалить вложение",
+  "chatSendError": "Не удалось отправить: {error}",
+  "chatSendTooltip": "Отправить",
+  "chatSessionsTooltip": "Сессии и модель",
+  "chatSettingsTooltip": "Настройки подключения",
+  "chatShowAll": "Показать все ({count})",
+  "chatUploadFailed": "Ошибка загрузки: {error}",
+  "commonCancel": "Отмена",
+  "commonDelete": "Удалить",
+  "filePreviewCannotRead": "Не удалось прочитать файл",
+  "filePreviewCannotStat": "Не удалось получить сведения о файле",
+  "filePreviewDecodeError": "Не удалось декодировать изображение",
+  "filePreviewLoadError": "Не удалось загрузить файл",
+  "filePreviewNoPreview": "Предпросмотр недоступен",
+  "filePreviewEdit": "Изменить",
+  "filePreviewSave": "Сохранить",
+  "filePreviewSaved": "Сохранено",
+  "filePreviewSaveError": "Ошибка сохранения",
+  "filePreviewTabPreview": "Просмотр",
+  "filePreviewTabSource": "Исходный код",
+  "filePreviewTooLarge": "Файл слишком большой для предпросмотра",
+  "filePreviewTruncated": "Показаны первые {size} — вывод обрезан",
+  "filesBackTooltip": "Назад к файлам",
+  "filesEmptyFileName": "(пустое имя файла)",
+  "filesEmptyFolder": "Пустая папка",
+  "filesFolderAccessDenied": "Не удалось получить доступ к этой папке.",
+  "filesFolderPickerError": "Не удалось открыть выбор папки: {error}",
+  "filesICloudSyncDone": "Синхронизировано файлов: {files} ({size}) — последняя синхронизация {when}",
+  "filesICloudSyncFailed": "Ошибка синхронизации iCloud: {error}",
+  "filesICloudSyncTooltip": "Синхронизировать сессии и приложения с iCloud",
+  "filesICloudSyncUnavailable": "Синхронизация iCloud недоступна — включите iCloud Drive для Fa в Настройки → Apple ID → iCloud",
+  "filesListFolderError": "Не удалось прочитать содержимое папки",
+  "filesMountUnavailableTooltip": "Ранее использованная папка недоступна: {path} — нажмите, чтобы выбрать снова",
+  "filesOpenFolderError": "Не удалось открыть папку",
+  "filesOpenProjectFolderTooltip": "Открыть папку проекта…",
+  "filesPanelTitle": "Файлы",
+  "filesRefreshTooltip": "Обновить",
+  "filesRetryButton": "Повторить",
+  "filesUnmountTooltip": "Отключить {path}",
+  "filesUpTooltip": "Вверх",
+  "filesUploadFailed": "Ошибка загрузки: {error}",
+  "filesUploadFailures": ", не удалось ({count}): {names}",
+  "filesUploadSummary": "{uploaded, plural, one{Загружен {uploaded} файл} few{Загружено {uploaded} файла} many{Загружено {uploaded} файлов} other{Загружено {uploaded} файла}}{failures}",
+  "filesUploadTooltip": "Загрузить файлы сюда",
+  "keysAddButton": "Добавить ключ",
+  "keysAddDialogTitle": "Добавить ключ",
+  "keysAddNameDuplicate": "Ключ с таким именем уже существует.",
+  "keysAddNameHint": "GITHUB_TOKEN",
+  "keysAddNameInvalid": "Используйте A–Z, 0–9 и подчёркивания, начиная с буквы.",
+  "keysAddNameLabel": "Имя",
+  "keysDeleteBody": "Сохранённое значение удаляется с этого устройства. Значение из файла .env, если оно есть, снова вступит в силу.",
+  "keysDeleteTitle": "Удалить {name}?",
+  "keysSectionNote": "Значения никогда не показываются. Сохранённые ключи хранятся на этом устройстве; сессионные исчезают после перезагрузки.",
+  "keysSectionTitle": "Ключи",
+  "keysSetButton": "Задать",
+  "keysSetDialogTitle": "Задать {name}",
+  "keysSourceEnv": "файл .env",
+  "keysSourceNone": "не задан",
+  "keysSourceProviderSession": "ключ провайдера · эта сессия",
+  "keysSourceSaved": "сохранён",
+  "keysValueHint": "Вставьте значение ключа",
+  "keysValueLabel": "Значение",
+  "launcherChatActionsTooltip": "Действия чата",
+  "faEntryHintTooltip":
+      "Касание: продолжить активный чат · Долгое нажатие: новый чат",
+  "launcherChatEmptyHint": "Пока пусто — спросите Fa о чём угодно.",
+  "launcherDissolveFolder": "Убрать папку",
+  "launcherFolderDefaultName": "Папка",
+  "launcherFolderNameHint": "Название папки",
+  "launcherOpenApp": "Открыть",
+  "@launcherOpenApp": {},
+  "launcherOpenAppError": "Не удалось открыть приложение: {error}",
+  "launcherRenameFolderTooltip": "Переименовать папку",
+  "launcherRestoreDemoApp": "Восстановить эталонную версию",
+  "launcherRestoreDemoAppDone": "Код приложения восстановлен (данные сохранены)",
+  "launcherRemoveWidget": "Удалить виджет",
+  "@launcherRemoveWidget": {},
+  "launcherRemoveWidgetTitle": "Удалить {name}?",
+  "@launcherRemoveWidgetTitle": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "launcherRemoveWidgetBody": "Файлы виджета удаляются; его данные (storage.json) сохраняются — при повторной установке состояние восстановится.",
+  "@launcherRemoveWidgetBody": {},
+  "launcherSearchHint": "Поиск виджетов…",
+  "@launcherSearchHint": {},
+  "launcherTabWidgets": "Виджеты",
+  "@launcherTabWidgets": {},
+  "launcherLoadUnpacked": "Загрузить папку",
+  "@launcherLoadUnpacked": {},
+  "unpackedLoadTitle": "Загрузить распакованный виджет",
+  "@unpackedLoadTitle": {},
+  "unpackedLoadIdLine": "id: {id}",
+  "@unpackedLoadIdLine": {
+    "placeholders": {
+      "id": {}
+    }
+  },
+  "unpackedLoadNetworkNote": "Виджет объявляет доступ к сети — он может выполнять запросы из сети (jsr.fetchJson).",
+  "@unpackedLoadNetworkNote": {},
+  "unpackedLoadCommandsNote": "Команды оболочки, которые он может запускать (jsr.exec): {commands}",
+  "@unpackedLoadCommandsNote": {
+    "placeholders": {
+      "commands": {}
+    }
+  },
+  "unpackedLoadReplaceNote": "Виджет с таким id уже существует ({source}, v{version}). Замена перезапишет его код; данные (storage.json) сохранятся.",
+  "@unpackedLoadReplaceNote": {
+    "placeholders": {
+      "source": {},
+      "version": {}
+    }
+  },
+  "unpackedLoadConfirm": "Загрузить",
+  "@unpackedLoadConfirm": {},
+  "unpackedLoadReplaceConfirm": "Заменить",
+  "@unpackedLoadReplaceConfirm": {},
+  "unpackedLoadErrorTitle": "Виджет не загружен",
+  "@unpackedLoadErrorTitle": {},
+  "unpackedLoadDone": "{name} загружен из папки",
+  "@unpackedLoadDone": {
+    "placeholders": {
+      "name": {}
+    }
+  },
+  "unpackedLoadFailed": "Не удалось загрузить: {error}",
+  "@unpackedLoadFailed": {
+    "placeholders": {
+      "error": {}
+    }
+  },
+  "unpackedSourceChip": "распакован",
+  "@unpackedSourceChip": {},
+  "unpackedSourceBadgeTooltip": "Загружен из локальной папки (распакованный)",
+  "@unpackedSourceBadgeTooltip": {},
+  "unpackedSourceCatalog": "установлен из каталога",
+  "@unpackedSourceCatalog": {},
+  "unpackedSourceUnpacked": "загружен из локальной папки",
+  "@unpackedSourceUnpacked": {},
+  "unpackedSourceAgent": "создан агентом",
+  "@unpackedSourceAgent": {},
+  "unpackedSourceUnknown": "установлен из неизвестного источника ({source})",
+  "@unpackedSourceUnknown": {
+    "placeholders": {
+      "source": {}
+    }
+  },
+  "settingsResetApps": "Сбросить приложения",
+  "@settingsResetApps": {},
+  "settingsResetAppsHint": "Вернуть приложения-виджеты к изначальному состоянию",
+  "@settingsResetAppsHint": {},
+  "settingsResetAppsConfirmTitle": "Сбросить все приложения?",
+  "@settingsResetAppsConfirmTitle": {},
+  "settingsResetAppsConfirmBody": "Будут удалены ВСЕ виджеты, которые вы скачали из каталога или создали, вместе со ВСЕМИ их данными (сохранённое состояние, настройки, хранилище). Сетка приложений станет пустой — скачать заново можно во вкладке Get widgets. Действие необратимо.",
+  "@settingsResetAppsConfirmBody": {},
+  "settingsResetAppsDone": "Приложения сброшены — удалено виджетов: {count}",
+  "@settingsResetAppsDone": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appsCatalogCreatedByMe": "Создано мной",
+  "@appsCatalogCreatedByMe": {},
+  "commonError": "Что-то пошло не так",
+  "@commonError": {},
+  "launcherTabGetWidgets": "Каталог виджетов",
+  "@launcherTabGetWidgets": {},
+  "launcherRestoreDemoAppFailed": "Не удалось восстановить приложение",
+  "launcherSeedErrorCopy": "Скопировать ошибку",
+  "launcherSeedErrorHint": "Отправьте эту ошибку Fa — он сможет починить приложение.",
+  "launcherSeedErrorTitle": "Приложение не установилось",
+  "launcherManifestErrorTitle": "Не удалось загрузить приложение",
+  "appsManifestErrorLabel": "Ошибка манифеста",
+  "launcherTileSizeIcon": "Иконка (1×1)",
+  "launcherTileSizeLarge": "Большой (4×4)",
+  "launcherTileSizeMedium": "Средний (4×2)",
+  "launcherTileSizeReset": "По умолчанию",
+  "launcherTileSizeSmall": "Маленький (2×2)",
+  "launcherTileSizeTall": "Высокий (1×2)",
+  "launcherTileSizeWide": "Широкий (2×1)",
+  "launcherTileSizeColumn": "Столбик (1×3)",
+  "launcherTileSizeRow": "Строка (3×1)",
+  "mediaFileMissing": "Медиафайл не найден",
+  "mediaModelsApiKeyNameHelper": "Имя сохранённого ключа (см. «Ключи») — никогда сам ключ. Пусто — ключ основного подключения.",
+  "mediaModelsApiKeyNameLabel": "Имя ключа API (необязательно)",
+  "mediaModelsCapabilitiesNote": "Модели этого эндпоинта поддерживают:",
+  "mediaModelsClearButton": "Сбросить",
+  "mediaModelsEditTitle": "Изменить: {slot}",
+  "mediaModelsFallbackSummary": "Как основное подключение",
+  "mediaModelsMainConnection": "Основное подключение",
+  "mediaModelsOverrideSummary": "{modelId} · {host}",
+  "mediaModelsSectionNote": "Запросы изображений, аудио, видео и транскрипции используют основное подключение, если слот не переопределён.",
+  "mediaModelsSectionTitle": "Медиамодели",
+  "mediaModelsSlotAudioTts": "Синтез речи",
+  "mediaModelsSlotImageGeneration": "Генерация изображений",
+  "mediaModelsSlotMusicGeneration": "Генерация музыки",
+  "mediaModelsSlotTranscription": "Транскрипция",
+  "mediaModelsSlotVideoGeneration": "Генерация видео",
+  "mediaModelsSlotVision": "Зрение (чтение изображений)",
+  "mediaMuteTooltip": "Выключить звук",
+  "mediaPauseTooltip": "Пауза",
+  "mediaPlayTooltip": "Воспроизвести",
+  "mediaUnmuteTooltip": "Включить звук",
+  "mediaVideoUnsupportedWeb": "Воспроизведение видео не поддерживается в веб-сборке",
+  "modelPresetBudgetDescription": "Самый дешёвый надёжный набор на каждый день — быстрый чат и все медиа через OpenRouter",
+  "modelPresetBudgetName": "Оптимальный по цене",
+  "modelPresetQualityDescription": "Топовый чат и флагманская генерация изображений — самый сильный набор на OpenRouter",
+  "modelPresetQualityName": "Качество",
+  "modelPresetsApplied": "Применено",
+  "modelPresetsChatLabel": "Чат",
+  "modelPresetsKeyMissing": "Для этого пресета нужен ключ API {provider}.",
+  "modelPresetsSectionTitle": "Пресеты моделей",
+  "modelPresetsSetKey": "Задать ключ",
+  "onboardingAiDisclaimer": "Ответы дают сторонние ИИ-провайдеры, которых вы подключаете. ИИ может ошибаться и быть неполным — всегда проверяйте важную информацию.",
+  "onboardingAiDisclaimerTitle": "ИИ может ошибаться",
+  "onboardingFeatureApps": "Создаёт настоящие мини-приложения с живыми виджетами прямо на домашнем экране",
+  "onboardingFeatureAutomation": "Автоматизирует календарь, напоминания и умный дом",
+  "onboardingFeatureMedia": "Генерирует изображения, музыку и видео по запросу",
+  "onboardingGetStarted": "Начать",
+  "onboardingModelsBody": "Один тап применяет целый набор — чат плюс модели для изображений, музыки и видео. Всё можно изменить позже в настройках.",
+  "onboardingModelsSetUpLater": "Настроить позже",
+  "onboardingModelsTitle": "Выберите модели",
+  "onboardingNext": "Далее",
+  "onboardingPermissionCalendar": "Календарь",
+  "onboardingPermissionCalendarDesc": "Планирование событий",
+  "onboardingPermissionContacts": "Контакты",
+  "onboardingPermissionContactsDesc": "Звонки и сообщения",
+  "onboardingPermissionHealth": "Здоровье",
+  "onboardingPermissionHealthDesc": "Сводки активности",
+  "onboardingPermissionHome": "Дом",
+  "onboardingPermissionHomeDesc": "Управление умным домом",
+  "onboardingPermissionMicrophone": "Микрофон",
+  "onboardingPermissionMicrophoneDesc": "Голосовой ввод",
+  "onboardingPermissionNotifications": "Уведомления",
+  "onboardingPermissionNotificationsDesc": "Напоминания и оповещения",
+  "onboardingPermissionsBody": "Всё это необязательно — основной чат работает и без этого. Fa спрашивает разрешение только в контексте, когда функции оно действительно нужно, а изменить решение можно в любой момент в системных настройках.",
+  "onboardingPermissionsTitle": "Разрешения — на ваших условиях",
+  "onboardingPrivacyKeysDesc": "Ключи API хранятся в системной связке ключей (iOS/macOS) или локальном защищённом хранилище — никогда в журналах чата.",
+  "onboardingPrivacyKeysTitle": "Ключи под замком",
+  "onboardingPrivacyOnDeviceDesc": "Ваши переписки и файлы остаются на этом устройстве.",
+  "onboardingPrivacyOnDeviceTitle": "Чаты и файлы остаются на устройстве",
+  "onboardingPrivacyPolicyLink": "Политика конфиденциальности",
+  "onboardingPrivacyProvidersDesc": "Контент отправляется только тем ИИ-провайдерам, которых вы явно подключили.",
+  "onboardingPrivacyProvidersTitle": "Провайдеров выбираете вы",
+  "onboardingPrivacyTitle": "Ваши данные остаются вашими",
+  "onboardingSkip": "Пропустить",
+  "onboardingWelcomeBody": "Общайтесь с ИИ-агентом, который делает реальную работу, а не просто разговаривает.",
+  "onboardingWelcomeTitle": "Знакомьтесь, Fa",
+  "quickStartCachedLabel": "{size} · {bytes} в кеше",
+  "quickStartLoading": "Загрузка модели…",
+  "quickStartSubtitle": "Уже на этом устройстве — один тап, ключ API не нужен.",
+  "quickStartTitle": "Загруженные модели",
+  "quickStartUse": "Использовать",
+  "secretRequestInvalidName": "Только UPPER_SNAKE: A–Z, 0–9, _, начиная с буквы",
+  "secretRequestNameLabel": "Имя ключа",
+  "secretRequestNotNow": "Не сейчас",
+  "secretRequestSave": "Сохранить",
+  "secretRequestTitle": "Fa нужен ключ",
+  "secretRequestValueLabel": "Значение ключа",
+  "settingsAddProvider": "Добавить провайдера",
+  "settingsApiKeyHint": "Вставьте ключ провайдера",
+  "settingsApiKeyLabel": "Ключ API",
+  "settingsApiKeyLocalHelper": "Оставьте пустым для локальных серверов (llama.cpp, Ollama, LM Studio)",
+  "settingsApiKeyOptionalLabel": "Ключ API (необязательно)",
+  "settingsApiKeyRequired": "Требуется ключ API",
+  "settingsApplyButton": "Применить",
+  "settingsBaseUrlHelper": "OpenAI-совместимая конечная точка",
+  "settingsBaseUrlLabel": "Базовый URL",
+  "settingsBaseUrlRequired": "Требуется базовый URL",
+  "settingsCliOnlyTitle": "Настройки только в CLI",
+  "settingsCliOnlyLead": "Эти настройки доступны в CLI и его файле конфигурации — приложение не может их предоставить:",
+  "settingsCliOnlyMcpServers": "Серверы MCP",
+  "settingsCliOnlyTtsrRules": "Правила потока (TTSR)",
+  "settingsCliOnlyCubeSandbox": "Песочница Cube",
+  "settingsCliOnlyPromptOverrides": "Переопределение промптов",
+  "settingsCliOnlyAgentMode": "Режим агента",
+  "settingsCliOnlyMemoryStores": "Хранилища памяти",
+  "settingsCancelButton": "Отмена",
+  "settingsCoderBadge": "для кода",
+  "settingsCorsNoteCustom": "Любая OpenAI-совместимая конечная точка. Провайдер должен разрешать браузерные (CORS) запросы — api.anthropic.com их не разрешает, поэтому к моделям Anthropic обращайтесь через OpenRouter.",
+  "settingsCopyDebugLogs": "Скопировать логи отладки",
+  "settingsSendTestCrashReport": "Отправить тестовый краш-репорт",
+  "settingsTestCrashReportNoFirebase": "Crashlytics не инициализирован на этом устройстве",
+  "settingsTestCrashReportSent": "Тестовый репорт отправлен — проверьте консоль Firebase через пару минут",
+  "settingsDebugLogsCopied": "Логи отладки скопированы в буфер обмена",
+  "settingsCorsNoteOllama": "Запросы идут напрямую из браузера на ollama.com, который сейчас не отправляет заголовки CORS, — вызовы из браузера завершаются ошибкой. Используйте здесь OpenRouter или выберите Ollama в мобильном/десктопном приложении.",
+  "settingsDefaultChatModelTitle": "Модель чата по умолчанию",
+  "settingsDapAddConnection": "Добавить подключение",
+  "settingsDapAgentIdLabel": "ID агента",
+  "settingsDapAgentNameLabel": "Имя агента",
+  "settingsDapPasswordLabel": "Пароль хаба",
+  "@settingsDapPasswordLabel": {
+    "description": "The hub password field on the connection editor"
+  },
+  "settingsDapChannelsEmpty": "Каналов пока нет — они появятся здесь, когда агент присоединится к каналу (dap_invite / dap_connect).",
+  "settingsDapChannelsTitle": "Каналы",
+  "settingsDapEditConnection": "Изменить подключение",
+  "settingsDapMakeActive": "Сделать активным",
+  "settingsDapActiveChip": "Активно",
+  "settingsDapSavedTitle": "Сохранённые подключения",
+  "settingsDapSavedHint": "Закладки хабов. Нажмите, чтобы переключить агента на этот хаб — переключение происходит сразу.",
+  "settingsDapRemoveSaved": "Удалить",
+  "settingsDapEnvNote": "Переменные DAP_HUB_URL или DAP_AGENT_NAME заданы в окружении — env имеет приоритет над сохранённым подключением.",
+  "settingsDapHubHint": "Агенты Fa находят друг друга и обмениваются сообщениями",
+  "settingsDapHubIntro": "Хаб — место встречи ваших агентов Fa: CLI, это приложение и браузерное расширение. Подключитесь один раз — и этот агент станет доступен по имени: другие смогут найти его и отправлять ему сообщения.",
+  "settingsAgentNetworkJoin": "Включить агента в сети",
+  "settingsAgentNetworkJoinHint": "Агент подключается к хабу как живой участник — CLI-пиры и другие приложения пишут ему напрямую.",
+  "settingsAgentNetworkUrl": "Адрес хаба",
+  "settingsAgentNetworkToken": "Токен пейринга",
+  "settingsAgentNetworkName": "Имя агента",
+  "settingsAgentNetworkSave": "Сохранить",
+  "settingsAgentNetworkConnected": "Подключён",
+  "settingsAgentNetworkConnecting": "Подключение…",
+  "settingsAgentNetworkOffline": "Не в сети",
+  "settingsAgentNetworkPeers": "Пиры",
+  "settingsAgentNetworkNoPeers": "Пиров пока не видно",
+  "settingsAgentNetworkDmHint": "Написать пиру…",
+  "settingsAgentNetworkSend": "Отправить ЛС",
+  "settingsAgentNetworkUnsupported": "Членство агента в сети недоступно на этой платформе.",
+  "settingsAgentNetworkSaved": "Настройки сети агента сохранены",
+  "settingsDapIdentityTitle": "Как вас видят другие агенты",
+  "settingsDapIdentityHint": "Имя — это адрес для других агентов. ID выводится из ключа этого устройства.",
+  "settingsDapInboundTitle": "Входящие сообщения",
+  "settingsDapInboundHint": "Куда попадают сообщения от других агентов",
+  "settingsDapInboundDedicated": "Отдельная сессия агента (рекомендуется)",
+  "settingsDapInboundCurrent": "Текущая открытая сессия",
+  "settingsDapInboundNamed": "Выбранная вами сессия",
+  "settingsDapInboundBadgeTooltip": "В эту сессию приходят сообщения от других агентов",
+  "settingsDapHubTitle": "Сеть агентов",
+  "settingsDapNameHint": "alice",
+  "settingsDapPasswordHint": "Оставьте пустым, чтобы сохранить текущий",
+  "@settingsDapPasswordHint": {
+    "description": "Helper text: an empty password field keeps the stored one"
+  },
+  "settingsDapProbeButton": "Проверить подключение",
+  "settingsDapStatusConnected": "Подключено",
+  "settingsDapStatusOffline": "Недоступен",
+  "settingsDapStatusUnknown": "Не проверено",
+  "settingsDapUnsupported": "DAP-хаб не поддерживается на этой платформе.",
+  "settingsDapUrlHint": "hub.example.com или ws://hub.example.com/ws",
+  "settingsDapUrlLabel": "URL хаба",
+  "settingsDapUrlRequired": "Требуется URL хаба",
+  "settingsDapLoadFailed": "Не удалось прочитать DAP-конфигурацию на этой машине.",
+  "settingsDapSaveFailed": "Не удалось сохранить подключение — проверьте URL хаба.",
+  "settingsDeleteButton": "Удалить",
+  "settingsDeleteProviderBody": "Провайдер удаляется из списка выбора. Текущее подключение не затрагивается.",
+  "settingsDeleteProviderTitle": "Удалить {name}?",
+  "settingsDownloadingWeights": "Скачивание весов модели…",
+  "settingsEditButton": "Изменить",
+  "settingsEditProviderTitle": "Изменить провайдера",
+  "settingsEditorKeyNote": "Имя, URL и модель сохраняются; ключ хранится в памяти только для этого сеанса — он не записывается на диск.",
+  "settingsEditorKeyNoteSecure": "Имя, URL и модель сохраняются; ключ хранится в защищённом хранилище ключей устройства (Keychain/Keystore), пока оно доступно.",
+  "settingsEditorKeepKeyNote": "Для этого провайдера сохранён ключ — оставьте поле пустым, чтобы не менять его.",
+  "settingsKeyNoteCustom": "Определение провайдера (имя, URL, модель) сохраняется — без секретов. Ключ API хранится в памяти только в течение этого сеанса и исчезает после перезагрузки.",
+  "settingsKeyNoteCustomSecure": "Определение провайдера (имя, URL, модель) сохраняется — без секретов. Сохранённые ключи хранятся в защищённом хранилище ключей устройства (Keychain/Keystore), пока оно доступно; несохранённый ключ остаётся в памяти только на этот сеанс.",
+  "settingsKeyNoteHosted": "Только в памяти: ваш ключ нигде не сохраняется и исчезает после перезагрузки. Запросы идут напрямую из браузера к провайдеру — ничего не проксируется и не хранится.",
+  "settingsKeyNoteHostedSecure": "Сохранённые ключи хранятся в защищённом хранилище ключей устройства (Keychain/Keystore), пока оно доступно; ключ, только введённый в форму, остаётся в памяти на этот сеанс. Запросы идут напрямую из приложения к провайдеру — ничего не проксируется.",
+  "settingsLoadingModel": "Загрузка модели…",
+  "settingsModelIdLabel": "ID модели",
+  "settingsModelIdOptionalLabel": "ID модели (необязательно)",
+  "settingsModelIdRequired": "Требуется ID модели",
+  "settingsModelsFetching": "Загрузка списка моделей с эндпоинта…",
+  "settingsModelsGroupTitle": "Модели",
+  "settingsNameRequired": "Требуется имя",
+  "settingsOnDeviceModelLabel": "Модель на устройстве",
+  "settingsPickModelTitle": "Выбор модели",
+  "settingsPickProviderTitle": "Выбор провайдера",
+  "settingsPresetCustom": "Пользовательский",
+  "settingsPresetOllama": "Ollama",
+  "settingsPresetOpenrouter": "OpenRouter",
+  "settingsPresetTransformersJs": "На устройстве (transformers.js)",
+  "settingsPresetWebllm": "На устройстве (WebLLM)",
+  "settingsProviderLabel": "Провайдер",
+  "settingsProviderModelSummary": "{model} · {provider}",
+  "settingsProviderNameHint": "Мой провайдер",
+  "settingsProviderNameLabel": "Имя",
+  "settingsProvidersSectionTitle": "Провайдеры",
+  "settingsSaveButton": "Сохранить",
+  "settingsStaleModelCache": "Ранее использованная модель ({model}) удалена из кеша — выберите модель, чтобы скачать её снова.",
+  "settingsSkillsAccess": "Доступ к навыкам",
+  "settingsSkillsAccessHint": "Использовать навыки Claude, Copilot или Codex из папки проекта (.claude, .github, .codex)",
+  "settingsSkillsToggles": "Встроенные навыки",
+  "settingsSkillsTogglesHint": "Включайте и отключайте навыки, встроенные в Fa",
+  "skillsAccessAsk": "Спрашивать",
+  "skillsAccessAllowed": "Разрешено",
+  "skillsAccessDenied": "Запрещено",
+  "skillsAccessDialogTitle": "Использовать существующие навыки агентов?",
+  "skillsAccessDialogBody": "В проекте могут быть навыки Claude, Copilot или Codex (папки .claude, .github, .codex) — инструкции, оставленные другими инструментами на этом устройстве. Fa может использовать их в ваших задачах.",
+  "skillsAccessAllow": "Разрешить",
+  "skillsAccessNotNow": "Не сейчас",
+  "settingsThemeDark": "Тёмная",
+  "settingsThemeLabel": "Тема",
+  "settingsChatTextLabel": "Размер текста в чате",
+  "settingsImagePreviewsLabel": "Превью изображений в высоком качестве",
+  "settingsImagePreviewsHelper": "Декодировать превью изображений в чате в полном разрешении. Выкл. — быстрое уменьшение до 600px.",
+  "settingsThemeLight": "Светлая",
+  "settingsThemeSystem": "Как в системе",
+  "settingsStartChat": "Начать чат",
+  "settingsTitle": "Настройки",
+  "settingsToolsBadge": "инструменты через промпт",
+  "settingsTransformersJsNote": "Работает полностью офлайн после скачивания · требуется WebGPU (Chrome/Edge/новые Safari) · весы скачиваются один раз с HuggingFace (публичный репозиторий, токен не нужен) и кешируются в браузере",
+  "settingsVisionBadge": "зрение",
+  "settingsWebllmNote": "Работает полностью офлайн после скачивания · требуется WebGPU (Chrome/Edge/новые Safari) · веса ~0.5-4 ГБ кешируются в браузере",
+  "taskModelSameAsMain": "Как основная",
+  "taskModelSave": "Сохранить",
+  "taskModelSectionTitle": "Модели для задач",
+  "taskModelSmolDescription": "Для саммари и сабагентов",
+  "taskModelSmolTitle": "Быстрая модель",
+  "taskModelUseMain": "Использовать основную",
+  "setupAppBarTitle": "Подключение к Fa",
+  "sidebarAllApps": "Все приложения ({count})",
+  "sidebarAppsHeader": "Приложения",
+  "sidebarCancel": "Отмена",
+  "sidebarDelete": "Удалить",
+  "sidebarDeleteUnavailable": "Удаление недоступно — сессия живёт в хост-приложении",
+  "sidebarDeletePersistedContent": "Сессия {id}",
+  "sidebarDeleteSessionContent": "Сохранённая сессия будет удалена безвозвратно.",
+  "sidebarDeleteSessionFailed": "Не удалось удалить сессию: {error}",
+  "sidebarDeleteSessionTitle": "Удалить сессию?",
+  "sidebarDeleteSessionTooltip": "Удалить сессию",
+  "sidebarLoadSessionsError": "Не удалось загрузить сессии",
+  "sidebarModelHeader": "Модель",
+  "sidebarNewSessionTooltip": "Новая сессия",
+  "sidebarNoActiveSession": "Нет активной сессии",
+  "sidebarNoModel": "нет модели",
+  "sidebarNoSessions": "Пока нет сессий",
+  "sidebarOnThisDevice": "На этом устройстве",
+  "sidebarOpenAppsGridTooltip": "Открыть все приложения",
+  "sidebarProviderAnthropic": "Anthropic",
+  "sidebarProviderGoogle": "Google",
+  "sidebarProviderOnDeviceWebllm": "На устройстве (WebLLM)",
+  "sidebarProviderOpenaiCompatible": "OpenAI-совместимый API",
+  "sidebarRefreshAppsTooltip": "Обновить приложения",
+  "sidebarRefreshSessionsTooltip": "Обновить сессии",
+  "sidebarRenameClear": "Сбросить",
+  "sidebarRenameDialogTitle": "Переименовать сессию",
+  "sidebarRenameHint": "Пустое имя вернёт название по умолчанию.",
+  "sidebarRenameNameLabel": "Название",
+  "sidebarRenameSessionTooltip": "Переименовать сессию",
+  "sidebarRetry": "Повторить",
+  "sidebarSessionTitle": "сессия {id}",
+  "sidebarSearchHint": "Поиск по сессиям",
+  "sidebarSearchClearTooltip": "Очистить поиск",
+  "sidebarSearchNoMatches": "Нет сессий по запросу «{query}»",
+  "@sidebarSearchNoMatches": {
+    "placeholders": {
+      "query": {}
+    }
+  },
+  "sidebarSessionsHeader": "Сессии",
+  "sidebarSubagentSessionCount": "{count, plural, one{{count} агент} few{{count} агента} many{{count} агентов} other{{count} агентов}}",
+  "@sidebarSubagentSessionCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "sidebarSubagentTitle": "субагент {id}",
+  "@sidebarSubagentTitle": {
+    "placeholders": {
+      "id": {
+        "type": "String"
+      }
+    }
+  },
+  "tjsCacheTitle": "Загруженные модели (transformers.js)",
+  "tjsCacheWebOnly": "On-device модели (transformers.js) доступны только в веб-сборке.",
+  "uploadTooLarge": "Загрузка слишком большая: {total} превышает лимит {max} на один пакет.",
+  "webllmCacheManagedByOs": "На этой платформе on-device модели управляются хранилищем ОС/приложения.",
+  "webllmCacheTitle": "Загруженные модели",
+  "settingsVisionLabel": "Поддерживает изображения (vision)",
+  "settingsIconsPerRow": "Иконок в ряд",
+  "settingsIconsPerRowHint": "Колонок в сетке домашнего экрана; Авто — 4 на телефоне, 6 на широких",
+  "settingsIconsPerRowAuto": "Авто",
+  "settingsShowOnboarding": "Показать приветствие",
+  "chatSteerTooltip": "Отправить сейчас (прервать)",
+  "bootstrapSessionStartError": "Не удалось запустить сессию: {error}",
+  "bootstrapRetry": "Повторить",
+  "workspaceDialogTitle": "Сессия",
+  "workspaceDialogChangeFolder": "Сменить папку…",
+  "workspaceDialogClearFolder": "Использовать личную папку",
+  "workspaceDialogClose": "Закрыть",
+  "workspaceDialogCurrentFolder": "Папка сессии",
+  "workspaceDialogHostPath": "Путь на хосте",
+  "workspaceDialogMountHint": "Файлы по /project/... в агенте указывают на эту папку на вашем Mac.",
+  "workspaceDialogUnsupported": "Проектные папки сейчас доступны только на macOS.",
+  "workspaceDialogPersonal": "Личная (папка не выбрана)",
+  "workspaceDialogMailbox": "Ваш mailbox",
+  "workspaceDialogMailboxHint": "Другие инстансы Fa могут писать этой сессии на этот адрес.",
+  "workspaceDialogMailboxCopy": "Копировать",
+  "workspaceDialogMailboxCopied": "Адрес mailbox скопирован",
+  "workspaceDialogRestrictTools": "Ограничить инструменты этой папкой",
+  "workspaceDialogRestrictToolsHint": "Отключает всё, что читало или писало бы за пределами смонтированной папки. Попытки выйти за рамки будут блокироваться (и в будущем — просить вашего подтверждения через диалог).",
+  "toolsAvailabilityTitle": "Инструменты",
+  "toolsAvailabilityHint": "Включайте и отключайте инструменты Fa — применяется сразу, без перезапуска.",
+  "settingsRedaction": "Скрытие секретов",
+  "settingsRedactionHint": "Маскирует API-ключи и секреты во всём, что Fa отправляет или сохраняет. Применяется сразу, без перезапуска.",
+  "toolsAvailabilityUnavailable": "Недоступно: {reason}",
+  "githubAccountSection": "GitHub-аккаунт",
+  "githubAccountHint": "Подключите GitHub, чтобы публиковать виджеты в каталог fa_widgets.",
+  "githubConnect": "Подключить GitHub",
+  "githubDisconnect": "Отключить",
+  "githubDisconnectConfirm": "Уже открытые PR останутся на GitHub — остановится только отслеживание статуса.",
+  "githubTokenHint": "GitHub-токен со scope public_repo",
+  "githubConnectTokenTab": "Токен",
+  "githubConnectDeviceTab": "Код устройства",
+  "githubConnectDeviceInstructions": "Введите этот код на github.com/login/device — он разрешит Fa создавать публичные репозитории виджетов от вашего имени.",
+  "githubCopyCode": "Скопировать код",
+  "githubOpenDevicePage": "Открыть github.com/login/device",
+  "githubConnectValidating": "Проверка…",
+  "myPublications": "Мои публикации",
+  "publicationsEmpty": "Пока ничего не опубликовано.",
+  "publicationsRefresh": "Обновить",
+  "publicationsOffline": "Нет сети — показаны последние известные состояния.",
+  "publicationStateOpen": "Открыт",
+  "publicationStatePublished": "Опубликован",
+  "publicationStateRejected": "Отклонён",
+  "publicationStateUnknown": "Неизвестно",
+  "widgetStatusNotPublished": "Не опубликован",
+  "widgetStatusValidating": "Проверка…",
+  "widgetStatusInvalid": "Ошибка валидации",
+  "widgetStatusFailed": "Не удалось опубликовать",
+  "widgetStatusErrors": "Ошибки валидатора:",
+  "widgetStatusOpenRun": "Открыть CI-запуск",
+  "widgetDetailVersion": "Версия",
+  "widgetDetailAuthor": "Автор",
+  "publicationSubmittedAt": "Отправлено {date}",
+  "@publicationSubmittedAt": {
+    "placeholders": {
+      "date": {}
+    }
+  },
+  "publicationComments": "{count, plural, =1{1 комментарий}few{{count} комментария}many{{count} комментариев}other{{count} комментария}}",
+  "publishWidgetTitle": "Публикация «{name}»",
+  "@publishWidgetTitle": {
+    "placeholders": {
+      "name": {}
+    }
+  },
+  "publishPreflightFailed": "Исправьте перед публикацией:",
+  "publishRepoNameLabel": "Имя репозитория",
+  "publishButton": "Опубликовать",
+  "publishInProgress": "Публикация…",
+  "publishSuccess": "Pull request открыт:",
+  "publishDone": "Готово",
+  "launcherPublishWidget": "Опубликовать…",
+  "@launcherPublishWidget": {
+    "description": "Tile-menu action that opens the widget publish sheet (issue #35)"
+  },
+  "githubTokenNoRepoScope": "Этот токен не может создавать репозитории — для публикации нужны права на repo. Используй classic PAT со скоупом public_repo (или fine-grained PAT с All repositories + Administration + Contents read/write). Вход по Device code часто даёт токен без прав на репозитории.",
+  "@githubTokenNoRepoScope": {
+    "description": "Shown when a connected GitHub token lacks repository rights"
+  },
+  "githubDeviceFallbackWarn": "Важно: этот вход через устройство использует публичный app «Copilot Plugin» — GitHub ограничивает его токены правами «только идентификация», публиковать они не могут. Чтобы публиковать по device code, зарегистрируй свой GitHub OAuth App (Settings → Developer settings → OAuth Apps, в поле Authorization callback URL укажи https://fa1.dev/oauth/callback) и сохрани его client id в Settings → Keys как github_oauth_client_id — либо собери приложение с --dart-define=FA_GITHUB_CLIENT_ID=<id>. А пока подключайся classic PAT (public_repo) на вкладке Token.",
+  "@githubDeviceFallbackWarn": {
+    "description": "Warning shown on the device-flow tab when only the fallback Copilot plugin client id is available"
+  },
+  "githubConnectWebTab": "Браузер",
+  "@githubConnectWebTab": {
+    "description": "Connect-sheet tab running the GitHub OAuth web flow through the fa1.dev callback page"
+  },
+  "githubBrowserHint": "Открывает github.com в браузере. После «Authorize» страница fa1.dev покажет одноразовый код — вставь его ниже. Нужен свой OAuth App: его client id в Keys как github_oauth_client_id и secret как github_oauth_client_secret.",
+  "@githubBrowserHint": {
+    "description": "Instructions shown on the Browser (OAuth web flow) tab"
+  },
+  "githubBrowserOpen": "Открыть GitHub снова",
+  "@githubBrowserOpen": {
+    "description": "Re-opens the github.com authorize page on the Browser tab"
+  },
+  "githubBrowserCodeHint": "Одноразовый код с fa1.dev",
+  "@githubBrowserCodeHint": {
+    "description": "Hint of the one-time-code field on the Browser tab"
+  },
+  "sessionDrivenElsewhere": "Сессией управляет {host} (pid {pid}) — вы просматриваете. Ваши сообщения будут переданы живому агенту.",
+  "@sessionDrivenElsewhere": {
+    "description": "Уведомление наблюдателя, когда живая аренда владения блокирует открытие сессии для управления (#428)",
+    "placeholders": {
+      "host": {
+        "type": "String"
+      },
+      "pid": {
+        "type": "int"
+      }
+    }
+  },
+  "sessionTooLargeTitle": "Сессия ({size} МБ) превышает бюджет мгновенного открытия — открыть её безопасно не удалось.",
+  "sessionMintFailed": "Не удалось создать новую сессию.",
+  "sessionBootSkippedOversize": "Открыта новая сессия — «{name}» ({size} МБ) превышает бюджет мгновенного открытия.",
+  "sessionBootSkippedOpen": "Открыть частями",
+  "dynamicMessagesButtonTooltip": "Динамические сообщения",
+  "@dynamicMessagesButtonTooltip": {
+    "description": "Top-bar button listing the session's dynamic messages (issue #102)"
+  },
+  "dynamicMessagesSheetTitle": "Динамические сообщения",
+  "@dynamicMessagesSheetTitle": {
+    "description": "Title of the dynamic-messages list sheet (issue #102 AC5)"
+  },
+  "dynamicMessagesLive": "активен",
+  "@dynamicMessagesLive": {
+    "description": "Badge marking a dynamic message with a running engine (issue #102)"
+  },
+  "dynamicMessagesEventCount": "{count, plural, one{1 событие} few{{count} события} many{{count} событий} other{{count} события}}",
+  "@dynamicMessagesEventCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    },
+    "description": "Event back-channel count in the dynamic-messages list (issue #102 AC5)"
+  },
+  "dynamicMessagesSaved": "Сохранено в приложениях как «{appId}»",
+  "@dynamicMessagesSaved": {
+    "placeholders": {
+      "appId": {
+        "type": "String"
+      }
+    },
+    "description": "Snack bar after a dynamic message is graduated into an installed app (issue #102 AC7)"
+  },
+  "dynamicMessagesSaveFailed": "Не удалось сохранить это динамическое сообщение как приложение.",
+  "@dynamicMessagesSaveFailed": {
+    "description": "Snack bar when graduating a dynamic message fails (issue #102 AC7)"
+  },
+  "dynamicTileSaveAsApp": "Сохранить как приложение",
+  "@dynamicTileSaveAsApp": {
+    "description": "Tile affordance graduating a dynamic message into an installed app (issue #102 AC7)"
+  },
+  "dynamicTilePermissions": "Разрешения",
+  "@dynamicTilePermissions": {
+    "description": "Tile affordance opening the app permission dialog for a dynamic message (issue #102)"
+  },
+  "dynamicTileError": "Ошибка виджета",
+  "@dynamicTileError": {
+    "description": "Title of the expandable error tile for a failed dynamic message (issue #102 AC9)"
+  },
+  "dynamicTileOverflow": "Виджет шире области чата — содержимое справа обрезано. Агента попросили перестроить виджет по ширине.",
+  "@dynamicTileOverflow": {
+    "description": "Overflow strip (error colors) on the dynamic-message tile once the canvas detected a viewport overflow (issue #692 C)"
+  },
+  "dynamicTileRetry": "Повторить",
+  "@dynamicTileRetry": {
+    "description": "Retry button on the dynamic-message error tile (issue #102 AC9)"
+  },
+  "dynamicTileMenu": "Ещё действия",
+  "@dynamicTileMenu": {
+    "description": "Overflow (⋮) menu on the dynamic-message tile title bar (issue #378)"
+  },
+  "dynamicTileOpenAsApp": "Открыть как приложение (без сохранения)",
+  "@dynamicTileOpenAsApp": {
+    "description": "Ephemeral full-screen launch of a dynamic message; nothing is installed (issue #378)"
+  },
+  "dynamicTileOpenUnavailable": "Виджет не запускается — ошибка загрузки. Сначала повторите запуск в чате.",
+  "@dynamicTileOpenUnavailable": {
+    "description": "Reason shown when the ephemeral open action is disabled for a failed widget (issue #378 E1)"
+  },
+  "themeConsentTitle": "Применить тему?",
+  "themeConsentBody": "Приложение {app} просит применить тему \"{pack}\".",
+  "@themeConsentBody": {
+    "placeholders": {
+      "app": {
+        "type": "String"
+      },
+      "pack": {
+        "type": "String"
+      }
+    }
+  },
+  "themeConsentContrast": "Внимание: часть цветовых пар темы ниже контрастности WCAG AA (4,5:1).",
+  "themeConsentApply": "Применить",
+  "themeConsentDeny": "Оставить текущую",
+  "themePacksTitle": "Темы оформления",
+  "themePacksSubtitle": "Установка .zip с theme.json, выбор активной темы и удаление",
+  "themePackDefault": "Стандартный вид Fa",
+  "themePackImport": "Импортировать тему",
+  "themePackDelete": "Удалить",
+  "themePackActiveChip": "активна",
+  "themePackWallpaperChip": "обои",
+  "themePackImported": "Тема \"{name}\" установлена",
+  "@themePackImported": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsCompactionLabel": "Компакция",
+  "@settingsCompactionLabel": {
+    "description": "Title of the Settings compaction-engine section (issue #287)"
+  },
+  "settingsCompactionHelper": "Как сжимается контекст при приближении к окну модели. Применяется при следующей компакции.",
+  "@settingsCompactionHelper": {
+    "description": "One-line explainer under the compaction section title (issue #287)"
+  },
+  "settingsCompactionStructured": "Структурированная (рекомендуется)",
+  "@settingsCompactionStructured": {
+    "description": "Picker item: the structured 2.0 engine (issue #287)"
+  },
+  "settingsCompactionStructuredHint": "Скрывает использованные записи на месте с раскрываемыми контрольными точками — для judge-прохода нужна настроенная модель.",
+  "@settingsCompactionStructuredHint": {
+    "description": "Tradeoff copy for the structured engine (issue #287, E1: no health-check claim)"
+  },
+  "settingsCompactionClassic": "Классическая (устаревшая 1.0)",
+  "@settingsCompactionClassic": {
+    "description": "Picker item: the classic 1.0 engine, the supported rollback (issue #287)"
+  },
+  "settingsCompactionClassicHint": "Сжатие с потерями в виде резюме префикса — без дополнительных вызовов модели.",
+  "@settingsCompactionClassicHint": {
+    "description": "Tradeoff copy for the classic engine (issue #287)"
+  },
+  "settingsCompactionSourceProject": "действует из проекта .fah/config.yaml",
+  "@settingsCompactionSourceProject": {
+    "description": "Source-layer caption when the project config wins (issue #287 AC2)"
+  },
+  "settingsCompactionSourceUser": "действует из пользовательского ~/.fah/config.yaml",
+  "@settingsCompactionSourceUser": {
+    "description": "Source-layer caption when the user config wins (issue #287 AC2)"
+  },
+  "settingsCompactionSourceFallback": "структурированная по умолчанию — compaction в конфигах не задан",
+  "@settingsCompactionSourceFallback": {
+    "description": "Source-layer caption when no config states a choice (issue #287 AC2)"
+  },
+  "settingsCompactionWebNote": "На вебе настройка недоступна — здесь нет файла конфигурации, применяется структурированный движок.",
+  "@settingsCompactionWebNote": {
+    "description": "Note shown instead of the picker on the web stub (issue #287 AC5)"
+  },
+  "settingsCompactionSaved": "Сохранено в {file} — применится при следующей компакции.",
+  "@settingsCompactionSaved": {
+    "placeholders": {
+      "file": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsCompactionSaveFailed": "Не удалось сохранить движок компакции: {error}",
+  "@settingsCompactionSaveFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsCompactionDocs": "Документация по компакции",
+  "@settingsCompactionDocs": {
+    "description": "Link to the compaction documentation from the settings section (issue #287)"
+  },
+  "settingsQueueTitle": "Очередь провайдеров",
+  "settingsQueueHelper": "Упорядоченная цепочка провайдеров: когда текущий умирает (квота, авторизация, сеть, таймаут, битый поток, 5xx, плохой finish), следующий перехватывает работу, а победитель закрепляется на сессию. Применяется со следующего запуска.",
+  "settingsQueueEmpty": "Очередь не задана — применяется одиночный провайдер/модель. Добавьте запись, чтобы собрать цепочку.",
+  "settingsQueueScopeEnv": "действует из переменной окружения FA_PROVIDERS_QUEUE — правьте её (здесь только чтение)",
+  "settingsQueueUnsupported": "Недоступно в вебе — здесь нет конфига и переменных окружения.",
+  "settingsQueueAdd": "Добавить запись",
+  "settingsQueueAddTitle": "Новая запись очереди",
+  "settingsQueueMoveUp": "Выше",
+  "settingsQueueMoveDown": "Ниже",
+  "settingsQueueRemove": "Удалить",
+  "settingsQueueSaved": "Очередь сохранена в {file} — применится со следующего запуска.",
+  "settingsQueueSaveFailed": "Не удалось сохранить очередь: {error}",
+  "themePackImportFailed": "Тема отклонена",
+  "settingsMobileAutomation": "Автоматизация устройства",
+  "mobileConsentTitle": "Автоматизация устройства",
+  "mobileConsentWhat": "Включив эту функцию, вы разрешаете службе специальных возможностей Fa читать содержимое экрана и выполнять нажатия и ввод текста от вашего имени, чтобы Fa мог управлять приложениями и настройками за вас.",
+  "mobileConsentOffByDefault": "По умолчанию служба выключена — ничего не работает, пока вы не включите её здесь.",
+  "mobileConsentDisableHint": "Отключить её можно в любой момент одним касанием в настройках Fa.",
+  "mobileConsentPrivacy": "Данные не покидают устройство: наружу отправляются только ваши сообщения — напрямую в настроенную модель.",
+  "mobileConsentEnable": "Включить — открыть настройки системы",
+  "mobileConsentDisable": "Выключить",
+  "mobileConsentStatusOn": "Служба специальных возможностей: включена",
+  "mobileConsentStatusOff": "Служба специальных возможностей: выключена",
+  "mobileConsentStoreUnavailable": "Автоматизация устройства недоступна в этой сборке Fa.",
+  "storeBannerTitle": "Fa в App Store",
+  "@storeBannerTitle": {
+    "description": "In-app Get banner: title"
+  },
+  "storeBannerBody": "Релиз в App Store платный — он финансирует разработку. Бета в TestFlight бесплатна навсегда.",
+  "@storeBannerBody": {
+    "description": "In-app Get banner: paid vs free-forever-beta messaging"
+  },
+  "storeBannerAndroidSoon": "Android: скоро",
+  "@storeBannerAndroidSoon": {
+    "description": "In-app Get banner: the Android slot while links.play is unset"
+  },
+  "storeBannerCta": "Открыть в App Store",
+  "@storeBannerCta": {
+    "description": "In-app Get banner: the primary CTA button"
+  },
+  "storeBannerBeta": "или присоединяйтесь к бесплатной бете в TestFlight",
+  "@storeBannerBeta": {
+    "description": "In-app Get banner: the secondary beta link"
+  },
+  "storeBannerDismiss": "Скрыть",
+  "@storeBannerDismiss": {
+    "description": "In-app Get banner: dismiss tooltip/label"
+  },
+  "networkModeLocal": "Локально",
+  "networkModeNetwork": "Сеть",
+  "networkWelcomeTitle": "Добро пожаловать в сети Fa",
+  "networkWelcomeBody": "Присоединитесь к существующей сети или создайте свою — каналы и витрины откроются здесь.",
+  "networkNeedsPasswordTitle": "Этой сети нужен ваш пароль",
+  "networkNeedsPasswordBody": "Синхронизация аккаунта нашла эту сеть, но её пароль сохранится только после первого входа. Введите его, чтобы открыть сеть.",
+  "networkNetworksTitle": "Сети",
+  "networkBackTooltip": "Назад",
+  "networkSearchHint": "Поиск сетей",
+  "networkSignInTitle": "Войти",
+  "networkSignInHelper": "Войдите через аккаунт ai-native.cloud, чтобы создавать сети и управлять ими.",
+  "networkSignInWithProvider": "Продолжить через {provider}",
+  "networkSignInWaiting": "Завершите вход в браузере…",
+  "networkSignInDeveloperSection": "Разработчик (только локально)",
+  "networkSignInMobileNote": "Вход через провайдера здесь недоступен, пока редирект fa:// не добавлен в список разрешённых на сервере — пока работает только вход для разработчика ниже.",
+  "networkSessionExpired": "Сессия истекла — войдите снова.",
+  "networkLoginLabel": "Логин",
+  "networkSignOut": "Выйти",
+  "networkAccountFallback": "Аккаунт",
+  "networkPublicSection": "Публичные сети",
+  "networkPublicMembers": "Участников: {count}",
+  "networkEmptyTitle": "Пока нет сетей",
+  "networkJoinFirst": "Присоединитесь к своей первой сети",
+  "networkNoMatches": "Ничего не найдено",
+  "networkCreateNetwork": "Создать сеть",
+  "networkNameLabel": "Название",
+  "networkPasswordLabel": "Пароль",
+  "networkCreate": "Создать",
+  "networkJoinTitle": "Присоединиться к сети",
+  "networkQuickSwitcherTitle": "Быстрый переход",
+  "networkJoinLinkLabel": "Ссылка-приглашение",
+  "networkJoinFill": "Заполнить",
+  "networkIdLabel": "Идентификатор или название сети",
+  "networkDisplayNameLabel": "Отображаемое имя",
+  "networkDisplayNameLocked": "Отображаемое имя привязано к вашему аккаунту.",
+  "networkJoinRequired": "Укажите идентификатор или название сети и пароль.",
+  "networkJoinInvalidCredentials": "Неверные учётные данные — {message}",
+  "networkJoinRetryAfter": " Повторите через {seconds} с.",
+  "networkJoin": "Присоединиться",
+  "networkSelectChannel": "Выберите канал",
+  "networkReconnecting": "Переподключение — сообщения будут отправлены после восстановления связи.",
+  "networkReconnectNow": "Переподключиться сейчас",
+  "networkMessageHint": "Написать в {channel}",
+  "networkNewChannel": "Новый канал",
+  "networkOnlineCount": "{count} в сети",
+  "networkRosterTitle": "Участники",
+  "networkRosterLoading": "Загрузка участников…",
+  "networkRosterEmpty": "Пока нет участников.",
+  "networkPresenceOnline": "В сети",
+  "networkPresenceOffline": "Не в сети",
+  "networkPresenceBusy": "Занят",
+  "networkMemberOwner": "Владелец",
+  "networkMemberAdmin": "Администратор",
+  "networkMemberMember": "Участник",
+  "networkMemberGuest": "Гость",
+  "networkMemberAgent": "Агент",
+  "networkMemberUnknown": "Неизвестно",
+  "networkAccessWholeNetwork": "Вся сеть",
+  "networkAccessChannels": "{count, plural, one{{count} канал} few{{count} канала} many{{count} каналов} other{{count} канала}}",
+  "networkAccessThisChannelOnly": "Только этот канал",
+  "networkAccessThisChannelAndOthers": "{count, plural, one{Этот канал + ещё {count} канал} few{Этот канал + ещё {count} канала} many{Этот канал + ещё {count} каналов} other{Этот канал + ещё {count} канала}}",
+  "networkAccessOtherChannels": "{count, plural, one{{count} другой канал} few{{count} других канала} many{{count} других каналов} other{{count} других канала}}",
+  "networkDropAgent": "Удалить агента…",
+  "networkDropAgentTitle": "Удалить этого агента?",
+  "networkDropAgentBody": "\"{displayName}\" будет удалён из сети и потеряет доступ. Это действие нельзя отменить.",
+  "networkDropAgentConfirm": "Удалить агента",
+  "networkChannelsSection": "Каналы",
+  "networkShowcasesSection": "Витрины",
+  "networkShowcaseReadOnly": "Только чтение — нажмите, чтобы войти в сеть и писать.",
+  "networkShowcaseMemberReadOnly": "Писать в эту витрину могут только владелец и администраторы.",
+  "networkConnecting": "Подключение…",
+  "networkNoChannels": "Нет каналов",
+  "networkChannelOptions": "Параметры канала",
+  "networkRenameChannel": "Переименовать канал…",
+  "@networkRenameChannel": {
+    "description": "Channel overflow menu item for renaming"
+  },
+  "networkRenameChannelTitle": "Переименовать канал",
+  "@networkRenameChannelTitle": {
+    "description": "Rename-channel dialog title"
+  },
+  "networkRename": "Переименовать",
+  "@networkRename": {
+    "description": "Rename-channel dialog confirm button"
+  },
+  "networkChannelNameRequired": "Название канала не должно быть пустым.",
+  "@networkChannelNameRequired": {
+    "description": "Rename-channel validation error"
+  },
+  "networkDeleteChannel": "Удалить канал…",
+  "@networkDeleteChannel": {
+    "description": "Channel overflow menu item for deleting"
+  },
+  "networkDeleteChannelTitle": "Удалить этот канал?",
+  "@networkDeleteChannelTitle": {
+    "description": "Delete-channel confirmation title"
+  },
+  "networkDeleteChannelBody": "Канал и все его сообщения будут удалены для всех. Это действие нельзя отменить.",
+  "@networkDeleteChannelBody": {
+    "description": "Delete-channel confirmation body"
+  },
+  "networkChannelDeleted": "Канал удалён",
+  "@networkChannelDeleted": {
+    "description": "Snackbar after a channel was deleted"
+  },
+  "networkAddAgent": "Добавить агента…",
+  "networkShowcasePublic": "Витрина (публичный)",
+  "networkAddAgentTitle": "Добавить агента",
+  "networkAddAgentWarning": "Передавайте эту строку только напрямую — любой, у кого она есть, сможет читать канал.",
+  "networkAddAgentNoKeys": "На этом устройстве нет ключей для этого канала.",
+  "networkAddAgentNoChannelKeys": "В кошельке нет ключей каналов — агент увидит каналы только после инвайта ключа",
+  "networkChannelKeyMissing": "Чтобы читать и писать в этом закрытом канале, на устройстве нужен его ключ.",
+  "networkChannelKeyImport": "Импортировать ключ канала",
+  "networkChannelKeyInviteLabel": "Приглашение с ключом канала",
+  "networkChannelKeyImportHint": "Вставьте приглашение в закрытый канал с устройства, где уже есть ключ.",
+  "networkChannelKeyWrongChannel": "Это приглашение относится к другому каналу.",
+  "networkChannelKeyWrongHub": "Это приглашение относится к другому хабу.",
+  "networkChannelKeyMismatch": "Открытый и закрытый ключи приглашения не соответствуют друг другу.",
+  "networkChannelKeyImportFailed": "Не удалось импортировать ключ канала. Повторите попытку.",
+  "networkAddAgentScopeChannel": "Этот канал",
+  "networkAddAgentScopeNetwork": "Вся сеть",
+  "networkAddAgentFormatLink": "Ссылка (приложение)",
+  "networkAddAgentFormatCli": "CLI-команда",
+  "networkAddAgentFormatEnv": "Env (CI)",
+  "networkAddAgentFormatDap": "DAP",
+  "networkAddAgentDapHint": "Скопируйте этот блок и вставьте его в чат fa (CLI, macOS, iOS или web) — агент автоматически присоединится к каналу.",
+  "dapEnrollmentJoined": "Подключились к DAP-каналу #{channel}. Сообщения канала теперь поступают этому агенту.",
+  "dapEnrollmentJoinedPlaintext": "Подключились к DAP-каналу #{channel}. Сообщения канала теперь поступают этому агенту. Предупреждение о хранении: закрытый ключ приглашения и учётные данные хаба хранятся в ОТКРЫТОМ ВИДЕ (без шифрования) в песочнице приложения (в web — IndexedDB).",
+  "dapEnrollmentFailed": "Не удалось подключиться к DAP-каналу #{channel}. Проверьте приглашение и соединение с хабом, затем повторите попытку.",
+  "dapEnrollmentUnsupported": "Подключение к DAP не поддерживается на этой платформе — используйте нативное приложение или fa CLI.",
+  "networkAddAgentEnroll": "Заэнроллить агента",
+  "networkAddAgentEnrollHint": "Выдача создаёт независимый отзываемый секрет: агенты с одинаковым именем могут подключаться одновременно. Секрет показывается ОДИН раз: скопируйте его сейчас.",
+  "networkAddAgentEnrollNeedSignIn": "Войдите в сеть, чтобы выдавать доступ агентам",
+  "networkAddAgentNameInvalid": "3–64 символа: a-z, 0-9, дефис",
+  "networkAddAgentEnvHint": "Env-переменные для CI-раннера (GitHub Actions) — ссылка уже несёт id сети и пароль (или ключи канала), ничего дописывать не нужно. Зарезервировано под будущий сетевой режим CLI — десктопные и мобильные агенты используют ссылку.",
+  "networkAddAgentNetworkHint": "Агент входит полным участником и видит все каналы сети.",
+  "networkAddAgentNetworkNoPassword": "Пароль сети недоступен на этом устройстве — при входе ссылка запросит его.",
+  "networkAddAgentCliHint": "Команда работает для хабов с прямым DAP-доступом (например, локальный стенд); CLI-вход на production fa_network — в разработке.",
+  "networkAddAgentNetworkCliHint": "CLI-подключение к сети пока не готово — используйте ссылку.",
+  "networkInviteCopied": "Приглашение скопировано в буфер обмена.",
+  "networkCopy": "Копировать",
+  "networkClose": "Закрыть",
+  "networkWalletTooltip": "Кошелёк",
+  "networkWalletExport": "Экспортировать кошелёк",
+  "networkWalletImport": "Импортировать кошелёк",
+  "networkWalletExported": "Кошелёк экспортирован — JSON скопирован в буфер обмена.",
+  "networkWalletExportFailed": "Не удалось экспортировать: {error}",
+  "networkWalletImported": "Кошелёк импортирован.",
+  "networkPassphraseLabel": "Парольная фраза",
+  "networkPassphraseRepeatLabel": "Повторите парольную фразу",
+  "networkPassphraseEmpty": "Парольная фраза не должна быть пустой.",
+  "networkPassphraseMismatch": "Парольные фразы не совпадают.",
+  "networkExport": "Экспортировать",
+  "networkImport": "Импортировать",
+  "networkWalletJsonLabel": "JSON экспортированного кошелька",
+  "networkWalletImportWarning": "Импорт заменит кошелёк на этом устройстве.",
+  "networkNameHint": "Отображаемое имя — станет lowercase-slug",
+  "@networkNameHint": {
+    "description": "Network name helper text (server rule)"
+  },
+  "networkPasswordHint": "8–128 символов",
+  "@networkPasswordHint": {
+    "description": "Network password helper text (server rule)"
+  },
+  "networkNameInvalid": "После слага нужно 3–64 символа (буквы, цифры, дефисы)",
+  "@networkNameInvalid": {
+    "description": "Network name validation error"
+  },
+  "networkPasswordInvalid": "Пароль: 8–128 символов",
+  "@networkPasswordInvalid": {
+    "description": "Network password validation error"
+  },
+  "networkListPublic": "Показывать в публичном каталоге",
+  "@networkListPublic": {
+    "description": "Create-network dialog checkbox — publish the network in the public catalog"
+  },
+  "networkDelete": "Удалить сеть…",
+  "@networkDelete": {
+    "description": "Network row menu item (owner only)"
+  },
+  "networkDeleteTitle": "Удалить эту сеть?",
+  "@networkDeleteTitle": {
+    "description": "Delete-network confirmation title"
+  },
+  "networkDeleteBody": "Сеть, её каналы и все сообщения будут удалены для всех. Это действие нельзя отменить.",
+  "@networkDeleteBody": {
+    "description": "Delete-network confirmation body"
+  },
+  "networkDeleted": "Сеть удалена",
+  "@networkDeleted": {
+    "description": "Snackbar after a network was deleted"
+  },
+  "networkSlugPreview": "Будет создана как: {slug}",
+  "@networkSlugPreview": {
+    "description": "Live slug preview under the network name field",
+    "placeholders": {
+      "slug": {}
+    }
+  },
+  "networkSignInToCreate": "Войдите, чтобы создать сеть",
+  "@networkSignInToCreate": {
+    "description": "Snackbar when create is attempted without a JWT"
+  },
+  "networkShowcaseUnavailable": "Эта сеть недоступна публично",
+  "@networkShowcaseUnavailable": {
+    "description": "Anonymous showcase: generic 404 (non-public or unknown network)"
+  },
+  "networkShowcaseReadOnlyBadge": "только чтение",
+  "@networkShowcaseReadOnlyBadge": {
+    "description": "Badge in the showcase header"
+  },
+  "@networkShowcaseReadOnly": {
+    "description": "Composer replacement in the anonymous showcase"
+  },
+  "networkBackToNetworks": "Назад к сетям",
+  "@networkBackToNetworks": {
+    "description": "Showcase back-button tooltip"
+  },
+  "networkAddAgentPublicHint": "Эту ссылку видят все — канал публичный. Агенты подключаются без ключей.",
+  "@networkAddAgentPublicHint": {
+    "description": "Agent invite dialog hint for public (keyless) channels"
+  }
+}

@@ -1,0 +1,467 @@
+part of 'agent_cli.dart';
+
+// Session-persistence members of [AgentCli] — split out of `agent_cli.dart`
+// to keep it under the repo's 2800-line size gate. Same library (a `part
+// of`), so the extension sees the class's private fields (`_session`,
+// `_persistedCount`) with no visibility change.
+
+extension AgentCliPersist on AgentCli {
+  /// Persists a single message as soon as the agent adds it to the transcript.
+  /// Keeps [_persistedCount] aligned so [_afterRun] only writes anything the
+  /// listener may have missed (e.g. a crash between the append and the await).
+  Future<void> _persistIncremental(AgentEvent event) async {
+    if (event is! MessageEndEvent) return;
+    final message = event.message;
+    // Aborted assistant streams are incomplete; TTSR's discard mode prunes
+    // them from memory and they should not survive in the session either.
+    // EXCEPT backend agent mode (issue #155): a graceful SIGTERM cancel
+    // must leave a resumable partial transcript on disk.
+    if (message is AssistantMessage &&
+        message.stopReason == StopReason.aborted &&
+        !config.persistAbortedPartials) {
+      return;
+    }
+    final session = _session;
+    if (session == null) return;
+    // Issue #437: a steered message merged at the step boundary carries
+    // the SAME object the steering FIFO queued at accept — consume its
+    // entry here (panel delivered + consumed marker), even if the append
+    // below is skipped as already-counted.
+    if (message is UserMessage && _pendingSteering.isNotEmpty) {
+      final index = _pendingSteering.indexWhere(
+        (entry) => identical(entry.message, message),
+      );
+      if (index >= 0) {
+        final entry = _pendingSteering.removeAt(index);
+        await _steeringDelivered(message, entry.recordId, entry.panel);
+      }
+    }
+    final messages = _agent.state.messages;
+    if (_persistedCount >= messages.length) return;
+    final recordId = await session.appendMessage(message);
+    _persistedCount++;
+    if (message is UserMessage) {
+      await _ingestObligations(message, recordId);
+    }
+  }
+
+  /// Classifies a persisted real-user message into the obligations ledger
+  /// and appends the snapshot (issue #1380 A1, rule-based v1 per Q1).
+  /// Structured-engine sessions only — a classic session never grows
+  /// ledger records, so its projection stays byte-identical (E3). The
+  /// engine resolves through the live settings override first (#288 chain
+  /// — the same expression the compaction driver uses). Persistence
+  /// failures swallow: one missed classification must never break message
+  /// persistence, and the writer's cumulative state rides the next
+  /// successful snapshot.
+  Future<void> _ingestObligations(UserMessage message, String recordId) async {
+    if (_effectiveCompactionEngine() == CompactionEngine.classic) {
+      return;
+    }
+    final session = _session;
+    if (session == null) return;
+    final writer = await _obligationsWriterFor(session);
+    final payload = writer.ingest(
+      text: userMessageText(message.content),
+      sourceRecordId: recordId,
+      at: message.timestamp,
+    );
+    if (payload == null) return;
+    // gh-1590: rate-bounded — an ingest inside the persist window
+    // coalesces behind the trailing flush (the writer's cumulative
+    // state carries it; the next snapshot heals a lost one).
+    await _appendObligationsSnapshot(session, payload);
+  }
+
+  /// The `obligation_mark_done` close path (issue #1380 lifecycle): marks
+  /// an entry done/superseded and persists the snapshot. An empty [id] is
+  /// the discovery mode — returns the open-obligation listing (ids,
+  /// statuses, clipped quotes) without closing anything. Unlike the
+  /// passive ingest above, failures are RETURNED — the agent must see
+  /// that its close did not land.
+  Future<String> closeObligation(String id, String status) async {
+    final session = _session;
+    if (session == null) return 'no session is open — the ledger is empty';
+    final writer = await _obligationsWriterFor(session);
+    if (id.isEmpty) {
+      final open = writer.ledger.open;
+      if (open.isEmpty) return 'no open obligations.';
+      return [
+        'open obligations (close with {"id": "..."}):',
+        for (final e in open)
+          '- ${e.id} [${e.kind.jsonName}] '
+              '${capLedgerText(e.text) ?? ''}',
+      ].join('\n');
+    }
+    final parsed = switch (status) {
+      'done' => ObligationStatus.done,
+      'superseded' => ObligationStatus.superseded,
+      _ => null,
+    };
+    if (parsed == null) {
+      return 'unknown status "$status" (use done or superseded)';
+    }
+    final payload = writer.markStatus(id, parsed);
+    if (payload == null) {
+      final ids = writer.ledger.entries.map((e) => e.id).toList();
+      return 'no obligation carries id $id. Open ids: '
+          '${ids.isEmpty ? "(none)" : ids.join(", ")}';
+    }
+    // Deliberate agent-visible write: bypasses the persist window — the
+    // close must land NOW, and the agent must see a failed landing.
+    if (!await _appendObligationsSnapshot(session, payload, force: true)) {
+      return 'marking $id ${parsed.jsonName} failed — the snapshot did not '
+          'persist; try again';
+    }
+    final openLeft = writer.ledger.open.length;
+    return '$id marked ${parsed.jsonName}. '
+        '$openLeft open obligation(s) remain.';
+  }
+
+  /// The writer for [session], rehydrated from its latest
+  /// `obligations_ledger` snapshot via the RAW FILE SCAN — never the
+  /// resident view: the latest snapshot routinely lies below a windowed
+  /// tail, and a resident-view rehydration would let the next snapshot
+  /// silently erase every entry under it (#488 class, review-blocking on
+  /// this slice). Rebuilt lazily when the session switches.
+  Future<ObligationsLedgerWriter> _obligationsWriterFor(Session session) async {
+    final existing = _obligationsWriter;
+    if (existing != null && identical(_obligationsWriterSession, session)) {
+      return existing;
+    }
+    // Session switch (gh-1590): land the previous session's coalesced
+    // ingest into ITS file before the writer swaps — the entries belong
+    // to that session's transcript (the deduper suppresses a no-op).
+    if (existing != null) {
+      final previous = _obligationsWriterSession;
+      if (previous != null) {
+        await _appendObligationsSnapshot(
+          previous,
+          existing.ledger.toPayload(),
+          force: true,
+        );
+      }
+    }
+    // gh-1590: the persist window opens with the (re)hydrated writer —
+    // a session switch never inherits the previous session's window or
+    // dedupe state (the same reset `_rehydrateJobBoard` performs).
+    _obligationsPersistThrottle.reset();
+    _obligationsPersistDeduper.reset();
+    final ledger = await _latestObligationsFromScan(session);
+    final writer = ObligationsLedgerWriter(initial: ledger);
+    _obligationsWriterSession = session;
+    return _obligationsWriter = writer;
+  }
+
+  /// The latest snapshot payload over the session's full file chain (the
+  /// repo's streamed, rotation-aware scan), or an empty ledger.
+  Future<ObligationsLedger> _latestObligationsFromScan(Session session) async {
+    final repo = _repo;
+    if (repo is! JsonlSessionRepo) return const ObligationsLedger([]);
+    final records = await repo.readCustomRecordsOfType(
+      await session.getMetadata(),
+      {obligationsLedgerRecordType},
+    );
+    return records.isEmpty
+        ? const ObligationsLedger([])
+        : ObligationsLedger.fromPayload(records.last.data);
+  }
+
+  /// The `session_search` host path (issue #1380 A2): one archive search
+  /// over the LIVE session's file chain through the repo's streamed scan.
+  /// A memory-backed repo (no file) degrades to an honest cannot-search
+  /// result — the tool stays registered under the same graceful-null
+  /// contract as ask/request_secret.
+  Future<SessionSearchOutcome> searchSessionArchive(
+    SessionSearchQuery query,
+  ) async {
+    final session = _session;
+    final repo = _repo;
+    if (session == null || repo is! JsonlSessionRepo) {
+      return _unsearchableOutcome();
+    }
+    final metadata = await session.getMetadata();
+    // Issue #1882 AC3: a scan over a heavy session file names the cost —
+    // the guard line rides the result so the agent (and the transcript)
+    // see the exact size plus the hygiene escapes.
+    final sizeNote = await _searchSizeNote(metadata.path);
+    final outcome = await repo.searchArchive(metadata, query);
+    return _withSizeNote(outcome, sizeNote);
+  }
+
+  /// The honest graceful-null degradation: the archive was NOT searched
+  /// (there is nothing to search) — the formatter prints this verbatim
+  /// instead of a completed-but-empty scan, which would read as "no
+  /// records match" (the dishonest rendering the rework pass called
+  /// out).
+  SessionSearchOutcome _unsearchableOutcome() => const SessionSearchOutcome(
+    hits: [],
+    recordsExamined: 0,
+    recordsTotal: 0,
+    truncated: false,
+    unavailableReason: 'no session file backs this host — nothing was searched',
+  );
+
+  /// The heavy-file guard line for the searched session, or '' when the
+  /// file is under the warn bound (issue #1882 AC3).
+  Future<String> _searchSizeNote(String path) async {
+    final heavyScan = await sessionSizeIfHeavy(_env, path);
+    if (heavyScan == null) return '';
+    return heavyScanGuardLines(heavyScan, path).first;
+  }
+
+  /// Copies [outcome] with the guard note attached (empty note = the
+  /// outcome unchanged — small files scan silently).
+  SessionSearchOutcome _withSizeNote(
+    SessionSearchOutcome outcome,
+    String sizeNote,
+  ) {
+    if (sizeNote.isEmpty) return outcome;
+    return SessionSearchOutcome(
+      hits: outcome.hits,
+      recordsExamined: outcome.recordsExamined,
+      recordsTotal: outcome.recordsTotal,
+      truncated: outcome.truncated,
+      nextContinuation: outcome.nextContinuation,
+      map: outcome.map,
+      truncationReason: outcome.truncationReason,
+      unavailableReason: outcome.unavailableReason,
+      sizeNote: sizeNote,
+    );
+  }
+
+  /// The pending-wait write path (issue #1380 AC5): a successful
+  /// `schedule_message` arms a timer — this records the `pending-wait`
+  /// obligation whose text is the timer's reason (verbatim from the call)
+  /// and whose source points at the scheduled-message record, so the
+  /// fired timer re-enters a context that already knows why it exists.
+  /// Structured-engine sessions only (a classic session never grows
+  /// ledger records, E3). Returns the human-readable outcome for the
+  /// attach site; failures are REPORTED here and swallowed by the
+  /// afterToolCall wrapper — the schedule itself already succeeded and
+  /// must never fail because its ledger note could not land.
+  Future<String> recordPendingWait({
+    required String resultText,
+    required Map<String, dynamic> arguments,
+  }) async {
+    if (_effectiveCompactionEngine() == CompactionEngine.classic) {
+      return 'classic engine — no obligations ledger';
+    }
+    final session = _session;
+    if (session == null) return 'no session is open — no ledger';
+    final scheduledId = RegExp(r'^scheduled (\S+) for ').firstMatch(resultText);
+    if (scheduledId == null) {
+      return 'schedule_message result did not carry a scheduled id — no '
+          'pending-wait entry written';
+    }
+    final text = arguments['text'];
+    final writer = await _obligationsWriterFor(session);
+    final payload = writer.ingestPendingWait(
+      text: text is String ? text : '',
+      sourceRecordId: scheduledId.group(1)!,
+    );
+    if (payload == null) {
+      return 'pending-wait already recorded for this timer';
+    }
+    // Deliberate write: bypasses the persist window — the ledger note
+    // for a freshly armed timer must not wait for the trailing flush.
+    if (!await _appendObligationsSnapshot(session, payload, force: true)) {
+      return 'recording the pending-wait failed — the snapshot did not '
+          'persist; it rides the next successful ledger write';
+    }
+    return 'pending-wait recorded: the ledger now carries the reason this '
+        'timer exists';
+  }
+
+  /// Appends one `obligations_ledger` snapshot (gh-1590): rate-bounded
+  /// like the other latest-snapshot-wins ledgers — the gate refuses
+  /// inside the persist window ([ledgerSnapshotPersistInterval], the
+  /// coalesced state rides the trailing flush), the deduper suppresses
+  /// byte-identical appends (a no-op teardown flush must not grow the
+  /// file). [force] bypasses the window for the deliberate close /
+  /// pending-wait paths and the shutdown flush. Returns whether the
+  /// snapshot LANDED (false: coalesced, deduped, empty, or failed).
+  Future<bool> _appendObligationsSnapshot(
+    Session session,
+    List<Map<String, Object?>> payload, {
+    bool force = false,
+  }) async {
+    // An empty ledger has nothing to say: an empty `[]` snapshot must
+    // not append (every no-ledger session would grow one at teardown)
+    // and must not stamp a persist window.
+    if (payload.isEmpty) return false;
+    if (!force && !_obligationsPersistThrottle.shouldPersistNow()) {
+      return false;
+    }
+    // Serialize ONCE — the dedupe key must be the exact payload that
+    // gets appended.
+    final json = jsonEncode(payload);
+    if (!_obligationsPersistDeduper.shouldPersist(json)) return false;
+    try {
+      await session.appendCustomEntry(
+        customType: obligationsLedgerRecordType,
+        data: payload,
+      );
+      _obligationsPersistDeduper.confirmPersisted();
+      _obligationsPersistThrottle.confirmPersisted();
+      return true;
+    } on Object {
+      // Swallowed deliberately (LedgerSnapshotDeduper protocol note): a
+      // failed append must not poison every later write — roll the
+      // deduper back so the retried identical snapshot is NOT skipped.
+      _obligationsPersistDeduper.revertFailedPersist();
+      return false;
+    }
+  }
+
+  /// The trailing flush leg for a coalesced ingest (gh-1590): re-runs
+  /// the persist with the writer's CURRENT full payload — the window has
+  /// elapsed, so the gate passes naturally.
+  Future<void> _flushCoalescedObligations() async {
+    if ((_session, _obligationsWriter) case (
+      final Session session,
+      final ObligationsLedgerWriter writer,
+    )) {
+      await _appendObligationsSnapshot(session, writer.ledger.toPayload());
+    }
+  }
+
+  /// gh-1590: the shutdown flush for the obligations ledger — a
+  /// coalesced ingest lands NOW (the deduper suppresses a no-op) and
+  /// the throttle's trailing Timer leg disarms: a pending Timer must
+  /// never hold the isolate at process exit.
+  Future<void> _flushObligationsLedger() {
+    _obligationsPersistThrottle.dispose();
+    final session = _session;
+    final writer = _obligationsWriter;
+    if (session == null || writer == null) return Future.value();
+    return _appendObligationsSnapshot(
+      session,
+      writer.ledger.toPayload(),
+      force: true,
+    );
+  }
+
+  /// Handles a CodeMie auth-session expiry if [message] matches one. Returns
+  /// `true` when the expiry was handled and the turn is finished.
+
+  Future<void> _persistMessages() async {
+    final session = _session;
+    if (session == null) return;
+    final messages = _agent.state.messages;
+    for (final message in messages.skip(_persistedCount)) {
+      await session.appendMessage(message);
+    }
+    _persistedCount = messages.length;
+  }
+
+  /// Persists a stuck-call liveness record (`tool_heartbeat` /
+  /// `tool_stuck`, gh-1054) at the session leaf. Custom records stay out of
+  /// model context — they are the session-visible audit trail external
+  /// watchers (and post-mortems) read to distinguish alive-busy from dead.
+  ///
+  /// Free-text fields (the args summary, the stuck detail with its
+  /// partial-output pointer) pass through the host's redaction pipeline
+  /// first: the session JSONL is an audit surface and must not leak
+  /// secrets the in-run hooks already mask elsewhere (gh-1054 review).
+  Future<void> _persistToolLivenessRecord(
+    String customType,
+    Map<String, Object?> data,
+  ) async {
+    final session = _session;
+    if (session == null) return;
+    final pipeline = config.redactionPipeline;
+    final safe = pipeline == null
+        ? data
+        : {
+            for (final entry in data.entries)
+              entry.key: entry.value is String
+                  ? pipeline.redact(entry.value as String)
+                  : entry.value,
+          };
+    await session.appendCustomEntry(customType: customType, data: safe);
+  }
+
+  /// The args summary for a liveness record: the command for shell calls,
+  /// otherwise the truncated JSON of the arguments — the record must name
+  /// WHAT was stuck without bloating the ledger.
+  Object? _stuckArgsSummary(Map<String, dynamic> args) {
+    const cap = 500;
+    final command = args['command'];
+    if (command is String) {
+      return command.length > cap ? command.substring(0, cap) : command;
+    }
+    if (args.isEmpty) return null;
+    final json = jsonEncode(args);
+    return json.length > cap ? '${json.substring(0, cap)}…' : json;
+  }
+
+  /// Persists one in-memory [message] at the session leaf on demand (the
+  /// checkpoint/rewind controller's sink), keeping [_persistedCount] aligned
+  /// so the run-end batch persistence skips it. Returns the new record id.
+  Future<String> _persistOneMessage(Message message) async {
+    final session = _session;
+    if (session == null) return '';
+    final id = await session.appendMessage(message);
+    _persistedCount++;
+    return id;
+  }
+
+  /// Persists a TTSR injection at the session leaf (the TTSR controller's
+  /// sink): the reminder as a hidden `ttsr-injection` custom message (it
+  /// projects into context as a user message and survives compaction) plus a
+  /// `ttsr_injection` record of the rule names for session restore. Bumps
+  /// [_persistedCount] by one — the in-memory injection message then counts
+  /// as persisted.
+  Future<void> _persistTtsrInjection(
+    String content,
+    List<String> ruleNames,
+  ) async {
+    final session = _session;
+    if (session == null) return;
+    await session.appendCustomMessageEntry(
+      customType: ttsrInjectionCustomType,
+      content: content,
+      display: false,
+      details: {'rules': ruleNames},
+    );
+    await session.appendCustomEntry(
+      customType: ttsrInjectionRecordType,
+      data: {'rules': ruleNames},
+    );
+    _persistedCount++;
+  }
+
+  /// Composes the pending-wait watcher onto the agent's `afterToolCall`
+  /// hook (issue #1380 AC5) — the same prior-chain composition
+  /// `attachToolPhaseLabels` uses, so every earlier hook keeps running.
+  /// Only a SUCCESSFUL `schedule_message` writes: the scheduled id comes
+  /// from the tool's own result line, the reason from its arguments.
+  /// The outcome is reported on the CLI log when it is NOT a clean
+  /// recording — a silently-dropped ledger note must stay discoverable
+  /// (it used to be constructed and discarded, indistinguishable from
+  /// success).
+  void _attachObligationPendingWaits() {
+    final priorAfter = _agent.afterToolCall;
+    _agent.afterToolCall = (context, cancelToken) async {
+      if (!context.isError && context.toolCall.name == 'schedule_message') {
+        try {
+          final outcome = await recordPendingWait(
+            resultText: context.result.content
+                .whereType<TextContent>()
+                .map((block) => block.text)
+                .join('\n'),
+            arguments: context.toolCall.arguments,
+          );
+          if (!outcome.startsWith('pending-wait recorded')) {
+            io.writeln('[obligations] pending-wait not recorded: $outcome');
+          }
+        } on Object {
+          // The schedule itself succeeded; a failed ledger note must
+          // never fail the tool call that armed the timer.
+        }
+      }
+      return priorAfter == null ? null : await priorAfter(context, cancelToken);
+    };
+  }
+}

@@ -1,0 +1,759 @@
+/// Intent-based model roles with ordered fallback chains and path-scoped
+/// overrides — the configuration half of the model-roles feature.
+///
+/// Ported (reduced) from oh-my-pi `packages/coding-agent/src/config/
+/// model-resolver.ts` and `model-roles.ts`. Deliberate reductions:
+///
+/// - Only the four card-mandated roles exist here: `default`, `smol`, `slow`,
+///   `plan` (exact omp names). omp's `vision`/`designer`/`commit`/`tiny`/
+///   `task`/`advisor` roles and its fuzzy catalog matching (`matchModel`,
+///   thinking suffixes, `@upstream` routing) are not ported; our chains name
+///   concrete `provider/modelId` entries resolved against the small
+///   [provider catalog](provider_catalog.dart).
+/// - Role inheritance is simplified to omp's
+///   `shouldInheritDefaultBeforePriority` behavior: an unset non-default role
+///   resolves through the `default` role's chain.
+/// - Path-scoped overrides follow omp's scoped `enabledModels` semantics
+///   (entry applies when the cwd is the configured path or a subdirectory),
+///   extended with glob patterns (`*`, `**`) as the card requires.
+///
+/// Runtime resolution, key rotation, and the fallback stream live in the
+/// sibling files of this directory; this file is pure configuration:
+/// parsing, validation, serialization, and chain selection.
+library;
+
+import 'dart:convert';
+
+import 'package:yaml/yaml.dart';
+
+import '../exceptions.dart';
+import '../providers/provider_tuning.dart' show parseProviderTimeoutMs;
+import '../providers/thinking.dart';
+import '../utils/path_text.dart';
+import 'provider_catalog.dart'
+    show catalogProvider, parseAuthHeaderName, validateAuthHeaderDialect;
+
+/// The model roles supported by [ModelRolesConfig], in declaration order.
+///
+/// Exact omp role names (`default`, `smol`, `slow`, `plan`) plus the
+/// harness-local `subagent` delegation role.
+const modelRoleIds = ['default', 'smol', 'slow', 'plan', 'subagent', 'memory'];
+
+/// The role used for ordinary agent runs.
+const defaultModelRole = 'default';
+
+/// The role compaction summarization resolves through when configured.
+const smolModelRole = 'smol';
+
+/// The role long-term-memory LLM work (consolidation, semantic search)
+/// resolves through when configured. Falls back to `smol`, then the main
+/// model — the memory call shapes match the smol cost class.
+const memoryModelRole = 'memory';
+
+/// The role spawned subagents resolve through when configured (items
+/// without a specialist role — `explore` keeps `smol`, `review` keeps
+/// `slow`). Falls back to the parent model when unset.
+const subagentModelRole = 'subagent';
+
+/// One entry of a role's fallback chain: a concrete model plus an optional
+/// API-key base-name override.
+final class ModelRef {
+  /// Creates a model reference.
+  const ModelRef({
+    required this.provider,
+    required this.modelId,
+    this.apiKeyName,
+    this.baseUrl,
+    this.contextWindow,
+    this.maxTokens,
+    this.input,
+    this.thinkingLevel,
+    this.authHeader,
+    this.project,
+    this.connectTimeout,
+    this.streamIdleTimeout,
+    this.keyless = false,
+  });
+
+  /// Parses the string shorthand `provider/modelId`.
+  ///
+  /// Throws [ConfigException] when [value] is not `<provider>/<modelId>`
+  /// with both sides non-empty.
+  factory ModelRef.parse(String value, {String? role}) {
+    final slash = value.indexOf('/');
+    if (slash <= 0 || slash == value.length - 1) {
+      throw ConfigException(
+        'invalid model reference "$value"${role == null ? '' : ' in role "$role"'}'
+        ' — expected "provider/modelId"',
+      );
+    }
+    return ModelRef(
+      provider: value.substring(0, slash).trim(),
+      modelId: value.substring(slash + 1).trim(),
+    );
+  }
+
+  /// Parses one chain entry from yaml: either the string shorthand or a map
+  /// with `provider`/`model` plus optional overrides.
+  factory ModelRef.fromYaml(Object? node, {String? role}) {
+    switch (node) {
+      case String value:
+        return ModelRef.parse(value, role: role);
+      case YamlMap entry:
+        // Leaf reads bind to `entry` (not `map`/`doc`): the settings
+        // completeness gate counts literal `map['…']` reads in parser
+        // sources as TOP-LEVEL keys, and these are section leaves
+        // (issue #964 review — `authHeader` tripped the ratchet).
+        final provider = entry['provider'];
+        final model = entry['model'];
+        if (provider is! String || provider.trim().isEmpty) {
+          throw ConfigException(
+            'model chain entry${role == null ? '' : ' in role "$role"'} '
+            'is missing a "provider" string',
+          );
+        }
+        if (model is! String || model.trim().isEmpty) {
+          throw ConfigException(
+            'model chain entry${role == null ? '' : ' in role "$role"'} '
+            'is missing a "model" string',
+          );
+        }
+        final where =
+            'model chain entry${role == null ? '' : ' in role "$role"'}';
+        final authHeader = parseAuthHeaderName(entry['authHeader'], where);
+        validateAuthHeaderDialect(authHeader, catalogProvider(provider), where);
+        // The project rides the wire RAW (issue #1941): a non-Latin-1 value
+        // makes Dart reject the header MID-CHAT — refuse it at parse time
+        // (the codemie-code daemon omits the header instead; a chain ref
+        // explicitly DEMANDS the project, so loud beats silent).
+        final project = _optionalString(entry, 'project', role);
+        if (project != null &&
+            !RegExp(r'^[\x20-\x7E\xA0-\xFF]*$').hasMatch(project)) {
+          throw ConfigException(
+            '$where: "project" must be a Latin-1 '
+            'header value (0x20-0x7E, 0xA0-0xFF), got: $project',
+          );
+        }
+        final keyless = _optionalBool(entry, 'keyless', role);
+        final keyName = _optionalString(entry, 'apiKeyName', role);
+        if (keyless && keyName != null) {
+          throw ConfigException(
+            '$where: "keyless" and "apiKeyName" are mutually exclusive — '
+            'a keyless endpoint takes no credential, so "$keyName" would '
+            'be silently ignored',
+          );
+        }
+        return ModelRef(
+          provider: provider.trim(),
+          modelId: model.trim(),
+          apiKeyName: keyName,
+          baseUrl: _optionalString(entry, 'baseUrl', role),
+          contextWindow: _optionalInt(entry, 'contextWindow', role),
+          maxTokens: _optionalInt(entry, 'maxTokens', role),
+          input: _optionalInput(entry, role),
+          thinkingLevel: _optionalThinkingLevel(entry, role),
+          authHeader: authHeader,
+          // The CodeMie project the chain bills (issue #1941): a pin
+          // without it serves from the chain and bills the user's DEFAULT
+          // project — the selected one is silently ignored.
+          project: project,
+          // Per-provider stall-recovery tuning (issue #1398): the watchdog
+          // knobs ride the chain entry, same place baseUrl/keys live.
+          connectTimeout: parseProviderTimeoutMs(
+            entry['connectTimeoutMs'],
+            'connectTimeoutMs',
+            where,
+          ),
+          streamIdleTimeout: parseProviderTimeoutMs(
+            entry['streamIdleTimeoutMs'],
+            'streamIdleTimeoutMs',
+            where,
+          ),
+          keyless: keyless,
+        );
+      default:
+        throw ConfigException(
+          'invalid model chain entry${role == null ? '' : ' in role "$role"'}: '
+          'expected "provider/modelId" or a map, got ${node.runtimeType}',
+        );
+    }
+  }
+
+  static String? _optionalString(YamlMap map, String key, String? role) {
+    final value = map[key];
+    if (value == null) return null;
+    if (value is! String || value.trim().isEmpty) {
+      throw ConfigException(
+        '"$key"${role == null ? '' : ' in role "$role"'} must be a '
+        'non-empty string',
+      );
+    }
+    return value.trim();
+  }
+
+  static int? _optionalInt(YamlMap map, String key, String? role) {
+    final value = map[key];
+    if (value == null) return null;
+    if (value is! int || value <= 0) {
+      throw ConfigException(
+        '"$key"${role == null ? '' : ' in role "$role"'} must be a '
+        'positive integer',
+      );
+    }
+    return value;
+  }
+
+  /// A `keyless: true` flag (gh-1570 AC8): the entry's endpoint needs NO
+  /// credential (a localhost bench server). Only `true` means keyless —
+  /// absent, null and `false` all read as false.
+  static bool _optionalBool(YamlMap map, String key, String? role) {
+    final value = map[key];
+    if (value == null) return false;
+    if (value is! bool) {
+      throw ConfigException(
+        '"$key"${role == null ? '' : ' in role "$role"'} must be a boolean',
+      );
+    }
+    return value;
+  }
+
+  /// The `input` modality list override (`["text","image"]`): an explicit
+  /// declaration wins over the catalog spec's modalities (issue #638 —
+  /// same named-error rules as the `models.custom` yaml field).
+  static List<String>? _optionalInput(YamlMap node, String? role) {
+    final value = node['input'];
+    if (value == null) return null;
+    if (value is! YamlList || value.isEmpty) {
+      throw ConfigException(
+        '"input"${role == null ? '' : ' in role "$role"'} must be a '
+        'non-empty list of "text"/"image"',
+      );
+    }
+    return [
+      for (final entry in value)
+        if (entry == 'text' || entry == 'image')
+          entry as String
+        else
+          throw ConfigException(
+            '"input"${role == null ? '' : ' in role "$role"'} entries must '
+            'be "text" or "image", got: $entry',
+          ),
+    ];
+  }
+
+  /// The thinking-level rung override (issue #734): one of
+  /// [configThinkingLevels]; `xhigh`/`max` are accepted and normalize to
+  /// `high` (the same fold the wire clamp applies), anything else fails
+  /// loud naming the ladder.
+  static String? _optionalThinkingLevel(YamlMap node, String? role) {
+    // Leaf read on `node`, not `map`: whole-config map reads (`map['…']`/
+    // `doc['…']`) are the parity guard's top-level-schema signal
+    // (test/parity/settings_completeness_test.dart); section leaves
+    // (`node['…']`, like `input` above) stay out of that registry.
+    final value = node['thinkingLevel'];
+    if (value == null) return null;
+    if (value is! String) {
+      throw ConfigException(
+        '"thinkingLevel"${role == null ? '' : ' in role "$role"'} must be '
+        'one of ${configThinkingLevels.join(', ')}, got: $value',
+      );
+    }
+    return normalizeConfigThinkingLevel(value.trim()) ??
+        (throw ConfigException(
+          '"thinkingLevel"${role == null ? '' : ' in role "$role"'} must be '
+          'one of ${configThinkingLevels.join(', ')}, got: $value',
+        ));
+  }
+
+  /// Catalog provider name (e.g. `openrouter`, `openai`, `anthropic`,
+  /// `google`); see `provider_catalog.dart`.
+  final String provider;
+
+  /// The model id sent to the provider (e.g. `anthropic/claude-sonnet-4`).
+  final String modelId;
+
+  /// Base name of the API key in the secrets store. Rotation stacks
+  /// `[apiKeyName]` with `[apiKeyName]_2`, `[apiKeyName]_3`, ... When null,
+  /// the provider's canonical env name is used.
+  final String? apiKeyName;
+
+  /// Provider base-URL override; the catalog default is used when null.
+  final String? baseUrl;
+
+  /// Context-window override (tokens); the catalog default is used when null.
+  final int? contextWindow;
+
+  /// Max-output-token override; the catalog default is used when null.
+  final int? maxTokens;
+
+  /// Input-modality override (`["text","image"]`); the catalog spec's
+  /// modalities are used when null (issue #638).
+  final List<String>? input;
+
+  /// Thinking-level override (`minimal…max`, `xhigh`/`max` normalize to
+  /// `high`); the adapter default (no thinking) is used when null
+  /// (issue #734).
+  final String? thinkingLevel;
+
+  /// Auth header name override (`authHeader:`, issue #964): the built model
+  /// sends `<authHeader>: <key>` instead of `Authorization: Bearer <key>`.
+  /// Null keeps the Bearer default.
+  final String? authHeader;
+
+  /// The CodeMie project the entry's requests bill (`project:`, issue
+  /// #1941) — rides the chain model as the `x-codemie-project` header. Null
+  /// keeps the backend's default-project fallback.
+  final String? project;
+
+  /// Per-provider connect/first-headers watchdog override
+  /// (`connectTimeoutMs`, issue #1398). Null keeps the global
+  /// `providerTimeouts:` value, then the 180 s default.
+  final Duration? connectTimeout;
+
+  /// Per-provider stream-idle watchdog override (`streamIdleTimeoutMs`,
+  /// issue #1398). Null keeps the global value, then the 300 s default.
+  final Duration? streamIdleTimeout;
+
+  /// The endpoint needs NO credential (`keyless: true`, gh-1570 AC8): a
+  /// localhost bench server or an unauthenticated gateway. The resolver
+  /// treats the entry as always credentialed and the stream factory
+  /// receives the EMPTY key — byte-parity with the non-roles keyless
+  /// boot. Saved roles configs never outrank a keyless pin.
+  final bool keyless;
+
+  /// The `provider/modelId` display form.
+  String get label => '$provider/$modelId';
+
+  /// Serializes to the map form (round-trips with [ModelRef.fromYaml]).
+  ///
+  /// The per-field emission funnels through one [writeIf] seam: a flat,
+  /// branchless field list (one line per optional field, byte-identical
+  /// output) instead of an if-block per field — the block-per-field shape
+  /// pushed this method past the CRAP gate with the `project:` addition
+  /// (issue #1941 review).
+  String toYaml() {
+    final buffer = StringBuffer()
+      ..write('provider: $provider\n')
+      ..write('model: $modelId\n');
+    void writeIf(bool present, String line) {
+      if (present) buffer.write(line);
+    }
+
+    writeIf(apiKeyName != null, 'apiKeyName: $apiKeyName\n');
+    writeIf(baseUrl != null, 'baseUrl: $baseUrl\n');
+    writeIf(contextWindow != null, 'contextWindow: $contextWindow\n');
+    writeIf(maxTokens != null, 'maxTokens: $maxTokens\n');
+    writeIf(thinkingLevel != null, 'thinkingLevel: $thinkingLevel\n');
+    // The `?.` interpolations build a throwaway string when the field is
+    // absent — writeIf decides the EMISSION, so the null branch never
+    // reaches the buffer (and `!` here would crash before the check).
+    writeIf(input != null, 'input: [${input?.join(', ')}]\n');
+    // RFC 7230 tokens may lead with yaml specials (`#`, `*`, `!`): a raw
+    // scalar would round-trip as a comment/alias. JSON quoting keeps the
+    // round-trip lossless (issue #964 review). Project names are free text
+    // too (issue #1941) — same quoting.
+    writeIf(authHeader != null, 'authHeader: ${jsonEncode(authHeader)}\n');
+    writeIf(project != null, 'project: ${jsonEncode(project)}\n');
+    writeIf(
+      connectTimeout != null,
+      'connectTimeoutMs: ${connectTimeout?.inMilliseconds}\n',
+    );
+    writeIf(
+      streamIdleTimeout != null,
+      'streamIdleTimeoutMs: ${streamIdleTimeout?.inMilliseconds}\n',
+    );
+    writeIf(keyless, 'keyless: true\n');
+    return buffer.toString();
+  }
+}
+
+/// Knobs for the rate-limit retry/fallback engine, mirroring omp's
+/// non-compaction retry policy (`retry.*` settings).
+final class ModelRolesRetryPolicy {
+  /// Creates a retry policy; all values have omp-shaped defaults.
+  const ModelRolesRetryPolicy({
+    this.retriesPerEntry = 2,
+    this.baseDelay = const Duration(milliseconds: 500),
+    this.maxBackoff = const Duration(seconds: 8),
+    this.maxWait = const Duration(minutes: 5),
+    this.maxWaitForLastEntry = const Duration(minutes: 5),
+    this.keyBackoff = const Duration(minutes: 1),
+  });
+
+  /// Parses the optional `retry:` yaml section.
+  factory ModelRolesRetryPolicy.fromYaml(YamlMap map) {
+    int? intValue(String key) {
+      final value = map[key];
+      if (value == null) return null;
+      if (value is! int || value < 0) {
+        throw ConfigException('"retry.$key" must be a non-negative integer');
+      }
+      return value;
+    }
+
+    Duration? ms(String key) {
+      final value = intValue(key);
+      return value == null ? null : Duration(milliseconds: value);
+    }
+
+    final retries = intValue('retriesPerEntry');
+    return ModelRolesRetryPolicy(
+      retriesPerEntry: retries ?? 2,
+      baseDelay: ms('baseDelayMs') ?? const Duration(milliseconds: 500),
+      maxBackoff: ms('maxBackoffMs') ?? const Duration(seconds: 8),
+      maxWait: ms('maxWaitMs') ?? const Duration(minutes: 5),
+      maxWaitForLastEntry:
+          ms('maxWaitForLastEntryMs') ?? const Duration(minutes: 5),
+      keyBackoff: ms('keyBackoffMs') ?? const Duration(minutes: 1),
+    );
+  }
+
+  /// Same-model retries (with backoff) before the run falls to the next
+  /// chain entry. Key rotations do not consume this budget (omp switches
+  /// credentials for free before spending retries).
+  final int retriesPerEntry;
+
+  /// First backoff sleep between same-entry attempts (omp `retry.baseDelayMs`).
+  final Duration baseDelay;
+
+  /// Cap on the exponential same-entry backoff (omp caps at 8000 ms).
+  final Duration maxBackoff;
+
+  /// Give-up threshold: a required sleep longer than this fails over to the
+  /// next chain entry instead of sleeping (omp `retry.maxDelayMs`).
+  final Duration maxWait;
+
+  /// Sole-entry wait-out ceiling (issue #1066): when a required retry wait
+  /// exceeds [maxWait] and no other chain entry is available to fail over
+  /// to, the chain waits out the rate limit anyway — bounded to
+  /// `min(delay, maxWaitForLastEntry)` so a pathological `Retry-After`
+  /// (hours) still ends the chain.
+  final Duration maxWaitForLastEntry;
+
+  /// How long a key (or chain entry) stays in backoff after a rate-limit
+  /// failure that carried no `Retry-After` hint.
+  final Duration keyBackoff;
+
+  /// Backoff before same-entry attempt [attempt] (1-based): exponential from
+  /// [baseDelay], capped at [maxBackoff], with 75–100% jitter (omp's
+  /// Anthropic-style jitter so concurrent sessions do not retry in lockstep).
+  Duration backoffFor(int attempt, double jitterFraction) {
+    var ms = baseDelay.inMilliseconds * (1 << (attempt - 1).clamp(0, 20));
+    if (ms > maxBackoff.inMilliseconds) ms = maxBackoff.inMilliseconds;
+    final jitter = 0.75 + 0.25 * jitterFraction.clamp(0.0, 1.0);
+    return Duration(milliseconds: (ms * jitter).round());
+  }
+
+  /// Serializes to yaml (round-trips with [ModelRolesRetryPolicy.fromYaml]).
+  String toYaml() {
+    return 'retriesPerEntry: $retriesPerEntry\n'
+        'baseDelayMs: ${baseDelay.inMilliseconds}\n'
+        'maxBackoffMs: ${maxBackoff.inMilliseconds}\n'
+        'maxWaitMs: ${maxWait.inMilliseconds}\n'
+        'maxWaitForLastEntryMs: ${maxWaitForLastEntry.inMilliseconds}\n'
+        'keyBackoffMs: ${keyBackoff.inMilliseconds}\n';
+  }
+}
+
+/// A path-scoped set of role chains, applied when the cwd matches [pattern].
+final class PathRoleOverride {
+  /// Creates an override for [pattern] with per-role chains.
+  const PathRoleOverride({required this.pattern, required this.roles});
+
+  /// Parses one `modelOverrides` yaml entry.
+  factory PathRoleOverride.fromYaml(Object? node) {
+    if (node is! YamlMap) {
+      throw const ConfigException(
+        'modelOverrides entries must be maps with "path" and "roles"',
+      );
+    }
+    final path = node['path'];
+    if (path is! String || path.trim().isEmpty) {
+      throw const ConfigException(
+        'modelOverrides entries require a non-empty "path" string',
+      );
+    }
+    return PathRoleOverride(
+      pattern: path.trim(),
+      roles: parseRoleChains(node['roles'], source: 'modelOverrides "$path"'),
+    );
+  }
+
+  /// Absolute path, `~`-rooted path, or glob (`*` matches within a segment,
+  /// `**` matches across segments).
+  final String pattern;
+
+  /// Role → chain pinned for matching directories.
+  final Map<String, List<ModelRef>> roles;
+
+  /// Serializes to yaml (round-trips with [PathRoleOverride.fromYaml]).
+  String toYaml() {
+    final buffer = StringBuffer()
+      ..write('path: $pattern\n')
+      ..write('roles:\n');
+    buffer.write(_chainsToYaml(roles, indent: 2));
+    return buffer.toString();
+  }
+}
+
+/// Parses a `roles:` map (role name → chain). Shared by the top-level
+/// section and [PathRoleOverride]; [source] labels errors.
+Map<String, List<ModelRef>> parseRoleChains(Object? node, {String? source}) {
+  if (node is! YamlMap) {
+    throw ConfigException(
+      '${source ?? 'roles'} must be a map of role name to model chain',
+    );
+  }
+  final roles = <String, List<ModelRef>>{
+    for (final entry in node.entries)
+      _parseRoleName(entry.key, source): _parseRoleChain(
+        entry.key as String,
+        entry.value,
+        source,
+      ),
+  };
+  if (roles.isEmpty) {
+    throw ConfigException('${source ?? 'roles'} declares no roles');
+  }
+  return roles;
+}
+
+/// Validates one role key of a `roles:` map; [source] labels errors.
+String _parseRoleName(Object? role, String? source) {
+  if (role is! String || !modelRoleIds.contains(role)) {
+    throw ConfigException(
+      'unknown model role "$role"${source == null ? '' : ' in $source'}'
+      ' — supported roles: ${modelRoleIds.join(', ')}',
+    );
+  }
+  return role;
+}
+
+/// Parses one role's chain (a non-empty list of model references).
+List<ModelRef> _parseRoleChain(String role, Object? chainNode, String? source) {
+  if (chainNode is! YamlList || chainNode.isEmpty) {
+    throw ConfigException(
+      '${_roleWhere(role, source)} must be a non-empty list of model references',
+    );
+  }
+  return [
+    for (final chainEntry in chainNode)
+      ModelRef.fromYaml(chainEntry, role: role),
+  ];
+}
+
+String _roleWhere(String role, String? source) =>
+    source == null ? 'role "$role"' : '$source role "$role"';
+
+String _chainsToYaml(Map<String, List<ModelRef>> roles, {int indent = 0}) {
+  final pad = ' ' * indent;
+  final buffer = StringBuffer();
+  for (final role in modelRoleIds) {
+    final chain = roles[role];
+    if (chain == null) continue;
+    buffer.write('$pad$role:\n');
+    for (final ref in chain) {
+      final lines = ref.toYaml().trimRight().split('\n');
+      buffer.write('$pad  - ${lines.first}\n');
+      for (final line in lines.skip(1)) {
+        buffer.write('$pad    $line\n');
+      }
+    }
+  }
+  return buffer.toString();
+}
+
+/// Whether [pattern] matches the working directory [cwd].
+///
+/// Semantics (omp's scoped entries, extended with globs per the card):
+///
+/// - a `~` prefix expands against [homeDir] (pass it explicitly; this library
+///   is pure Dart and never reads the environment itself);
+/// - a pattern containing `*` is a glob: `*` matches any run of non-`/`
+///   characters, `**` matches anything (including `/`);
+/// - any other pattern is a path prefix: it matches the cwd itself and any
+///   of its subdirectories.
+///
+/// Matching is lexical (no filesystem access); redundant trailing slashes
+/// are stripped. The cwd should be absolute.
+bool pathPatternMatches(String pattern, String cwd, {String? homeDir}) {
+  final pat = _normalizePattern(pattern, homeDir);
+  if (pat == null) return false;
+  final dir = stripTrailingSlashes(cwd.trim());
+  if (pat.isEmpty || dir.isEmpty) return false;
+
+  if (pat.contains('*')) {
+    return _globPatternMatches(pat, dir);
+  }
+
+  return dir == pat || dir.startsWith('$pat/');
+}
+
+/// Trims [pattern] and expands a `~` prefix against [homeDir] (pass it
+/// explicitly; this library is pure Dart and never reads the environment
+/// itself). Returns `null` when the pattern needs a home directory that was
+/// not provided.
+String? _normalizePattern(String pattern, String? homeDir) {
+  var pat = pattern.trim();
+  if (pat.startsWith('~')) {
+    if (homeDir == null) return null;
+    pat = pat.length == 1 ? homeDir : '$homeDir${pat.substring(1)}';
+  }
+  return stripTrailingSlashes(pat);
+}
+
+/// Whether the glob [pattern] (`*` matches any run of non-`/` characters,
+/// `**` matches anything, including `/`) matches [dir] lexically.
+bool _globPatternMatches(String pattern, String dir) {
+  final regex = StringBuffer('^');
+  for (var i = 0; i < pattern.length; i++) {
+    final char = pattern[i];
+    if (char == '*') {
+      final doubleStar = i + 1 < pattern.length && pattern[i + 1] == '*';
+      regex.write(doubleStar ? '.*' : '[^/]*');
+      if (doubleStar) i++;
+    } else {
+      regex.write(RegExp.escape(char));
+    }
+  }
+  regex.write(r'$');
+  return RegExp(regex.toString()).hasMatch(dir);
+}
+
+/// Model-role configuration: role → ordered fallback chains, path-scoped
+/// overrides, and the retry policy.
+final class ModelRolesConfig {
+  /// Creates a config; [roles] maps role id to its ordered chain.
+  ModelRolesConfig({
+    required Map<String, List<ModelRef>> roles,
+    this.pathOverrides = const [],
+    this.retry = const ModelRolesRetryPolicy(),
+  }) : roles = Map.unmodifiable({
+         for (final entry in roles.entries)
+           entry.key: List<ModelRef>.unmodifiable(entry.value),
+       });
+
+  /// Parses the `roles:` / `modelOverrides:` / `retry:` sections of the CLI
+  /// config. Strict: any schema problem throws [ConfigException] (a corrupt
+  /// roles section must surface, never silently reset to defaults).
+  factory ModelRolesConfig.fromYaml(YamlMap map) {
+    final rolesNode = map['roles'];
+    if (rolesNode == null) {
+      throw const ConfigException('no "roles" section in config');
+    }
+    final roles = parseRoleChains(rolesNode);
+
+    final overridesNode = map['modelOverrides'];
+    final overrides = <PathRoleOverride>[];
+    if (overridesNode != null) {
+      if (overridesNode is! YamlList) {
+        throw const ConfigException('"modelOverrides" must be a list');
+      }
+      for (final entry in overridesNode) {
+        overrides.add(PathRoleOverride.fromYaml(entry));
+      }
+    }
+
+    final retryNode = map['retry'];
+    if (retryNode != null && retryNode is! YamlMap) {
+      throw const ConfigException('"retry" must be a map of retry settings');
+    }
+    final retry = retryNode == null
+        ? const ModelRolesRetryPolicy()
+        : ModelRolesRetryPolicy.fromYaml(retryNode);
+
+    return ModelRolesConfig(
+      roles: roles,
+      pathOverrides: overrides,
+      retry: retry,
+    );
+  }
+
+  /// Role id → ordered fallback chain (first entry is primary).
+  final Map<String, List<ModelRef>> roles;
+
+  /// Path-scoped role chains, most-specific match wins.
+  final List<PathRoleOverride> pathOverrides;
+
+  /// Retry/fallback knobs.
+  final ModelRolesRetryPolicy retry;
+
+  /// Resolves [role]'s chain for the working directory [cwd].
+  ///
+  /// Resolution order (mirroring omp):
+  ///
+  /// 1. the longest matching [pathOverrides] pattern that pins [role];
+  /// 2. the top-level [roles] chain for [role];
+  /// 3. for non-default roles, the `default` role's chain (omp's
+  ///    inherit-default-before-priority behavior);
+  /// 4. `null` when nothing applies (the caller falls back to its legacy
+  ///    single-model wiring).
+  List<ModelRef>? chainFor(String role, {String? cwd, String? homeDir}) {
+    if (!modelRoleIds.contains(role)) {
+      throw ConfigException(
+        'unknown model role "$role" — supported roles: '
+        '${modelRoleIds.join(', ')}',
+      );
+    }
+    if (cwd != null) {
+      final matching =
+          pathOverrides
+              .where(
+                (override) =>
+                    override.roles.containsKey(role) &&
+                    pathPatternMatches(override.pattern, cwd, homeDir: homeDir),
+              )
+              .toList()
+            ..sort((a, b) => b.pattern.length.compareTo(a.pattern.length));
+      if (matching.isNotEmpty) return matching.first.roles[role];
+    }
+    return roles[role] ??
+        (role == defaultModelRole ? null : roles[defaultModelRole]);
+  }
+
+  /// Whether [role] resolves EXPLICITLY for [cwd] — a top-level chain or a
+  /// matching [pathOverrides] pattern ([chainFor]'s steps 1–2) — rather
+  /// than through the inherit-default step. Callers distinguish "the user
+  /// configured this role here" from "the role rides the default chain":
+  /// a subagent keeps the parent's live wiring (its runtime-resolved
+  /// output-cap ladder entry) unless its role is genuinely pinned
+  /// (issue #302).
+  bool pinsRole(String role, {String? cwd, String? homeDir}) {
+    if (roles.containsKey(role)) return true;
+    if (cwd == null) return false;
+    return pathOverrides.any(
+      (override) =>
+          override.roles.containsKey(role) &&
+          pathPatternMatches(override.pattern, cwd, homeDir: homeDir),
+    );
+  }
+
+  /// Serializes to the `roles:` / `modelOverrides:` / `retry:` yaml sections
+  /// (round-trips with [ModelRolesConfig.fromYaml]).
+  String toYaml() {
+    final buffer = StringBuffer()
+      ..write('roles:\n')
+      ..write(_chainsToYaml(roles, indent: 2));
+    if (pathOverrides.isNotEmpty) {
+      buffer.write('modelOverrides:\n');
+      for (final override in pathOverrides) {
+        final lines = override.toYaml().trimRight().split('\n');
+        buffer.write('  - ${lines.first}\n');
+        for (final line in lines.skip(1)) {
+          buffer.write('    $line\n');
+        }
+      }
+    }
+    buffer
+      ..write('retry:\n')
+      ..write(
+        retry
+            .toYaml()
+            .trimRight()
+            .split('\n')
+            .map((line) => '  $line\n')
+            .join(),
+      );
+    return buffer.toString();
+  }
+}

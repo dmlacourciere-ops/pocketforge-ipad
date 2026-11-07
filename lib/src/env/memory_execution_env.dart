@@ -1,0 +1,578 @@
+/// Pure-Dart in-memory [ExecutionEnv] implementation.
+///
+/// This is the default environment for tests and web consumers: it keeps the
+/// whole filesystem in memory and implements the [FileSystem] never-throw
+/// invariant trivially. [MemoryExecutionEnv] adds a [Shell]; by default the
+/// shell is [UnavailableShell], which reports
+/// [ExecutionErrorCode.shellUnavailable] (the correct answer on web).
+library;
+
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'execution_env.dart';
+
+/// A point-in-time deep copy of a [MemoryFileSystem] tree — see
+/// [FsSnapshotExporter.exportSnapshot].
+final class MemoryFsSnapshot {
+  const MemoryFsSnapshot({required this.dirs, required this.files});
+
+  /// Every directory below the root, depth-first with children sorted by
+  /// name — the same order a [FileSystem.listDir]-based traversal yields.
+  final List<String> dirs;
+
+  /// File path → deep-copied bytes, in the same traversal order as [dirs]
+  /// (insertion-ordered map).
+  final Map<String, Uint8List> files;
+}
+
+/// A filesystem that can export a point-in-time deep copy of its whole
+/// tree in ONE synchronous pass.
+///
+/// Unlike an async `listDir`/`readBinaryFile` walk, a synchronous copy has
+/// no event-loop yield points, so a concurrent write can never interleave
+/// mid-copy and tear the snapshot. Persistence layers that serialize the
+/// tree (the web sandbox's `PersistentWebExecutionEnv`) must prefer this
+/// over walking whenever the delegate implements it.
+abstract interface class FsSnapshotExporter {
+  /// Deep-copies the whole tree below [FileSystem.cwd] synchronously.
+  /// Traversal order matches a `listDir` walk exactly (depth-first,
+  /// children sorted by name), so an export of a quiescent tree is
+  /// identical to an async walk of it.
+  MemoryFsSnapshot exportSnapshot();
+}
+
+/// In-memory [FileSystem] with POSIX-style (`/`-separated) paths.
+///
+/// Paths are normalized (`.`/`..` resolved, duplicate slashes collapsed) and
+/// relative paths are resolved against [cwd]. Writes and appends create
+/// parent directories automatically, matching the `dart:io` implementation.
+final class MemoryFileSystem
+    implements
+        FileSystem,
+        RangedReadFileSystem,
+        FsSnapshotExporter,
+        RenamableFileSystem {
+  /// Creates a [MemoryFileSystem] rooted at [cwd] (default `/`).
+  MemoryFileSystem({this.cwd = '/'}) {
+    _dirs.add('/');
+  }
+
+  @override
+  final String cwd;
+
+  final Map<String, _MemoryFile> _files = {};
+  final Set<String> _dirs = {};
+
+  String _normalize(String path) {
+    var p = path;
+    if (!p.startsWith('/')) p = '$cwd/$p';
+    final segments = <String>[];
+    for (final segment in p.split('/')) {
+      if (segment.isEmpty || segment == '.') continue;
+      if (segment == '..') {
+        if (segments.isNotEmpty) segments.removeLast();
+        continue;
+      }
+      segments.add(segment);
+    }
+    return segments.isEmpty ? '/' : '/${segments.join('/')}';
+  }
+
+  String _parentOf(String path) {
+    final index = path.lastIndexOf('/');
+    return index <= 0 ? '/' : path.substring(0, index);
+  }
+
+  void _ensureParents(String path) {
+    var dir = _parentOf(path);
+    final created = <String>[];
+    while (!_dirs.contains(dir)) {
+      created.add(dir);
+      dir = _parentOf(dir);
+    }
+    _dirs.addAll(created);
+  }
+
+  @override
+  Future<Result<String, FileError>> absolutePath(String path) async {
+    return Ok(_normalize(path));
+  }
+
+  @override
+  Future<Result<String, FileError>> joinPath(List<String> parts) async {
+    return Ok(_normalize(parts.join('/')));
+  }
+
+  Future<Result<_MemoryFile, FileError>> _readFile(String path) async {
+    final resolved = _normalize(path);
+    if (_dirs.contains(resolved)) {
+      return Err(
+        FileError(FileErrorCode.isDirectory, 'Is a directory', path: resolved),
+      );
+    }
+    final file = _files[resolved];
+    if (file == null) {
+      return Err(
+        FileError(FileErrorCode.notFound, 'No such file', path: resolved),
+      );
+    }
+    return Ok(file);
+  }
+
+  @override
+  Future<Result<String, FileError>> readTextFile(String path) async {
+    final result = await _readFile(path);
+    if (result.isErr) return Err(result.errorOrNull!);
+    return Ok(utf8.decode(result.valueOrNull!.bytes));
+  }
+
+  @override
+  Future<Result<Uint8List, FileError>> readBinaryFile(String path) async {
+    final result = await _readFile(path);
+    if (result.isErr) return Err(result.errorOrNull!);
+    return Ok(Uint8List.fromList(result.valueOrNull!.bytes));
+  }
+
+  @override
+  Future<Result<Uint8List, FileError>> readRange(
+    String path,
+    int start,
+    int end,
+  ) async {
+    final result = await _readFile(path);
+    if (result.isErr) return Err(result.errorOrNull!);
+    final bytes = result.valueOrNull!.bytes;
+    final from = start.clamp(0, bytes.length);
+    final to = end.clamp(from, bytes.length);
+    if (to <= from) return Ok(Uint8List(0));
+    return Ok(Uint8List.fromList(bytes.sublist(from, to)));
+  }
+
+  @override
+  Future<Result<List<String>, FileError>> readTextLines(
+    String path, {
+    int? maxLines,
+  }) async {
+    if (maxLines != null && maxLines <= 0) return const Ok([]);
+    final result = await readTextFile(path);
+    if (result.isErr) return Err(result.errorOrNull!);
+    var content = result.valueOrNull!;
+    if (content.endsWith('\n')) {
+      content = content.substring(0, content.length - 1);
+    }
+    final lines = content.isEmpty ? <String>[] : content.split('\n');
+    if (maxLines != null && lines.length > maxLines) {
+      return Ok(lines.sublist(0, maxLines));
+    }
+    return Ok(lines);
+  }
+
+  @override
+  Future<Result<void, FileError>> writeFile(String path, String content) async {
+    return writeBinaryFile(path, Uint8List.fromList(utf8.encode(content)));
+  }
+
+  @override
+  Future<Result<void, FileError>> writeBinaryFile(
+    String path,
+    Uint8List content,
+  ) async {
+    final resolved = _normalize(path);
+    _ensureParents(resolved);
+    _files[resolved] = _MemoryFile(
+      content,
+      DateTime.now().millisecondsSinceEpoch,
+    );
+    return const Ok(null);
+  }
+
+  @override
+  Future<Result<void, FileError>> appendFile(
+    String path,
+    String content,
+  ) async {
+    final resolved = _normalize(path);
+    _ensureParents(resolved);
+    final existing = _files[resolved];
+    final bytes = existing?.bytes ?? Uint8List(0);
+    final encoded = Uint8List.fromList(utf8.encode(content));
+    final appended = Uint8List(bytes.length + encoded.length);
+    appended.setAll(0, bytes);
+    appended.setAll(bytes.length, encoded);
+    _files[resolved] = _MemoryFile(
+      appended,
+      DateTime.now().millisecondsSinceEpoch,
+    );
+    return const Ok(null);
+  }
+
+  @override
+  MemoryFsSnapshot exportSnapshot() {
+    final root = _normalize(cwd);
+    final dirs = <String>[];
+    final files = <String, Uint8List>{};
+    void walk(String dir) {
+      final prefix = dir == '/' ? '/' : '$dir/';
+      final children = _childNames(dir, prefix).toList()..sort();
+      for (final name in children) {
+        final child = '$prefix$name';
+        if (_dirs.contains(child)) {
+          dirs.add(child);
+          walk(child);
+        } else {
+          final file = _files[child];
+          if (file != null) files[child] = Uint8List.fromList(file.bytes);
+        }
+      }
+    }
+
+    if (_dirs.contains(root)) walk(root);
+    return MemoryFsSnapshot(dirs: dirs, files: files);
+  }
+
+  /// Test-only: updates the modification time of [path] to [mtimeMs].
+  /// No-op when the file does not exist.
+  void setMtime(String path, int mtimeMs) {
+    final resolved = _normalize(path);
+    final file = _files[resolved];
+    if (file == null) return;
+    _files[resolved] = _MemoryFile(file.bytes, mtimeMs);
+  }
+
+  @override
+  Future<Result<FileInfo, FileError>> fileInfo(String path) async {
+    final resolved = _normalize(path);
+    final file = _files[resolved];
+    if (file != null) {
+      return Ok(
+        FileInfo(
+          name: resolved.split('/').last,
+          path: resolved,
+          kind: FileKind.file,
+          size: file.bytes.length,
+          mtimeMs: file.mtimeMs,
+        ),
+      );
+    }
+    if (_dirs.contains(resolved)) {
+      return Ok(
+        FileInfo(
+          name: resolved == '/' ? '/' : resolved.split('/').last,
+          path: resolved,
+          kind: FileKind.directory,
+          size: 0,
+          mtimeMs: 0,
+        ),
+      );
+    }
+    return Err(
+      FileError(
+        FileErrorCode.notFound,
+        'No such file or directory',
+        path: resolved,
+      ),
+    );
+  }
+
+  @override
+  Future<Result<List<FileInfo>, FileError>> listDir(String path) async {
+    final resolved = _normalize(path);
+    if (_files.containsKey(resolved)) {
+      return Err(
+        FileError(
+          FileErrorCode.notDirectory,
+          'Not a directory',
+          path: resolved,
+        ),
+      );
+    }
+    if (!_dirs.contains(resolved)) {
+      return Err(
+        FileError(FileErrorCode.notFound, 'No such directory', path: resolved),
+      );
+    }
+    final prefix = resolved == '/' ? '/' : '$resolved/';
+    final children = _childNames(resolved, prefix);
+    final infos = <FileInfo>[];
+    for (final name in children) {
+      final childPath = '$prefix$name';
+      final info = await fileInfo(childPath);
+      if (info.isOk) infos.add(info.valueOrNull!);
+    }
+    infos.sort((a, b) => a.name.compareTo(b.name));
+    return Ok(infos);
+  }
+
+  Set<String> _childNames(String resolved, String prefix) {
+    final children = <String>{};
+    for (final dir in _dirs) {
+      if (dir.startsWith(prefix) && dir != resolved) {
+        children.add(dir.substring(prefix.length).split('/').first);
+      }
+    }
+    for (final file in _files.keys) {
+      if (file.startsWith(prefix)) {
+        children.add(file.substring(prefix.length).split('/').first);
+      }
+    }
+    return children;
+  }
+
+  @override
+  Future<Result<bool, FileError>> exists(String path) async {
+    final resolved = _normalize(path);
+    return Ok(_files.containsKey(resolved) || _dirs.contains(resolved));
+  }
+
+  @override
+  Future<Result<void, FileError>> createDir(
+    String path, {
+    bool recursive = true,
+  }) async {
+    final resolved = _normalize(path);
+    if (!recursive) {
+      final parent = _parentOf(resolved);
+      if (!_dirs.contains(parent)) {
+        return Err(
+          FileError(
+            FileErrorCode.notFound,
+            'Parent directory missing',
+            path: resolved,
+          ),
+        );
+      }
+    }
+    _dirs.add(resolved);
+    _ensureParents(resolved);
+    return const Ok(null);
+  }
+
+  @override
+  Future<Result<void, FileError>> remove(
+    String path, {
+    bool recursive = false,
+    bool force = false,
+  }) async {
+    final resolved = _normalize(path);
+    final isFile = _files.containsKey(resolved);
+    final isDir = _dirs.contains(resolved);
+    if (!isFile && !isDir) {
+      if (force) return const Ok(null);
+      return Err(
+        FileError(
+          FileErrorCode.notFound,
+          'No such file or directory',
+          path: resolved,
+        ),
+      );
+    }
+    if (isFile) {
+      _files.remove(resolved);
+      return const Ok(null);
+    }
+    return _removeDir(resolved, recursive: recursive);
+  }
+
+  @override
+  Future<Result<void, FileError>> renamePath(String from, String to) async {
+    final resolvedFrom = _normalize(from);
+    final resolvedTo = _normalize(to);
+    final file = _files[resolvedFrom];
+    if (file == null) {
+      return Err(
+        FileError(
+          FileErrorCode.notFound,
+          'No such file or directory',
+          path: resolvedFrom,
+        ),
+      );
+    }
+    _files.remove(resolvedFrom);
+    _files[resolvedTo] = file;
+    return const Ok(null);
+  }
+
+  Result<void, FileError> _removeDir(
+    String resolved, {
+    required bool recursive,
+  }) {
+    final prefix = '$resolved/';
+    final hasChildren =
+        _dirs.any((d) => d.startsWith(prefix)) ||
+        _files.keys.any((f) => f.startsWith(prefix));
+    if (hasChildren && !recursive) {
+      return Err(
+        FileError(FileErrorCode.invalid, 'Directory not empty', path: resolved),
+      );
+    }
+    _dirs.removeWhere((d) => d == resolved || d.startsWith(prefix));
+    _files.removeWhere((f, _) => f.startsWith(prefix));
+    return const Ok(null);
+  }
+}
+
+final class _MemoryFile {
+  _MemoryFile(this.bytes, this.mtimeMs);
+
+  final Uint8List bytes;
+  final int mtimeMs;
+}
+
+/// A [Shell] that reports [ExecutionErrorCode.shellUnavailable] for every
+/// command — the correct behavior on platforms without a process shell
+/// (web, or any sandboxed environment).
+final class UnavailableShell implements Shell {
+  /// Creates an [UnavailableShell].
+  const UnavailableShell();
+
+  @override
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  }) async {
+    return const Err(
+      ExecutionError(
+        ExecutionErrorCode.shellUnavailable,
+        'No shell is available in this environment',
+      ),
+    );
+  }
+}
+
+/// Replays one stored snapshot envelope into [delegate]: parses and
+/// validates everything BEFORE touching the tree so a corrupt snapshot
+/// cannot leave a half-restored filesystem, then creates the dirs and
+/// writes the files.
+///
+/// Returns the envelope's v1-ness on a successful replay (`true` = the
+/// pre-migration sessions-inline envelope is again the only durable copy
+/// of the sessions until the next full save pass — issue #238 F1), or
+/// null when the envelope is unreadable, carries an unhandled version, or
+/// the replay threw — the caller then preserves the raw record under its
+/// backup key instead of discarding it (version bumps must never wipe).
+///
+/// Shared codec of the snapshot envelope (`version`/`dirs`/`files`
+/// records written by the persistence mirrors); the app's
+/// `PersistentWebExecutionEnv` and the extension's `ChromeStorageEnv`
+/// twin both restore through it (issue #1996 — the decode/replay block
+/// used to live twice).
+Future<bool?> restoreSnapshotEnvelope(
+  ExecutionEnv delegate,
+  String raw,
+  int currentVersion,
+) async {
+  Map<String, dynamic> decoded;
+  try {
+    final d = jsonDecode(raw);
+    if (d is! Map<String, dynamic>) return null;
+    decoded = d;
+  } on Object {
+    return null;
+  }
+  final version = decoded['version'];
+  if (version != 1 && version != currentVersion) return null;
+  try {
+    final dirs = <String>[for (final d in decoded['dirs'] as List) d as String];
+    final files = <(String, Uint8List)>[
+      for (final f in decoded['files'] as List)
+        ((f as Map)['path'] as String, base64Decode(f['data'] as String)),
+    ];
+    for (final dir in dirs) {
+      await delegate.createDir(dir);
+    }
+    for (final (path, bytes) in files) {
+      await delegate.writeBinaryFile(path, bytes);
+    }
+    return version == 1;
+  } on Object {
+    // Corrupt snapshot → clean start, never crash boot.
+    return null;
+  }
+}
+
+/// Overlays version-independent session records onto a restored tree
+/// (newer-or-equal truth): one corrupt record costs that file, not boot.
+/// [sessionPathOf] maps a record key to its session path (null skips the
+/// key); the class-specific key shape stays with each twin.
+///
+/// Returns the record keys seen, so the caller can seed its
+/// stale-record eviction set (issues #237/#238 ordering). Shared by the
+/// app's `PersistentWebExecutionEnv` and the extension's
+/// `ChromeStorageEnv` (issue #1996).
+Future<Set<String>> restoreSessionRecords(
+  ExecutionEnv delegate,
+  Map<String, Object?> records,
+  String? Function(String key) sessionPathOf,
+) async {
+  final keys = <String>{};
+  for (final entry in records.entries) {
+    final path = sessionPathOf(entry.key);
+    if (path == null) continue;
+    keys.add(entry.key);
+    final data = entry.value;
+    if (data is! String) continue;
+    try {
+      await delegate.writeBinaryFile(path, base64Decode(data));
+    } on Object {
+      // Torn record → skip this file only (the session layer's own
+      // quarantine handles a broken JSONL from here).
+    }
+  }
+  return keys;
+}
+
+/// In-memory [ExecutionEnv]: [MemoryFileSystem] plus a [Shell].
+///
+/// The default shell is [UnavailableShell]; pass a custom [shell] to test
+/// shell-consuming code without spawning real processes. When the shell
+/// implements [BackgroundShell] (the app's sandbox shells do), the env
+/// forwards detached-job calls to it.
+final class MemoryExecutionEnv extends MemoryFileSystem
+    implements ExecutionEnv, BackgroundShell {
+  /// Creates a [MemoryExecutionEnv] rooted at [cwd].
+  MemoryExecutionEnv({super.cwd, this._shell = const UnavailableShell()});
+
+  final Shell _shell;
+
+  @override
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  }) {
+    return _shell.exec(command, options: options);
+  }
+
+  @override
+  bool get backgroundJobsSupported {
+    final shell = _shell;
+    if (shell case final BackgroundShell bg) return bg.backgroundJobsSupported;
+    return false;
+  }
+
+  @override
+  Future<Result<ShellJob, ExecutionError>> startShellJob(
+    String command, {
+    required String id,
+    required String logPath,
+    ShellExecOptions? options,
+  }) {
+    final shell = _shell;
+    if (shell case final BackgroundShell bg) {
+      return bg.startShellJob(
+        command,
+        id: id,
+        logPath: logPath,
+        options: options,
+      );
+    }
+    return Future.value(
+      const Err(
+        ExecutionError(
+          ExecutionErrorCode.shellUnavailable,
+          'background shell jobs are not supported by this shell',
+        ),
+      ),
+    );
+  }
+}

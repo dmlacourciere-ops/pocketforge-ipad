@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Attach assets to <tag>'s release, creating it when missing — the single
+# draft-capable create path for build-macos.yml / build-mobile.yml
+# (issue #282 E3 + review of #294).
+#
+# Race-idempotent (E3): if `gh release create` loses the view→create race
+# (another job/run created the release in between), fall back to
+# uploading into the winner's release instead of failing. A failed create
+# would fire the job's draft lifecycle guard against the WINNER's
+# in-flight draft.
+#
+# Ownership-stamped: the create path makes a DRAFT (gh-1801 rework: the
+# release never goes live from a leg — the tag-run release-provenance job
+# publishes + flags latest once the signed SHA256SUMS is attached). The
+# body stamps
+#   <!-- release-draft-owner: run/<run_id>/job/<job_id> -->
+# and release_draft_guard.sh deletes that draft ONLY on an exact
+# run+job match — never the sibling leg's mid-upload draft (daily-publish
+# runs the mobile and macOS legs concurrently on the same derived tag).
+# The marker is an invisible HTML comment in the body.
+#
+# Usage: release_attach_or_create.sh <tag> <asset> [<asset>...]
+#   reads the release body from release-notes.md in the CWD (a minimal
+#   body is written when the file is missing/empty)
+# Env: GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_JOB (Actions defaults),
+#      GH_TOKEN/GITHUB_TOKEN.
+set -euo pipefail
+
+tag="${1:?usage: release_attach_or_create.sh <tag> <assets...>}"
+repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
+shift
+assets=("$@")
+if [ "${#assets[@]}" -eq 0 ]; then
+  # gh-1801 hard refusal: creating a release with zero resolved assets is
+  # the `fa update` breaker (an empty `latest` 404s every
+  # fa-<os>-<arch>.tar.gz until backfill — v1.0.630, 2026-10-23). Attaching
+  # is the caller's only honest option when it resolved nothing — fail
+  # loud here, never create empty. Pinned by
+  # test/release_empty_latest_guard_test.dart.
+  echo "::error::no assets to attach for $tag — refusing to create or touch a release with an empty asset list (gh-1801): resolve at least one artifact or skip the release step" >&2
+  exit 1
+fi
+
+upload_all() { # exists-path: gate-guarded attach + (servable DRAFT-only) publish + latest
+  # gh-2042 (AC1): every upload passes the immutability gate — on a
+  # PUBLISHED release an unattached fa-* asset refuses the whole call loud,
+  # an already-attached one skips, and non-fa store/DMG refreshers keep
+  # their clobber-refresh contract. Drafts attach exactly as before.
+  # gh-2042 (review): ONE call for the WHOLE list — the gate's contract is
+  # per-call all-or-nothing ("refuse before any upload"), so per-asset
+  # invocation would judge each asset against its own release-view
+  # snapshot (N round-trips, a wider draft→published TOCTOU window, and a
+  # partial mutation when an early benign asset uploads before a later
+  # fa-* refusal).
+  bash "$(dirname "$0")/release_asset_gate.sh" "$tag" "${assets[@]}"
+  # Latest policy (#282 + gh-1801 rework + gh-2042): publish + latest ONLY
+  # when the release can actually serve `fa update` — that means the signed
+  # checksums are already on it (`fa update` hard-fails without
+  # SHA256SUMS(.sig), bin/self_manage.dart provenance gate) — AND it is
+  # still a DRAFT (the provenance-flip recovery window). A PUBLISHED
+  # release is never re-flaged `--latest` here: on an older release that
+  # would drag the latest badge (and `fa update`) backwards to a downgrade.
+  if release_serves_fa_update; then
+    case "$(gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft 2>/dev/null || echo false)" in
+      true)
+        gh release edit "$tag" --draft=false --latest --repo "$repo"
+        # gh-1899: same duplicate-tag race as the tag train — a twin draft
+        # minted by a sibling leg of THIS run would otherwise rot until the
+        # 24h sweeper. The tag is published and servable here (the flip is
+        # gated on the signed checksums), so own-run twin drafts are orphans.
+        bash "$(dirname "$0")/release_draft_dedupe.sh" "$tag" \
+          || echo "::warning::gh-1899 twin-draft dedupe failed — the release is published and servable, so this is cleanup noise only; the 24h sweeper remains the backstop"
+        ;;
+      *)
+        echo "release $tag is already published — publish/latest flip skipped (gh-2042: latest never moves backwards; the signed SHA256SUMS re-upload is release-provenance's job)"
+        ;;
+    esac
+  else
+    echo "release $tag is not yet servable (no SHA256SUMS on it) — publish+latest left to the release-provenance step (gh-1801)"
+  fi
+}
+
+# fa-update servability = the signed checksums are on the release. Every
+# fa-* archive alone is NOT enough: `fa update` fetches SHA256SUMS(.sig)
+# and aborts when either is missing (bin/self_manage.dart).
+release_serves_fa_update() {
+  local names
+  names=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null || true)
+  printf '%s\n' "$names" | grep -qE '^SHA256SUMS(\.sig)?$'
+}
+
+if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+  upload_all
+  echo "✅ attached ${#assets[@]} asset(s) to existing release $tag"
+  exit 0
+fi
+
+# Body: prepared notes (CHANGELOG section / conventional-commit fallback)
+# plus the ownership marker the guard verifies before deleting.
+notes="release-notes.md"
+marker="<!-- release-draft-owner: run/${GITHUB_RUN_ID:?GITHUB_RUN_ID must be set (GitHub Actions default env)}/job/${GITHUB_JOB:?GITHUB_JOB must be set (GitHub Actions default env)} -->"
+[ -s "$notes" ] || printf 'Release %s — see the CHANGELOG.\n' "$tag" > "$notes"
+grep -qF "$marker" "$notes" || printf '\n%s\n' "$marker" >> "$notes"
+
+# A `gh release create` for a MISSING tag mints a lightweight API tag:
+# no push event → no ci.yml tag run → no publish/binaries (the v0.1.408
+# silent class, issue #597). If the ref is absent, mint it as an
+# ANNOTATED tag and push it with the PAT the job already carries
+# (GH_TOKEN=RELEASE_PAT in build-macos) so the tag CI fires. The mint
+# itself (GH_TOKEN guard, persisted-checkout-extraheader strip, push,
+# train-start verification) lives in scripts/release_tag_mint.sh —
+# gh-2026: the v1.0.663 / v1.0.665 minted pushes rode actions/checkout's
+# persisted GITHUB_TOKEN extraheader (it outranks the URL credentials),
+# GitHub suppresses workflow triggers for GITHUB_TOKEN pushes, no tag run
+# ever existed on those refs, and the drafts rotted behind green legs.
+# A mint whose train does not start now fails loud BEFORE any draft is
+# created, so the leg goes red and the failure-path draft guard has
+# nothing to reclaim.
+# Gate on the DEFINITE missing verdict (ls-remote --exit-code rc 2):
+# sandboxes without an origin remote fatal with 128 — indeterminable
+# falls through to the plain create path (test fixtures rely on it).
+set +e
+git ls-remote --exit-code origin "refs/tags/$tag" >/dev/null 2>&1
+ls_remote_rc=$?
+set -e
+if [ "$ls_remote_rc" -eq 2 ]; then
+  bash "$(dirname "$0")/release_tag_mint.sh" "$tag"
+fi
+
+# Bare vX.Y.Z title (#282): matches the tag, matches pub.dev. gh-1801
+# rework: the create is DRAFT-ONLY. Whatever this leg resolved
+# (AAB/IPA/store APKs, DMGs/zips) is not the signed provenance `fa update`
+# demands — a leg that arrives first must never publish the release, let
+# alone flag it latest (threads 2/6). The draft is ownership-stamped (the
+# marker below) so this job's draft lifecycle guard reclaims it on
+# failure; the tag-run binaries job attaches the CLI assets into it and
+# release-provenance (ci.yml) publishes + flags latest once SHA256SUMS.sig
+# is on board.
+if gh release create "$tag" \
+  --repo "$repo" \
+  --title "$tag" \
+  --draft \
+  --notes-file "$notes" \
+  "${assets[@]}"; then
+  echo "✅ created draft release $tag with ${#assets[@]} asset(s) — publish is provenance-owned (gh-1801)"
+  exit 0
+fi
+
+# E3 idempotency: the create may have lost the view→create race — the
+# winner's release now exists. Attach instead of failing (a failing
+# create would fire the guard against the winner's in-flight draft).
+if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+  upload_all
+  echo "✅ lost the create race — attached ${#assets[@]} asset(s) to the concurrently created release $tag"
+  exit 0
+fi
+
+echo "::error::release create for $tag failed and no concurrent release appeared — see the step log above" >&2
+exit 1

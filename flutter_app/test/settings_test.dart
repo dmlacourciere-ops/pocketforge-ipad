@@ -1,0 +1,1257 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/ui/screens/chat_screen.dart';
+import 'package:fa/services/flutter_session_manager.dart';
+import 'package:fa/services/last_connection.dart';
+import 'package:fa/main.dart';
+import 'package:fa/services/provider_registry.dart';
+import 'package:fa/ui/screens/models_settings_page.dart';
+import 'package:fa/ui/screens/provider_editor_page.dart';
+import 'package:fa/ui/screens/settings.dart';
+import 'package:fa_ui/fa_ui.dart'
+    show
+        AddProviderPresetPickerPage,
+        MediaModelsScope,
+        MediaModelsStore,
+        ProviderPreset;
+import 'package:fa/transformers_js/transformers_js_types.dart';
+import 'package:fa/webllm/webllm_types.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fa_ui/fa_ui.dart'
+    show MediaSlotModelPage, MediaSlotProviderPickerPage;
+
+StreamFunction _singleTextResponse(String text) {
+  return (model, context, {cancelToken}) {
+    final stream = AssistantMessageEventStream();
+    final message = AssistantMessage(
+      content: [TextContent(text: text)],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: Usage.zero,
+      stopReason: StopReason.stop,
+      timestamp: DateTime.now(),
+    );
+    stream.push(DoneEvent(reason: StopReason.stop, message: message));
+    stream.end();
+    return stream;
+  };
+}
+
+AgentService _fakeService() {
+  return AgentService(
+    agent: Agent(
+      model: Model(
+        id: 'test-model',
+        api: 'test-api',
+        provider: 'test',
+        baseUrl: 'https://example.com',
+        contextWindow: 100000,
+        maxTokens: 4096,
+      ),
+      systemPrompt: 'You are Fa.',
+      streamFunction: _singleTextResponse('hi'),
+      toolRegistry: ToolRegistry(const []),
+    ),
+    env: MemoryExecutionEnv(),
+    sessionsRoot: '/sessions',
+  );
+}
+
+TextField _field(WidgetTester tester, String label) {
+  return tester.widget<TextField>(find.widgetWithText(TextField, label));
+}
+
+/// Picks the provider row labelled [label] in the provider-first list.
+Future<void> _selectProvider(WidgetTester tester, String label) async {
+  await tester.ensureVisible(find.text(label).last);
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
+}
+
+/// Taps the form's primary button, scrolling it into view first (the form
+/// can overflow small test surfaces).
+Future<void> _tapConnect(WidgetTester tester, String label) async {
+  await tester.ensureVisible(find.text(label));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label));
+  await tester.pump();
+}
+
+/// A TextField inside the full-screen provider add/edit page.
+Finder _editorField(String label) {
+  return find.descendant(
+    of: find.byType(ProviderEditorPage),
+    matching: find.widgetWithText(TextField, label),
+  );
+}
+
+/// A `/models` fetch reporting two chat models (the quick-select path).
+Future<ModelsEndpointInfo> _someModels(
+  String baseUrl, {
+  required String apiKey,
+}) async =>
+    (const ['acme-1', 'acme-2'], const <String, int>{}, const <String, int>{});
+
+/// Sets the provider editor's model through the model selector its model
+/// row opens (the editor itself has no model text field anymore).
+Future<void> _setEditorModel(
+  WidgetTester tester,
+  String rowLabel,
+  String modelId,
+) async {
+  await tester.tap(
+    find.descendant(
+      of: find.byType(ProviderEditorPage),
+      matching: find.widgetWithText(InkWell, rowLabel),
+    ),
+  );
+  await tester.pumpAndSettle();
+  final page = find.byType(MediaSlotModelPage);
+  expect(page, findsOneWidget);
+  await tester.enterText(
+    find.descendant(
+      of: page,
+      matching: find.widgetWithText(TextField, 'Model id'),
+    ),
+    modelId,
+  );
+  await tester.tap(
+    find.descendant(
+      of: page,
+      matching: find.widgetWithText(FilledButton, 'Save'),
+    ),
+  );
+  await tester.pumpAndSettle();
+}
+
+Future<void> _pumpForm(
+  WidgetTester tester,
+  ProviderRegistry registry, {
+  Future<void> Function(AgentConfig config)? onConnect,
+  WebLlmEngineApi? webLlmEngine,
+  TransformersJsEngineApi? transformersJsEngine,
+  ModelsEndpointFetcher? modelsFetcher,
+  bool? isWeb,
+}) {
+  return tester.pumpWidget(
+    MaterialApp(
+      home: Scaffold(
+        body: SingleChildScrollView(
+          child: AgentSettingsForm(
+            registry: registry,
+            webLlmEngine: webLlmEngine,
+            transformersJsEngine: transformersJsEngine,
+            modelsFetcher: modelsFetcher,
+            isWeb: isWeb,
+            onConnect: onConnect ?? (_) async {},
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+/// Fake [TransformersJsEngineApi] for the settings form: records load calls,
+/// emits scripted progress reports, and can hold the load open (to assert
+/// mid-download UI) or fail it.
+final class FakeTransformersJsEngine implements TransformersJsEngineApi {
+  var available = true;
+  Object? loadError;
+
+  /// Standard (async) broadcast, like the real engine: progress lands on a
+  /// later microtask, so tests pump to let it render.
+  final progress = StreamController<TransformersJsProgress>.broadcast();
+
+  TransformersJsModelPreset? loadedPreset;
+
+  /// While non-null and incomplete, `loadModel` awaits it after emitting
+  /// [pendingProgress].
+  Completer<void>? loadGate;
+
+  /// Emitted by `loadModel` before the gate.
+  TransformersJsProgress? pendingProgress;
+
+  @override
+  bool get isAvailable => available;
+
+  @override
+  String? get loadedModelId => loadedPreset?.id;
+
+  @override
+  Stream<TransformersJsProgress> get progressEvents => progress.stream;
+
+  @override
+  Future<void> loadModel(TransformersJsModelPreset preset) async {
+    final error = loadError;
+    if (error != null) throw error;
+    final pending = pendingProgress;
+    if (pending != null) progress.add(pending);
+    final gate = loadGate;
+    if (gate != null) await gate.future;
+    loadedPreset = preset;
+  }
+
+  @override
+  Future<void Function()> chatStream({
+    required List<TransformersJsChatMessage> messages,
+    required void Function(String chunk) onChunk,
+    void Function(String finishReason)? onDone,
+    void Function(String message)? onError,
+    int? maxTokens,
+  }) async => () {};
+
+  @override
+  Future<void> interrupt() async {}
+
+  @override
+  Future<void> unloadModel() async {}
+
+  @override
+  Future<TransformersJsCacheInfo?> modelCacheInfo(String modelId) async => null;
+
+  @override
+  Future<void> deleteCachedModel(String modelId) async {}
+}
+
+final class FakeWebLlmEngine implements WebLlmEngineApi {
+  var available = true;
+  Object? loadError;
+
+  /// Standard (async) broadcast, like the real engine: progress lands on
+  /// a later microtask, so tests pump to let it render.
+  final progress = StreamController<WebLlmProgress>.broadcast();
+
+  WebLlmModelPreset? loadedPreset;
+
+  /// While non-null and incomplete, `loadModel` awaits it after emitting
+  /// [pendingProgress].
+  Completer<void>? loadGate;
+
+  /// Emitted by `loadModel` before the gate.
+  WebLlmProgress? pendingProgress;
+
+  @override
+  bool get isAvailable => available;
+
+  @override
+  String? get loadedModelId => loadedPreset?.id;
+
+  @override
+  Stream<WebLlmProgress> get progressEvents => progress.stream;
+
+  @override
+  Future<void> loadModel(WebLlmModelPreset preset) async {
+    final error = loadError;
+    if (error != null) throw error;
+    final pending = pendingProgress;
+    if (pending != null) progress.add(pending);
+    final gate = loadGate;
+    if (gate != null) await gate.future;
+    loadedPreset = preset;
+  }
+
+  @override
+  Future<void Function()> chatStream({
+    required List<WebLlmChatMessage> messages,
+    required void Function(String chunk) onChunk,
+    void Function(String finishReason)? onDone,
+    void Function(String message)? onError,
+    int? maxTokens,
+  }) async => () {};
+
+  @override
+  Future<void> interrupt() async {}
+
+  @override
+  Future<WebLlmCacheInfo?> modelCacheInfo(String modelId) async => null;
+
+  @override
+  Future<void> deleteCachedModel(String modelId) async {}
+}
+
+void main() {
+  group('BYOK setup screen', () {
+    testWidgets('shows the provider picker, key/model/url fields, and the '
+        'key-storage notice', (tester) async {
+      await tester.pumpWidget(const MyApp());
+
+      expect(find.text('Connect to Fa'), findsOneWidget);
+      // The provider-first list shows the built-in presets directly.
+      expect(find.text('OpenRouter'), findsOneWidget);
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+      expect(find.text('Ollama'), findsOneWidget);
+      expect(find.text('Custom'), findsOneWidget);
+      // WebLLM is web-only; on the default (non-web) test platform it is
+      // hidden even though its engine stub exists.
+      expect(find.text('On-device (WebLLM)'), findsNothing);
+      await tester.tap(find.text('OpenRouter').last);
+      await tester.pumpAndSettle();
+
+      expect(find.text('Add provider'), findsOneWidget);
+      expect(find.text('API key'), findsOneWidget);
+      expect(find.text('Model id'), findsOneWidget);
+      expect(find.text('Base URL'), findsOneWidget);
+      // Android is a KeychainStore surface now (issue #329) and tests run
+      // on the default android target: the hosted note states on-device
+      // secure storage instead of "in-memory only … gone on reload".
+      expect(
+        find.textContaining('secure key store (Keychain/Keystore)'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('gone on reload'), findsNothing);
+      expect(find.text('Start chat'), findsOneWidget);
+    });
+
+    testWidgets('requires an API key before connecting', (tester) async {
+      await tester.pumpWidget(const MyApp());
+
+      await _tapConnect(tester, 'Start chat');
+
+      expect(find.text('API key is required'), findsOneWidget);
+      // Still on the setup screen — no navigation happened.
+      expect(find.text('Connect to Fa'), findsOneWidget);
+    });
+
+    testWidgets('defaults to OpenRouter with a read-only base URL', (
+      tester,
+    ) async {
+      await tester.pumpWidget(const MyApp());
+      // Provider-first form: reveal the OpenRouter fields by picking it.
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('OpenRouter').first);
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+
+      final url = _field(tester, 'Base URL');
+      expect(url.enabled, isFalse);
+      expect(url.controller!.text, 'https://openrouter.ai/api/v1');
+      expect(
+        _field(tester, 'Model id').controller!.text,
+        ProviderPreset.openrouter.defaultModel,
+      );
+      // Built-in presets cannot be edited or deleted.
+      expect(find.text('Edit'), findsNothing);
+      expect(find.text('Delete'), findsNothing);
+    });
+
+    testWidgets('switching presets updates the base URL and model default', (
+      tester,
+    ) async {
+      await tester.pumpWidget(const MyApp());
+
+      await _selectProvider(tester, 'Ollama');
+
+      expect(
+        _field(tester, 'Base URL').controller!.text,
+        'https://ollama.com/v1',
+      );
+      expect(_field(tester, 'Model id').controller!.text, 'gpt-oss:120b');
+      // Ollama Cloud may block browser calls — the UI must say so.
+      expect(find.textContaining('CORS'), findsOneWidget);
+    });
+
+    testWidgets('custom preset enables the base URL field and shows the '
+        'CORS note', (tester) async {
+      await tester.pumpWidget(const MyApp());
+
+      await _selectProvider(tester, 'Custom');
+
+      expect(_field(tester, 'Base URL').enabled, isTrue);
+      expect(find.textContaining('CORS'), findsOneWidget);
+      expect(find.textContaining('api.anthropic.com'), findsOneWidget);
+    });
+
+    testWidgets('on-device preset shows the model picker and offline note', (
+      tester,
+    ) async {
+      await _pumpForm(tester, ProviderRegistry.inMemory(), isWeb: true);
+
+      await _selectProvider(tester, 'On-device (WebLLM)');
+
+      // The key/model/URL fields are replaced by the on-device model picker.
+      expect(find.text('API key'), findsNothing);
+      expect(find.text('Base URL'), findsNothing);
+      expect(find.text('On-device model'), findsOneWidget);
+      expect(find.textContaining('SmolLM2 1.7B'), findsOneWidget);
+      // Every WebLLM preset row carries the prompt-tools badge; the selected
+      // preset is not a coder model, so no "coder" badge.
+      expect(find.text('tools via prompt'), findsOneWidget);
+      expect(find.text('coder'), findsNothing);
+      expect(
+        find.textContaining('Runs fully offline after download'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('WebGPU'), findsOneWidget);
+    });
+
+    testWidgets('host build hides the WebLLM provider row', (tester) async {
+      await tester.pumpWidget(const MyApp());
+
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+
+      // WebLLM is web-only; its stub is not selectable on host platforms.
+      expect(find.text('On-device (WebLLM)'), findsNothing);
+      await tester.tap(find.text('OpenRouter').last);
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('a typed model is not clobbered by preset switching', (
+      tester,
+    ) async {
+      await tester.pumpWidget(const MyApp());
+      await tester.pumpAndSettle();
+      // Reveal the default provider's fields first (provider-first form).
+      await tester.ensureVisible(find.text('OpenRouter').first);
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'my-own-model',
+      );
+      await _selectProvider(tester, 'Ollama');
+
+      expect(_field(tester, 'Model id').controller!.text, 'my-own-model');
+    });
+  });
+
+  group('WebLLM model presets', () {
+    test('drops everything below ~1.5 GB (too weak for agent work)', () {
+      // 13 presets ≥ ~1.5 GB download, smallest first.
+      expect(webLlmModelPresets, hasLength(13));
+      expect(webLlmModelPresets.first.id, 'SmolLM2-1.7B-Instruct-q4f16_1-MLC');
+      const droppedIds = [
+        'SmolLM2-135M-Instruct-q0f16-MLC',
+        'SmolLM2-360M-Instruct-q0f16-MLC',
+        'Qwen3-0.6B-q4f16_1-MLC',
+        'Qwen3-1.7B-q4f16_1-MLC',
+        'Qwen3.5-0.8B-q4f16_1-MLC',
+        'Qwen3.5-2B-q4f16_1-MLC',
+        'Qwen2.5-0.5B-Instruct-q0f16-MLC',
+        'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+        'Qwen2.5-Coder-1.5B-Instruct-q4f16_1-MLC',
+        'Llama-3.2-1B-Instruct-q4f16_1-MLC',
+        'Llama-3.2-1B-Instruct-q4f32_1-MLC',
+        'gemma-2-2b-it-q4f16_1-MLC-1k',
+        // The `-1k` window variants: a sub-4096 window cannot hold the Fa
+        // system prompt (~3.3k engine tokens), so they failed on the first
+        // message; their full-window siblings cover the same weights.
+        'Phi-3.5-mini-instruct-q4f16_1-MLC-1k',
+        'Llama-3.1-8B-Instruct-q4f16_1-MLC-1k',
+      ];
+      for (final id in droppedIds) {
+        expect(findWebLlmPreset(id), isNull, reason: id);
+      }
+      const keptIds = [
+        'Qwen2.5-Coder-3B-Instruct-q4f16_1-MLC',
+        'Qwen3.5-4B-q4f16_1-MLC',
+        'Qwen3-4B-q4f16_1-MLC',
+      ];
+      for (final id in keptIds) {
+        expect(findWebLlmPreset(id), isNotNull, reason: id);
+      }
+    });
+
+    test('groups new families smallest-first next to their base family', () {
+      final ids = webLlmModelPresets.map((p) => p.id).toList();
+      // Qwen2.5-Coder sits between Qwen2.5 and Qwen3.
+      expect(
+        ids.indexOf('Qwen2.5-Coder-3B-Instruct-q4f16_1-MLC'),
+        greaterThan(ids.indexOf('Qwen2.5-7B-Instruct-q4f16_1-MLC')),
+      );
+      expect(
+        ids.indexOf('Qwen2.5-Coder-3B-Instruct-q4f16_1-MLC'),
+        lessThan(ids.indexOf('Qwen3-4B-q4f16_1-MLC')),
+      );
+      // Qwen3.5 sits between Qwen3 and Phi.
+      expect(
+        ids.indexOf('Qwen3.5-4B-q4f16_1-MLC'),
+        greaterThan(ids.indexOf('Qwen3-4B-q4f16_1-MLC')),
+      );
+      expect(
+        ids.indexOf('Qwen3.5-4B-q4f16_1-MLC'),
+        lessThan(ids.indexOf('Phi-3.5-mini-instruct-q4f16_1-MLC')),
+      );
+    });
+
+    test('flags exactly the Qwen2.5-Coder presets as coder', () {
+      expect(webLlmModelPresets.where((p) => p.isCoder).map((p) => p.id), [
+        'Qwen2.5-Coder-3B-Instruct-q4f16_1-MLC',
+      ]);
+    });
+
+    test('every preset requests an 8192-token window sized for the Fa system '
+        'prompt', () {
+      // The sizing rule (documented on WebLlmModelPreset.contextWindow): the
+      // engine-visible system prompt (sandbox prompt + prompt-tools
+      // instructions) measures ~3.3k engine tokens, so 2048/4096 windows
+      // fail on the first message or within a few turns. One window for
+      // every preset; the `-1k` variants are dropped (above).
+      for (final preset in webLlmModelPresets) {
+        expect(preset.contextWindow, 8192, reason: preset.id);
+        expect(preset.id, isNot(endsWith('-1k')), reason: preset.id);
+      }
+    });
+  });
+
+  group('Custom providers', () {
+    testWidgets('adding a provider puts it in the picker and prefills the '
+        'form', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      await _pumpForm(tester, registry, modelsFetcher: _someModels);
+
+      await tester.tap(find.text('Add provider'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ProviderEditorPage), findsOneWidget);
+
+      await tester.enterText(_editorField('Name'), 'Acme');
+      await tester.enterText(
+        _editorField('Base URL'),
+        'https://acme.example/v1',
+      );
+      await _setEditorModel(tester, 'Model id (optional)', 'acme-1');
+      // The key stays empty: the editor marks it optional and a keyless
+      // provider saves fine (local servers need no key).
+      expect(_editorField('API key (optional)'), findsOneWidget);
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(registry.providers, hasLength(1));
+      expect(registry.keyFor(registry.providers.single.id), isNull);
+      // The new provider is selected and prefills the connection fields.
+      expect(find.text('Acme'), findsOneWidget);
+      expect(
+        _field(tester, 'Base URL').controller!.text,
+        'https://acme.example/v1',
+      );
+      expect(_field(tester, 'Model id').controller!.text, 'acme-1');
+      // Custom providers offer edit (icon); deletion lives in the editor.
+      expect(find.byIcon(Icons.edit_outlined), findsOneWidget);
+      expect(find.text('Delete'), findsNothing);
+      expect(
+        find.textContaining(
+          'The provider definition (name, URL, model) is '
+          'saved',
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('the editor validates required fields', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      await _pumpForm(tester, registry);
+
+      await tester.tap(find.text('Add provider'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pump();
+
+      expect(find.text('Name is required'), findsOneWidget);
+      expect(registry.providers, isEmpty);
+    });
+
+    testWidgets('a provider key is remembered for the session after connect', (
+      tester,
+    ) async {
+      final registry = ProviderRegistry.inMemory();
+      final provider = await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      AgentConfig? connected;
+      await _pumpForm(
+        tester,
+        registry,
+        onConnect: (config) async => connected = config,
+      );
+
+      await _selectProvider(tester, 'Acme');
+      // Custom providers mark the key optional (local servers need none).
+      expect(find.text('API key (optional)'), findsOneWidget);
+      expect(find.textContaining('local servers'), findsOneWidget);
+      await tester.enterText(
+        find.widgetWithText(TextField, 'API key (optional)'),
+        'sk-acme',
+      );
+      await _tapConnect(tester, 'Start chat');
+      await tester.pumpAndSettle();
+
+      expect(connected?.apiKey, 'sk-acme');
+      expect(connected?.baseUrl, 'https://acme.example/v1');
+      expect(registry.keyFor(provider.id), 'sk-acme');
+
+      // Re-picking the provider prefills the remembered key.
+      await _selectProvider(tester, 'Ollama');
+      await _selectProvider(tester, 'Acme');
+      expect(_field(tester, 'API key (optional)').controller!.text, 'sk-acme');
+    });
+
+    testWidgets('the custom preset connects without an API key', (
+      tester,
+    ) async {
+      AgentConfig? connected;
+      await _pumpForm(
+        tester,
+        ProviderRegistry.inMemory(),
+        onConnect: (config) async => connected = config,
+      );
+
+      await _selectProvider(tester, 'Custom');
+      // The key field turns optional for custom endpoints (local servers).
+      expect(find.text('API key'), findsNothing);
+      expect(find.text('API key (optional)'), findsOneWidget);
+      expect(find.textContaining('local servers'), findsOneWidget);
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Base URL'),
+        'http://localhost:8080/v1',
+      );
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'llama3',
+      );
+      await _tapConnect(tester, 'Start chat');
+      await tester.pumpAndSettle();
+
+      expect(find.text('API key is required'), findsNothing);
+      expect(connected?.apiKey, isEmpty);
+      expect(connected?.baseUrl, 'http://localhost:8080/v1');
+      expect(connected?.modelId, 'llama3');
+    });
+
+    testWidgets('a saved provider connects without an API key', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      final provider = await registry.add(
+        name: 'Local',
+        baseUrl: 'http://localhost:8080/v1',
+        modelId: 'llama3',
+      );
+      AgentConfig? connected;
+      await _pumpForm(
+        tester,
+        registry,
+        onConnect: (config) async => connected = config,
+      );
+
+      await _selectProvider(tester, 'Local');
+      expect(find.text('API key (optional)'), findsOneWidget);
+      await _tapConnect(tester, 'Start chat');
+      await tester.pumpAndSettle();
+
+      expect(find.text('API key is required'), findsNothing);
+      expect(connected?.apiKey, isEmpty);
+      expect(connected?.baseUrl, 'http://localhost:8080/v1');
+      // No session key remembered for a keyless connect.
+      expect(registry.keyFor(provider.id), isNull);
+    });
+
+    testWidgets('hosted presets still require an API key', (tester) async {
+      await _pumpForm(tester, ProviderRegistry.inMemory());
+
+      // Ollama Cloud is hosted (ollama.com) — keyless must not pass.
+      await _selectProvider(tester, 'Ollama');
+      expect(find.text('API key'), findsOneWidget);
+      await _tapConnect(tester, 'Start chat');
+      await tester.pump();
+
+      expect(find.text('API key is required'), findsOneWidget);
+    });
+
+    testWidgets('editing a provider updates the saved definition', (
+      tester,
+    ) async {
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      await _pumpForm(tester, registry, modelsFetcher: _someModels);
+      await _selectProvider(tester, 'Acme');
+
+      await tester.ensureVisible(find.byIcon(Icons.edit_outlined));
+      await tester.tap(find.byIcon(Icons.edit_outlined));
+      await tester.pumpAndSettle();
+      expect(
+        tester.widget<TextField>(_editorField('Name')).controller!.text,
+        'Acme',
+      );
+
+      await _setEditorModel(tester, 'Model id (optional)', 'acme-2');
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(registry.providers.single.modelId, 'acme-2');
+      expect(_field(tester, 'Model id').controller!.text, 'acme-2');
+    });
+
+    testWidgets('editing a provider keeps its persisted identity kind', (
+      tester,
+    ) async {
+      // The app edit path rebuilds the entry and hands it to the registry;
+      // a rebuild that dropped `kind` would demote a codex entry back to
+      // URL-shape dispatch guessing on the very URL the user just edited.
+      final registry = ProviderRegistry.inMemory();
+      final provider = await registry.add(
+        name: 'ChatGPT Codex',
+        baseUrl: chatGptCodexBaseUrl,
+        modelId: 'gpt-5.6-sol',
+        kind: 'chatgpt-codex',
+      );
+      registry.rememberKey(provider.id, 'blob');
+      await _pumpForm(tester, registry, modelsFetcher: _someModels);
+      await _selectProvider(tester, 'ChatGPT Codex');
+
+      await tester.ensureVisible(find.byIcon(Icons.edit_outlined));
+      await tester.tap(find.byIcon(Icons.edit_outlined));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        _editorField('Base URL'),
+        'https://relay.example.net/codex-proxy',
+      );
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+
+      expect(registry.providers.single.kind, 'chatgpt-codex');
+      expect(registry.providers.single.id, provider.id);
+      expect(
+        registry.providers.single.baseUrl,
+        'https://relay.example.net/codex-proxy',
+      );
+    });
+
+    testWidgets('deleting a provider removes it from the picker and resets '
+        'the selection', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      await _pumpForm(tester, registry);
+      await _selectProvider(tester, 'Acme');
+
+      // Deletion lives in the full-screen editor page.
+      await tester.ensureVisible(find.byIcon(Icons.edit_outlined));
+      await tester.tap(find.byIcon(Icons.edit_outlined));
+      await tester.pumpAndSettle();
+      expect(find.byType(ProviderEditorPage), findsOneWidget);
+      await tester.tap(find.text('Delete'));
+      await tester.pumpAndSettle();
+      expect(find.text('Delete Acme?'), findsOneWidget);
+      await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+      await tester.pumpAndSettle();
+
+      expect(registry.providers, isEmpty);
+      expect(find.text('Acme'), findsNothing);
+      // Selection fell back to a built-in preset.
+      expect(find.text('OpenRouter'), findsOneWidget);
+      expect(find.text('Delete'), findsNothing);
+
+      // And it is gone from the picker entries too.
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+      expect(find.text('Acme'), findsNothing);
+      expect(find.text('Ollama'), findsOneWidget);
+    });
+  });
+
+  group('Chat screen settings gear', () {
+    testWidgets('opens the settings screen with the providers section and '
+        'the cache section', (tester) async {
+      final service = _fakeService();
+      await service.initialize();
+      final manager = FlutterSessionManager(
+        env: MemoryExecutionEnv(),
+        sessionsRoot: '/sessions',
+      )..addSession('fake-session', service);
+      await tester.pumpWidget(MaterialApp(home: ChatScreen(manager: manager)));
+      await tester.pumpAndSettle();
+
+      // The chat-bar gear is gone (settings open from the launcher
+      // sidebar); exercise the screen directly, as the sidebar push does.
+      await tester.pumpWidget(
+        MaterialApp(home: SettingsScreen(service: service)),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Settings'), findsOneWidget);
+      // Providers first; everything model-related lives behind the Models
+      // row now (the dedicated page).
+      expect(find.text('Providers'), findsOneWidget);
+      expect(find.text('Add provider'), findsOneWidget);
+      expect(find.text('Models'), findsOneWidget);
+      // Host build: the WebLLM stub is unavailable, so the downloaded-
+      // models cache section collapses to the platform note.
+      expect(
+        find.textContaining('managed by the OS/app storage'),
+        findsOneWidget,
+      );
+
+      // The Models row opens the page with the chat-model flow.
+      await tester.tap(find.text('Models'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ModelsSettingsPage), findsOneWidget);
+      expect(find.text('Default chat model'), findsOneWidget);
+      expect(find.text('test-model · example.com'), findsOneWidget);
+    });
+
+    testWidgets('the Models row opens the models page (above Agents)', (
+      tester,
+    ) async {
+      // AgentService.create (not the plain constructor) wires the subagent
+      // manager, so the Agents section renders. Create it in a real-async
+      // window: its bundled-skill asset load waits out a clock that never
+      // advances in the fake test zone.
+      late final AgentService service;
+      await tester.runAsync(() async {
+        service = await AgentService.create(
+          config: AgentConfig(
+            providerKind: 'openai-completions',
+            modelId: 'test-model',
+            baseUrl: 'https://example.com',
+            apiKey: 'test-key',
+          ),
+          env: MemoryExecutionEnv(),
+          streamFunction: _singleTextResponse('hi'),
+        );
+      });
+      // A media-models store in scope, as in the real app shell — without
+      // it the presets/media sections collapse to nothing. The scope must
+      // sit ABOVE the MaterialApp: the pushed Models page builds inside
+      // the Navigator, above the home subtree.
+      await tester.pumpWidget(
+        MediaModelsScope(
+          store: MediaModelsStore.inMemory(),
+          child: MaterialApp(home: SettingsScreen(service: service)),
+        ),
+      );
+      Future<void> pumpN([int n = 10]) async {
+        for (var i = 0; i < n; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+      }
+
+      await pumpN();
+
+      // The SingleChildScrollView builds the whole column eagerly: the
+      // Models row sits above the Agents section on the top level.
+      final models = find.text('Models');
+      final agents = find.text('Agents');
+      expect(models, findsOneWidget);
+      expect(agents, findsOneWidget);
+      expect(
+        tester.getTopLeft(models).dy,
+        lessThan(tester.getTopLeft(agents).dy),
+      );
+
+      // The row pushes the dedicated page with every model surface —
+      // including the provider-queue editor (issue #693).
+      await tester.tap(models);
+      await pumpN();
+      expect(find.byType(ModelsSettingsPage), findsOneWidget);
+      expect(find.byType(ProviderQueueSection), findsOneWidget);
+      expect(find.text('Model presets'), findsOneWidget);
+      expect(find.text('Default chat model'), findsOneWidget);
+      expect(find.text('Media models'), findsOneWidget);
+
+      // Unmount the tree, then dispose the service inside a real-async
+      // window — both BEFORE the binding's invariant check (a teardown
+      // would run too late). The final long pump lets any one-shot fake
+      // timer the service scheduled during the pumps fire and clear.
+      await tester.pumpWidget(const SizedBox());
+      await tester.runAsync(() async => service.dispose());
+      await tester.pump(const Duration(minutes: 10));
+    });
+
+    testWidgets('the Models row shows a dialog on wide canvases', (
+      tester,
+    ) async {
+      // Desktop/windowed surfaces get the centered dialog (pushFaPage),
+      // not a full-screen push. The test view runs at dpr 3.0, so set the
+      // PHYSICAL size for a 1280×800 logical canvas.
+      tester.view.devicePixelRatio = 3;
+      tester.view.physicalSize = const Size(3840, 2400);
+      addTearDown(tester.view.reset);
+      final service = _fakeService();
+      await service.initialize();
+      await tester.pumpWidget(
+        MaterialApp(home: SettingsScreen(service: service)),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Models'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(Dialog), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byType(Dialog),
+          matching: find.byType(ModelsSettingsPage),
+        ),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a registry provider without a key fails validation', (
+      tester,
+    ) async {
+      final service = _fakeService();
+      await service.initialize();
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      final manager = FlutterSessionManager(
+        env: MemoryExecutionEnv(),
+        sessionsRoot: '/sessions',
+      )..addSession('fake-session', service);
+      await tester.pumpWidget(MaterialApp(home: ChatScreen(manager: manager)));
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SettingsScreen(service: service, registry: registry),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Open the default-chat-model picker (two-step): the registry
+      // provider's entry carries no key — apply still works (keyless
+      // local endpoints are legitimate). The chat-model row lives on the
+      // Models page now.
+      await tester.tap(find.text('Models'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('test-model · example.com'));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaSlotProviderPickerPage), findsOneWidget);
+      await tester.tap(find.text('Acme'));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaSlotModelPage), findsOneWidget);
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'acme-1',
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Save'));
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      expect(service.modelId, 'acme-1');
+    });
+
+    testWidgets('applying a picked model saves the last connection', (
+      tester,
+    ) async {
+      final env = MemoryExecutionEnv();
+      final store = await LastConnectionStore.load(env);
+      final registry = ProviderRegistry.inMemory();
+      final service = _fakeService();
+      await service.initialize();
+      final manager = FlutterSessionManager(env: env, sessionsRoot: '/sessions')
+        ..addSession('fake-session', service);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: ChatScreen(
+            manager: manager,
+            registry: registry,
+            lastConnectionStore: store,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: SettingsScreen(
+            service: service,
+            registry: registry,
+            lastConnectionStore: store,
+            modelsFetcher: _someModels,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Add a keyless local provider through the Providers section.
+      await tester.ensureVisible(find.text('Add provider'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Add provider'));
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.pumpAndSettle();
+      expect(find.byType(AddProviderPresetPickerPage), findsOneWidget);
+      // 'Custom' is the LAST tile and may sit below the fold — scroll the
+      // picker's own list to it first (ensureVisible cannot see tiles the
+      // lazy ListView has not built yet).
+      await tester.scrollUntilVisible(
+        find.text('Custom'),
+        200,
+        scrollable: find.descendant(
+          of: find.byType(AddProviderPresetPickerPage),
+          matching: find.byType(Scrollable),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Custom'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ProviderEditorPage), findsOneWidget);
+      await tester.enterText(find.widgetWithText(TextField, 'Name'), 'Local');
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Base URL'),
+        'http://localhost:8080/v1',
+      );
+      await _setEditorModel(tester, 'Model id (optional)', 'llama3');
+      await tester.tap(find.widgetWithText(FilledButton, 'Save'));
+      await tester.pumpAndSettle();
+      expect(find.text('Local'), findsOneWidget);
+
+      // The default-chat-model flow: the two-step picker (provider →
+      // model), the same one the role/media rows open. Its row lives on
+      // the Models page now.
+      await tester.tap(find.text('Models'));
+      await tester.pumpAndSettle();
+      expect(find.byType(ModelsSettingsPage), findsOneWidget);
+      await tester.tap(find.text('test-model · example.com'));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaSlotProviderPickerPage), findsOneWidget);
+      await tester.tap(find.text('Local'));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaSlotModelPage), findsOneWidget);
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'llama3',
+      );
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('Save'));
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      // Back on the Models page; the connection was reconfigured and
+      // saved.
+      expect(find.byType(ModelsSettingsPage), findsOneWidget);
+      expect(find.text('llama3 · Local'), findsOneWidget);
+      final connection = store.connection;
+      expect(connection, isNotNull);
+      expect(connection!.providerKind, 'openai-completions');
+      expect(connection.modelId, 'llama3');
+      expect(connection.baseUrl, 'http://localhost:8080/v1');
+    });
+  });
+
+  group('On-device (WebLLM) connect', () {
+    testWidgets('connect loads with progress and hands over the webllm '
+        'config', (tester) async {
+      final engine = FakeWebLlmEngine()
+        ..pendingProgress = const WebLlmProgress(
+          fraction: 0.4,
+          text: 'Downloading weights… 40%',
+        )
+        ..loadGate = Completer<void>();
+      AgentConfig? connected;
+      await _pumpForm(
+        tester,
+        ProviderRegistry.inMemory(),
+        webLlmEngine: engine,
+        isWeb: true,
+        onConnect: (config) async => connected = config,
+      );
+
+      await _selectProvider(tester, 'On-device (WebLLM)');
+
+      await tester.ensureVisible(find.text('Start chat'));
+      await tester.tap(find.text('Start chat'));
+      // Let the connect flow reach the (held) load and render progress.
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Downloading weights… 40%'), findsOneWidget);
+      final bar = tester.widget<LinearProgressIndicator>(
+        find.byType(LinearProgressIndicator),
+      );
+      expect(bar.value, 0.4);
+      expect(engine.loadedPreset, isNull);
+      expect(connected, isNull);
+
+      engine.loadGate!.complete();
+      await tester.pumpAndSettle();
+
+      expect(engine.loadedPreset?.id, webLlmModelPresets.first.id);
+      expect(connected?.providerKind, webLlmProviderKind);
+      expect(connected?.modelId, webLlmModelPresets.first.id);
+      expect(connected?.baseUrl, isEmpty);
+      expect(connected?.apiKey, isEmpty);
+      expect(connected?.contextWindow, webLlmModelPresets.first.contextWindow);
+      expect(connected?.maxTokens, 1024);
+      // Progress UI is cleared once the connect flow finishes.
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+    });
+
+    testWidgets('a failed load surfaces the engine error', (tester) async {
+      final engine = FakeWebLlmEngine()..loadError = StateError('No WebGPU');
+      AgentConfig? connected;
+      await _pumpForm(
+        tester,
+        ProviderRegistry.inMemory(),
+        webLlmEngine: engine,
+        isWeb: true,
+        onConnect: (config) async => connected = config,
+      );
+
+      await _selectProvider(tester, 'On-device (WebLLM)');
+
+      await tester.ensureVisible(find.text('Start chat'));
+      await tester.tap(find.text('Start chat'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('No WebGPU'), findsOneWidget);
+      expect(connected, isNull);
+      // The form returns to idle: no progress bar, button usable again.
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+    });
+  });
+
+  group('On-device (transformers.js) provider', () {
+    // The provider is web-only; host widget tests exercise the web case
+    // through the form's isWeb seam (kIsWeb is a compile-time constant).
+    testWidgets('is visible on web; the removed gemma row stays gone', (
+      tester,
+    ) async {
+      await _pumpForm(tester, ProviderRegistry.inMemory(), isWeb: true);
+
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+      expect(find.text('On-device (transformers.js)'), findsOneWidget);
+      expect(find.text('On-device (Gemma)'), findsNothing);
+      expect(find.text('On-device (WebLLM)'), findsOneWidget);
+      await tester.tap(find.text('OpenRouter').last);
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('is hidden on mobile (no on-device provider remains)', (
+      tester,
+    ) async {
+      await tester.pumpWidget(const MyApp());
+
+      await tester.tap(find.text('OpenRouter').first);
+      await tester.pumpAndSettle();
+      expect(find.text('On-device (transformers.js)'), findsNothing);
+      expect(find.textContaining('On-device (Gemma'), findsNothing);
+      await tester.tap(find.text('OpenRouter').last);
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('shows the model picker with vision/tools badges and the '
+        'public-repo note', (tester) async {
+      await _pumpForm(tester, ProviderRegistry.inMemory(), isWeb: true);
+
+      await _selectProvider(tester, 'On-device (transformers.js)');
+
+      // The key/model/URL fields are replaced by the on-device model picker;
+      // no HuggingFace token field (the ONNX repo is public).
+      expect(find.text('API key'), findsNothing);
+      expect(find.text('Base URL'), findsNothing);
+      expect(find.text('HuggingFace token (optional)'), findsNothing);
+      expect(find.text('On-device model'), findsOneWidget);
+      expect(find.textContaining('Gemma 4 E2B (ONNX)'), findsOneWidget);
+      expect(find.textContaining('~3.4 GB'), findsOneWidget);
+      expect(find.text('vision'), findsOneWidget);
+      expect(find.text('tools via prompt'), findsOneWidget);
+      expect(
+        find.textContaining('Runs fully offline after download'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('no token'), findsOneWidget);
+    });
+
+    testWidgets('connect loads with progress and hands over the '
+        'transformers_js config', (tester) async {
+      final engine = FakeTransformersJsEngine()
+        ..pendingProgress = const TransformersJsProgress(
+          fraction: 0.4,
+          text: 'Downloading model weights…',
+        )
+        ..loadGate = Completer<void>();
+      AgentConfig? connected;
+      await _pumpForm(
+        tester,
+        ProviderRegistry.inMemory(),
+        transformersJsEngine: engine,
+        isWeb: true,
+        onConnect: (config) async => connected = config,
+      );
+
+      await _selectProvider(tester, 'On-device (transformers.js)');
+      await tester.ensureVisible(find.text('Start chat'));
+      await tester.tap(find.text('Start chat'));
+      // Let the connect flow reach the (held) load and render progress.
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Downloading model weights…'), findsOneWidget);
+      final bar = tester.widget<LinearProgressIndicator>(
+        find.byType(LinearProgressIndicator),
+      );
+      expect(bar.value, 0.4);
+      expect(connected, isNull);
+
+      engine.loadGate!.complete();
+      await tester.pumpAndSettle();
+
+      expect(engine.loadedPreset?.id, transformersJsModelPresets.first.id);
+      expect(connected?.providerKind, transformersJsProviderKind);
+      expect(connected?.modelId, transformersJsModelPresets.first.id);
+      expect(connected?.baseUrl, isEmpty);
+      expect(connected?.apiKey, isEmpty);
+      expect(
+        connected?.contextWindow,
+        transformersJsModelPresets.first.contextWindow,
+      );
+      expect(connected?.maxTokens, 1024);
+      // Progress UI is cleared once the connect flow finishes.
+      expect(find.byType(LinearProgressIndicator), findsNothing);
+    });
+
+    testWidgets('a failed load surfaces the engine error', (tester) async {
+      final engine = FakeTransformersJsEngine()
+        ..loadError = StateError(
+          'This browser has no WebGPU support, which on-device inference '
+          'needs.',
+        );
+      await _pumpForm(
+        tester,
+        ProviderRegistry.inMemory(),
+        transformersJsEngine: engine,
+        isWeb: true,
+      );
+
+      await _selectProvider(tester, 'On-device (transformers.js)');
+      await _tapConnect(tester, 'Start chat');
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('no WebGPU support'), findsOneWidget);
+      expect(engine.loadedPreset, isNull);
+    });
+  });
+
+  group('transformersJsProviderVisible', () {
+    test('web only', () {
+      expect(transformersJsProviderVisible(isWeb: true), isTrue);
+      expect(transformersJsProviderVisible(isWeb: false), isFalse);
+    });
+  });
+
+  group('webLlmProviderVisible', () {
+    test('web only', () {
+      expect(webLlmProviderVisible(isWeb: true), isTrue);
+      expect(webLlmProviderVisible(isWeb: false), isFalse);
+    });
+  });
+}

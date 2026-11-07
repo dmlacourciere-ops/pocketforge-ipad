@@ -1,0 +1,2745 @@
+// ignore: unused_import
+import 'package:intl/intl.dart' as intl;
+import 'app_localizations.dart';
+
+// ignore_for_file: type=lint
+
+/// The translations for English (`en`).
+class AppLocalizationsEn extends AppLocalizations {
+  AppLocalizationsEn([String locale = 'en']) : super(locale);
+
+  @override
+  String get appTitle => 'Fa';
+
+  @override
+  String get approvalAllowOnce => 'Allow once';
+
+  @override
+  String approvalAllowToolTitle(Object tool) {
+    return 'Allow $tool?';
+  }
+
+  @override
+  String get approvalAlwaysAllow => 'Always allow';
+
+  @override
+  String get approvalDeny => 'Deny';
+
+  @override
+  String get attachedEmpty => 'No messages yet — say something below';
+
+  @override
+  String get attachedToCli => 'attached to fa cli';
+
+  @override
+  String get sendToCli => 'Message the fa cli session…';
+
+  @override
+  String get sessionFolderPersonal => 'Personal';
+
+  @override
+  String get sessionInfoNameLabel => 'Session name';
+
+  @override
+  String get newSessionFolderTitle => 'New session — folder';
+
+  @override
+  String newSessionCurrentFolder(Object folder) {
+    return 'Current folder ($folder)';
+  }
+
+  @override
+  String get approvalModeAlwaysAsk => 'Always ask';
+
+  @override
+  String get approvalModeAlwaysAskHint => 'Every tool call asks for approval.';
+
+  @override
+  String get approvalModeTitle => 'Tool approvals';
+
+  @override
+  String get approvalModeWrite => 'Write';
+
+  @override
+  String get approvalModeWriteHint =>
+      'File reads run freely; writes, edits and shell commands ask for approval.';
+
+  @override
+  String get approvalModeYolo => 'YOLO';
+
+  @override
+  String get approvalModeYoloHint =>
+      'All tools run without asking (destructive shell commands still ask).';
+
+  @override
+  String approvalTierLabel(Object tier) {
+    return 'Tier: $tier';
+  }
+
+  @override
+  String appsAskFaAbout(Object name) {
+    return 'Ask Fa about $name';
+  }
+
+  @override
+  String get appsAskFaHint => 'e.g. make the buttons bigger and purple';
+
+  @override
+  String get appsAskFaSubtitle =>
+      'Fa gets your message, the app state and a screenshot.';
+
+  @override
+  String get appsAskFaTooltip => 'Ask Fa about this app';
+
+  @override
+  String get appsChatEmptyHint => 'Nothing here yet — ask Fa about this app.';
+
+  @override
+  String get appsCollapseChatTooltip => 'Collapse chat';
+
+  @override
+  String get appsDismissReplyTooltip => 'Dismiss';
+
+  @override
+  String get appsEmptyState =>
+      'No apps yet. Ask Fa to build one —\nit will land in the apps/ folder.';
+
+  @override
+  String get appsFaStatusThinking => 'thinking…';
+
+  @override
+  String get appsFaStatusWorking => 'Fa is working…';
+
+  @override
+  String get appsFaStatusWriting => 'writing…';
+
+  @override
+  String get appsFollowUpHint => 'Follow up…';
+
+  @override
+  String get appsGridTitle => 'Apps';
+
+  @override
+  String get appsHideAppsTooltip => 'Hide apps';
+
+  @override
+  String appsLoadError(Object error) {
+    return 'Failed to load apps: $error';
+  }
+
+  @override
+  String widgetsCatalogInstallFailed(Object error) {
+    return 'Install failed: $error';
+  }
+
+  @override
+  String get widgetsCatalogNotInstalled => 'Widget is not installed yet.';
+
+  @override
+  String get widgetsCatalogOffline =>
+      'Offline — showing the last known catalog.';
+
+  @override
+  String widgetsCatalogLoadFailed(Object error) {
+    return 'Could not load the widgets catalog.\n$error';
+  }
+
+  @override
+  String get widgetsCatalogFilterAll => 'All';
+
+  @override
+  String get widgetsCatalogRetry => 'Retry';
+
+  @override
+  String get appsOpenChatTooltip => 'Open chat';
+
+  @override
+  String get appsOpenFullChatTooltip => 'Open full chat';
+
+  @override
+  String get appsOpenTrajectoryTooltip => 'Open trajectory';
+
+  @override
+  String get appsPermissionCalendar => 'Calendar';
+
+  @override
+  String get appsPermissionCalendarDesc =>
+      'jsr.fa.calendar — read your system calendar events';
+
+  @override
+  String get appsPermissionContacts => 'Contacts';
+
+  @override
+  String get appsPermissionContactsDesc =>
+      'jsr.fa.contacts — address book (coming soon)';
+
+  @override
+  String get appsPermissionHealth => 'Health';
+
+  @override
+  String get appsPermissionHealthDesc =>
+      'jsr.fa.health — health data (coming soon)';
+
+  @override
+  String get appsPermissionHomekit => 'HomeKit';
+
+  @override
+  String get appsPermissionHomekitDesc =>
+      'jsr.fa.homekit — smart home devices (coming soon)';
+
+  @override
+  String get appsPermissionKeys => 'Host keys';
+
+  @override
+  String get appsPermissionKeysDesc =>
+      'jsr.fa.keys — read the API keys saved in Fa and request new ones';
+
+  @override
+  String get appsPermissionTheme => 'Theme packs';
+
+  @override
+  String get appsPermissionThemeDesc =>
+      'jsr.fa.theme — list theme packs and apply one (the user confirms every apply)';
+
+  @override
+  String get appsPermissionLlm => 'LLM';
+
+  @override
+  String get appsPermissionLlmDesc =>
+      'jsr.fa.llm — let the app ask the connected model';
+
+  @override
+  String get appsPermissionMedia => 'Media';
+
+  @override
+  String get appsPermissionMediaDesc =>
+      'jsr.fa.media — generate images, speech, and music';
+
+  @override
+  String get appsPermissionMicrophone => 'Microphone';
+
+  @override
+  String get appsPermissionMicrophoneDesc =>
+      'jsr.fa.asr — record audio and transcribe speech';
+
+  @override
+  String get appsPermissionNetwork => 'Network';
+
+  @override
+  String get appsPermissionNetworkDesc =>
+      'jsr.fetchJson — let the app call HTTP APIs';
+
+  @override
+  String get appsPermissionNotifications => 'Notifications';
+
+  @override
+  String get appsPermissionNotificationsDesc =>
+      'jsr.fa.notify — schedule local notifications';
+
+  @override
+  String get appsPermissionsDone => 'Done';
+
+  @override
+  String appsPermissionsTitle(Object name) {
+    return '$name permissions';
+  }
+
+  @override
+  String get appsPermissionsTooltip => 'App permissions';
+
+  @override
+  String get appsCloseTooltip => 'Close app';
+
+  @override
+  String get appsRefreshTooltip => 'Refresh';
+
+  @override
+  String get appsReloadTooltip => 'Reload app';
+
+  @override
+  String get appsSendToFa => 'Send to Fa';
+
+  @override
+  String get appsSendTooltip => 'Send';
+
+  @override
+  String get appsShowAppsTooltip => 'Show apps';
+
+  @override
+  String appsStartError(Object error, Object name) {
+    return 'Failed to start $name:\n$error';
+  }
+
+  @override
+  String get appsStopTooltip => 'Stop';
+
+  @override
+  String get askAnswerAction => 'Answer';
+
+  @override
+  String get askBack => 'Back';
+
+  @override
+  String get askCancel => 'Cancel';
+
+  @override
+  String get askNext => 'Next';
+
+  @override
+  String get askOtherLabel => 'Other (type your own)';
+
+  @override
+  String askQuestionProgress(Object index, Object total) {
+    return 'Question $index of $total';
+  }
+
+  @override
+  String get askQuestionTitle => 'Question';
+
+  @override
+  String get askRecommended => 'Recommended';
+
+  @override
+  String get askYourAnswerLabel => 'Your answer';
+
+  @override
+  String get cacheBrowserSubtitle =>
+      'On-device model weights cached in your browser. Deleting frees space; a model re-downloads on next use.';
+
+  @override
+  String cacheDeleteTitle(Object name) {
+    return 'Delete $name?';
+  }
+
+  @override
+  String cacheDeleteTooltip(Object name) {
+    return 'Delete $name';
+  }
+
+  @override
+  String cacheDeleteWeightsBrowser(Object size) {
+    return 'Removes the downloaded weights ($size) from the browser cache. The model downloads again the next time you use it.';
+  }
+
+  @override
+  String cacheEntryCached(Object bytes, Object size) {
+    return '$size · $bytes cached';
+  }
+
+  @override
+  String get cacheNoModels => 'No models downloaded yet.';
+
+  @override
+  String cacheNoticeDeleteFailed(Object error, Object name) {
+    return 'Failed to delete $name: $error';
+  }
+
+  @override
+  String cacheNoticeDeleted(Object name) {
+    return 'Deleted $name.';
+  }
+
+  @override
+  String cacheNoticeLoadedModel(Object name) {
+    return '$name was the loaded model — it downloads again on next use.';
+  }
+
+  @override
+  String get chatAbortTooltip => 'Abort';
+
+  @override
+  String chatAttachError(Object error, Object name) {
+    return 'Could not attach $name: $error';
+  }
+
+  @override
+  String get chatAttachFile => 'Attach file';
+
+  @override
+  String chatAttachNoName(Object name) {
+    return 'Could not attach \"$name\": no usable file name.';
+  }
+
+  @override
+  String get chatAttachTooltip => 'Attach';
+
+  @override
+  String get chatCamera => 'Camera';
+
+  @override
+  String get chatCollapse => 'Collapse';
+
+  @override
+  String get chatCopiedToClipboard => 'Session copied to clipboard';
+
+  @override
+  String get chatCopySessionTooltip => 'Copy session';
+
+  @override
+  String get chatFilesTooltip => 'Files';
+
+  @override
+  String get chatGallery => 'Gallery';
+
+  @override
+  String get chatInputHint => 'Type a message';
+
+  @override
+  String get chatMicDenied =>
+      'Microphone access was denied. Enable it in the system privacy settings (Privacy & Security → Microphone), then try again.';
+
+  @override
+  String chatMicError(Object error) {
+    return 'Voice input failed: $error';
+  }
+
+  @override
+  String get chatMicStopTooltip => 'Stop recording';
+
+  @override
+  String get chatMicTooltip => 'Voice input';
+
+  @override
+  String get chatModelSwitchTooltip => 'Switch model';
+
+  @override
+  String get chatRemoveAttachment => 'Remove attachment';
+
+  @override
+  String chatSendError(Object error) {
+    return 'Could not send: $error';
+  }
+
+  @override
+  String get chatSendTooltip => 'Send';
+
+  @override
+  String get chatSessionsTooltip => 'Sessions & model';
+
+  @override
+  String get chatSettingsTooltip => 'Connection settings';
+
+  @override
+  String chatShowAll(Object count) {
+    return 'Show all ($count)';
+  }
+
+  @override
+  String chatUploadFailed(Object error) {
+    return 'Upload failed: $error';
+  }
+
+  @override
+  String get commonCancel => 'Cancel';
+
+  @override
+  String get commonDelete => 'Delete';
+
+  @override
+  String get filePreviewCannotRead => 'Cannot read file';
+
+  @override
+  String get filePreviewCannotStat => 'Cannot stat file';
+
+  @override
+  String get filePreviewDecodeError => 'Could not decode image';
+
+  @override
+  String get filePreviewLoadError => 'Could not load file';
+
+  @override
+  String get filePreviewNoPreview => 'No preview available';
+
+  @override
+  String get filePreviewEdit => 'Edit';
+
+  @override
+  String get filePreviewSave => 'Save';
+
+  @override
+  String get filePreviewSaved => 'Saved';
+
+  @override
+  String get filePreviewSaveError => 'Save failed';
+
+  @override
+  String get filePreviewTabPreview => 'Preview';
+
+  @override
+  String get filePreviewTabSource => 'Source';
+
+  @override
+  String get filePreviewTooLarge => 'File too large to preview';
+
+  @override
+  String filePreviewTruncated(Object size) {
+    return 'Showing the first $size — truncated';
+  }
+
+  @override
+  String get filesBackTooltip => 'Back to files';
+
+  @override
+  String get filesEmptyFileName => '(empty file name)';
+
+  @override
+  String get filesEmptyFolder => 'Empty folder';
+
+  @override
+  String get filesFolderAccessDenied => 'Could not get access to that folder.';
+
+  @override
+  String filesFolderPickerError(Object error) {
+    return 'Could not open folder picker: $error';
+  }
+
+  @override
+  String filesICloudSyncDone(Object files, Object size, Object when) {
+    return 'Synced $files files ($size) — last sync $when';
+  }
+
+  @override
+  String filesICloudSyncFailed(Object error) {
+    return 'iCloud sync failed: $error';
+  }
+
+  @override
+  String get filesICloudSyncTooltip => 'Sync sessions and apps with iCloud';
+
+  @override
+  String get filesICloudSyncUnavailable =>
+      'iCloud sync is unavailable — enable iCloud Drive for Fa in Settings → Apple ID → iCloud';
+
+  @override
+  String get filesListFolderError => 'Could not list folder';
+
+  @override
+  String filesMountUnavailableTooltip(Object path) {
+    return 'Previously used folder is unavailable: $path — tap to pick again';
+  }
+
+  @override
+  String get filesOpenFolderError => 'Could not open folder';
+
+  @override
+  String get filesOpenProjectFolderTooltip => 'Open project folder…';
+
+  @override
+  String get filesPanelTitle => 'Files';
+
+  @override
+  String get filesRefreshTooltip => 'Refresh';
+
+  @override
+  String get filesRetryButton => 'Retry';
+
+  @override
+  String filesUnmountTooltip(Object path) {
+    return 'Unmount $path';
+  }
+
+  @override
+  String get filesUpTooltip => 'Up';
+
+  @override
+  String filesUploadFailed(Object error) {
+    return 'Upload failed: $error';
+  }
+
+  @override
+  String filesUploadFailures(Object count, Object names) {
+    return ', $count failed: $names';
+  }
+
+  @override
+  String filesUploadSummary(Object failures, num uploaded) {
+    String _temp0 = intl.Intl.pluralLogic(
+      uploaded,
+      locale: localeName,
+      other: 'Uploaded $uploaded files',
+      one: 'Uploaded 1 file',
+    );
+    return '$_temp0$failures';
+  }
+
+  @override
+  String get filesUploadTooltip => 'Upload files here';
+
+  @override
+  String get keysAddButton => 'Add key';
+
+  @override
+  String get keysAddDialogTitle => 'Add key';
+
+  @override
+  String get keysAddNameDuplicate => 'A key with this name already exists.';
+
+  @override
+  String get keysAddNameHint => 'GITHUB_TOKEN';
+
+  @override
+  String get keysAddNameInvalid =>
+      'Use A–Z, 0–9 and underscores, starting with a letter.';
+
+  @override
+  String get keysAddNameLabel => 'Name';
+
+  @override
+  String get keysDeleteBody =>
+      'The saved value is removed from this device. A value from the .env file, if any, applies again.';
+
+  @override
+  String keysDeleteTitle(Object name) {
+    return 'Delete $name?';
+  }
+
+  @override
+  String get keysSectionNote =>
+      'Values are never displayed. Saved keys persist on this device; session keys are gone on reload.';
+
+  @override
+  String get keysSectionTitle => 'Keys';
+
+  @override
+  String get keysSetButton => 'Set';
+
+  @override
+  String keysSetDialogTitle(Object name) {
+    return 'Set $name';
+  }
+
+  @override
+  String get keysSourceEnv => 'env file';
+
+  @override
+  String get keysSourceNone => 'not set';
+
+  @override
+  String get keysSourceProviderSession => 'provider key · this session';
+
+  @override
+  String get keysSourceSaved => 'saved';
+
+  @override
+  String get keysValueHint => 'Paste the key value';
+
+  @override
+  String get keysValueLabel => 'Value';
+
+  @override
+  String get launcherChatActionsTooltip => 'Chat actions';
+
+  @override
+  String get faEntryHintTooltip =>
+      'Tap: continue the active chat · Hold: new chat';
+
+  @override
+  String get launcherChatEmptyHint => 'Nothing here yet — ask Fa anything.';
+
+  @override
+  String get launcherDissolveFolder => 'Remove folder';
+
+  @override
+  String get launcherFolderDefaultName => 'Folder';
+
+  @override
+  String get launcherFolderNameHint => 'Folder name';
+
+  @override
+  String get launcherOpenApp => 'Open';
+
+  @override
+  String launcherOpenAppError(Object error) {
+    return 'Could not open the app: $error';
+  }
+
+  @override
+  String get launcherRenameFolderTooltip => 'Rename folder';
+
+  @override
+  String get launcherRestoreDemoApp => 'Restore reference version';
+
+  @override
+  String get launcherRestoreDemoAppDone =>
+      'App code restored (your data was kept)';
+
+  @override
+  String get launcherRemoveWidget => 'Remove widget';
+
+  @override
+  String launcherRemoveWidgetTitle(String name) {
+    return 'Remove $name?';
+  }
+
+  @override
+  String get launcherRemoveWidgetBody =>
+      'The widget files are deleted; its saved data (storage.json) is kept, so reinstalling restores its state.';
+
+  @override
+  String get launcherSearchHint => 'Search widgets…';
+
+  @override
+  String get launcherTabWidgets => 'Widgets';
+
+  @override
+  String get launcherLoadUnpacked => 'Load unpacked';
+
+  @override
+  String get unpackedLoadTitle => 'Load unpacked widget';
+
+  @override
+  String unpackedLoadIdLine(Object id) {
+    return 'id: $id';
+  }
+
+  @override
+  String get unpackedLoadNetworkNote =>
+      'This widget declares network access — it can fetch from the network (jsr.fetchJson).';
+
+  @override
+  String unpackedLoadCommandsNote(Object commands) {
+    return 'Shell commands it may run (jsr.exec): $commands';
+  }
+
+  @override
+  String unpackedLoadReplaceNote(Object source, Object version) {
+    return 'A widget with this id already exists ($source, v$version). Replacing overwrites its code; the saved data (storage.json) is kept.';
+  }
+
+  @override
+  String get unpackedLoadConfirm => 'Load';
+
+  @override
+  String get unpackedLoadReplaceConfirm => 'Replace';
+
+  @override
+  String get unpackedLoadErrorTitle => 'Widget was not loaded';
+
+  @override
+  String unpackedLoadDone(Object name) {
+    return '$name loaded from the folder';
+  }
+
+  @override
+  String unpackedLoadFailed(Object error) {
+    return 'Load failed: $error';
+  }
+
+  @override
+  String get unpackedSourceChip => 'unpacked';
+
+  @override
+  String get unpackedSourceBadgeTooltip =>
+      'Loaded from a local folder (unpacked)';
+
+  @override
+  String get unpackedSourceCatalog => 'installed from the catalog';
+
+  @override
+  String get unpackedSourceUnpacked => 'loaded from a local folder';
+
+  @override
+  String get unpackedSourceAgent => 'created by the agent';
+
+  @override
+  String unpackedSourceUnknown(Object source) {
+    return 'installed from an unknown source ($source)';
+  }
+
+  @override
+  String get settingsResetApps => 'Reset apps';
+
+  @override
+  String get settingsResetAppsHint =>
+      'Restore the widget apps to their initial state';
+
+  @override
+  String get settingsResetAppsConfirmTitle => 'Reset all apps?';
+
+  @override
+  String get settingsResetAppsConfirmBody =>
+      'This deletes EVERY widget you downloaded from the catalog or created here, together with ALL its data (saved state, settings, storage). The apps grid returns to a clean slate — re-download anything from Get widgets. This cannot be undone.';
+
+  @override
+  String settingsResetAppsDone(int count) {
+    return 'Apps reset — $count widget(s) removed';
+  }
+
+  @override
+  String get appsCatalogCreatedByMe => 'Created by me';
+
+  @override
+  String get commonError => 'Something went wrong';
+
+  @override
+  String get launcherTabGetWidgets => 'Get widgets';
+
+  @override
+  String get launcherRestoreDemoAppFailed => 'Could not restore the app';
+
+  @override
+  String get launcherSeedErrorCopy => 'Copy error';
+
+  @override
+  String get launcherSeedErrorHint =>
+      'Send this error to Fa — it can fix the app.';
+
+  @override
+  String get launcherSeedErrorTitle => 'App failed to install';
+
+  @override
+  String get launcherManifestErrorTitle => 'App failed to load';
+
+  @override
+  String get appsManifestErrorLabel => 'Manifest error';
+
+  @override
+  String get launcherTileSizeIcon => 'Icon (1×1)';
+
+  @override
+  String get launcherTileSizeLarge => 'Large (4×4)';
+
+  @override
+  String get launcherTileSizeMedium => 'Medium (4×2)';
+
+  @override
+  String get launcherTileSizeReset => 'Reset to default';
+
+  @override
+  String get launcherTileSizeSmall => 'Small (2×2)';
+
+  @override
+  String get launcherTileSizeTall => 'Tall (1×2)';
+
+  @override
+  String get launcherTileSizeWide => 'Wide (2×1)';
+
+  @override
+  String get launcherTileSizeColumn => 'Column (1×3)';
+
+  @override
+  String get launcherTileSizeRow => 'Row (3×1)';
+
+  @override
+  String get mediaFileMissing => 'Media file not found';
+
+  @override
+  String get mediaModelsApiKeyNameHelper =>
+      'Name of a saved key (see Keys) — never the key itself. Empty reuses the main connection\'s key.';
+
+  @override
+  String get mediaModelsApiKeyNameLabel => 'API key name (optional)';
+
+  @override
+  String get mediaModelsCapabilitiesNote =>
+      'This endpoint\'s models suggest support for:';
+
+  @override
+  String get mediaModelsClearButton => 'Clear';
+
+  @override
+  String mediaModelsEditTitle(Object slot) {
+    return 'Edit $slot';
+  }
+
+  @override
+  String get mediaModelsFallbackSummary => 'Same as main connection';
+
+  @override
+  String get mediaModelsMainConnection => 'Main connection';
+
+  @override
+  String mediaModelsOverrideSummary(Object host, Object modelId) {
+    return '$modelId · $host';
+  }
+
+  @override
+  String get mediaModelsSectionNote =>
+      'Image, audio, video and transcription calls use the main connection unless a slot overrides it.';
+
+  @override
+  String get mediaModelsSectionTitle => 'Media models';
+
+  @override
+  String get mediaModelsSlotAudioTts => 'Text-to-speech';
+
+  @override
+  String get mediaModelsSlotImageGeneration => 'Image generation';
+
+  @override
+  String get mediaModelsSlotMusicGeneration => 'Music generation';
+
+  @override
+  String get mediaModelsSlotTranscription => 'Transcription';
+
+  @override
+  String get mediaModelsSlotVideoGeneration => 'Video generation';
+
+  @override
+  String get mediaModelsSlotVision => 'Vision (image reading)';
+
+  @override
+  String get mediaMuteTooltip => 'Mute';
+
+  @override
+  String get mediaPauseTooltip => 'Pause';
+
+  @override
+  String get mediaPlayTooltip => 'Play';
+
+  @override
+  String get mediaUnmuteTooltip => 'Unmute';
+
+  @override
+  String get mediaVideoUnsupportedWeb =>
+      'Video playback is not supported in the web build';
+
+  @override
+  String get modelPresetBudgetDescription =>
+      'Cheapest solid combo for every day — fast chat plus all media on OpenRouter';
+
+  @override
+  String get modelPresetBudgetName => 'Budget optimal';
+
+  @override
+  String get modelPresetQualityDescription =>
+      'Top-tier chat plus flagship image generation — the strongest combo on OpenRouter';
+
+  @override
+  String get modelPresetQualityName => 'Quality';
+
+  @override
+  String get modelPresetsApplied => 'Applied';
+
+  @override
+  String get modelPresetsChatLabel => 'Chat';
+
+  @override
+  String modelPresetsKeyMissing(Object provider) {
+    return 'This preset needs an API key for $provider.';
+  }
+
+  @override
+  String get modelPresetsSectionTitle => 'Model presets';
+
+  @override
+  String get modelPresetsSetKey => 'Set key';
+
+  @override
+  String get onboardingAiDisclaimer =>
+      'Answers come from third-party AI providers you connect. AI can be wrong or incomplete — always verify important information.';
+
+  @override
+  String get onboardingAiDisclaimerTitle => 'AI can make mistakes';
+
+  @override
+  String get onboardingFeatureApps =>
+      'Builds real mini-apps with live widgets right on your home grid';
+
+  @override
+  String get onboardingFeatureAutomation =>
+      'Automates your calendar, reminders and smart home';
+
+  @override
+  String get onboardingFeatureMedia =>
+      'Generates images, music and video on demand';
+
+  @override
+  String get onboardingGetStarted => 'Get started';
+
+  @override
+  String get onboardingModelsBody =>
+      'One tap applies a full combo — chat plus image, music and video models. You can change everything later in Settings.';
+
+  @override
+  String get onboardingModelsSetUpLater => 'Set up later';
+
+  @override
+  String get onboardingModelsTitle => 'Pick your models';
+
+  @override
+  String get onboardingNext => 'Continue';
+
+  @override
+  String get onboardingPermissionCalendar => 'Calendar';
+
+  @override
+  String get onboardingPermissionCalendarDesc => 'Event planning';
+
+  @override
+  String get onboardingPermissionContacts => 'Contacts';
+
+  @override
+  String get onboardingPermissionContactsDesc => 'Call and message actions';
+
+  @override
+  String get onboardingPermissionHealth => 'Health';
+
+  @override
+  String get onboardingPermissionHealthDesc => 'Activity summaries';
+
+  @override
+  String get onboardingPermissionHome => 'Home';
+
+  @override
+  String get onboardingPermissionHomeDesc => 'Smart home control';
+
+  @override
+  String get onboardingPermissionMicrophone => 'Microphone';
+
+  @override
+  String get onboardingPermissionMicrophoneDesc => 'Voice input';
+
+  @override
+  String get onboardingPermissionNotifications => 'Notifications';
+
+  @override
+  String get onboardingPermissionNotificationsDesc => 'Reminders and alerts';
+
+  @override
+  String get onboardingPermissionsBody =>
+      'All of these are optional — core chat works without any of them. Fa asks only in context, when a feature actually needs it, and you can change your mind anytime in the system Settings.';
+
+  @override
+  String get onboardingPermissionsTitle => 'Permissions, on your terms';
+
+  @override
+  String get onboardingPrivacyKeysDesc =>
+      'API keys live in the platform Keychain (iOS/macOS) or the local secure store — never in chat logs.';
+
+  @override
+  String get onboardingPrivacyKeysTitle => 'Keys stay locked away';
+
+  @override
+  String get onboardingPrivacyOnDeviceDesc =>
+      'Your conversations and files stay on this device.';
+
+  @override
+  String get onboardingPrivacyOnDeviceTitle => 'Chats and files stay on device';
+
+  @override
+  String get onboardingPrivacyPolicyLink => 'Privacy policy';
+
+  @override
+  String get onboardingPrivacyProvidersDesc =>
+      'Content is sent only to the AI providers you explicitly connect.';
+
+  @override
+  String get onboardingPrivacyProvidersTitle => 'You choose the providers';
+
+  @override
+  String get onboardingPrivacyTitle => 'Your data stays yours';
+
+  @override
+  String get onboardingSkip => 'Skip';
+
+  @override
+  String get onboardingWelcomeBody =>
+      'Chat with an AI agent that does real work, not just talk.';
+
+  @override
+  String get onboardingWelcomeTitle => 'Meet Fa';
+
+  @override
+  String quickStartCachedLabel(Object bytes, Object size) {
+    return '$size · $bytes cached';
+  }
+
+  @override
+  String get quickStartLoading => 'Loading model…';
+
+  @override
+  String get quickStartSubtitle =>
+      'Already on this device — one tap, no API key needed.';
+
+  @override
+  String get quickStartTitle => 'Downloaded models';
+
+  @override
+  String get quickStartUse => 'Use';
+
+  @override
+  String get secretRequestInvalidName =>
+      'Use UPPER_SNAKE: A–Z, 0–9, _, starting with a letter';
+
+  @override
+  String get secretRequestNameLabel => 'Key name';
+
+  @override
+  String get secretRequestNotNow => 'Not now';
+
+  @override
+  String get secretRequestSave => 'Save';
+
+  @override
+  String get secretRequestTitle => 'Fa needs a key';
+
+  @override
+  String get secretRequestValueLabel => 'Key value';
+
+  @override
+  String get settingsAddProvider => 'Add provider';
+
+  @override
+  String get settingsApiKeyHint => 'Paste your provider key';
+
+  @override
+  String get settingsApiKeyLabel => 'API key';
+
+  @override
+  String get settingsApiKeyLocalHelper =>
+      'Leave empty for local servers (llama.cpp, Ollama, LM Studio)';
+
+  @override
+  String get settingsApiKeyOptionalLabel => 'API key (optional)';
+
+  @override
+  String get settingsApiKeyRequired => 'API key is required';
+
+  @override
+  String get settingsApplyButton => 'Apply';
+
+  @override
+  String get settingsBaseUrlHelper => 'OpenAI-compatible endpoint';
+
+  @override
+  String get settingsBaseUrlLabel => 'Base URL';
+
+  @override
+  String get settingsBaseUrlRequired => 'Base URL is required';
+
+  @override
+  String get settingsCliOnlyTitle => 'CLI-only settings';
+
+  @override
+  String get settingsCliOnlyLead =>
+      'These settings live in the CLI and its config file — this app cannot host them:';
+
+  @override
+  String get settingsCliOnlyMcpServers => 'MCP servers';
+
+  @override
+  String get settingsCliOnlyTtsrRules => 'Stream rules (TTSR)';
+
+  @override
+  String get settingsCliOnlyCubeSandbox => 'Cube sandbox';
+
+  @override
+  String get settingsCliOnlyPromptOverrides => 'Prompt overrides';
+
+  @override
+  String get settingsCliOnlyAgentMode => 'Agent mode';
+
+  @override
+  String get settingsCliOnlyMemoryStores => 'Memory stores';
+
+  @override
+  String get settingsCancelButton => 'Cancel';
+
+  @override
+  String get settingsCoderBadge => 'coder';
+
+  @override
+  String get settingsCorsNoteCustom =>
+      'Any OpenAI-compatible endpoint. The provider must allow browser (CORS) requests — api.anthropic.com does not, so reach Anthropic models via OpenRouter instead.';
+
+  @override
+  String get settingsCopyDebugLogs => 'Copy debug logs';
+
+  @override
+  String get settingsSendTestCrashReport => 'Send test crash report';
+
+  @override
+  String get settingsTestCrashReportNoFirebase =>
+      'Crashlytics not initialized on this device';
+
+  @override
+  String get settingsTestCrashReportSent =>
+      'Test report sent — check the Firebase console in a few minutes';
+
+  @override
+  String get settingsDebugLogsCopied => 'Debug logs copied to clipboard';
+
+  @override
+  String get settingsCorsNoteOllama =>
+      'Calls go straight from your browser to ollama.com, which currently does not send CORS headers — browser calls fail. Use OpenRouter here, or pick Ollama from the mobile/desktop app instead.';
+
+  @override
+  String get settingsDefaultChatModelTitle => 'Default chat model';
+
+  @override
+  String get settingsDapAddConnection => 'Add connection';
+
+  @override
+  String get settingsDapAgentIdLabel => 'Agent id';
+
+  @override
+  String get settingsDapAgentNameLabel => 'Agent name';
+
+  @override
+  String get settingsDapPasswordLabel => 'Hub password';
+
+  @override
+  String get settingsDapChannelsEmpty =>
+      'No channels yet — channels appear here once the agent joins one (dap_invite / dap_connect).';
+
+  @override
+  String get settingsDapChannelsTitle => 'Channels';
+
+  @override
+  String get settingsDapEditConnection => 'Edit connection';
+
+  @override
+  String get settingsDapMakeActive => 'Make active';
+
+  @override
+  String get settingsDapActiveChip => 'Active';
+
+  @override
+  String get settingsDapSavedTitle => 'Saved connections';
+
+  @override
+  String get settingsDapSavedHint =>
+      'Bookmarked hubs. Tap one to make it the hub this agent is online on — the switch is live.';
+
+  @override
+  String get settingsDapRemoveSaved => 'Remove';
+
+  @override
+  String get settingsDapEnvNote =>
+      'DAP_HUB_URL or DAP_AGENT_NAME is set in the environment — env overrides the saved connection.';
+
+  @override
+  String get settingsDapHubHint => 'Let Fa agents find and message each other';
+
+  @override
+  String get settingsDapHubIntro =>
+      'A hub is where your Fa agents meet — the CLI, this app, and the browser extension. Connect once and this agent becomes reachable by name: others can find it and send it messages.';
+
+  @override
+  String get settingsAgentNetworkJoin => 'Join as agent';
+
+  @override
+  String get settingsAgentNetworkJoinHint =>
+      'Your agent joins the hub as a live, addressable member — CLI peers and other apps reach it by DM.';
+
+  @override
+  String get settingsAgentNetworkUrl => 'Hub URL';
+
+  @override
+  String get settingsAgentNetworkToken => 'Pairing token';
+
+  @override
+  String get settingsAgentNetworkName => 'Agent name';
+
+  @override
+  String get settingsAgentNetworkSave => 'Save';
+
+  @override
+  String get settingsAgentNetworkConnected => 'Connected';
+
+  @override
+  String get settingsAgentNetworkConnecting => 'Connecting…';
+
+  @override
+  String get settingsAgentNetworkOffline => 'Offline';
+
+  @override
+  String get settingsAgentNetworkPeers => 'Peers';
+
+  @override
+  String get settingsAgentNetworkNoPeers => 'No peers visible yet';
+
+  @override
+  String get settingsAgentNetworkDmHint => 'Message a peer…';
+
+  @override
+  String get settingsAgentNetworkSend => 'Send DM';
+
+  @override
+  String get settingsAgentNetworkUnsupported =>
+      'Agent network membership is not available on this platform.';
+
+  @override
+  String get settingsAgentNetworkSaved => 'Agent network settings saved';
+
+  @override
+  String get settingsDapIdentityTitle => 'How other agents see you';
+
+  @override
+  String get settingsDapIdentityHint =>
+      'The name is how other agents address you. The id is derived from this device’s key.';
+
+  @override
+  String get settingsDapInboundTitle => 'Incoming messages';
+
+  @override
+  String get settingsDapInboundHint => 'Where messages from other agents land';
+
+  @override
+  String get settingsDapInboundDedicated =>
+      'A dedicated agent session (recommended)';
+
+  @override
+  String get settingsDapInboundCurrent => 'Whichever session is open';
+
+  @override
+  String get settingsDapInboundNamed => 'A session you pick';
+
+  @override
+  String get settingsDapInboundBadgeTooltip =>
+      'This session receives messages from other agents';
+
+  @override
+  String get settingsDapHubTitle => 'Agent network';
+
+  @override
+  String get settingsDapNameHint => 'alice';
+
+  @override
+  String get settingsDapPasswordHint => 'Leave empty to keep the current one';
+
+  @override
+  String get settingsDapProbeButton => 'Check connection';
+
+  @override
+  String get settingsDapStatusConnected => 'Connected';
+
+  @override
+  String get settingsDapStatusOffline => 'Unreachable';
+
+  @override
+  String get settingsDapStatusUnknown => 'Not checked';
+
+  @override
+  String get settingsDapUnsupported =>
+      'DAP hub is not supported on this platform.';
+
+  @override
+  String get settingsDapUrlHint => 'hub.example.com or ws://hub.example.com/ws';
+
+  @override
+  String get settingsDapUrlLabel => 'Hub URL';
+
+  @override
+  String get settingsDapUrlRequired => 'Hub URL is required';
+
+  @override
+  String get settingsDapLoadFailed =>
+      'Could not read the DAP config on this machine.';
+
+  @override
+  String get settingsDapSaveFailed =>
+      'Could not save the DAP connection — check the hub URL.';
+
+  @override
+  String get settingsDeleteButton => 'Delete';
+
+  @override
+  String get settingsDeleteProviderBody =>
+      'The provider is removed from the picker. The current connection is not affected.';
+
+  @override
+  String settingsDeleteProviderTitle(Object name) {
+    return 'Delete $name?';
+  }
+
+  @override
+  String get settingsDownloadingWeights => 'Downloading model weights…';
+
+  @override
+  String get settingsEditButton => 'Edit';
+
+  @override
+  String get settingsEditProviderTitle => 'Edit provider';
+
+  @override
+  String get settingsEditorKeyNote =>
+      'Name, URL and model are saved; the key is kept in memory for this session only — never persisted.';
+
+  @override
+  String get settingsEditorKeyNoteSecure =>
+      'Name, URL and model are saved; the key is stored in the device\'s secure key store (Keychain/Keystore) while it\'s available.';
+
+  @override
+  String get settingsEditorKeepKeyNote =>
+      'A key is saved for this provider — leave the field empty to keep it.';
+
+  @override
+  String get settingsKeyNoteCustom =>
+      'The provider definition (name, URL, model) is saved — no secrets. The API key stays in memory for this session only and is gone on reload.';
+
+  @override
+  String get settingsKeyNoteCustomSecure =>
+      'The provider definition (name, URL, model) is saved — no secrets. Saved keys are stored in the device\'s secure key store (Keychain/Keystore) while it\'s available; an unsaved key stays in memory for this session only.';
+
+  @override
+  String get settingsKeyNoteHosted =>
+      'In-memory only: your key is never persisted and is gone on reload. Calls go straight from your browser to the provider — nothing is proxied or stored.';
+
+  @override
+  String get settingsKeyNoteHostedSecure =>
+      'Saved keys are stored in the device\'s secure key store (Keychain/Keystore) while it\'s available; a key only typed into the form stays in memory for this session. Calls go straight from the app to the provider — nothing is proxied.';
+
+  @override
+  String get settingsLoadingModel => 'Loading model…';
+
+  @override
+  String get settingsModelIdLabel => 'Model id';
+
+  @override
+  String get settingsModelIdOptionalLabel => 'Model id (optional)';
+
+  @override
+  String get settingsModelIdRequired => 'Model id is required';
+
+  @override
+  String get settingsModelsFetching => 'Fetching models from the endpoint…';
+
+  @override
+  String get settingsModelsGroupTitle => 'Models';
+
+  @override
+  String get settingsNameRequired => 'Name is required';
+
+  @override
+  String get settingsOnDeviceModelLabel => 'On-device model';
+
+  @override
+  String get settingsPickModelTitle => 'Choose model';
+
+  @override
+  String get settingsPickProviderTitle => 'Choose provider';
+
+  @override
+  String get settingsPresetCustom => 'Custom';
+
+  @override
+  String get settingsPresetOllama => 'Ollama';
+
+  @override
+  String get settingsPresetOpenrouter => 'OpenRouter';
+
+  @override
+  String get settingsPresetTransformersJs => 'On-device (transformers.js)';
+
+  @override
+  String get settingsPresetWebllm => 'On-device (WebLLM)';
+
+  @override
+  String get settingsProviderLabel => 'Provider';
+
+  @override
+  String settingsProviderModelSummary(Object model, Object provider) {
+    return '$model · $provider';
+  }
+
+  @override
+  String get settingsProviderNameHint => 'My provider';
+
+  @override
+  String get settingsProviderNameLabel => 'Name';
+
+  @override
+  String get settingsProvidersSectionTitle => 'Providers';
+
+  @override
+  String get settingsSaveButton => 'Save';
+
+  @override
+  String settingsStaleModelCache(Object model) {
+    return 'The previously used model ($model) was removed from the cache — pick a model to download it again.';
+  }
+
+  @override
+  String get settingsSkillsAccess => 'Skills access';
+
+  @override
+  String get settingsSkillsAccessHint =>
+      'Reuse skills Claude, Copilot or Codex left in the project folder (.claude, .github, .codex)';
+
+  @override
+  String get settingsSkillsToggles => 'Built-in skills';
+
+  @override
+  String get settingsSkillsTogglesHint =>
+      'Enable or disable the skills that ship with Fa';
+
+  @override
+  String get skillsAccessAsk => 'Ask';
+
+  @override
+  String get skillsAccessAllowed => 'Allowed';
+
+  @override
+  String get skillsAccessDenied => 'Denied';
+
+  @override
+  String get skillsAccessDialogTitle => 'Reuse existing agent skills?';
+
+  @override
+  String get skillsAccessDialogBody =>
+      'This project may contain skills from Claude, Copilot or Codex (.claude, .github, .codex folders) — instructions other tools placed on this machine. Fa can reuse them for your tasks.';
+
+  @override
+  String get skillsAccessAllow => 'Allow';
+
+  @override
+  String get skillsAccessNotNow => 'Not now';
+
+  @override
+  String get settingsThemeDark => 'Dark';
+
+  @override
+  String get settingsThemeLabel => 'Theme';
+
+  @override
+  String get settingsChatTextLabel => 'Chat text size';
+
+  @override
+  String get settingsImagePreviewsLabel => 'High-quality image previews';
+
+  @override
+  String get settingsImagePreviewsHelper =>
+      'Decode chat image previews at full resolution. Off keeps the faster 600px downscale.';
+
+  @override
+  String get settingsThemeLight => 'Light';
+
+  @override
+  String get settingsThemeSystem => 'System';
+
+  @override
+  String get settingsStartChat => 'Start chat';
+
+  @override
+  String get settingsTitle => 'Settings';
+
+  @override
+  String get settingsToolsBadge => 'tools via prompt';
+
+  @override
+  String get settingsTransformersJsNote =>
+      'Runs fully offline after download · needs WebGPU (Chrome/Edge/newer Safari) · weights download once from HuggingFace (public repo, no token) and are cached in your browser';
+
+  @override
+  String get settingsVisionBadge => 'vision';
+
+  @override
+  String get settingsWebllmNote =>
+      'Runs fully offline after download · needs WebGPU (Chrome/Edge/newer Safari) · weights ~0.5-4 GB cached in your browser';
+
+  @override
+  String get taskModelSameAsMain => 'Same as main';
+
+  @override
+  String get taskModelSave => 'Save';
+
+  @override
+  String get taskModelSectionTitle => 'Task models';
+
+  @override
+  String get taskModelSmolDescription => 'For summaries and subagents';
+
+  @override
+  String get taskModelSmolTitle => 'Quick model';
+
+  @override
+  String get taskModelUseMain => 'Use main model';
+
+  @override
+  String get setupAppBarTitle => 'Connect to Fa';
+
+  @override
+  String sidebarAllApps(Object count) {
+    return 'All apps ($count)';
+  }
+
+  @override
+  String get sidebarAppsHeader => 'Apps';
+
+  @override
+  String get sidebarCancel => 'Cancel';
+
+  @override
+  String get sidebarDelete => 'Delete';
+
+  @override
+  String get sidebarDeleteUnavailable =>
+      'Delete unavailable — session lives in the host app';
+
+  @override
+  String sidebarDeletePersistedContent(Object id) {
+    return 'Session $id';
+  }
+
+  @override
+  String get sidebarDeleteSessionContent =>
+      'This removes the saved session permanently.';
+
+  @override
+  String sidebarDeleteSessionFailed(Object error) {
+    return 'Could not delete session: $error';
+  }
+
+  @override
+  String get sidebarDeleteSessionTitle => 'Delete session?';
+
+  @override
+  String get sidebarDeleteSessionTooltip => 'Delete session';
+
+  @override
+  String get sidebarLoadSessionsError => 'Could not load sessions';
+
+  @override
+  String get sidebarModelHeader => 'Model';
+
+  @override
+  String get sidebarNewSessionTooltip => 'New session';
+
+  @override
+  String get sidebarNoActiveSession => 'No active session';
+
+  @override
+  String get sidebarNoModel => 'no model';
+
+  @override
+  String get sidebarNoSessions => 'No sessions yet';
+
+  @override
+  String get sidebarOnThisDevice => 'On this device';
+
+  @override
+  String get sidebarOpenAppsGridTooltip => 'Open apps grid';
+
+  @override
+  String get sidebarProviderAnthropic => 'Anthropic';
+
+  @override
+  String get sidebarProviderGoogle => 'Google';
+
+  @override
+  String get sidebarProviderOnDeviceWebllm => 'On-device (WebLLM)';
+
+  @override
+  String get sidebarProviderOpenaiCompatible => 'OpenAI-compatible API';
+
+  @override
+  String get sidebarRefreshAppsTooltip => 'Refresh apps';
+
+  @override
+  String get sidebarRefreshSessionsTooltip => 'Refresh sessions';
+
+  @override
+  String get sidebarRenameClear => 'Clear';
+
+  @override
+  String get sidebarRenameDialogTitle => 'Rename session';
+
+  @override
+  String get sidebarRenameHint => 'An empty name restores the default one.';
+
+  @override
+  String get sidebarRenameNameLabel => 'Name';
+
+  @override
+  String get sidebarRenameSessionTooltip => 'Rename session';
+
+  @override
+  String get sidebarRetry => 'Retry';
+
+  @override
+  String sidebarSessionTitle(Object id) {
+    return 'session $id';
+  }
+
+  @override
+  String get sidebarSearchHint => 'Search sessions';
+
+  @override
+  String get sidebarSearchClearTooltip => 'Clear search';
+
+  @override
+  String sidebarSearchNoMatches(Object query) {
+    return 'No sessions match \"$query\"';
+  }
+
+  @override
+  String get sidebarSessionsHeader => 'Sessions';
+
+  @override
+  String sidebarSubagentSessionCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count agents',
+      one: '1 agent',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String sidebarSubagentTitle(String id) {
+    return 'subagent $id';
+  }
+
+  @override
+  String get tjsCacheTitle => 'Downloaded models (transformers.js)';
+
+  @override
+  String get tjsCacheWebOnly =>
+      'On-device (transformers.js) models are available in the web build only.';
+
+  @override
+  String uploadTooLarge(Object max, Object total) {
+    return 'Upload is too large: $total exceeds the $max per-batch limit.';
+  }
+
+  @override
+  String get webllmCacheManagedByOs =>
+      'On-device models are managed by the OS/app storage on this platform.';
+
+  @override
+  String get webllmCacheTitle => 'Downloaded models';
+
+  @override
+  String get settingsVisionLabel => 'Supports images (vision)';
+
+  @override
+  String get settingsIconsPerRow => 'Icons per row';
+
+  @override
+  String get settingsIconsPerRowHint =>
+      'Home grid columns; Auto is 4 on phone, 6 on wide screens';
+
+  @override
+  String get settingsIconsPerRowAuto => 'Auto';
+
+  @override
+  String get settingsShowOnboarding => 'Show welcome tour';
+
+  @override
+  String get chatSteerTooltip => 'Send now (interrupt)';
+
+  @override
+  String bootstrapSessionStartError(Object error) {
+    return 'Could not start a session: $error';
+  }
+
+  @override
+  String get bootstrapRetry => 'Retry';
+
+  @override
+  String get workspaceDialogTitle => 'Session';
+
+  @override
+  String get workspaceDialogChangeFolder => 'Change folder…';
+
+  @override
+  String get workspaceDialogClearFolder => 'Use Personal folder';
+
+  @override
+  String get workspaceDialogClose => 'Close';
+
+  @override
+  String get workspaceDialogCurrentFolder => 'Session folder';
+
+  @override
+  String get workspaceDialogHostPath => 'Host path';
+
+  @override
+  String get workspaceDialogMountHint =>
+      'Files at /project/... in the agent map to this folder on your Mac.';
+
+  @override
+  String get workspaceDialogUnsupported =>
+      'Project folders are only available on macOS right now.';
+
+  @override
+  String get workspaceDialogPersonal => 'Personal (no folder mounted)';
+
+  @override
+  String get workspaceDialogMailbox => 'Your mailbox';
+
+  @override
+  String get workspaceDialogMailboxHint =>
+      'Other Fa agents can message this session at this address.';
+
+  @override
+  String get workspaceDialogMailboxCopy => 'Copy';
+
+  @override
+  String get workspaceDialogMailboxCopied => 'Mailbox address copied';
+
+  @override
+  String get workspaceDialogRestrictTools => 'Restrict tools to this folder';
+
+  @override
+  String get workspaceDialogRestrictToolsHint =>
+      'Disable anything that would read or write outside the mounted folder. Off-project attempts will be blocked (and a dialog will ask you to approve them once that flow is wired up).';
+
+  @override
+  String get toolsAvailabilityTitle => 'Tools';
+
+  @override
+  String get toolsAvailabilityHint =>
+      'Turn tools off or on for Fa — applies immediately, no restart.';
+
+  @override
+  String get settingsRedaction => 'Secret redaction';
+
+  @override
+  String get settingsRedactionHint =>
+      'Mask API keys and secrets in everything Fa sends or stores. Applies immediately, no restart.';
+
+  @override
+  String toolsAvailabilityUnavailable(Object reason) {
+    return 'Unavailable: $reason';
+  }
+
+  @override
+  String get githubAccountSection => 'GitHub account';
+
+  @override
+  String get githubAccountHint =>
+      'Connect GitHub to publish your widgets to the fa_widgets catalog.';
+
+  @override
+  String get githubConnect => 'Connect GitHub';
+
+  @override
+  String get githubDisconnect => 'Disconnect';
+
+  @override
+  String get githubDisconnectConfirm =>
+      'PRs already opened stay on GitHub — only status polling stops.';
+
+  @override
+  String get githubTokenHint => 'GitHub token with public_repo scope';
+
+  @override
+  String get githubConnectTokenTab => 'Token';
+
+  @override
+  String get githubConnectDeviceTab => 'Device code';
+
+  @override
+  String get githubConnectDeviceInstructions =>
+      'Enter this code at github.com/login/device — it lets Fa create public widget repos under your account.';
+
+  @override
+  String get githubCopyCode => 'Copy code';
+
+  @override
+  String get githubOpenDevicePage => 'Open github.com/login/device';
+
+  @override
+  String get githubConnectValidating => 'Validating…';
+
+  @override
+  String get myPublications => 'My publications';
+
+  @override
+  String get publicationsEmpty => 'Nothing published yet.';
+
+  @override
+  String get publicationsRefresh => 'Refresh';
+
+  @override
+  String get publicationsOffline => 'Offline — showing last known states.';
+
+  @override
+  String get publicationStateOpen => 'Open';
+
+  @override
+  String get publicationStatePublished => 'Published';
+
+  @override
+  String get publicationStateRejected => 'Rejected';
+
+  @override
+  String get publicationStateUnknown => 'Unknown';
+
+  @override
+  String get widgetStatusNotPublished => 'Not published';
+
+  @override
+  String get widgetStatusValidating => 'Validating…';
+
+  @override
+  String get widgetStatusInvalid => 'Invalid';
+
+  @override
+  String get widgetStatusFailed => 'Publish failed';
+
+  @override
+  String get widgetStatusErrors => 'Validator errors:';
+
+  @override
+  String get widgetStatusOpenRun => 'Open CI run';
+
+  @override
+  String get widgetDetailVersion => 'Version';
+
+  @override
+  String get widgetDetailAuthor => 'Author';
+
+  @override
+  String publicationSubmittedAt(Object date) {
+    return 'Submitted $date';
+  }
+
+  @override
+  String publicationComments(num count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count comments',
+      one: '1 comment',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String publishWidgetTitle(Object name) {
+    return 'Publish “$name”';
+  }
+
+  @override
+  String get publishPreflightFailed => 'Fix these issues before publishing:';
+
+  @override
+  String get publishRepoNameLabel => 'Repository name';
+
+  @override
+  String get publishButton => 'Publish';
+
+  @override
+  String get publishInProgress => 'Publishing…';
+
+  @override
+  String get publishSuccess => 'Pull request opened:';
+
+  @override
+  String get publishDone => 'Done';
+
+  @override
+  String get launcherPublishWidget => 'Publish…';
+
+  @override
+  String get githubTokenNoRepoScope =>
+      'This token cannot create repositories — publishing needs repo rights. Use a classic PAT with the public_repo scope (or a fine-grained PAT with All repositories + Administration + Contents read/write). The Device code login often yields a token without repo rights.';
+
+  @override
+  String get githubDeviceFallbackWarn =>
+      'Heads-up: this device login uses the public Copilot Plugin app, whose tokens GitHub limits to identity-only — they cannot publish. To publish via device code, register your own GitHub OAuth App (Settings → Developer settings → OAuth Apps, set the Authorization callback URL to https://fa1.dev/oauth/callback) and save its client id in Settings → Keys as github_oauth_client_id, or rebuild the app with --dart-define=FA_GITHUB_CLIENT_ID=<id>. Until then, connect with a classic PAT (public_repo) on the Token tab.';
+
+  @override
+  String get githubConnectWebTab => 'Browser';
+
+  @override
+  String get githubBrowserHint =>
+      'Opens github.com in your browser. After \"Authorize\" the fa1.dev callback page shows a one-time code — paste it below. Needs your own OAuth App: its client id in Keys as github_oauth_client_id and its secret as github_oauth_client_secret.';
+
+  @override
+  String get githubBrowserOpen => 'Open GitHub again';
+
+  @override
+  String get githubBrowserCodeHint => 'One-time code from fa1.dev';
+
+  @override
+  String sessionDrivenElsewhere(String host, int pid) {
+    return 'Driven by $host (pid $pid) — you are viewing. Your messages are delivered to the live agent.';
+  }
+
+  @override
+  String sessionTooLargeTitle(String size) {
+    return 'Session ($size MB) is over the instant-open budget and couldn\'t be opened safely.';
+  }
+
+  @override
+  String get sessionMintFailed => 'Couldn\'t create a new session.';
+
+  @override
+  String sessionBootSkippedOversize(String name, String size) {
+    return 'Resumed a fresh session — “$name” ($size MB) is over the instant-open budget.';
+  }
+
+  @override
+  String get sessionBootSkippedOpen => 'Open windowed';
+
+  @override
+  String get dynamicMessagesButtonTooltip => 'Dynamic messages';
+
+  @override
+  String get dynamicMessagesSheetTitle => 'Dynamic messages';
+
+  @override
+  String get dynamicMessagesLive => 'live';
+
+  @override
+  String dynamicMessagesEventCount(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count events',
+      one: '1 event',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String dynamicMessagesSaved(String appId) {
+    return 'Saved to your apps as “$appId”';
+  }
+
+  @override
+  String get dynamicMessagesSaveFailed =>
+      'Could not save this dynamic message as an app.';
+
+  @override
+  String get dynamicTileSaveAsApp => 'Save as app';
+
+  @override
+  String get dynamicTilePermissions => 'Permissions';
+
+  @override
+  String get dynamicTileError => 'Widget error';
+
+  @override
+  String get dynamicTileOverflow =>
+      'This widget is wider than the chat viewport — content on the right is clipped. The agent has been asked to rebuild it to fit.';
+
+  @override
+  String get dynamicTileRetry => 'Retry';
+
+  @override
+  String get dynamicTileMenu => 'More actions';
+
+  @override
+  String get dynamicTileOpenAsApp => 'Open as app (without saving)';
+
+  @override
+  String get dynamicTileOpenUnavailable =>
+      'Widget can\'t start — boot failed. Retry it in the chat first.';
+
+  @override
+  String get themeConsentTitle => 'Apply theme pack?';
+
+  @override
+  String themeConsentBody(String app, String pack) {
+    return '$app wants to apply the theme pack \"$pack\".';
+  }
+
+  @override
+  String get themeConsentContrast =>
+      'Warning: some color pairs in this pack are below WCAG AA contrast (4.5:1).';
+
+  @override
+  String get themeConsentApply => 'Apply';
+
+  @override
+  String get themeConsentDeny => 'Keep current';
+
+  @override
+  String get themePacksTitle => 'Theme packs';
+
+  @override
+  String get themePacksSubtitle =>
+      'Install a .zip with theme.json, switch the active pack, or remove one';
+
+  @override
+  String get themePackDefault => 'Default Fa look';
+
+  @override
+  String get themePackImport => 'Import theme pack';
+
+  @override
+  String get themePackDelete => 'Remove';
+
+  @override
+  String get themePackActiveChip => 'active';
+
+  @override
+  String get themePackWallpaperChip => 'wallpaper';
+
+  @override
+  String themePackImported(String name) {
+    return 'Theme pack \"$name\" installed';
+  }
+
+  @override
+  String get settingsCompactionLabel => 'Compaction';
+
+  @override
+  String get settingsCompactionHelper =>
+      'How the context is compacted when it nears the model\'s window. Applies at the next compaction.';
+
+  @override
+  String get settingsCompactionStructured => 'Structured (recommended)';
+
+  @override
+  String get settingsCompactionStructuredHint =>
+      'Hides consumed records in place, expandable on demand — requires a configured model for the judge pass.';
+
+  @override
+  String get settingsCompactionClassic => 'Classic (legacy 1.0)';
+
+  @override
+  String get settingsCompactionClassicHint =>
+      'Lossy prefix summary — zero extra model calls.';
+
+  @override
+  String get settingsCompactionSourceProject =>
+      'effective from the project .fah/config.yaml';
+
+  @override
+  String get settingsCompactionSourceUser =>
+      'effective from the user ~/.fah/config.yaml';
+
+  @override
+  String get settingsCompactionSourceFallback =>
+      'structured default — no compaction setting in any config';
+
+  @override
+  String get settingsCompactionWebNote =>
+      'Not configurable on the web — there is no config file here, so the structured engine applies.';
+
+  @override
+  String settingsCompactionSaved(String file) {
+    return 'Saved to $file — applies at the next compaction.';
+  }
+
+  @override
+  String settingsCompactionSaveFailed(String error) {
+    return 'Could not save the compaction engine: $error';
+  }
+
+  @override
+  String get settingsCompactionDocs => 'Compaction docs';
+
+  @override
+  String get settingsQueueTitle => 'Provider queue';
+
+  @override
+  String get settingsQueueHelper =>
+      'An ordered chain of providers: when the current provider dies (quota, auth, network, timeout, malformed stream, 5xx, bad finish), the next takes over and the winner sticks for the session. Applies from the next run.';
+
+  @override
+  String get settingsQueueEmpty =>
+      'No provider queue — the single provider/model boot applies. Add an entry to build the chain.';
+
+  @override
+  String get settingsQueueScopeEnv =>
+      'effective from the FA_PROVIDERS_QUEUE environment variable — edit the env to change it (read-only here)';
+
+  @override
+  String get settingsQueueUnsupported =>
+      'Not configurable on the web — there is no config file or environment here.';
+
+  @override
+  String get settingsQueueAdd => 'Add entry';
+
+  @override
+  String get settingsQueueAddTitle => 'Add queue entry';
+
+  @override
+  String get settingsQueueMoveUp => 'Move up';
+
+  @override
+  String get settingsQueueMoveDown => 'Move down';
+
+  @override
+  String get settingsQueueRemove => 'Remove';
+
+  @override
+  String settingsQueueSaved(String file) {
+    return 'Queue saved to $file — applies from the next run.';
+  }
+
+  @override
+  String settingsQueueSaveFailed(String error) {
+    return 'Could not save the queue: $error';
+  }
+
+  @override
+  String get themePackImportFailed => 'Theme pack rejected';
+
+  @override
+  String get settingsMobileAutomation => 'Device automation';
+
+  @override
+  String get mobileConsentTitle => 'Device automation';
+
+  @override
+  String get mobileConsentWhat =>
+      'Enabling this lets the Fa accessibility service read the screen content and perform taps and typing on your behalf, so Fa can drive apps and settings for you.';
+
+  @override
+  String get mobileConsentOffByDefault =>
+      'The service is off by default — nothing runs until you turn it on here.';
+
+  @override
+  String get mobileConsentDisableHint =>
+      'You can disable it any time with one tap in Fa settings.';
+
+  @override
+  String get mobileConsentPrivacy =>
+      'Your data stays on the device: only the messages you exchange are sent inline to the model you configured.';
+
+  @override
+  String get mobileConsentEnable => 'Enable — open system settings';
+
+  @override
+  String get mobileConsentDisable => 'Disable';
+
+  @override
+  String get mobileConsentStatusOn => 'Accessibility service: on';
+
+  @override
+  String get mobileConsentStatusOff => 'Accessibility service: off';
+
+  @override
+  String get mobileConsentStoreUnavailable =>
+      'Device automation is not available in this build of Fa.';
+
+  @override
+  String get storeBannerTitle => 'Get Fa on the App Store';
+
+  @override
+  String get storeBannerBody =>
+      'The App Store release is paid — it funds development. The TestFlight beta is free forever.';
+
+  @override
+  String get storeBannerAndroidSoon => 'Android: coming soon';
+
+  @override
+  String get storeBannerCta => 'Open the App Store';
+
+  @override
+  String get storeBannerBeta => 'or join the free TestFlight beta';
+
+  @override
+  String get storeBannerDismiss => 'Hide banner';
+
+  @override
+  String get networkModeLocal => 'Local';
+
+  @override
+  String get networkModeNetwork => 'Network';
+
+  @override
+  String get networkWelcomeTitle => 'Welcome to Fa networks';
+
+  @override
+  String get networkWelcomeBody =>
+      'Join an existing network or create your own — channels and showcases open here.';
+
+  @override
+  String get networkNeedsPasswordTitle => 'This network needs your password';
+
+  @override
+  String get networkNeedsPasswordBody =>
+      'Account sync listed this network, but its password is stored only after you join once. Enter it to open the network.';
+
+  @override
+  String get networkNetworksTitle => 'Networks';
+
+  @override
+  String get networkBackTooltip => 'Back';
+
+  @override
+  String get networkSearchHint => 'Search networks';
+
+  @override
+  String get networkSignInTitle => 'Sign in';
+
+  @override
+  String get networkSignInHelper =>
+      'Sign in with your ai-native.cloud account to create and manage networks.';
+
+  @override
+  String networkSignInWithProvider(Object provider) {
+    return 'Continue with $provider';
+  }
+
+  @override
+  String get networkSignInWaiting => 'Complete the sign-in in your browser…';
+
+  @override
+  String get networkSignInDeveloperSection => 'Developer (local only)';
+
+  @override
+  String get networkSignInMobileNote =>
+      'Provider sign-in is unavailable here until the fa:// redirect is allowlisted on the server — only the developer login below works for now.';
+
+  @override
+  String get networkSessionExpired => 'Session expired — sign in again.';
+
+  @override
+  String get networkLoginLabel => 'Login';
+
+  @override
+  String get networkSignOut => 'Sign out';
+
+  @override
+  String get networkAccountFallback => 'Account';
+
+  @override
+  String get networkPublicSection => 'Public networks';
+
+  @override
+  String networkPublicMembers(Object count) {
+    return '$count members';
+  }
+
+  @override
+  String get networkEmptyTitle => 'No networks yet';
+
+  @override
+  String get networkJoinFirst => 'Join your first network';
+
+  @override
+  String get networkNoMatches => 'No matches';
+
+  @override
+  String get networkCreateNetwork => 'Create a network';
+
+  @override
+  String get networkNameLabel => 'Name';
+
+  @override
+  String get networkPasswordLabel => 'Password';
+
+  @override
+  String get networkCreate => 'Create';
+
+  @override
+  String get networkJoinTitle => 'Join a network';
+
+  @override
+  String get networkQuickSwitcherTitle => 'Quick switch';
+
+  @override
+  String get networkJoinLinkLabel => 'Join link';
+
+  @override
+  String get networkJoinFill => 'Fill';
+
+  @override
+  String get networkIdLabel => 'Network id or name';
+
+  @override
+  String get networkDisplayNameLabel => 'Display name';
+
+  @override
+  String get networkDisplayNameLocked => 'Display name locked to your account.';
+
+  @override
+  String get networkJoinRequired =>
+      'Network id or name and password are required.';
+
+  @override
+  String networkJoinInvalidCredentials(Object message) {
+    return 'Invalid credentials — $message';
+  }
+
+  @override
+  String networkJoinRetryAfter(Object seconds) {
+    return ' Try again in ${seconds}s.';
+  }
+
+  @override
+  String get networkJoin => 'Join';
+
+  @override
+  String get networkSelectChannel => 'Select a channel';
+
+  @override
+  String get networkReconnecting =>
+      'Reconnecting — messages will send when back.';
+
+  @override
+  String get networkReconnectNow => 'Reconnect now';
+
+  @override
+  String networkMessageHint(Object channel) {
+    return 'Message $channel';
+  }
+
+  @override
+  String get networkNewChannel => 'New channel';
+
+  @override
+  String networkOnlineCount(Object count) {
+    return '$count online';
+  }
+
+  @override
+  String get networkRosterTitle => 'Members';
+
+  @override
+  String get networkRosterLoading => 'Loading members…';
+
+  @override
+  String get networkRosterEmpty => 'No members yet.';
+
+  @override
+  String get networkPresenceOnline => 'Online';
+
+  @override
+  String get networkPresenceOffline => 'Offline';
+
+  @override
+  String get networkPresenceBusy => 'Busy';
+
+  @override
+  String get networkMemberOwner => 'Owner';
+
+  @override
+  String get networkMemberAdmin => 'Admin';
+
+  @override
+  String get networkMemberMember => 'Member';
+
+  @override
+  String get networkMemberGuest => 'Guest';
+
+  @override
+  String get networkMemberAgent => 'Agent';
+
+  @override
+  String get networkMemberUnknown => 'Unknown';
+
+  @override
+  String get networkAccessWholeNetwork => 'Whole network';
+
+  @override
+  String networkAccessChannels(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count channels',
+      one: '1 channel',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get networkAccessThisChannelOnly => 'This channel only';
+
+  @override
+  String networkAccessThisChannelAndOthers(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: 'This channel + $count other channels',
+      one: 'This channel + 1 other channel',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String networkAccessOtherChannels(int count) {
+    String _temp0 = intl.Intl.pluralLogic(
+      count,
+      locale: localeName,
+      other: '$count other channels',
+      one: '1 other channel',
+    );
+    return '$_temp0';
+  }
+
+  @override
+  String get networkDropAgent => 'Drop agent…';
+
+  @override
+  String get networkDropAgentTitle => 'Drop this agent?';
+
+  @override
+  String networkDropAgentBody(String displayName) {
+    return '\"$displayName\" will be removed from this network and lose access. This cannot be undone.';
+  }
+
+  @override
+  String get networkDropAgentConfirm => 'Drop agent';
+
+  @override
+  String get networkChannelsSection => 'Channels';
+
+  @override
+  String get networkShowcasesSection => 'Showcases';
+
+  @override
+  String get networkShowcaseReadOnly =>
+      'Read-only preview — tap to join the network and write.';
+
+  @override
+  String get networkShowcaseMemberReadOnly =>
+      'Only the owner and admins can post in this showcase.';
+
+  @override
+  String get networkConnecting => 'Connecting…';
+
+  @override
+  String get networkNoChannels => 'No channels';
+
+  @override
+  String get networkChannelOptions => 'Channel options';
+
+  @override
+  String get networkRenameChannel => 'Rename channel…';
+
+  @override
+  String get networkRenameChannelTitle => 'Rename channel';
+
+  @override
+  String get networkRename => 'Rename';
+
+  @override
+  String get networkChannelNameRequired => 'Channel name cannot be empty.';
+
+  @override
+  String get networkDeleteChannel => 'Delete channel…';
+
+  @override
+  String get networkDeleteChannelTitle => 'Delete this channel?';
+
+  @override
+  String get networkDeleteChannelBody =>
+      'The channel and all its messages are deleted for everyone. This cannot be undone.';
+
+  @override
+  String get networkChannelDeleted => 'Channel deleted';
+
+  @override
+  String get networkAddAgent => 'Add agent…';
+
+  @override
+  String get networkShowcasePublic => 'Showcase (public)';
+
+  @override
+  String get networkAddAgentTitle => 'Add an agent';
+
+  @override
+  String get networkAddAgentWarning =>
+      'Share out-of-band — anyone with this string can read the channel.';
+
+  @override
+  String get networkAddAgentNoKeys =>
+      'No keys for this channel on this device.';
+
+  @override
+  String get networkAddAgentNoChannelKeys =>
+      'No channel keys in this wallet — the agent will see channels only after a key invite';
+
+  @override
+  String get networkChannelKeyMissing =>
+      'This device needs the private channel key to read and write.';
+
+  @override
+  String get networkChannelKeyImport => 'Import channel key';
+
+  @override
+  String get networkChannelKeyInviteLabel => 'Channel key invite';
+
+  @override
+  String get networkChannelKeyImportHint =>
+      'Paste the private-channel invite from a device that already has the key.';
+
+  @override
+  String get networkChannelKeyWrongChannel =>
+      'This invite is for a different channel.';
+
+  @override
+  String get networkChannelKeyWrongHub => 'This invite is for a different hub.';
+
+  @override
+  String get networkChannelKeyMismatch =>
+      'The invite public and private keys do not match.';
+
+  @override
+  String get networkChannelKeyImportFailed =>
+      'The channel key could not be imported. Try again.';
+
+  @override
+  String get networkAddAgentScopeChannel => 'This channel';
+
+  @override
+  String get networkAddAgentScopeNetwork => 'Whole network';
+
+  @override
+  String get networkAddAgentFormatLink => 'Link (app)';
+
+  @override
+  String get networkAddAgentFormatCli => 'CLI command';
+
+  @override
+  String get networkAddAgentFormatEnv => 'Env (CI)';
+
+  @override
+  String get networkAddAgentFormatDap => 'DAP';
+
+  @override
+  String get networkAddAgentDapHint =>
+      'Copy this block and paste it into the fa chat (CLI, macOS, iOS or web) — the agent joins the channel automatically.';
+
+  @override
+  String dapEnrollmentJoined(String channel) {
+    return 'Joined DAP channel #$channel. Channel mail now reaches this agent.';
+  }
+
+  @override
+  String dapEnrollmentJoinedPlaintext(String channel) {
+    return 'Joined DAP channel #$channel. Channel mail now reaches this agent. Storage warning: the invite private key and hub credential are stored UNENCRYPTED (plaintext) in this app\'s sandbox (IndexedDB on web).';
+  }
+
+  @override
+  String dapEnrollmentFailed(String channel) {
+    return 'Couldn\'t join DAP channel #$channel. Check the invite and hub connection, then try again.';
+  }
+
+  @override
+  String get dapEnrollmentUnsupported =>
+      'DAP join is not supported on this platform — use a native app or the fa CLI.';
+
+  @override
+  String get networkAddAgentEnroll => 'Enroll agent';
+
+  @override
+  String get networkAddAgentEnrollHint =>
+      'Enrollment creates an independent, revocable credential, so agents with the same name can connect simultaneously. The secret is shown ONCE: copy it now.';
+
+  @override
+  String get networkAddAgentEnrollNeedSignIn =>
+      'Sign in to the network to enroll agents';
+
+  @override
+  String get networkAddAgentNameInvalid => '3–64 chars: a-z, 0-9, hyphens';
+
+  @override
+  String get networkAddAgentEnvHint =>
+      'Env vars for a CI runner (GitHub Actions) — the link already carries the network id + password (or the channel keys); nothing else to fill in. Reserved for the upcoming CLI network mode — desktop and mobile agents use the link.';
+
+  @override
+  String get networkAddAgentNetworkHint =>
+      'The agent joins as a full member and sees every channel in the network.';
+
+  @override
+  String get networkAddAgentNetworkNoPassword =>
+      'The network password is not on this device — the link will ask for it.';
+
+  @override
+  String get networkAddAgentCliHint =>
+      'The command works against hubs with direct DAP access (e.g. the local stand); CLI join for production fa_network is coming.';
+
+  @override
+  String get networkAddAgentNetworkCliHint =>
+      'CLI network join is not shipped yet — share the link for now.';
+
+  @override
+  String get networkInviteCopied => 'Invite copied to clipboard.';
+
+  @override
+  String get networkCopy => 'Copy';
+
+  @override
+  String get networkClose => 'Close';
+
+  @override
+  String get networkWalletTooltip => 'Wallet';
+
+  @override
+  String get networkWalletExport => 'Export wallet';
+
+  @override
+  String get networkWalletImport => 'Import wallet';
+
+  @override
+  String get networkWalletExported =>
+      'Wallet exported — JSON copied to clipboard.';
+
+  @override
+  String networkWalletExportFailed(Object error) {
+    return 'Export failed: $error';
+  }
+
+  @override
+  String get networkWalletImported => 'Wallet imported.';
+
+  @override
+  String get networkPassphraseLabel => 'Passphrase';
+
+  @override
+  String get networkPassphraseRepeatLabel => 'Repeat passphrase';
+
+  @override
+  String get networkPassphraseEmpty => 'Passphrase must not be empty.';
+
+  @override
+  String get networkPassphraseMismatch => 'Passphrases do not match.';
+
+  @override
+  String get networkExport => 'Export';
+
+  @override
+  String get networkImport => 'Import';
+
+  @override
+  String get networkWalletJsonLabel => 'Exported wallet JSON';
+
+  @override
+  String get networkWalletImportWarning =>
+      'Importing replaces the wallet on this device.';
+
+  @override
+  String get networkNameHint => 'A display name — becomes a lowercase slug';
+
+  @override
+  String get networkPasswordHint => '8–128 characters';
+
+  @override
+  String get networkNameInvalid =>
+      'Needs 3–64 chars after slugifying (letters, digits, hyphens)';
+
+  @override
+  String get networkPasswordInvalid => 'Password must be 8–128 characters';
+
+  @override
+  String get networkListPublic => 'List in the public directory';
+
+  @override
+  String get networkDelete => 'Delete network…';
+
+  @override
+  String get networkDeleteTitle => 'Delete this network?';
+
+  @override
+  String get networkDeleteBody =>
+      'The network, its channels and all messages are deleted for everyone. This cannot be undone.';
+
+  @override
+  String get networkDeleted => 'Network deleted';
+
+  @override
+  String networkSlugPreview(Object slug) {
+    return 'Will be created as: $slug';
+  }
+
+  @override
+  String get networkSignInToCreate => 'Sign in to create a network';
+
+  @override
+  String get networkShowcaseUnavailable =>
+      'This network is not publicly available';
+
+  @override
+  String get networkShowcaseReadOnlyBadge => 'read-only';
+
+  @override
+  String get networkBackToNetworks => 'Back to networks';
+
+  @override
+  String get networkAddAgentPublicHint =>
+      'Anyone with this link can read the channel — it is public. Agents join keyless.';
+}

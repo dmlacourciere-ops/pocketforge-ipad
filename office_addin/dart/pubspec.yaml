@@ -1,0 +1,24 @@
+# Office taskpane bridge package (issue #182): the pane is the fa Flutter
+# app now — this package ships only what the app embeds (Office.js facade,
+# outlook.* tools, quarantine, manifest validator, the fake for tests).
+# Built into the app bundle via flutter_app's path dep; the standalone
+# dart2js taskpane agent of #94 is gone.
+name: fa_office_agent
+description: >-
+  fa agent bridge for the Office Add-in taskpane (issues #89/#182):
+  Office.js host bridge, outlook.* tools, manifest validation. Compiled
+  into the fa web app that scripts/build_office_addin.sh bundles at
+  outlook/app/.
+publish_to: none
+version: 0.2.0
+
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+
+dependencies:
+  flutter_agent_harness:
+    path: ../../
+
+dev_dependencies:
+  lints: ^6.1.0
+  test: ^1.31.2

@@ -1,0 +1,944 @@
+/// Session-scoped manager for retained subagent handles. Phase 3a of the
+/// subagents 2.0 plan.
+///
+/// Owns the [SubagentHandle] registry, persists it into the parent session
+/// as a `subagent_registry` record, and rehydrates on restart. The manager
+/// itself is transport-neutral: session creation/resumption is injected
+/// through callbacks so the CLI and the app can wire their own session
+/// backends.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+
+import '../a2a/a2a_client.dart';
+import '../a2a/a2a_mail_gateway.dart';
+import '../messaging/agent_message.dart';
+import '../messaging/fallback_messaging_repository.dart';
+import '../messaging/messaging_repository.dart';
+import '../session/ledger_caps.dart';
+import 'subagent.dart';
+
+/// One observable event from a subagent (status transition, output preview,
+/// or an inbound message — Phase 3b).
+final class SubagentEvent {
+  const SubagentEvent({required this.handle, this.message});
+  final SubagentHandle handle;
+  final SubagentMessage? message;
+}
+
+/// The outcome of recording a child's explicit `reply` (gh-1951 AC2):
+/// the `reply` tool acks delivery ONLY on [recorded] — a parent-visible
+/// record must exist before the child is told "delivered".
+enum ReplyRecordOutcome {
+  /// The parent-visible record was written (the handle's `lastReply`).
+  recorded,
+
+  /// A reply was already recorded this run — the FIRST stays the
+  /// deliverable; this call was noted on [SubagentHandle.duplicateReplies]
+  /// and did not replace it.
+  duplicateNoted,
+
+  /// No live handle for the child — nothing was recorded; the caller
+  /// must return an error, never a false ack.
+  noHandle,
+}
+
+typedef ChildSessionFactory =
+    Future<String> Function(String parentSessionId, String childId);
+
+/// Callback to record the subagent registry into the parent session.
+typedef SubagentRegistrySink =
+    Future<void> Function(List<Map<String, dynamic>> registry);
+
+/// Callback to rehydrate the registry from the parent session.
+typedef SubagentRegistrySource = Future<List<Map<String, dynamic>>> Function();
+
+/// The session-record type of the registry snapshot: one full row list
+/// per write, in the parent session's JSONL (a side-leaf custom record).
+const String subagentRegistryRecordType = 'subagent_registry';
+
+/// Char cap of a persisted `task`/`error` string in a `subagent_registry`
+/// snapshot row (gh-1073): the task text is display + resume metadata, not
+/// child context — the child's own transcript carries the real prompt.
+const int subagentRegistryTextCapChars = 4000;
+
+/// Char cap of a persisted batch `context` (gh-1073). Generous — the
+/// resume path (issue #222) re-renders it into the child's system prompt —
+/// while bounding the pathological batch that made the registry records
+/// average ~140 KB on the ticket's session.
+const int subagentRegistryContextCapChars = 32000;
+
+/// Char cap of a persisted `lastReply` (gh-1073): a preview; the full
+/// reply reaches the parent as its own message.
+const int subagentRegistryReplyCapChars = 4000;
+
+/// The steering text a host's [SubagentManager.wakeChild] ride resumes a
+/// child with (gh-970). The resumed run's warm wake drains the inbox
+/// first, so the pending mail itself forms the prompt — this line only
+/// frames the turn.
+const String childInboxWakePrompt =
+    'Your inbox has pending mail that arrived while you were finished — '
+    'process it now.';
+
+/// Session-scoped subagent manager.
+/// Launches a detached, non-interactive run of a session so a SLEEPING
+/// agent processes its pending inbox mail right away (issue: "if the
+/// target is asleep it will never read the message"). Hosts wire the
+/// launcher (the CLI spawns its own binary with `--session <name>`); the
+/// run appends to the same session JSONL, so a later interactive
+/// `fa --session <name>` resumes that exact transcript. Null disables the
+/// wake path — callers then get a "how to start it" hint instead.
+typedef MailboxWakeLauncher =
+    Future<String?> Function({
+      required String cwd,
+      required String sessionId,
+      String? sessionName,
+    });
+
+final class SubagentManager {
+  SubagentManager({
+    required this.parentSessionId,
+    this.createChildSession,
+    this.sink,
+    this.source,
+    this.messaging,
+    this.wakeProcess,
+    this.homeDir,
+    this.selfId = 'main',
+    this.maxPendingMessages = 16,
+    this.maxReplyChars = 8000,
+    this.persistInterval = ledgerSnapshotPersistInterval,
+    this.clock = _systemUtcClock,
+  });
+
+  /// The manager's clock, stamped into `createdAt`/`lastActivity`.
+  /// Injectable so tests drive spawn ages and stall windows
+  /// deterministically (issue #383 heartbeat).
+  final DateTime Function() clock;
+
+  static DateTime _systemUtcClock() => DateTime.now().toUtc();
+
+  /// The parent session id (used to derive child session paths and to
+  /// write child session headers' `metadata.parent` at flush time).
+  ///
+  /// Mutable by necessity: both hosts construct the manager before their
+  /// session id exists (the JSONL header is written on first flush, well
+  /// after boot) and assign the real id when it materializes — the same
+  /// moment [mailboxPrefix] is set. Leaving this empty is what wrote
+  /// `parent: ""` into every real child file and flattened the sidebar
+  /// tree (issue #426).
+  String parentSessionId;
+
+  /// Detached headless launcher for waking asleep mailboxes (see
+  /// [MailboxWakeLauncher]). Null when the host cannot spawn processes.
+  final MailboxWakeLauncher? wakeProcess;
+
+  /// The user's home directory, used to shorten cwd tags in directory
+  /// views (`/home/u/git/x` → `~/git/x`). Null leaves cwd tags as-is.
+  final String? homeDir;
+
+  /// Injected: creates a new child session, returns its id.
+  final ChildSessionFactory? createChildSession;
+
+  /// Injected: persists the registry into the parent session.
+  final SubagentRegistrySink? sink;
+
+  /// Injected: reads the persisted registry from the parent session.
+  final SubagentRegistrySource? source;
+
+  /// Injected: the messaging fabric. When present, inter-agent messages go
+  /// through per-agent inboxes (visible across processes sharing the
+  /// messaging root) instead of the in-process pending queue.
+  final MessagingRepository? messaging;
+
+  /// This host's own agent id in the messaging fabric (`main` for the
+  /// orchestrator). Inbox drains for the loop use it.
+  final String selfId;
+
+  /// Namespace prefix for every mailbox this manager touches (e.g. the
+  /// parent session id): two Fa instances sharing one messaging root never
+  /// drain each other's inboxes. Mutable — the host sets it once the
+  /// session (and thus its id) exists. Empty = single-instance mode.
+  String mailboxPrefix = '';
+
+  /// This host's machine name for `name@machine` addressing (issue #27
+  /// phase 2): a `@machine` suffix matching it (case-insensitive) is
+  /// stripped before local resolution; any other machine is phase-3 A2A
+  /// territory and stays unresolved. Null = the host did not report one —
+  /// machine-suffixed addresses then never resolve locally.
+  String? machineName;
+
+  /// Wakes a retained child with pending inbox mail by resuming it in its
+  /// own session (gh-970). Hosts WITH the child-resume capability wire
+  /// their executor's resume here:
+  /// `wakeChild = (id) => executor.resumeChild(id, childInboxWakePrompt)` —
+  /// the resumed run's warm wake drains the inbox as its first action, so
+  /// the reminder (or sibling mail) that fired into a finished monitor is
+  /// consumed and the recurrence continues. Null (the app host — no
+  /// child-resume capability) keeps the sweep a no-op; the mail waits for
+  /// the next task_send/steer.
+  Future<void> Function(String id)? wakeChild;
+
+  /// Children with a wake currently in flight — the sweep tick must not
+  /// stack a second wake onto a running one.
+  final _wakingChildren = <String>{};
+
+  /// Children whose wake threw — retired for this manager's lifetime so a
+  /// permanently unwakeable child (unreadable session) cannot spin the
+  /// sweep on every tick. Status gates re-eligibility anyway; this covers
+  /// children whose status did not change because the wake failed early.
+  final _unwakeableChildren = <String>{};
+
+  /// Starts a wake for every retained child that (a) holds pending inbox
+  /// mail and (b) can be woken — [SubagentStatus.completed] or
+  /// [SubagentStatus.idle]. Failed/aborted children stay manual
+  /// (task_resume semantics); queued/running children consume their inbox
+  /// at the next turn boundary on their own. Fire-and-forget by design:
+  /// the sweep rides the host's inbox tick and never blocks it. Returns
+  /// how many wakes were STARTED. Without [wakeChild] or a fabric this is
+  /// a cheap no-op.
+  Future<int> wakeChildrenWithPendingMail() async {
+    final wake = wakeChild;
+    if (wake == null) return 0;
+    var started = 0;
+    for (final handle in handles) {
+      final id = handle.id;
+      if (_wakingChildren.contains(id) || _unwakeableChildren.contains(id)) {
+        continue;
+      }
+      const wakeable = {SubagentStatus.completed, SubagentStatus.idle};
+      if (!wakeable.contains(handle.status)) continue;
+      if (await pendingInboxCount(id) == 0) continue;
+      _wakingChildren.add(id);
+      started++;
+      unawaited(
+        wake(id)
+            .catchError((Object _) {
+              _unwakeableChildren.add(id);
+            })
+            .whenComplete(() => _wakingChildren.remove(id)),
+      );
+    }
+    return started;
+  }
+
+  /// The A2A boundary gateway (issue #27 phase 3): when set, a
+  /// `name@machine` address naming ANOTHER machine delivers through the
+  /// `a2a:` config's server for that machine. Null = foreign machines
+  /// stay unresolved (the phase-2 honest error).
+  A2aMailGateway? a2aGateway;
+
+  /// The fabric mailbox for a local agent id. An id containing `/` is
+  /// already an absolute mailbox (cross-instance addressing like
+  /// `<sessionId>/main`) and passes through unprefixed.
+  String mailboxOf(String id) {
+    if (id.contains('/')) return id;
+    return mailboxPrefix.isEmpty ? id : '$mailboxPrefix/$id';
+  }
+
+  /// Size guard: messages queued to one child before new ones are rejected
+  /// (Phase 3b pending-queue guard).
+  final int maxPendingMessages;
+
+  /// Size guard: reply/message body cap in characters.
+  final int maxReplyChars;
+
+  /// The write-time persist window for the registry snapshot (gh-1590):
+  /// conversational mutations inside the window coalesce behind one
+  /// append plus a trailing flush. Injectable so tests drive the
+  /// trailing leg deterministically (same shape as the clock).
+  final Duration persistInterval;
+
+  /// gh-1590: bounds WHEN registry snapshots may append — conversational
+  /// mutations (message deliveries, replies, compaction counters)
+  /// coalesce behind the trailing flush, because only the latest
+  /// snapshot is ever read on resume. Durability-critical mutations
+  /// (register/update/dispose/attach, the #332 turn-boundary billing)
+  /// persist immediately. Reset with the registry in [reset]; flushed
+  /// and disarmed by [flushPersist].
+  late final LedgerSnapshotThrottle _persistThrottle = LedgerSnapshotThrottle(
+    minInterval: persistInterval,
+    clock: clock,
+    onFlushDue: _persist,
+  );
+
+  /// gh-1590: suppresses byte-identical snapshot appends — a repeated
+  /// no-op flush (or a repeated empty-registry snapshot) must not grow
+  /// the session file. Reset with the registry in [reset].
+  final LedgerSnapshotDeduper _persistDeduper = LedgerSnapshotDeduper();
+
+  final _handles = <String, SubagentHandle>{};
+  final _events = StreamController<SubagentEvent>.broadcast();
+  var _rehydrated = false;
+
+  /// All handles in registration order.
+  List<SubagentHandle> get handles => List.unmodifiable(_handles.values);
+
+  /// Broadcast stream of subagent events.
+  Stream<SubagentEvent> get events => _events.stream;
+
+  /// Looks up a handle by id.
+  SubagentHandle? operator [](String id) => _handles[id];
+
+  /// Rehydrates the registry from the parent session (idempotent).
+  ///
+  /// Issue #332: rows that were `queued`/`running` when the snapshot was
+  /// written belong to a runner in the process that wrote it — no live
+  /// runner exists in THIS one (restart/interrupt before the child's first
+  /// request is the common case). Left as-is they stay 'running' forever
+  /// (zombie rows in task_status and the composer badge, and task_cancel
+  /// can't clear them), so they settle here to [SubagentStatus.failed] —
+  /// failed, not aborted, so a child with partial progress stays resumable
+  /// (`task_resume` refuses aborted children). Terminal rows and `idle`
+  /// (waiting for input — an actionable, resumable state, not a liveness
+  /// claim) pass through untouched, and the settled snapshot is persisted
+  /// so a later restart reads terminal rows instead of resurrecting the
+  /// zombie.
+  ///
+  /// Hosts AWAIT this at boot (interactive [AgentCli.run], headless
+  /// [AgentCli.runHeadless], session switch): the registry must be loaded
+  /// and its zombie rows settled before the first prompt can spawn children
+  /// — otherwise a same-id spawn races the load and its persist replaces
+  /// the not-yet-loaded rows. A mid-run row (requests > 0) is REAL since
+  /// the executor bills usage at every turn boundary; an interrupted resume
+  /// also carries its prior generation's usage.
+  Future<void> rehydrate() async {
+    if (_rehydrated) return;
+    _rehydrated = true;
+    final raw = await source?.call() ?? const [];
+    var settled = false;
+    for (final entry in raw) {
+      final handle = SubagentHandle.fromJson(entry);
+      // Boot-race guard (issue #332): a row registered by THIS process
+      // (a spawn that beat the registry load) is newer than the snapshot
+      // — the live in-process row wins and the snapshot copy is dropped,
+      // so a late-finishing load can never settle or clobber a live child.
+      if (_handles.containsKey(handle.id)) continue;
+      _handles[handle.id] = handle;
+      if (handle.status == SubagentStatus.queued ||
+          handle.status == SubagentStatus.running) {
+        handle.status = SubagentStatus.failed;
+        handle.error = handle.requests == 0
+            ? 'interrupted before start: the host session ended before this '
+                  'child completed its first request'
+            : 'interrupted: the host session ended while this child was '
+                  'running';
+        handle.lastActivity = DateTime.now().toUtc().toIso8601String();
+        settled = true;
+        _emit(handle);
+      }
+    }
+    if (settled) _persist(force: true);
+  }
+
+  /// Drops the registry view so the next [rehydrate] loads afresh — used
+  /// when the host switches to a different parent session (each session owns
+  /// its own registry). Wake bookkeeping is dropped with it: the new
+  /// session's children start clean.
+  void reset() {
+    _handles.clear();
+    _rehydrated = false;
+    _wakingChildren.clear();
+    _unwakeableChildren.clear();
+    // gh-1590: the persist window and dedupe state open with the
+    // (re)hydrated registry — a session switch never inherits the
+    // previous session's window (the same reset `_rehydrateJobBoard`
+    // performs next to its deduper).
+    _persistThrottle.reset();
+    _persistDeduper.reset();
+  }
+
+  /// Registers a new subagent — NEVER creates a child session eagerly.
+  ///
+  /// The handle's [SubagentHandle.sessionId] is a synthetic
+  /// `<parentSessionId>/<id>` placeholder until the executor calls
+  /// [attachSession] with the real JSONL path (at completion). This keeps the
+  /// session repo free of empty `.jsonl` files for subagents that never run
+  /// to completion (fast-register path, steering aborts, etc.).
+  Future<SubagentHandle> register({
+    required String id,
+    required String name,
+    required String agentType,
+    required String task,
+    String context = '',
+  }) async {
+    final now = clock().toIso8601String();
+    final handle = SubagentHandle(
+      id: id,
+      name: name,
+      agentType: agentType,
+      // Placeholder until the executor does the real attachSession call.
+      sessionId: '$parentSessionId/$id',
+      createdAt: now,
+      task: task,
+      context: context,
+    )..lastActivity = now;
+    // Issue #222: an explicit fresh respawn after a failed same-named child
+    // links back to the latest previous generation so UIs can collapse the
+    // chain (no silent clones — the link makes the chain visible). LIVE
+    // same-named children never link: two parallel batches may share a
+    // display name, and a live child is not a superseded generation —
+    // linking it would hide a running agent from the collapsed views.
+    for (final existing in _handles.values) {
+      if (existing.name == name && existing.isTerminal) {
+        handle.supersedes = existing.id;
+      }
+    }
+    _handles[id] = handle;
+    _emit(handle);
+    // Durability-critical: a spawned child must survive a process death
+    // (task_status reads the registry; the spawn race, issue #332).
+    _persist(force: true);
+    return handle;
+  }
+
+  /// Updates a handle's status and emits an event. [clearError] drops the
+  /// recorded failure — the resume path (issue #222) clears the old error
+  /// when a failed child goes back to running.
+  Future<void> update(
+    String id, {
+    SubagentStatus? status,
+    int? tokens,
+    int? requests,
+    String? modelId,
+    String? error,
+    bool clearError = false,
+  }) async {
+    final handle = _handles[id];
+    if (handle == null) return;
+    if (status != null) handle.status = status;
+    if (tokens != null) handle.tokens += tokens;
+    if (requests != null) handle.requests += requests;
+    if (modelId != null) handle.modelId = modelId;
+    if (error != null) handle.error = error;
+    if (clearError) handle.error = null;
+    handle.lastActivity = clock().toIso8601String();
+    _emit(handle);
+    // Durability-critical: status transitions and the issue #332
+    // turn-boundary usage billing — an interrupted child must find its
+    // billed usage in the FILE on resume, not behind a persist window.
+    _persist(force: true);
+  }
+
+  /// Removes a handle (dispose).
+  Future<void> dispose(String id) async {
+    _handles.remove(id);
+    // Durability-critical: the cleared registry must reach the file, or
+    // a stale snapshot resurrects the disposed child on resume (the
+    // deduper keeps repeated empty snapshots from growing the file).
+    _persist(force: true);
+  }
+
+  /// Queues [message] for [id] (Phase 3b `agent_message` / parent steering).
+  /// Throws [StateError] for an unknown id or a full pending queue; caps the
+  /// body at [maxReplyChars] unless [capText] is false — the warm-wake
+  /// resume path passes the parent's steering verbatim (the mailbox cap
+  /// would silently truncate it AND shrink it under the over-window
+  /// guard, letting an oversized request slip through to the provider).
+  /// Aborted children refuse new messages.
+  ///
+  /// With a [messaging] fabric the message is DELIVERED to the recipient's
+  /// inbox (cross-process visible); otherwise it sits in the in-process
+  /// pending queue. `main` ([selfId]) is a valid recipient — that is how
+  /// children message the parent.
+  Future<void> enqueueMessage(
+    String id,
+    SubagentMessage message, {
+    bool capText = true,
+  }) async {
+    final handle = _handles[id];
+    await _guardRecipient(id, handle);
+    final capped = capText ? _capMessage(message) : message;
+    final gateway = a2aGateway;
+    if (gateway != null && id.contains('@')) {
+      await _deliverViaA2a(gateway, id, capped);
+      return;
+    }
+    if (messaging != null) {
+      await _deliverViaFabric(id, handle, capped);
+      return;
+    }
+    if (handle!.pendingMessages.length >= maxPendingMessages) {
+      throw StateError(
+        'subagent "$id" pending queue is full ($maxPendingMessages) — '
+        'the child must consume its messages first',
+      );
+    }
+    handle.pendingMessages.add(capped);
+    _touchWithMessage(handle, capped);
+  }
+
+  /// Cross-machine delivery (issue #27 phase 3): the address rides the A2A
+  /// boundary gateway. Wire failures surface as [StateError] so the tool
+  /// reports them like any other undeliverable target.
+  Future<void> _deliverViaA2a(
+    A2aMailGateway gateway,
+    String id,
+    SubagentMessage message,
+  ) async {
+    try {
+      await gateway.deliver(
+        AgentMessage(
+          id: newMessageId(),
+          fromId: mailboxOf(message.fromId),
+          toId: id,
+          text: message.text,
+          sentAt: message.sentAt,
+          hops: message.hops,
+        ),
+      );
+    } on A2aException catch (error) {
+      throw StateError('a2a delivery to "$id" failed: ${error.message}');
+    }
+  }
+
+  /// Recipient validation for [enqueueMessage]: known local handle, the
+  /// [selfId] inbox (fabric only), an absolute cross-instance mailbox
+  /// (fabric only), a foreign `name@machine` address when the A2A gateway
+  /// is wired (issue #27 phase 3), or a hub target the routing fabric
+  /// resolves — hub peers (16-hex ids, display names, `#channels`) have no
+  /// local handle. Aborted children refuse messages; remote `a2a:` children
+  /// refuse them too (nothing drains their local inbox — see the guard).
+  Future<void> _guardRecipient(String id, SubagentHandle? handle) async {
+    if (!await _isDeliverable(id, handle)) {
+      // A hub-shaped target while the hub is still connecting is a
+      // transient state, not an unknown recipient: say so, so the model
+      // retries instead of rerouting the message into a dead file inbox
+      // (gh-1825).
+      final router = messaging is RoutingMessagingRepository
+          ? messaging as RoutingMessagingRepository
+          : null;
+      if (id.startsWith('#') && router != null && !router.isConnected) {
+        throw StateError(
+          'DAP hub is not connected yet — the channel "$id" will be '
+          'reachable in a few seconds; retry the same agent_message then',
+        );
+      }
+      throw StateError(
+        'unknown subagent "$id" — available: ${_handles.keys.join(', ')}',
+      );
+    }
+    final refusal = _localInboxRefusal(id, handle);
+    if (refusal != null) throw StateError(refusal);
+  }
+
+  /// Whether [id] names an address this manager can deliver into: a known
+  /// local handle, the [selfId] inbox or an absolute cross-instance
+  /// mailbox when the fabric is wired, a foreign `name@machine` address
+  /// when the A2A gateway is, or a hub target the routing fabric resolves.
+  Future<bool> _isDeliverable(String id, SubagentHandle? handle) async {
+    if (handle != null) return true;
+    if ((id == selfId || id.contains('/')) && messaging != null) return true;
+    if (id.contains('@') && a2aGateway != null) return true;
+    return _hubResolvable(id);
+  }
+
+  /// Why [handle] takes no further messages, or null when it does:
+  /// aborted children refuse everything; a remote `a2a:` child has NO
+  /// local loop draining its inbox (the remote prompt is assembled once,
+  /// at send time) — queueing mail for it is silent mail loss. Name the
+  /// real channel instead.
+  String? _localInboxRefusal(String id, SubagentHandle? handle) {
+    if (handle?.status == SubagentStatus.aborted) {
+      return 'subagent "$id" is aborted and takes no messages';
+    }
+    if (handle != null && handle.agentType.startsWith('a2a:')) {
+      return ('subagent "$id" (${handle.agentType}) runs on a remote a2a server — '
+          'it has no local inbox to deliver into; follow up with a new '
+          'task item (agent ${handle.agentType}) carrying your message in '
+          'its task text');
+    }
+    return null;
+  }
+
+  /// Whether [id] resolves on the routing (hub) transport — consulted only
+  /// for ids that are NOT local addresses (no handle, not [selfId], not an
+  /// absolute mailbox): local routing always wins over the hub roster, and
+  /// a bare local id must never leak to the hub prefixed. False while the
+  /// routing transport is down — offline hub mail fails honestly instead
+  /// of dead-dropping into a file inbox nobody polls.
+  Future<bool> _hubResolvable(String id) async {
+    if (_handles.containsKey(id) || id == selfId || id.contains('/')) {
+      return false;
+    }
+    final router = messaging is RoutingMessagingRepository
+        ? messaging as RoutingMessagingRepository
+        : null;
+    return router != null &&
+        router.isConnected &&
+        await router.resolveTarget(id) != null;
+  }
+
+  /// The body cap: overlong messages are truncated with a marker.
+  SubagentMessage _capMessage(SubagentMessage message) {
+    if (message.text.length <= maxReplyChars) return message;
+    return SubagentMessage(
+      fromId: message.fromId,
+      text: '${message.text.substring(0, maxReplyChars)}…[truncated]',
+      sentAt: message.sentAt,
+      hops: message.hops,
+    );
+  }
+
+  /// Fabric delivery: bounded by the recipient's unread inbox size.
+  Future<void> _deliverViaFabric(
+    String id,
+    SubagentHandle? handle,
+    SubagentMessage message,
+  ) async {
+    // A hub-resolvable target keeps its RAW id — the hub roster knows bare
+    // ids and channels, a session prefix would hide them from the
+    // resolver. Everything else gets the namespaced file mailbox.
+    final mailbox = await _hubResolvable(id) ? id : mailboxOf(id);
+    final pending = await messaging!.peek(mailbox);
+    if (pending.length >= maxPendingMessages) {
+      throw StateError(
+        'subagent "$id" pending queue is full ($maxPendingMessages) — '
+        'the child must consume its messages first',
+      );
+    }
+    await messaging!.send(
+      AgentMessage(
+        id: newMessageId(),
+        fromId: mailboxOf(message.fromId),
+        toId: mailbox,
+        text: message.text,
+        sentAt: message.sentAt,
+        hops: message.hops,
+        // Issue #520: owner mail (user input from an attached client)
+        // must stay user-kind across the fabric — it wakes the idle
+        // agent streak-cap-free and is attributed as the user's words.
+        kind: message.isUserInput
+            ? AgentMessageKind.user
+            : AgentMessageKind.agent,
+      ),
+    );
+    if (handle != null) _touchWithMessage(handle, message);
+  }
+
+  /// Shared bookkeeping after a message is accepted for [handle].
+  void _touchWithMessage(SubagentHandle handle, SubagentMessage message) {
+    handle.lastActivity = clock().toIso8601String();
+    _events.add(SubagentEvent(handle: handle, message: message));
+    // gh-1590: coalesced — a message delivery is a conversational
+    // mutation; the mail itself lives in the fabric, the registry row
+    // only gains `lastActivity` + the pending queue. The trailing flush
+    // (or [flushPersist] at teardown) lands the final state.
+    _persist();
+  }
+
+  /// Drains [id]'s pending queue (delivered messages leave the registry).
+  /// With a [messaging] fabric this consumes the agent's file inbox.
+  Future<List<SubagentMessage>> drainMessages(String id) async {
+    final fabric = messaging;
+    if (fabric != null) {
+      final drained = await fabric.drain(mailboxOf(id));
+      return [
+        for (final m in drained)
+          SubagentMessage(
+            fromId: m.fromId,
+            text: m.text,
+            sentAt: m.sentAt,
+            hops: m.hops,
+            isUserInput: m.kind == AgentMessageKind.user,
+            toId: m.toId,
+            fromName: m.fromName,
+          ),
+      ];
+    }
+    final handle = _handles[id];
+    if (handle == null) return const [];
+    final drained = List<SubagentMessage>.of(handle.pendingMessages);
+    handle.pendingMessages.clear();
+    return drained;
+  }
+
+  /// In-flight liveness touch (issue #383 heartbeat): the executor calls
+  /// this when the child proves provider-side life — a completed assistant
+  /// response — stamping [SubagentHandle.lastActivity] and the running
+  /// turn's usage snapshot. Deliberately in-memory only: the registry
+  /// snapshot is not rewritten per provider turn (a write storm for a
+  /// freshness signal the next real update refreshes anyway).
+  void touch(String id, {required int tokens, required int requests}) {
+    final handle = _handles[id];
+    if (handle == null) return;
+    handle.lastActivity = clock().toIso8601String();
+    handle.liveTokens = tokens;
+    handle.liveRequests = requests;
+  }
+
+  /// Context-pressure stamp (issue #439): the executor calls this at every
+  /// child turn boundary with the reconciled request pressure and the
+  /// effective window, so `task_status` can show the wall approaching.
+  /// gh-1742 adds the observed channel (`usage.input + cacheRead` of the
+  /// last completed request) and the window's verification state (AC6).
+  /// In-memory event stamp like [touch] — the next boundary refreshes it.
+  void notePressure(
+    String id, {
+    required int estTokens,
+    required int windowTokens,
+    int? observedTokens,
+    bool windowVerified = false,
+  }) {
+    final handle = _handles[id];
+    if (handle == null) return;
+    handle.estTokens = estTokens;
+    handle.windowTokens = windowTokens;
+    handle.observedTokens = observedTokens;
+    handle.windowVerified = windowVerified;
+    _emit(handle);
+  }
+
+  /// Records a completed proactive compaction (issue #439): bumps the
+  /// counter, stamps the freed-token count and the time, and persists —
+  /// unlike [notePressure] this is a durable lifecycle fact. gh-1590:
+  /// the append coalesces inside the persist window — the counter is
+  /// in-memory until the trailing flush (or the next durability-critical
+  /// snapshot, or [flushPersist] at teardown) lands it.
+  void recordCompaction(String id, {required int freedTokens}) {
+    final handle = _handles[id];
+    if (handle == null || freedTokens <= 0) return;
+    handle.compactions++;
+    handle.lastCompactionFreed = freedTokens;
+    final now = clock().toIso8601String();
+    handle.lastCompactionAt = now;
+    handle.lastActivity = now;
+    _emit(handle);
+    _persist();
+  }
+
+  /// Compaction-health stamp (issue #1924): the executor reports every
+  /// failed child compaction pass; after its bounded latch trips, [error]
+  /// carries the actionable parent-visible text (resume compacts first /
+  /// respawn). A successful pass clears the stamp. In-memory event stamp
+  /// like [notePressure].
+  void noteCompactionHealth(String id, {String? error}) {
+    final handle = _handles[id];
+    if (handle == null) return;
+    handle.compactionError = error;
+    _emit(handle);
+  }
+
+  /// Counts the unread inbox messages of [id] (0 without a fabric) — the
+  /// `mail:N` indicator in the agents panel.
+  Future<int> pendingInboxCount(String id) async =>
+      (await messaging?.peek(mailboxOf(id)) ?? const []).length;
+
+  /// The unread inbox messages of [id] (empty without a fabric) — the
+  /// pending-inbox block of the observe/detail views.
+  Future<List<AgentMessage>> pendingInbox(String id) async =>
+      await messaging?.peek(mailboxOf(id)) ?? const [];
+
+  /// Non-draining pending check (issue #647): the child-loop steering
+  /// probe. Covers the fabric inbox AND the in-memory pending queue —
+  /// the `mail:N` panel count above reads the fabric only.
+  Future<bool> hasPendingMessages(String id) async =>
+      (await pendingInboxCount(id)) > 0 ||
+      (_handles[id]?.pendingMessages.isNotEmpty ?? false);
+
+  /// The send time of the oldest unconsumed pending mail for [id] — the
+  /// fabric inbox AND the in-process pending queue (issue #1923 AC3:
+  /// `task_status` flags mail sitting past the delivery SLO). Null = no
+  /// pending mail. O(pending); no timers, no background tasks. Entries
+  /// already carry their enqueue stamp (`sentAt`), so this only reads.
+  Future<DateTime?> oldestPendingMailSince(String id) async {
+    final sentAts = <String>[
+      for (final m in await pendingInbox(id)) m.sentAt,
+      for (final m
+          in _handles[id]?.pendingMessages ?? const <SubagentMessage>[])
+        m.sentAt,
+    ];
+    final stamps = <DateTime>[];
+    for (final sentAt in sentAts) {
+      final t = DateTime.tryParse(sentAt);
+      if (t != null) stamps.add(t);
+    }
+    if (stamps.isEmpty) return null;
+    return stamps.reduce((a, b) => a.isBefore(b) ? a : b);
+  }
+
+  /// Records the child's explicit `reply` (Phase 3b) on its handle.
+  ///
+  /// gh-1951: the outcome is explicit because the ack must be truthful —
+  /// [ReplyRecordOutcome.noHandle] means NOTHING was recorded and the
+  /// caller (the `reply` tool) must return an error, never a false
+  /// "delivered". A double reply is idempotent (edge case): the FIRST
+  /// reply stays the deliverable; later calls are counted as
+  /// [SubagentHandle.duplicateReplies] and never overwrite it.
+  Future<ReplyRecordOutcome> recordReply(String id, String text) async {
+    final handle = _handles[id];
+    if (handle == null) return ReplyRecordOutcome.noHandle;
+    if (handle.lastReply != null) {
+      handle.duplicateReplies++;
+      handle.lastActivity = clock().toIso8601String();
+      _events.add(SubagentEvent(handle: handle));
+      _persist();
+      return ReplyRecordOutcome.duplicateNoted;
+    }
+    handle.lastReply = text.length > maxReplyChars
+        ? '${text.substring(0, maxReplyChars)}…[truncated]'
+        : text;
+    handle.lastActivity = clock().toIso8601String();
+    _events.add(SubagentEvent(handle: handle));
+    // gh-1590: coalesced — the parent-visible record lives on the handle
+    // (read by every result build); the registry row carries the preview.
+    _persist();
+    return ReplyRecordOutcome.recorded;
+  }
+
+  /// Awaits the serialized durable registry snapshot (gh-1951 AC2
+  /// ordering): the `reply` tool acks only after the parent-visible
+  /// record is durable. Unlike [flushPersist] this never disposes the
+  /// persist throttle — teardown keeps using it.
+  Future<void> persistNow() {
+    _persist(force: true);
+    return _persistChain;
+  }
+
+  /// gh-1951 AC6, called at RESUME start: snapshots any undelivered reply
+  /// left by a previous child life WITHOUT mutating the handle. The
+  /// executor persists the snapshot as a carried artifact FIRST (so the
+  /// resume completion surfaces the pointer) and only calls
+  /// [clearPendingReply] after that persist succeeded — review round 2:
+  /// clearing before the persist meant a throwing host redactor left the
+  /// handle AND the durable snapshot cleared with no artifact written, so
+  /// a retry resume found nothing and the acked reply was silently gone.
+  /// Returns the carried reply, or null.
+  String? peekPendingReply(String id) {
+    final handle = _handles[id];
+    if (handle == null) return null;
+    final pending = handle.lastReply;
+    if (pending == null && handle.duplicateReplies == 0) return null;
+    return pending;
+  }
+
+  /// gh-1951 AC6: clears a pending reply AFTER its carried artifact is
+  /// durable (see [peekPendingReply]) — a failed persist leaves the reply
+  /// on the handle, so a retry resume carries it again (at-least-once;
+  /// never a silent loss).
+  void clearPendingReply(String id) {
+    final handle = _handles[id];
+    if (handle == null) return;
+    handle.lastReply = null;
+    handle.duplicateReplies = 0;
+    _events.add(SubagentEvent(handle: handle));
+    _persist();
+  }
+
+  /// Attaches the child's real session file to its handle (called by the
+  /// executor at child completion when a session factory is wired). The
+  /// handle's placeholder id becomes the real JSONL path used by
+  /// `/agents open <id>` and `task_observe`.
+  Future<void> attachSession(String id, String sessionPath) async {
+    final handle = _handles[id];
+    if (handle == null) return;
+    handle.sessionId = sessionPath;
+    handle.lastActivity = clock().toIso8601String();
+    _events.add(SubagentEvent(handle: handle));
+    // Durability-critical: the real session path must survive a process
+    // death (`/agents open <id>` reads it from the registry).
+    _persist(force: true);
+  }
+
+  /// Closes the event stream, flushing a coalesced registry snapshot
+  /// first (gh-1590): a host tearing the manager down must not lose the
+  /// conversational mutations that coalesced inside the persist window.
+  Future<void> close() async {
+    await flushPersist();
+    await _events.close();
+  }
+
+  /// gh-1590: the shutdown flush — a coalesced snapshot lands NOW (the
+  /// deduper suppresses a no-op) and the throttle's trailing Timer leg
+  /// disarms: a pending Timer must never hold the isolate at process
+  /// exit, and a reply/message that settled inside the persist window
+  /// must still reach the file. Drains the persist chain before
+  /// returning.
+  Future<void> flushPersist() {
+    _persistThrottle.dispose();
+    _persist(force: true);
+    return _persistChain;
+  }
+
+  void _emit(SubagentHandle handle) {
+    _events.add(SubagentEvent(handle: handle));
+  }
+
+  var _persistChain = Future<void>.value();
+
+  /// Persists a registry snapshot best-effort: serialized (writes never
+  /// interleave) and fire-and-forget — the spawn path must NEVER wait on
+  /// session I/O (an awaited write breaks the background-task steering
+  /// race), and a failed write must never break a spawn. Every mutation
+  /// writes a full fresh snapshot, so a lost write is healed by the next
+  /// one.
+  ///
+  /// gh-1073: display strings are truncated
+  /// ([subagentRegistryTextCapChars] / [subagentRegistryContextCapChars] /
+  /// [subagentRegistryReplyCapChars]) — the snapshot rows were averaging
+  /// ~140 KB on a month-long session.
+  ///
+  /// gh-1590: the appends are also RATE-BOUNDED — [force] (the
+  /// durability-critical paths and [flushPersist]) bypasses the window;
+  /// every other mutation coalesces behind the trailing flush leg
+  /// ([_persistThrottle]), because only the latest snapshot is ever
+  /// read on resume. The deduper suppresses byte-identical snapshots
+  /// (previously impossible — every mutation re-stamped `lastActivity`
+  /// — but the repeated empty-registry/no-op flushes make it
+  /// load-bearing now).
+  void _persist({bool force = false}) {
+    final write = sink;
+    if (write == null) return;
+    _persistChain = _persistChain.then((_) async {
+      // gh-1590: the window gate — a refused mutation reserves the
+      // trailing flush (which re-enters here unforced) and skips the
+      // encode entirely.
+      if (!force && !_persistThrottle.shouldPersistNow()) return;
+      // Serialize ONCE — the dedupe key must be the exact payload that
+      // gets appended, and the rows must read the NEWEST handle state
+      // (mutations that queued behind the chain coalesce into it).
+      final snapshot = [
+        for (final h in _handles.values) _cappedRegistryRow(h.toJson()),
+      ];
+      final json = jsonEncode(snapshot);
+      if (!_persistDeduper.shouldPersist(json)) return;
+      try {
+        await write(snapshot);
+        _persistDeduper.confirmPersisted();
+        _persistThrottle.confirmPersisted();
+      } on Object {
+        // Best-effort — the next mutation rewrites the full snapshot;
+        // roll the deduper back first so the retried identical snapshot
+        // is NOT skipped.
+        _persistDeduper.revertFailedPersist();
+      }
+    });
+  }
+
+  /// One persisted registry row with the display strings capped (gh-1073).
+  Map<String, dynamic> _cappedRegistryRow(Map<String, dynamic> row) => {
+    ...row,
+    'task':
+        capLedgerText(
+          row['task'] as String?,
+          maxChars: subagentRegistryTextCapChars,
+        ) ??
+        '',
+    if (row['context'] != null)
+      'context': capLedgerText(
+        row['context'] as String?,
+        maxChars: subagentRegistryContextCapChars,
+      ),
+    if (row['error'] != null)
+      'error': capLedgerText(
+        row['error'] as String?,
+        maxChars: subagentRegistryTextCapChars,
+      ),
+    if (row['lastReply'] != null)
+      'lastReply': capLedgerText(
+        row['lastReply'] as String?,
+        maxChars: subagentRegistryReplyCapChars,
+      ),
+  };
+}

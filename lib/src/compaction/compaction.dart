@@ -1,0 +1,1657 @@
+/// The compaction pipeline: decide, cut, summarize, and rewrite history.
+///
+/// Ported from pi-mono `packages/agent/src/harness/compaction/compaction.ts`
+/// and `compaction/utils.ts`. The pipeline is token-based, never
+/// message-count-based:
+///
+/// 1. [estimateContextTokens] (see `token_estimation.dart`) measures the
+///    context; [shouldCompact] compares it against the model window minus a
+///    16384-token reserve.
+/// 2. [findCutPoint] walks the session branch backwards, keeping ~20k recent
+///    tokens and cutting only on valid message boundaries.
+/// 3. [generateSummary] asks an LLM for a structured checkpoint summary of
+///    the compacted region using pi's fixed prompt.
+/// 4. [CompactionManager.compactSession] appends a [CompactionRecord]; the
+///    session's context projection then replaces the summarized region with
+///    the summary. On any failure nothing is appended — compaction is
+///    failure-safe and never loses history.
+///
+/// Deliberate divergences from the TypeScript original:
+///
+/// - The summary LLM call is an injected [SummarizeFn] instead of pi's
+///   `models.completeSimple`, so tests can fake it and any provider adapter
+///   can back it. [streamFunctionSummarizer] adapts a [StreamFunction].
+/// - pi clamps the summary's `maxTokens` to `0.8 * reserveTokens`; our
+///   [StreamFunction] has no options slot, so the clamp is the adapter's
+///   responsibility.
+/// - Failures surface as [CompactionException] (pi returns a `Result` and the
+///   harness rethrows the error).
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+
+import '../agent/agent_loop.dart';
+import '../cancel_token.dart';
+import '../context.dart';
+import '../exceptions.dart';
+import '../model.dart';
+import '../prompts/prompt_overrides.dart';
+import '../prompts/prompts.g.dart';
+import '../session/session_record.dart';
+import '../session/session_tree.dart';
+import '../session/uuid.dart';
+import '../types.dart';
+import '../user_text.dart';
+import 'summary_sanitizer.dart';
+import 'token_estimation.dart';
+
+export '../compaction/compaction_engine.dart'
+    show CompactionEngine, resolveCompactionEngine;
+export '../user_text.dart' show isSyntheticUserText, userMessageText;
+export '../compaction/structured/expand_tool.dart'
+    show CompactExpandController, compactExpandToolName;
+export '../prompts/prompts.g.dart'
+    show
+        hideJudgeSystemPrompt,
+        pinnedOperativePrompt,
+        structuredCheckpointPrompt,
+        summarizationPrompt,
+        summarizationSystemPrompt,
+        turnPrefixSummarizationPrompt,
+        updateSummarizationPrompt;
+
+// ---------------------------------------------------------------------------
+// Prompts (ported verbatim from pi's compaction.ts)
+// ---------------------------------------------------------------------------
+//
+// The summarization prompts live outside Dart code in `prompts/compaction/`
+// (see AGENTS.md); the constants are generated into
+// `../prompts/prompts.g.dart` and re-exported here so existing imports keep
+// working.
+
+/// The compaction prompts used by both engines, bundled so CLI prompt
+/// overrides (the `prompts:` config section, see
+/// `lib/src/prompts/prompt_overrides.dart`) can replace them without
+/// changing the pipeline's shape. The defaults are the built-in prompts:
+/// [defaultCompactionPrompts] is byte-identical to the historical
+/// constants.
+final class CompactionPrompts {
+  /// Creates a prompt bundle; each field defaults to the built-in prompt.
+  const CompactionPrompts({
+    this.system = summarizationSystemPrompt,
+    this.summary = summarizationPrompt,
+    this.summaryUpdate = updateSummarizationPrompt,
+    this.turnPrefix = turnPrefixSummarizationPrompt,
+    this.hideJudgeSystem = hideJudgeSystemPrompt,
+    this.structuredCheckpoint = structuredCheckpointPrompt,
+    this.pinnedOperative = pinnedOperativePrompt,
+  });
+
+  /// Resolves the bundle against CLI prompt [overrides] (names mirror the
+  /// `prompts/compaction/` tree ids). Null or empty overrides yield
+  /// [defaultCompactionPrompts].
+  factory CompactionPrompts.fromOverrides(PromptOverrides? overrides) {
+    if (overrides == null || overrides.isEmpty) {
+      return defaultCompactionPrompts;
+    }
+    return CompactionPrompts(
+      system: overrides.resolve(
+        'compaction/summary_system',
+        summarizationSystemPrompt,
+      ),
+      summary: overrides.resolve('compaction/summary', summarizationPrompt),
+      summaryUpdate: overrides.resolve(
+        'compaction/summary_update',
+        updateSummarizationPrompt,
+      ),
+      turnPrefix: overrides.resolve(
+        'compaction/turn_prefix',
+        turnPrefixSummarizationPrompt,
+      ),
+      hideJudgeSystem: overrides.resolve(
+        'compaction/hide_judge',
+        hideJudgeSystemPrompt,
+      ),
+      structuredCheckpoint: overrides.resolve(
+        'compaction/structured_checkpoint',
+        structuredCheckpointPrompt,
+      ),
+      pinnedOperative: overrides.resolve(
+        'compaction/pinned_operative',
+        pinnedOperativePrompt,
+      ),
+    );
+  }
+
+  /// System prompt of the summarization LLM call.
+  final String system;
+
+  /// Instructions for the first summary.
+  final String summary;
+
+  /// Instructions for updating a previous summary.
+  final String summaryUpdate;
+
+  /// Instructions for a split-turn prefix summary.
+  final String turnPrefix;
+
+  /// System prompt of the structured-engine hide judge (issue #148).
+  final String hideJudgeSystem;
+
+  /// Instruction tail of the structured-engine checkpoint call (#148).
+  final String structuredCheckpoint;
+
+  /// gh-1409 verbatim-preserve duty (AC3): appended to every
+  /// summarization call whose input carries the pinned-operative block.
+  /// The prompt is belt — the fold carrier (the pin registry) is the
+  /// boundary; a summary that drops a pinned line is repaired from the
+  /// registry at request assembly, never trusted from summary text.
+  final String pinnedOperative;
+}
+
+/// The built-in compaction prompts (no overrides).
+const defaultCompactionPrompts = CompactionPrompts();
+
+// ---------------------------------------------------------------------------
+// Conversation serialization (ported from pi's compaction/utils.ts)
+// ---------------------------------------------------------------------------
+
+const _toolResultMaxChars = 2000;
+
+String _safeJsonEncode(Object? value) {
+  try {
+    return jsonEncode(value);
+  } catch (_) {
+    return '[unserializable]';
+  }
+}
+
+String _truncateForSummary(String text, int maxChars) {
+  if (text.length <= maxChars) return text;
+  final truncatedChars = text.length - maxChars;
+  return '${text.substring(0, maxChars)}\n\n'
+      '[... $truncatedChars more characters truncated]';
+}
+
+/// Serialize messages to plain text for summarization prompts.
+///
+/// Ported from pi's `serializeConversation`: `[User]:`, `[Assistant]:`,
+/// `[Assistant thinking]:`, `[Assistant tool calls]:`, and truncated
+/// `[Tool result]:` lines, joined by blank lines. Image blocks are skipped.
+String serializeConversation(List<Message> messages) {
+  final parts = <String>[];
+
+  for (final msg in messages) {
+    switch (msg) {
+      case UserMessage(:final content):
+        _serializeUserMessage(content, parts);
+      case AssistantMessage(:final content):
+        _serializeAssistantMessage(content, parts);
+      case ToolResultMessage(:final content):
+        _serializeToolResultMessage(content, parts);
+      default:
+    }
+  }
+
+  return parts.join('\n\n');
+}
+
+/// Serializes one user message into a `[User]:` line appended to [parts]
+/// (empty text is skipped; image blocks are ignored).
+void _serializeUserMessage(Object content, List<String> parts) {
+  final text = content is String
+      ? content
+      : (content as List<ContentBlock>)
+            .whereType<TextContent>()
+            .map((block) => block.text)
+            .join();
+  if (text.isNotEmpty) parts.add('[User]: $text');
+}
+
+/// Serializes one tool-result message into a truncated `[Tool result]:` line
+/// appended to [parts] (empty text is skipped).
+void _serializeToolResultMessage(
+  List<ContentBlock> content,
+  List<String> parts,
+) {
+  final text = content
+      .whereType<TextContent>()
+      .map((block) => block.text)
+      .join();
+  if (text.isNotEmpty) {
+    parts.add(
+      '[Tool result]: ${_truncateForSummary(text, _toolResultMaxChars)}',
+    );
+  }
+}
+
+/// Serializes one assistant message into `[Assistant thinking]:`,
+/// `[Assistant]:`, and `[Assistant tool calls]:` lines appended to [parts].
+void _serializeAssistantMessage(
+  List<ContentBlock> content,
+  List<String> parts,
+) {
+  final textParts = <String>[];
+  final thinkingParts = <String>[];
+  final toolCalls = <String>[];
+  for (final block in content) {
+    _classifyAssistantBlock(block, textParts, thinkingParts, toolCalls);
+  }
+  if (thinkingParts.isNotEmpty) {
+    parts.add('[Assistant thinking]: ${thinkingParts.join('\n')}');
+  }
+  if (textParts.isNotEmpty) {
+    parts.add('[Assistant]: ${textParts.join('\n')}');
+  }
+  if (toolCalls.isNotEmpty) {
+    parts.add('[Assistant tool calls]: ${toolCalls.join('; ')}');
+  }
+}
+
+/// Routes one assistant content [block] into the text, thinking, or tool-call
+/// accumulator (other block kinds, e.g. images, are ignored).
+void _classifyAssistantBlock(
+  ContentBlock block,
+  List<String> textParts,
+  List<String> thinkingParts,
+  List<String> toolCalls,
+) {
+  switch (block) {
+    case TextContent(:final text):
+      textParts.add(text);
+    case ThinkingContent(:final thinking):
+      thinkingParts.add(thinking);
+    case ToolCall(:final name, :final arguments):
+      final args = arguments.entries
+          .map((entry) => '${entry.key}=${_safeJsonEncode(entry.value)}')
+          .join(', ');
+      toolCalls.add('$name($args)');
+    default:
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File operations (ported from pi's compaction/utils.ts)
+// ---------------------------------------------------------------------------
+
+/// File paths touched by a compaction range.
+///
+/// Ported from pi's `FileOperations`.
+final class FileOperations {
+  /// Creates an empty [FileOperations] accumulator.
+  FileOperations();
+
+  /// Files read but not necessarily modified.
+  final read = <String>{};
+
+  /// Files written by full-file write operations.
+  final written = <String>{};
+
+  /// Files modified by edit operations.
+  final edited = <String>{};
+}
+
+/// Create an empty file-operation accumulator. Ported from pi's
+/// `createFileOps`.
+FileOperations createFileOps() => FileOperations();
+
+/// Add file operations from assistant `read`/`write`/`edit` tool calls to
+/// [fileOps]. Ported from pi's `extractFileOpsFromMessage`.
+void extractFileOpsFromMessage(Message message, FileOperations fileOps) {
+  if (message is! AssistantMessage) return;
+  for (final block in message.content) {
+    if (block is! ToolCall) continue;
+    final path = block.arguments['path'];
+    if (path is! String) continue;
+    switch (block.name) {
+      case 'read':
+        fileOps.read.add(path);
+      case 'write':
+        fileOps.written.add(path);
+      case 'edit':
+        fileOps.edited.add(path);
+    }
+  }
+}
+
+/// Compute sorted read-only and modified file lists from accumulated
+/// operations. Ported from pi's `computeFileLists`.
+({List<String> readFiles, List<String> modifiedFiles}) computeFileLists(
+  FileOperations fileOps,
+) {
+  final modified = {...fileOps.edited, ...fileOps.written};
+  final readOnly = fileOps.read.where((f) => !modified.contains(f)).toList()
+    ..sort();
+  final modifiedFiles = modified.toList()..sort();
+  return (readFiles: readOnly, modifiedFiles: modifiedFiles);
+}
+
+/// Format file lists as summary metadata tags. Ported from pi's
+/// `formatFileOperations`.
+String formatFileOperations(
+  List<String> readFiles,
+  List<String> modifiedFiles,
+) {
+  final sections = <String>[];
+  if (readFiles.isNotEmpty) {
+    sections.add('<read-files>\n${readFiles.join('\n')}\n</read-files>');
+  }
+  if (modifiedFiles.isNotEmpty) {
+    sections.add(
+      '<modified-files>\n${modifiedFiles.join('\n')}\n</modified-files>',
+    );
+  }
+  if (sections.isEmpty) return '';
+  return '\n\n${sections.join('\n\n')}';
+}
+
+// ---------------------------------------------------------------------------
+// Open user request candidates (issue #81)
+// ---------------------------------------------------------------------------
+
+/// Candidate lines carry the user's own words at full fidelity — checkpoint
+/// content is uncapped by owner ruling (issue #81 v2, constraint 1); only
+/// the prompt-file instruction text is budgeted.
+///
+/// The synthetic-user-text predicate and the content fold live in
+/// `../user_text.dart` (the ONE copy — issue #1380 review consolidation);
+/// re-exported here for the historical import path.
+
+/// The `asked <date>[, record <id-prefix>]` pointer of a candidate line.
+String _userRequestPointer(String? recordId, DateTime timestamp) {
+  final date = timestamp.toUtc().toIso8601String().substring(0, 10);
+  if (recordId == null || recordId.isEmpty) return 'asked $date';
+  final prefix = recordId.length <= 8 ? recordId : recordId.substring(0, 8);
+  return 'asked $date, record $prefix';
+}
+
+/// Extracts open-user-request candidate lines from [messages]: EVERY
+/// user-role text, oldest first — the summarizer LLM itself judges which
+/// are open asks, so no message is lost to a detection gate (issue #86).
+/// Only structural non-user content is skipped: `<system-notice>`
+/// envelopes, agent mail, and projected branch summaries. [recordIds],
+/// when given, runs parallel to [messages] and lands in the line pointer;
+/// null/empty entries fall back to a date-only pointer.
+List<String> userRequestCandidateLines(
+  List<Message> messages, {
+  List<String?>? recordIds,
+}) {
+  final lines = <String>[];
+  for (var i = 0; i < messages.length; i++) {
+    final message = messages[i];
+    if (message is! UserMessage) continue;
+    final text = userMessageText(message.content);
+    if (text.isEmpty || isSyntheticUserText(text)) {
+      continue;
+    }
+    final id = (recordIds != null && i < recordIds.length)
+        ? recordIds[i]
+        : null;
+    final flat = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    lines.add('- [${_userRequestPointer(id, message.timestamp)}] $flat');
+  }
+  return lines;
+}
+
+/// Renders the `USER REQUEST CANDIDATES` block appended to the summarizer
+/// input (after the conversation, before `<previous-checkpoint>`), or `null`
+/// when there are no candidates — the section is then the LLM's to fill
+/// with "(none)".
+String? userRequestCandidatesBlock(
+  List<Message> messages, {
+  List<String?>? recordIds,
+}) {
+  final lines = userRequestCandidateLines(messages, recordIds: recordIds);
+  if (lines.isEmpty) return null;
+  final header =
+      'USER REQUEST CANDIDATES (every user-role message, oldest first — '
+      'you judge which are open asks; fill `## Open User Requests` from '
+      'these):';
+  final buffer = StringBuffer(header);
+  for (final line in lines) {
+    buffer
+      ..writeln()
+      ..write(line);
+  }
+  return buffer.toString();
+}
+
+// ---------------------------------------------------------------------------
+// Settings and the compaction decision
+// ---------------------------------------------------------------------------
+
+/// Compaction thresholds and retention settings.
+///
+/// Ported from pi's `CompactionSettings`.
+final class CompactionSettings {
+  /// Creates a [CompactionSettings].
+  const CompactionSettings({
+    required this.enabled,
+    required this.reserveTokens,
+    required this.keepRecentTokens,
+  });
+
+  /// Creates settings scaled to a model's context [window] (in tokens).
+  ///
+  /// gh-1742 (AC3): PROPORTIONAL headroom above the legacy-parity band.
+  /// The legacy flat reserve (16,384) was tuned for 200k windows — 1.6%
+  /// of a 1M window, which let real input ride 976k–982k for hours on the
+  /// kimi-k3 session before the first auto-compaction. The scaling rule:
+  ///
+  /// - `reserveTokens = min(65536, max(window ~/ 16, legacyReserve))` —
+  ///   6.25% of the window, clamped to 64Ki, floored by the EXACT legacy
+  ///   curve (`min(16384, max(1024, window ~/ 4))`, degenerate clamps
+  ///   included). The legacy term dominates below 262,144 (where
+  ///   `window/16` would undercut it — the hosted 128k/200k class rides
+  ///   the legacy line exactly, so an estimate-only provider (E1) still
+  ///   compacts no later than before); the proportional term takes over
+  ///   above it, so a 1M window keeps ≥60k headroom at the trigger
+  ///   (enough to absorb one huge tool result plus estimator drift);
+  /// - `keepRecentTokens = min(131072, max(window ~/ 8, legacyKeep))` —
+  ///   the post-compaction floor scales with the window (12.5%, clamped
+  ///   128Ki) above the mirrored legacy curve
+  ///   (`min(20000, max(2048, window ~/ 2))`), so the sawtooth restarts
+  ///   proportional on big windows instead of always ~20k.
+  ///
+  /// Monotone in the window: a bigger window reserves (and keeps) as much
+  /// or more (max of two monotone curves under monotone clamps).
+  /// Degenerate small windows relax the floors proportionally so the
+  /// reserve never eats half the window and the kept region never eats
+  /// all of it (below that, compaction could not free anything).
+  factory CompactionSettings.forWindow(int window) {
+    // Legacy-parity floors (gh-1742 AC3 + review round 1, comment 1):
+    // the pre-gh-1742 curves, byte-identical. The reserve floor is what
+    // keeps the (16k, 262k) band — most hosted sessions — firing no
+    // later than before; `window/16` alone compacts up to 12,288 tokens
+    // later there.
+    final legacyReserve = min(16384, max(1024, window ~/ 4));
+    final legacyKeep = min(20000, max(2048, window ~/ 2));
+    var reserveTokens = min(65536, max(window ~/ 16, legacyReserve));
+    var keepRecentTokens = min(131072, max(window ~/ 8, legacyKeep));
+    if (reserveTokens >= window ~/ 2) {
+      reserveTokens = max(128, window ~/ 4);
+    }
+    if (keepRecentTokens >= window) {
+      keepRecentTokens = max(256, window ~/ 2);
+    }
+    return CompactionSettings(
+      enabled: true,
+      reserveTokens: reserveTokens,
+      keepRecentTokens: keepRecentTokens,
+    );
+  }
+
+  /// Enable automatic compaction decisions.
+  final bool enabled;
+
+  /// Tokens reserved for the summary prompt and output.
+  final int reserveTokens;
+
+  /// Approximate recent-context tokens to keep after compaction.
+  final int keepRecentTokens;
+}
+
+/// Default compaction settings (pi's `DEFAULT_COMPACTION_SETTINGS`):
+/// reserve 16384 tokens, keep ~20000 recent tokens.
+const defaultCompactionSettings = CompactionSettings(
+  enabled: true,
+  reserveTokens: 16384,
+  keepRecentTokens: 20000,
+);
+
+/// Cap for the issue #1914 retry escalation's halved retention budget: a
+/// retry pass must cut deeper than the pass that freed nothing, but it still
+/// retains a viable recent window (mirrors the smallest legacy
+/// `CompactionSettings.forWindow` keep floor). Never INFLATES a configured
+/// keep below this — the floor is `min(this, the configured keep)`.
+const _minRetryKeepRecentTokens = 2048;
+
+/// Whether context usage exceeds the compaction threshold.
+///
+/// Ported from pi's `shouldCompact`: compacts when
+/// `contextTokens > contextWindow - reserveTokens`.
+bool shouldCompact(
+  int contextTokens,
+  int contextWindow,
+  CompactionSettings settings,
+) {
+  if (!settings.enabled) return false;
+  return contextTokens > contextWindow - settings.reserveTokens;
+}
+
+// ---------------------------------------------------------------------------
+// Fit-the-window summarization payloads (issue #729)
+// ---------------------------------------------------------------------------
+
+/// The outbound-payload budget (in estimated tokens) for a summarizer whose
+/// model window is [summarizerWindow]: the window minus the settings'
+/// reserve (which prices the summary prompt and its output), floored at
+/// half the window so a summarizer window smaller than the reserve (a tiny
+/// smol role under a big main window's settings) still leaves room to
+/// summarize into. Every compaction request's estimated payload must stay
+/// at or under this — the invariant asserted in tests on the recorded
+/// outbound prompts.
+int summarizationPayloadBudget(
+  int summarizerWindow,
+  CompactionSettings settings,
+) => max(summarizerWindow - settings.reserveTokens, summarizerWindow ~/ 2);
+
+/// Splits [messages] into consecutive chunks whose serialized conversation
+/// text estimates under [budgetTokens] (issue #729). Order is preserved and
+/// the chunks concatenate back to the whole region; a single message bigger
+/// than the budget becomes its own oversized chunk — the prompt builder
+/// truncates it with an explicit note, since chunking cannot split it.
+List<List<Message>> chunkSummarizableMessages(
+  List<Message> messages,
+  int budgetTokens,
+) {
+  final chunks = <List<Message>>[];
+  var current = <Message>[];
+  var currentTokens = 0;
+  for (final message in messages) {
+    final tokens = estimateStringTokens(serializeConversation([message]));
+    if (current.isNotEmpty && currentTokens + tokens > budgetTokens) {
+      chunks.add(current);
+      current = <Message>[];
+      currentTokens = 0;
+    }
+    current.add(message);
+    currentTokens += tokens;
+  }
+  if (current.isNotEmpty) chunks.add(current);
+  return chunks;
+}
+
+// ---------------------------------------------------------------------------
+// Cut point selection
+// ---------------------------------------------------------------------------
+
+/// Cut point selected for compaction.
+///
+/// Ported from pi's `CutPointResult`.
+final class CutPointResult {
+  /// Creates a [CutPointResult].
+  const CutPointResult({
+    required this.firstKeptEntryIndex,
+    required this.turnStartIndex,
+    required this.isSplitTurn,
+  });
+
+  /// Index of the first entry retained after compaction.
+  final int firstKeptEntryIndex;
+
+  /// Index of the turn-start entry when the cut splits a turn, otherwise -1.
+  final int turnStartIndex;
+
+  /// Whether the selected cut point splits an in-progress turn.
+  final bool isSplitTurn;
+}
+
+List<int> _findValidCutPoints(
+  List<SessionRecord> entries,
+  int startIndex,
+  int endIndex,
+) {
+  final cutPoints = <int>[];
+  for (var i = startIndex; i < endIndex; i++) {
+    final entry = entries[i];
+    if (entry is MessageRecord) {
+      // Any message role except tool results may start the kept region.
+      if (entry.message.role != 'toolResult') cutPoints.add(i);
+    } else if (entry is BranchSummaryRecord || entry is CustomMessageRecord) {
+      cutPoints.add(i);
+    }
+  }
+  return cutPoints;
+}
+
+/// Find the user-visible message that starts the turn containing an entry.
+///
+/// Ported from pi's `findTurnStartIndex`.
+int findTurnStartIndex(
+  List<SessionRecord> entries,
+  int entryIndex,
+  int startIndex,
+) {
+  for (var i = entryIndex; i >= startIndex; i--) {
+    final entry = entries[i];
+    if (entry is BranchSummaryRecord || entry is CustomMessageRecord) {
+      return i;
+    }
+    if (entry is MessageRecord && entry.message.role == 'user') return i;
+  }
+  return -1;
+}
+
+/// Walks entries backwards from [endIndex], accumulating estimated tokens
+/// until [keepRecentTokens] is exhausted, then snaps the cut forward to the
+/// first valid cut point at or after the budget-crossing entry (never a tool
+/// result). Defaults to the first valid cut point when the budget is never
+/// reached.
+int _accumulateCutIndex(
+  List<SessionRecord> entries,
+  int startIndex,
+  int endIndex,
+  int keepRecentTokens,
+  List<int> cutPoints,
+) {
+  var accumulatedTokens = 0;
+  var cutIndex = cutPoints.first;
+
+  for (var i = endIndex - 1; i >= startIndex; i--) {
+    final entry = entries[i];
+    if (entry is! MessageRecord) continue;
+    accumulatedTokens += estimateTokens(entry.message);
+    if (accumulatedTokens >= keepRecentTokens) {
+      for (final cutPoint in cutPoints) {
+        if (cutPoint >= i) {
+          cutIndex = cutPoint;
+          break;
+        }
+      }
+      break;
+    }
+  }
+  return cutIndex;
+}
+
+/// Snaps [cutIndex] backwards over non-message records so configuration
+/// entries stay with the kept region.
+int _snapBackOverNonMessages(
+  List<SessionRecord> entries,
+  int cutIndex,
+  int startIndex,
+) {
+  while (cutIndex > startIndex) {
+    final prevEntry = entries[cutIndex - 1];
+    if (prevEntry is CompactionRecord || prevEntry is MessageRecord) break;
+    cutIndex--;
+  }
+  return cutIndex;
+}
+
+/// Find the compaction cut point that keeps approximately [keepRecentTokens]
+/// recent tokens.
+///
+/// Ported from pi's `findCutPoint`: walks entries backwards accumulating
+/// estimated tokens until the budget is exhausted, then snaps the cut forward
+/// to the next valid cut point (never a tool result) and backwards over
+/// non-message records so configuration entries stay with the kept region.
+///
+/// [minFirstKeptIndex] is the retry-escalation floor (issue #1914): when the
+/// backward walk never reaches [keepRecentTokens] — the estimator's chars/4
+/// tally can stay under the budget across a transcript the provider prices
+/// far higher (dense tokenizers, usage anchors, system/tool overhead the
+/// per-message walk never sees) — the fallback cut lands on the FIRST valid
+/// cut point and keeps essentially the whole branch, so a retry pass with
+/// identical inputs repeats the identical cut and frees nothing again. When
+/// the natural cut lands OLDER than this floor, it advances to the first
+/// valid cut point at/after the floor, guaranteeing a retry cut is strictly
+/// newer than the cut that just failed. A natural cut newer than the floor
+/// is left alone.
+CutPointResult findCutPoint(
+  List<SessionRecord> entries,
+  int startIndex,
+  int endIndex,
+  int keepRecentTokens, {
+  int? minFirstKeptIndex,
+}) {
+  final cutPoints = _findValidCutPoints(entries, startIndex, endIndex);
+
+  if (cutPoints.isEmpty) {
+    return CutPointResult(
+      firstKeptEntryIndex: startIndex,
+      turnStartIndex: -1,
+      isSplitTurn: false,
+    );
+  }
+  var cutIndex = _accumulateCutIndex(
+    entries,
+    startIndex,
+    endIndex,
+    keepRecentTokens,
+    cutPoints,
+  );
+  cutIndex = _snapBackOverNonMessages(entries, cutIndex, startIndex);
+  if (minFirstKeptIndex != null && cutIndex < minFirstKeptIndex) {
+    final advanced = cutPoints.firstWhere(
+      (cutPoint) => cutPoint >= minFirstKeptIndex,
+      orElse: () => -1,
+    );
+    if (advanced >= 0) cutIndex = advanced;
+  }
+  final cutEntry = entries[cutIndex];
+  final isUserMessage =
+      cutEntry is MessageRecord && cutEntry.message.role == 'user';
+  final turnStartIndex = isUserMessage
+      ? -1
+      : findTurnStartIndex(entries, cutIndex, startIndex);
+
+  return CutPointResult(
+    firstKeptEntryIndex: cutIndex,
+    turnStartIndex: turnStartIndex,
+    isSplitTurn: !isUserMessage && turnStartIndex != -1,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Summary generation
+// ---------------------------------------------------------------------------
+
+/// A single summarization request handed to a [SummarizeFn].
+final class SummarizationRequest {
+  /// Creates a [SummarizationRequest].
+  const SummarizationRequest({required this.prompt, this.cancelToken});
+
+  /// The full user prompt (serialized conversation + instructions).
+  final String prompt;
+
+  /// Cancellation for the underlying LLM call, if any.
+  final CancelToken? cancelToken;
+}
+
+/// Result of a [SummarizeFn] call. Success carries [text]; failure carries
+/// [error] and optionally marks the call as [isAborted].
+final class SummarizationResult {
+  const SummarizationResult._({this.text, this.error, this.isAborted = false});
+
+  /// A successful summary.
+  factory SummarizationResult.success(String text) {
+    return SummarizationResult._(text: text);
+  }
+
+  /// A failed (or aborted, when [aborted] is true) summarization.
+  factory SummarizationResult.failure(String error, {bool aborted = false}) {
+    return SummarizationResult._(error: error, isAborted: aborted);
+  }
+
+  /// The summary text on success, `null` on failure.
+  final String? text;
+
+  /// The failure description on failure, `null` on success.
+  final String? error;
+
+  /// Whether the call was aborted rather than failed.
+  final bool isAborted;
+
+  /// Whether the call produced a summary.
+  bool get isSuccess => text != null;
+}
+
+/// The injectable summary LLM call.
+///
+/// Implementations must never throw — return [SummarizationResult.failure]
+/// instead, mirroring the providers-never-throw contract. The compaction
+/// pipeline is defensive anyway: a throw is converted into a failure.
+typedef SummarizeFn =
+    Future<SummarizationResult> Function(SummarizationRequest request);
+
+/// Adapts a provider [StreamFunction] into a [SummarizeFn].
+///
+/// Sends the [CompactionPrompts.system] prompt (the built-in
+/// [summarizationSystemPrompt] unless overridden) plus the request prompt as
+/// a single user message and joins the response's text blocks. Error and
+/// aborted stop reasons map to failure results (errors-as-events contract);
+/// a throwing [StreamFunction] is defensive-converted into a failure.
+///
+/// Summaries are standalone requests, so every call runs with
+/// `cacheRetention: 'none'` and a fresh routing session id (uuidv7) via
+/// [StreamCacheRouting]: summarization never writes to nor routes through
+/// the session's prompt cache (pi's compaction `callCompleteSimple`).
+SummarizeFn streamFunctionSummarizer(
+  StreamFunction streamFunction,
+  Model model, {
+  CompactionPrompts prompts = defaultCompactionPrompts,
+  void Function(String delta)? onDelta,
+}) {
+  return (SummarizationRequest request) async {
+    try {
+      final stream = StreamCacheRouting.runWith(
+        () => streamFunction(
+          model,
+          Context(
+            systemPrompt: prompts.system,
+            messages: [UserMessage.text(request.prompt)],
+          ),
+          cancelToken: request.cancelToken,
+        ),
+        sessionId: uuidv7(),
+        cacheRetention: 'none',
+      );
+      // Surface streaming deltas (text + thinking) to the host UI while the
+      // result future resolves: EventStream buffers until listened, and
+      // `result` resolves independently of subscription, so this drain is
+      // safe for the single-subscription stream.
+      if (onDelta != null) {
+        stream.listen((event) {
+          final delta = switch (event) {
+            TextDeltaEvent(:final delta) => delta,
+            ThinkingDeltaEvent(:final delta) => delta,
+            _ => null,
+          };
+          if (delta != null && delta.isNotEmpty) onDelta(delta);
+        });
+      }
+      final response = await stream.result;
+      return switch (response.stopReason) {
+        StopReason.aborted => SummarizationResult.failure(
+          response.errorMessage ?? 'Summarization aborted',
+          aborted: true,
+        ),
+        StopReason.error => SummarizationResult.failure(
+          'Summarization failed: ${response.errorMessage ?? 'Unknown error'}',
+        ),
+        _ => SummarizationResult.success(
+          response.content
+              .whereType<TextContent>()
+              .map((block) => block.text)
+              .join('\n'),
+        ),
+      };
+    } catch (error) {
+      return SummarizationResult.failure('Summarization failed: $error');
+    }
+  };
+}
+
+Future<String> _runSummarization({
+  required String prompt,
+  required SummarizeFn summarize,
+  required CancelToken? cancelToken,
+  required String failureLabel,
+}) async {
+  SummarizationResult result;
+  try {
+    result = await summarize(
+      SummarizationRequest(prompt: prompt, cancelToken: cancelToken),
+    );
+  } catch (error) {
+    result = SummarizationResult.failure('$failureLabel: $error');
+  }
+  if (result.isAborted) {
+    throw CompactionException(
+      result.error ?? '$failureLabel aborted',
+      code: CompactionErrorCode.aborted,
+    );
+  }
+  final text = result.text;
+  if (text == null) {
+    throw CompactionException(
+      result.error ?? failureLabel,
+      code: CompactionErrorCode.summarizationFailed,
+    );
+  }
+  return text;
+}
+
+/// gh-1409: the compaction-pinned skill operative lines threaded into
+/// every summarization call — the rendered prompt [block] (the PINNED
+/// OPERATIVE LINES section) plus the raw verbatim [lines] for the
+/// sanitizer's pin exemption (AC4). Null/absent when the session carries
+/// no pins.
+final class PinnedOperativePayload {
+  const PinnedOperativePayload({required this.block, required this.lines});
+
+  /// The rendered `PINNED OPERATIVE LINES` block (from
+  /// `pinnedOperativePromptBlock`).
+  final String block;
+
+  /// The raw verbatim pin lines (P3) — the sanitizer never strips or
+  /// rewrites a line containing one.
+  final Set<String> lines;
+}
+
+/// Generate (or update) a conversation summary for compaction.
+///
+/// Ported from pi's `generateSummary`: serializes [messages] into
+/// `<conversation>` tags, optionally appends `<previous-checkpoint>` for
+/// iterative updates, and ends with the fixed structured prompt (plus
+/// `Additional focus:` when [customInstructions] is given). Throws
+/// [CompactionException] on failure — callers must treat compaction as
+/// failure-safe and leave history untouched.
+///
+/// [maxPromptTokens] (issue #729) bounds the outbound payload: when the
+/// built prompt estimates over it, the region is summarized CHUNK-WISE —
+/// each chunk under [maxPromptTokens], every chunk's summary threaded into
+/// the next as `<previous-checkpoint>` (the existing iterative-update
+/// mechanism; the first chunk uses the plain summary prompt, later chunks
+/// the update prompt) — and the last fold is returned. A single message
+/// bigger than the budget is truncated with an explicit note. Under the
+/// budget (and when `null`) the prompt is byte-identical to the unbounded
+/// path.
+Future<String> generateSummary(
+  List<Message> messages, {
+  required SummarizeFn summarize,
+  String? customInstructions,
+  String? previousSummary,
+  CancelToken? cancelToken,
+  CompactionPrompts prompts = defaultCompactionPrompts,
+  String? userRequestCandidates,
+  int? maxPromptTokens,
+  PinnedOperativePayload? pinnedOperative,
+}) async {
+  // Issue #1131: the previous checkpoint re-enters this prompt verbatim —
+  // heal it first so a poisoned old summary cannot be paraphrased forward
+  // into a fresh one (idempotent; clean records are unaffected). gh-1409:
+  // pinned lines ride the heal protected (AC4) — a pin inside an old
+  // checkpoint survives sanitization byte-identical.
+  previousSummary = previousSummary == null
+      ? null
+      : sanitizeSummary(
+          previousSummary,
+          protectedLines: pinnedOperative?.lines ?? const {},
+        ).text;
+  var basePrompt = previousSummary != null
+      ? prompts.summaryUpdate
+      : prompts.summary;
+  // gh-1409 AC3: the verbatim-preserve duty rides the instruction tail of
+  // every call whose input carries the pinned block.
+  if (pinnedOperative != null) {
+    basePrompt = '$basePrompt\n\n${prompts.pinnedOperative}';
+  }
+  if (customInstructions != null) {
+    basePrompt = '$basePrompt\n\nAdditional focus: $customInstructions';
+  }
+  String build(
+    String conversation,
+    String? candidates,
+    String? prior,
+    String instructions,
+  ) {
+    final prompt = StringBuffer()
+      ..write('<conversation>\n')
+      ..write(conversation)
+      ..write('\n</conversation>\n\n');
+    if (candidates != null) {
+      prompt
+        ..write(candidates)
+        ..write('\n\n');
+    }
+    if (pinnedOperative != null) {
+      prompt
+        ..write(pinnedOperative.block)
+        ..write('\n\n');
+    }
+    if (prior != null) {
+      prompt.write('<previous-checkpoint>\n$prior\n</previous-checkpoint>\n\n');
+    }
+    prompt.write(instructions);
+    return prompt.toString();
+  }
+
+  final full = build(
+    serializeConversation(messages),
+    userRequestCandidates ?? userRequestCandidatesBlock(messages),
+    previousSummary,
+    basePrompt,
+  );
+  if (maxPromptTokens == null ||
+      estimateStringTokens(full) <= maxPromptTokens) {
+    return _runSummarization(
+      prompt: full,
+      summarize: summarize,
+      cancelToken: cancelToken,
+      failureLabel: 'Summarization failed',
+    );
+  }
+
+  // Over the payload budget (#729): chunk the region, fold chunk-wise.
+  // Each chunk carries only its own request candidates (the whole-range
+  // block would ride every chunk and re-inflate the payload); the record
+  // `<id>` pointers degrade to date-only on this path.
+  var prior = previousSummary;
+  var fold = '';
+  final chunks = chunkSummarizableMessages(
+    messages,
+    max(maxPromptTokens - _chunkEnvelopeReserveTokens, 256),
+  );
+  for (var i = 0; i < chunks.length; i++) {
+    final candidates = userRequestCandidatesBlock(chunks[i]);
+    final instructions = i == 0
+        ? basePrompt
+        : (pinnedOperative == null
+              ? prompts.summaryUpdate
+              // E7: the verbatim-preserve duty rides every chunk.
+              : '${prompts.summaryUpdate}\n\n${prompts.pinnedOperative}');
+    final conversation = truncateForSummaryBudget(
+      serializeConversation(chunks[i]),
+      budgetTokens: maxPromptTokens,
+      envelopeChars: _summaryEnvelopeChars(
+        candidates: candidates,
+        prior: prior,
+        instructions: instructions,
+        pinnedBlock: pinnedOperative?.block,
+      ),
+    );
+    fold = await _runSummarization(
+      prompt: build(conversation, candidates, prior, instructions),
+      summarize: summarize,
+      cancelToken: cancelToken,
+      failureLabel: 'Summarization failed',
+    );
+    prior = fold;
+  }
+  return fold;
+}
+
+/// Prompt overhead reserved per chunk before the conversation text: tags,
+/// candidates, the previous-checkpoint block and the instruction tail.
+/// The exact fit is enforced by [truncateForSummaryBudget]; this only
+/// sizes the chunk plan.
+const _chunkEnvelopeReserveTokens = 4096;
+
+/// Upper bound on the `\n\n[... N more characters truncated]` note that
+/// [_truncateForSummary] appends (10-digit count ≈ 45 chars), reserved so
+/// the annotated text still fits the budget.
+const _truncateNoteChars = 48;
+
+/// Truncates serialized conversation text so a prompt of [envelopeChars]
+/// (everything around the conversation, measured) plus the text estimates
+/// under [budgetTokens], with an explicit truncation note (never silent).
+/// Shared by the classic and structured engines (issue #729).
+String truncateForSummaryBudget(
+  String conversation, {
+  required int budgetTokens,
+  required int envelopeChars,
+}) {
+  final maxChars = max(
+    budgetTokens * 4 - envelopeChars - _truncateNoteChars,
+    1024,
+  );
+  return _truncateForSummary(conversation, maxChars);
+}
+
+int _summaryEnvelopeChars({
+  required String? candidates,
+  required String? prior,
+  required String instructions,
+  String? pinnedBlock,
+}) {
+  final prompt = StringBuffer()..write('<conversation>\n\n</conversation>\n\n');
+  if (candidates != null) {
+    prompt
+      ..write(candidates)
+      ..write('\n\n');
+  }
+  // The pinned block rides EVERY summarization prompt (gh-1409 AC3) — it
+  // must count against the envelope or a host with a large
+  // `OperativePinConfig.budgetChars` pushes summarization payloads past
+  // `summarizationPayloadBudget` (review round 2, suggestion 7).
+  if (pinnedBlock != null) {
+    prompt
+      ..write(pinnedBlock)
+      ..write('\n\n');
+  }
+  if (prior != null) {
+    prompt.write('<previous-checkpoint>\n$prior\n</previous-checkpoint>\n\n');
+  }
+  prompt.write(instructions);
+  return prompt.length;
+}
+
+Future<String> _generateTurnPrefixSummary(
+  List<Message> messages, {
+  required SummarizeFn summarize,
+  CancelToken? cancelToken,
+  CompactionPrompts prompts = defaultCompactionPrompts,
+  int? maxPromptTokens,
+  PinnedOperativePayload? pinnedOperative,
+}) {
+  // E7: the split-turn prefix carries the verbatim-preserve duty too.
+  final duty = pinnedOperative == null ? '' : '\n\n${prompts.pinnedOperative}';
+  var conversation = serializeConversation(messages);
+  var prompt =
+      '<conversation>\n$conversation\n</conversation>\n\n'
+      '${pinnedOperative == null ? '' : '${pinnedOperative.block}\n\n'}'
+      '${prompts.turnPrefix}$duty';
+  if (maxPromptTokens != null &&
+      estimateStringTokens(prompt) > maxPromptTokens) {
+    // Issue #729: the split-turn prefix never rides an over-window
+    // request either — a turn prefix bigger than the summarizer's whole
+    // payload budget is truncated head-first with the explicit note (one
+    // call, bounded, lossy where chunking has no update prompt to fold
+    // into).
+    final envelopeChars = prompt.length - conversation.length;
+    conversation = truncateForSummaryBudget(
+      conversation,
+      budgetTokens: maxPromptTokens,
+      envelopeChars: envelopeChars,
+    );
+    prompt =
+        '<conversation>\n$conversation\n</conversation>\n\n'
+        '${pinnedOperative == null ? '' : '${pinnedOperative.block}\n\n'}'
+        '${prompts.turnPrefix}$duty';
+  }
+  return _runSummarization(
+    prompt: prompt,
+    summarize: summarize,
+    cancelToken: cancelToken,
+    failureLabel: 'Turn prefix summarization failed',
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline orchestration
+// ---------------------------------------------------------------------------
+
+/// Prepared inputs for a compaction run.
+///
+/// Ported from pi's `CompactionPreparation`.
+final class CompactionPreparation {
+  /// Creates a [CompactionPreparation].
+  const CompactionPreparation({
+    required this.firstKeptEntryId,
+    required this.messagesToSummarize,
+    required this.turnPrefixMessages,
+    required this.isSplitTurn,
+    required this.tokensBefore,
+    this.previousSummary,
+    this.readFiles = const [],
+    this.modifiedFiles = const [],
+    this.settings = defaultCompactionSettings,
+    this.summarizableRecordIds = const [],
+  });
+
+  /// Entry id where retained history starts.
+  final String firstKeptEntryId;
+
+  /// Messages summarized into the history summary.
+  final List<Message> messagesToSummarize;
+
+  /// Prefix messages summarized separately when compaction splits a turn.
+  final List<Message> turnPrefixMessages;
+
+  /// Whether compaction splits a turn.
+  final bool isSplitTurn;
+
+  /// Estimated context tokens before compaction.
+  final int tokensBefore;
+
+  /// Previous compaction summary used for iterative updates.
+  final String? previousSummary;
+
+  /// Session-record id per message of [messagesToSummarize] (parallel list,
+  /// null for synthetic messages) — powers the `record <id>` pointer of the
+  /// open-request candidates.
+  final List<String?> summarizableRecordIds;
+
+  /// Files read in the compacted history (accumulated across compactions).
+  final List<String> readFiles;
+
+  /// Files modified in the compacted history (accumulated across
+  /// compactions).
+  final List<String> modifiedFiles;
+
+  /// Settings used to prepare compaction.
+  final CompactionSettings settings;
+}
+
+/// Generated compaction data ready to persist as a [CompactionRecord].
+///
+/// Ported from pi's `CompactionResult`.
+final class CompactionResult {
+  /// Creates a [CompactionResult].
+  const CompactionResult({
+    required this.summary,
+    required this.firstKeptEntryId,
+    required this.tokensBefore,
+    this.details,
+  });
+
+  /// Summary text that replaces compacted history in future context.
+  final String summary;
+
+  /// Entry id where retained history starts.
+  final String firstKeptEntryId;
+
+  /// Estimated context tokens before compaction.
+  final int tokensBefore;
+
+  /// Structured details stored with the compaction entry: a
+  /// `{'readFiles': [...], 'modifiedFiles': [...]}` map.
+  final Object? details;
+}
+
+List<Message> _entryToSummarizableMessages(SessionRecord entry) {
+  return switch (entry) {
+    MessageRecord(:final message) => [message],
+    CustomMessageRecord(:final content, :final timestamp) => [
+      UserMessage(content: content, timestamp: timestamp),
+    ],
+    BranchSummaryRecord(:final summary, :final timestamp) =>
+      summary.isEmpty
+          ? const []
+          : [
+              UserMessage.text(
+                '$branchSummaryPrefix'
+                // Issue #1131: summarize the healed text, never the raw
+                // persisted record — poison must not be paraphrased forward.
+                '${sanitizeSummary(summary).text}'
+                '$branchSummarySuffix',
+                timestamp: timestamp,
+              ),
+            ],
+    // Compaction records themselves never enter a summary.
+    _ => const [],
+  };
+}
+
+/// Threads the previous compaction (at [prevCompactionIndex], or none when
+/// negative) into a preparation: its summary for iterative updates, its kept
+/// boundary as the new summarize-region start, and its accumulated file
+/// operations into [fileOps].
+({String? previousSummary, int boundaryStart, int prevKeptIndex})
+_previousCompactionContext(
+  List<SessionRecord> pathEntries,
+  int prevCompactionIndex,
+  FileOperations fileOps,
+) {
+  String? previousSummary;
+  var boundaryStart = 0;
+  var prevKeptIndex = -1;
+  if (prevCompactionIndex >= 0) {
+    final prevCompaction = pathEntries[prevCompactionIndex] as CompactionRecord;
+    previousSummary = prevCompaction.summary;
+    final firstKeptEntryIndex = pathEntries.indexWhere(
+      (entry) => entry.id == prevCompaction.firstKeptEntryId,
+    );
+    prevKeptIndex = firstKeptEntryIndex;
+    boundaryStart = firstKeptEntryIndex >= 0
+        ? firstKeptEntryIndex
+        : prevCompactionIndex + 1;
+    if (prevCompaction.fromHook != true) {
+      final details = prevCompaction.details;
+      if (details is Map) {
+        final readFiles = details['readFiles'];
+        if (readFiles is List) {
+          fileOps.read.addAll(readFiles.whereType<String>());
+        }
+        final modifiedFiles = details['modifiedFiles'];
+        if (modifiedFiles is List) {
+          fileOps.edited.addAll(modifiedFiles.whereType<String>());
+        }
+      }
+    }
+  }
+  return (
+    previousSummary: previousSummary,
+    boundaryStart: boundaryStart,
+    prevKeptIndex: prevKeptIndex,
+  );
+}
+
+/// Index of the last [CompactionRecord] in [pathEntries], or -1 when there
+/// is none.
+int _findLastCompactionIndex(List<SessionRecord> pathEntries) {
+  for (var i = pathEntries.length - 1; i >= 0; i--) {
+    if (pathEntries[i] is CompactionRecord) return i;
+  }
+  return -1;
+}
+
+/// Summarizable messages of the entries in `[start, end)`, in order.
+List<Message> _summarizableMessagesInRange(
+  List<SessionRecord> pathEntries,
+  int start,
+  int end,
+) {
+  final messages = <Message>[];
+  for (var i = start; i < end; i++) {
+    messages.addAll(_entryToSummarizableMessages(pathEntries[i]));
+  }
+  return messages;
+}
+
+/// Adds the file operations of every message in [messages] to [fileOps].
+void _accumulateFileOps(List<Message> messages, FileOperations fileOps) {
+  for (final message in messages) {
+    extractFileOpsFromMessage(message, fileOps);
+  }
+}
+
+/// Issue #1914 retry escalation: a retry pass whose cut lands at or older
+/// than the previous fold's kept boundary repeats the identical cut — the
+/// backward chars/4 walk never reached keepRecentTokens over a transcript
+/// the provider prices far higher (dense tokenizers, usage anchors,
+/// system/tool overhead the per-message walk never sees), so the fallback
+/// keeps essentially the whole branch and the retry frees nothing. Detected
+/// directly (not predicted), so a healthy iterative fold — whose natural cut
+/// is always newer than the previous kept boundary — keeps the shipped
+/// parameters byte-for-byte. On a repeat: halve the retention budget (floored
+/// at half the configured keep — a retry still retains a viable recent
+/// window) and advance the cut strictly past the failed boundary, so every
+/// retry makes progress and the chain converges toward a real fold.
+CutPointResult _escalateRepeatedCut({
+  required List<SessionRecord> pathEntries,
+  required int boundaryStart,
+  required int prevCompactionIndex,
+  required int prevKeptIndex,
+  required CompactionSettings settings,
+  required CutPointResult natural,
+}) {
+  if (prevCompactionIndex < 0 || prevKeptIndex < boundaryStart) return natural;
+  if (natural.firstKeptEntryIndex > prevKeptIndex) return natural;
+  final escalatedKeep = max(
+    min(_minRetryKeepRecentTokens, settings.keepRecentTokens),
+    settings.keepRecentTokens >> 1,
+  );
+  return findCutPoint(
+    pathEntries,
+    boundaryStart,
+    pathEntries.length,
+    escalatedKeep,
+    minFirstKeptIndex: prevKeptIndex + 1,
+  );
+}
+
+/// The compaction pipeline over a [Session], mirroring pi's harness-level
+/// `compact()`.
+///
+/// Usage mirrors pi: callers check [shouldCompact] with
+/// [estimateContextTokens] against the model's context window, then call
+/// [compactSession] explicitly (pi compacts on demand while the harness is
+/// idle, never inside the run loop).
+final class CompactionManager {
+  /// Creates a [CompactionManager] with an injected summary LLM call.
+  const CompactionManager({
+    required this.summarize,
+    this.settings = defaultCompactionSettings,
+    this.prompts = defaultCompactionPrompts,
+    this.memoryExtractionHook,
+    this.summarizerWindow,
+    this.pinnedOperative,
+  });
+
+  /// The summary LLM call used for every summarization.
+  final SummarizeFn summarize;
+
+  /// Thresholds and retention settings for [compactSession].
+  final CompactionSettings settings;
+
+  /// The summarization prompts (built-in unless overridden via the CLI
+  /// config `prompts:` section).
+  final CompactionPrompts prompts;
+
+  /// Optional Phase 2 hook: called after a successful compaction with the
+  /// summarized span's text, so durable facts can be extracted into the
+  /// long-term memory store. Failures are swallowed (never block compaction).
+  final Future<void> Function(String summarizedText)? memoryExtractionHook;
+
+  /// The summarizer model's own context window (issue #729) — the smol
+  /// role's when it differs from the main model's. `null` leaves the
+  /// summarization payloads unbounded (legacy behavior); when set, every
+  /// outbound summary request is chunked/truncated to
+  /// [summarizationPayloadBudget] so it fits the summarizer's window.
+  final int? summarizerWindow;
+
+  /// gh-1409: the session's compaction-pinned skill operative lines.
+  /// `null` (default) → every prompt is byte-identical to the pre-pin
+  /// pipeline (F4 compat guard).
+  final PinnedOperativePayload? pinnedOperative;
+
+  /// The outbound payload budget for [summarizerWindow], or `null` when
+  /// unbounded.
+  int? get _maxPromptTokens => summarizerWindow == null
+      ? null
+      : summarizationPayloadBudget(summarizerWindow!, settings);
+
+  /// Prepare session branch records for compaction, or return `null` when
+  /// compaction is not applicable (empty branch, or the last entry is already
+  /// a compaction).
+  ///
+  /// Ported from pi's `prepareCompaction`: the summarized region starts at
+  /// the previous compaction's kept boundary (with its summary threaded in
+  /// for iterative updates), and file operations accumulate across
+  /// compactions.
+  CompactionPreparation? prepareCompaction(
+    List<SessionRecord> pathEntries, {
+    required int tokensBefore,
+    CompactionSettings? settings,
+  }) {
+    final effectiveSettings = settings ?? this.settings;
+    if (pathEntries.isEmpty || pathEntries.last is CompactionRecord) {
+      return null;
+    }
+
+    final prevCompactionIndex = _findLastCompactionIndex(pathEntries);
+
+    final fileOps = createFileOps();
+    final prevContext = _previousCompactionContext(
+      pathEntries,
+      prevCompactionIndex,
+      fileOps,
+    );
+    final previousSummary = prevContext.previousSummary;
+    final boundaryStart = prevContext.boundaryStart;
+
+    final cutPoint = _escalateRepeatedCut(
+      pathEntries: pathEntries,
+      boundaryStart: boundaryStart,
+      prevCompactionIndex: prevCompactionIndex,
+      prevKeptIndex: prevContext.prevKeptIndex,
+      settings: effectiveSettings,
+      natural: findCutPoint(
+        pathEntries,
+        boundaryStart,
+        pathEntries.length,
+        effectiveSettings.keepRecentTokens,
+      ),
+    );
+    final firstKeptEntryId = pathEntries[cutPoint.firstKeptEntryIndex].id;
+
+    final historyEnd = cutPoint.isSplitTurn
+        ? cutPoint.turnStartIndex
+        : cutPoint.firstKeptEntryIndex;
+    final messagesToSummarize = <Message>[];
+    final summarizableRecordIds = <String?>[];
+    for (var i = boundaryStart; i < historyEnd; i++) {
+      for (final message in _entryToSummarizableMessages(pathEntries[i])) {
+        messagesToSummarize.add(message);
+        summarizableRecordIds.add(pathEntries[i].id);
+      }
+    }
+    final turnPrefixMessages = cutPoint.isSplitTurn
+        ? _summarizableMessagesInRange(
+            pathEntries,
+            cutPoint.turnStartIndex,
+            cutPoint.firstKeptEntryIndex,
+          )
+        : <Message>[];
+    _accumulateFileOps(messagesToSummarize, fileOps);
+    _accumulateFileOps(turnPrefixMessages, fileOps);
+    final fileLists = computeFileLists(fileOps);
+
+    return CompactionPreparation(
+      firstKeptEntryId: firstKeptEntryId,
+      messagesToSummarize: messagesToSummarize,
+      turnPrefixMessages: turnPrefixMessages,
+      isSplitTurn: cutPoint.isSplitTurn,
+      tokensBefore: tokensBefore,
+      previousSummary: previousSummary,
+      readFiles: fileLists.readFiles,
+      modifiedFiles: fileLists.modifiedFiles,
+      settings: effectiveSettings,
+      summarizableRecordIds: summarizableRecordIds,
+    );
+  }
+
+  /// Generate compaction summary data from a [preparation].
+  ///
+  /// Ported from pi's `compact`: split turns summarize history and turn
+  /// prefix separately; the file-operation metadata tags are appended to the
+  /// summary. Throws [CompactionException] on any summarization failure.
+  Future<CompactionResult> compact(
+    CompactionPreparation preparation, {
+    String? customInstructions,
+    CancelToken? cancelToken,
+  }) async {
+    final userRequests = userRequestCandidatesBlock(
+      preparation.messagesToSummarize,
+      recordIds: preparation.summarizableRecordIds,
+    );
+    final maxPromptTokens = _maxPromptTokens;
+    String summary;
+
+    if (preparation.isSplitTurn && preparation.turnPrefixMessages.isNotEmpty) {
+      final history = preparation.messagesToSummarize.isNotEmpty
+          ? await generateSummary(
+              preparation.messagesToSummarize,
+              summarize: summarize,
+              customInstructions: customInstructions,
+              previousSummary: preparation.previousSummary,
+              cancelToken: cancelToken,
+              prompts: prompts,
+              userRequestCandidates: userRequests,
+              maxPromptTokens: maxPromptTokens,
+              pinnedOperative: pinnedOperative,
+            )
+          : 'No prior history.';
+      final turnPrefix = await _generateTurnPrefixSummary(
+        preparation.turnPrefixMessages,
+        summarize: summarize,
+        cancelToken: cancelToken,
+        prompts: prompts,
+        maxPromptTokens: maxPromptTokens,
+        pinnedOperative: pinnedOperative,
+      );
+      summary =
+          '$history\n\n---\n\n**Turn Context (split turn):**\n\n$turnPrefix';
+    } else {
+      summary = await generateSummary(
+        preparation.messagesToSummarize,
+        summarize: summarize,
+        customInstructions: customInstructions,
+        previousSummary: preparation.previousSummary,
+        cancelToken: cancelToken,
+        prompts: prompts,
+        userRequestCandidates: userRequests,
+        maxPromptTokens: maxPromptTokens,
+        pinnedOperative: pinnedOperative,
+      );
+    }
+
+    // Issue #1131: a summary re-renders on every later turn, so ephemeral,
+    // time-scoped claims ("your last tool call's result was dropped") are
+    // stripped pre-persist; the fires are logged in the record details.
+    // gh-1409 AC4: pinned lines are protected — the sanitizer strips the
+    // ephemeral claims AROUND them, never the pins themselves.
+    final sanitized = sanitizeSummary(
+      summary,
+      protectedLines: pinnedOperative?.lines ?? const {},
+    );
+    summary = sanitized.text;
+
+    summary += formatFileOperations(
+      preparation.readFiles,
+      preparation.modifiedFiles,
+    );
+
+    return CompactionResult(
+      summary: summary,
+      firstKeptEntryId: preparation.firstKeptEntryId,
+      tokensBefore: preparation.tokensBefore,
+      details: {
+        'readFiles': preparation.readFiles,
+        'modifiedFiles': preparation.modifiedFiles,
+        if (sanitized.stripped.isNotEmpty)
+          'sanitizedEphemeral': sanitized.stripped,
+      },
+    );
+  }
+
+  /// Compact the active branch of [session] and append a [CompactionRecord].
+  ///
+  /// Returns the appended record, or `null` when there is nothing to compact.
+  /// Failure-safe: when summarization throws, no record is appended and the
+  /// session history is fully preserved. The session's
+  /// [Session.buildContextMessages] then projects the summary in place of the
+  /// compacted region.
+  Future<CompactionRecord?> compactSession(
+    Session session, {
+    String? customInstructions,
+    CancelToken? cancelToken,
+  }) async {
+    final path = await session.getBranch();
+    final tokensBefore = estimateContextTokens(
+      await session.buildContextMessages(),
+    ).tokens;
+    final preparation = prepareCompaction(path, tokensBefore: tokensBefore);
+    if (preparation == null) return null;
+    final result = await compact(
+      preparation,
+      customInstructions: customInstructions,
+      cancelToken: cancelToken,
+    );
+    // gh-2044 rework CI fix: an EMPTY region with a BLANK answer must not
+    // become a checkpoint. generateSummary's #729 chunked path over zero
+    // summarizable messages returns '' without any LM call, and this
+    // method used to append that empty summary as a junk CompactionRecord
+    // — the transcript then LOOKED compacted while nothing was folded,
+    // the leaf record made every later prepareCompaction decline ("last
+    // entry is already a compaction"), and the classic pass ladder
+    // reported a hollow `success: true` through its no-work terminal
+    // while the context was still over the trigger (CI red, core shard
+    // 1/4 + hostile-env: "gh-1743: when nothing is droppable the budget
+    // timeout keeps the failure verdict" — the branch settled under the
+    // trigger, fell through to the classic engine, and that hollow
+    // success flipped the failure verdict). A run that cannot produce
+    // relief fails honestly instead (gh-1743's failure-verdict
+    // contract). The dial itself is untouched — issue #515's
+    // budget-kill pin rides the in-flight call even over an empty region
+    // — and issue #578's dialed-blank-summary contract (a real region,
+    // the summarizer answered blank, the record still lands) is the case
+    // this guard deliberately does NOT touch.
+    if (result.summary.trim().isEmpty &&
+        preparation.messagesToSummarize.isEmpty &&
+        preparation.turnPrefixMessages.isEmpty) {
+      throw const CompactionException(
+        'compaction had nothing to summarize above the keep-recent cut — '
+        'the foldable region is empty',
+        code: CompactionErrorCode.invalidSession,
+      );
+    }
+    final recordId = await session.appendCompaction(
+      summary: result.summary,
+      firstKeptEntryId: result.firstKeptEntryId,
+      tokensBefore: result.tokensBefore,
+      details: result.details,
+    );
+    final record = await session.getEntry(recordId);
+    final compactionRecord = record is CompactionRecord ? record : null;
+    _maybeExtractMemory(compactionRecord, preparation, memoryExtractionHook);
+    return compactionRecord;
+  }
+
+  /// Phase 2: extract durable facts from the summarized span into memory.
+  /// Fire-and-forget — never blocks or fails the compaction.
+  void _maybeExtractMemory(
+    CompactionRecord? record,
+    CompactionPreparation preparation,
+    Future<void> Function(String)? hook,
+  ) {
+    if (record == null || hook == null) return;
+    final summarizedText = _collectSummarizedText(preparation);
+    if (summarizedText.isNotEmpty) {
+      unawaited(hook(summarizedText).catchError((_) {}));
+    }
+  }
+
+  /// Flattens the messages-to-summarize into a single text block.
+  String _collectSummarizedText(CompactionPreparation preparation) {
+    return preparation.messagesToSummarize
+        .map(_messageToText)
+        .where((t) => t.isNotEmpty)
+        .join('\n');
+  }
+
+  /// Extracts plain text from a message for memory extraction.
+  String _messageToText(dynamic m) {
+    if (m is UserMessage) return m.content.toString();
+    if (m is AssistantMessage) {
+      return m.content.whereType<TextContent>().map((t) => t.text).join();
+    }
+    return '';
+  }
+}

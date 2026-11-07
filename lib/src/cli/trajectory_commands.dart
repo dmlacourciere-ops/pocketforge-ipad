@@ -1,0 +1,257 @@
+/// The `/trajectory` command family split from [AgentCli] to keep
+/// agent_cli.dart under the repo's 2800-line size gate. Same library (a
+/// `part of`), so the extension sees the class's private members.
+///
+/// Read-only surfaces over the active session's records: the plain-text
+/// TUI fallback (`view`), the cumulative cost table (`cost`), the live
+/// record follower (`tail`), and the full-detail record view
+/// (`inspect <n>`). Rendering lives in `trajectory_tui.dart`; this file
+/// only resolves the active session and prints.
+part of 'agent_cli.dart';
+
+/// Implementation members of [AgentCli] for the `/trajectory` family.
+extension on AgentCli {
+  /// `/trajectory [view|cost|tail|inspect <n>]` — bare defaults to view.
+  Future<void> _handleTrajectoryCommand(String rest) async {
+    final parts = rest.isEmpty ? const <String>[] : rest.split(_spaces);
+    switch (parts.isEmpty ? 'view' : parts.first) {
+      case 'view':
+        await _trajectoryView();
+      case 'cost':
+        await _trajectoryCost();
+      case 'tail':
+        await _trajectoryTail();
+      case 'inspect':
+        await _trajectoryInspect(parts.length > 1 ? parts[1] : '');
+      default:
+        io.writeln('usage: /trajectory [view|cost|tail|inspect <n>]');
+    }
+  }
+
+  Future<void> _trajectoryView() async {
+    final snapshot = await _trajectorySnapshot();
+    if (snapshot == null) return;
+    for (final line in trajectoryLines(snapshot, width: _trajectoryWidth)) {
+      io.writeln(line);
+    }
+  }
+
+  Future<void> _trajectoryCost() async {
+    final snapshot = await _trajectorySnapshot();
+    if (snapshot == null) return;
+    for (final line in trajectoryCostLines(snapshot)) {
+      io.writeln(line);
+    }
+  }
+
+  Future<void> _trajectoryInspect(String arg) async {
+    final snapshot = await _trajectorySnapshot();
+    if (snapshot == null) return;
+    final lines = await trajectoryInspectReport(
+      snapshot,
+      arg,
+      resolveHidden: _resolveHiddenPreviews,
+    );
+    for (final line in lines) {
+      io.writeln(line);
+    }
+  }
+
+  /// Resolves one compacted row's hidden range on demand (issue #385
+  /// F4): a one-pass chunk-reader lookup, previews capped at
+  /// [hiddenRecordPreviewLimit]. Null = no active session (the report
+  /// prints the header only); empty = the range could not be served and
+  /// the report renders the honest "not captured" marker (E6).
+  Future<List<TrajectoryHiddenRecordPreview>?> _resolveHiddenPreviews(
+    TrajectoryCompactedRecord record,
+  ) async {
+    final session = _session;
+    if (session == null) return null;
+    try {
+      return await _resolveHiddenPreviewsIn(session, record);
+    } on Object {
+      return const [];
+    }
+  }
+
+  /// The session-shaped half of the resolver: windowed storages read the
+  /// raw file (the evicted records sit OFF the kept branch); full-open
+  /// sessions resolve in memory.
+  Future<List<TrajectoryHiddenRecordPreview>> _resolveHiddenPreviewsIn(
+    Session session,
+    TrajectoryCompactedRecord record,
+  ) async {
+    final ids = record.hiddenRecordIds ?? const <String>[];
+    final Map<String, SessionRecord> resolved;
+    if (session.getStorage() case final WindowedSessionStorage windowed) {
+      resolved = await windowed.reader.readRecordsByIds(ids.toSet());
+    } else {
+      // Full-open session: every record is resident — resolve in memory.
+      final all = await session.getBranch();
+      resolved = {for (final resolved in all) resolved.id: resolved};
+    }
+    return projectHiddenRecordPreviews(recordIds: ids, resolved: resolved);
+  }
+
+  /// Follows the active session's records, one row per appended record,
+  /// until interrupted (in the live REPL, Ctrl+C also exits `fa`).
+  Future<void> _trajectoryTail() async {
+    final session = _session;
+    if (session == null) {
+      io.writeln('no active session');
+      return;
+    }
+    await _warnHeavyScanOnce();
+    io.writeln(_style.dim('following session records — Ctrl+C to stop'));
+    final tailer = TrajectoryTailer(width: _trajectoryWidth);
+    final interrupted = io.interrupts.first.then((_) => true);
+    var stopped = false;
+    while (!stopped) {
+      stopped = await _tailPoll(tailer, session, interrupted);
+    }
+  }
+
+  /// One tail poll: prints the fresh lines; true when the poll FAILED
+  /// (the error is printed) or the interrupt fired.
+  Future<bool> _tailPoll(
+    TrajectoryTailer tailer,
+    Session session,
+    Future<bool> interrupted,
+  ) async {
+    try {
+      for (final line in tailer.tail(await session.getBranch())) {
+        io.writeln(line);
+      }
+    } on Object catch (error) {
+      io.writeln(tuiError('trajectory: tail failed: $error'));
+      return true;
+    }
+    return Future.any<bool>([
+      interrupted,
+      Future<void>.delayed(trajectoryPollInterval).then((_) => false),
+    ]);
+  }
+
+  /// The active session's snapshot, or null after printing why not.
+  Future<TrajectorySnapshot?> _trajectorySnapshot() async {
+    final session = _session;
+    if (session == null) {
+      io.writeln('no active session');
+      return null;
+    }
+    await _warnHeavyScanOnce();
+    return trajectorySnapshotOf(await session.getBranch());
+  }
+
+  /// Issue #1882 AC3: a trajectory read over a heavy session file warns
+  /// once per process (exact size + the hygiene escapes) instead of
+  /// silently scanning gigabytes.
+  Future<void> _warnHeavyScanOnce() async {
+    final session = _session;
+    if (session == null || _heavyScanGuardShown) return;
+    _heavyScanGuardShown = true;
+    final path = (await session.getMetadata()).path;
+    for (final line in await heavyScanGuardIfHeavy(_coreToolEnv, path)) {
+      io.writeln(_style.dim(line));
+    }
+  }
+
+  /// Persists the outbound-request capture so replayed sessions rebuild the
+  /// Request tab (issue #385): unseen prompt/manifest blobs land as their
+  /// own records, wire dumps only when the loop captured a raw one (opt-in
+  /// config; redacted through the active pipeline and capped here). A
+  /// CustomRecord is context-omitted; the ordering matters — the summary
+  /// must land before its assistant message (the replay walk expects it as
+  /// the step's predecessor), which the persister's record order guarantees.
+  Future<void> _onModelRequest(ModelRequestEvent event) async {
+    final session = _session;
+    if (session == null) return;
+    if (_trajectoryBlobPersister == null ||
+        _trajectoryBlobPersisterSession != session) {
+      _trajectoryBlobPersister = TrajectoryBlobPersister(
+        redactText: config.redactionPipeline?.redact,
+      );
+      _trajectoryBlobPersisterSession = session;
+    }
+    // gh-1745: the heavy half of the capture (per-message previews/block
+    // texts, the raw wire dump) spills into the session's request-blob
+    // dir; the JSONL record keeps lightweight metadata plus the spill
+    // pointer. A failed (or killed-switch) spill falls back to the legacy
+    // inline persistence — the capture is never lost.
+    var detail = event.detail;
+    var rawWireDump = event.rawWireDump;
+    if (config.trajectoryRequestBlobs) {
+      final spill =
+          await (_requestBlobStore ??= TrajectoryRequestBlobStore(
+            env: _coreToolEnv,
+            sessionId: () => _session?.cachedId,
+            // gh-1745 rework: the canonical bytes derivation threaded
+            // through the config (no inline MB→bytes shift here).
+            maxBytes: config.trajectoryRequestBlobMaxBytes,
+            ttlDays: config.trajectoryRequestBlobTtlDays,
+          )).write(
+            detail: event.detail,
+            rawWireDump: event.rawWireDump,
+            redactWireDump: config.redactionPipeline?.redact,
+          );
+      if (spill != null) {
+        detail = stripTrajectoryRequestDetail(
+          event.detail,
+          spillFile: spill.file,
+          wireDumpHash: spill.wireDumpHash,
+        );
+        rawWireDump = null;
+      }
+    }
+    final records = _trajectoryBlobPersister!.recordsFor(
+      detail,
+      promptBlob: event.promptBlob,
+      manifestBlob: event.manifestBlob,
+      rawWireDump: rawWireDump,
+    );
+    for (final (:customType, :data) in records) {
+      await session.appendCustomEntry(customType: customType, data: data);
+    }
+  }
+
+  /// Persists the FinalizeGate task ledger (gh-1412): the hidden
+  /// `task_ledger` record post-mortems and the bench summary read. The
+  /// event fires once per run, right before the run ends; a persist
+  /// failure must never take the run down (best-effort, like the blob
+  /// records). The free-text fields pass through the host's redaction
+  /// pipeline first: the record is an audit surface (session JSONL, wire
+  /// frame, bench sync) whose fields quote agent-authored verification
+  /// commands and observed output — the same gh-1054 convention the
+  /// sibling liveness records follow.
+  Future<void> _onTaskLedger(TaskLedgerEvent event) async {
+    final session = _session;
+    if (session == null) return;
+    final pipeline = config.redactionPipeline;
+    final data = pipeline == null
+        ? event.ledger.toJson()
+        : {
+            'items': [
+              for (final item in event.ledger.items)
+                {
+                  ...item.toJson(),
+                  'requirement': pipeline.redact(item.requirement),
+                  'command': pipeline.redact(item.command),
+                  'expected': pipeline.redact(item.expected),
+                  'actual': pipeline.redact(item.actual),
+                },
+            ],
+          };
+    try {
+      await session.appendCustomEntry(
+        customType: taskLedgerRecordType,
+        data: data,
+      );
+    } on Object catch (error) {
+      io.writeln(tuiError('task ledger persist failed: $error'));
+    }
+  }
+
+  int get _trajectoryWidth => io.columns > 0 ? io.columns : 80;
+}
+
+final RegExp _spaces = RegExp(r'\s+');

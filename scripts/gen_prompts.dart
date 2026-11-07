@@ -1,0 +1,519 @@
+/// Regenerates the committed Dart prompt constants from the Markdown prompt
+/// files under `prompts/` (and the example app's `prompts/`).
+///
+/// Prompts live outside Dart code (see AGENTS.md). The Markdown files are the
+/// source of truth; this script compiles them into pure-Dart constant files
+/// that `lib/` (which must stay `dart:io`-free) can embed:
+///
+/// ```sh
+/// dart run scripts/gen_prompts.dart          # rewrite the .g.dart files
+/// dart run scripts/gen_prompts.dart --check  # fail if the .g.dart files are stale
+/// ```
+///
+/// The sync test `test/prompts/prompts_sync_test.dart` reruns this generation
+/// and fails on any drift.
+library;
+
+import 'dart:io';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show parseFrontmatter;
+import 'package:path/path.dart' as p;
+
+/// Output path (repo-root-relative) for the core package's prompt constants.
+const rootOutputPath = 'lib/src/prompts/prompts.g.dart';
+
+/// Output path (repo-root-relative) for the example app's prompt constants.
+const exampleOutputPath = 'flutter_app/lib/prompts.g.dart';
+
+/// Header emitted at the top of [rootOutputPath].
+const rootHeader = '''
+/// GENERATED — do not edit. Edit the Markdown sources under `prompts/` and
+/// rerun `dart run scripts/gen_prompts.dart`.
+///
+/// Prompts live outside Dart code (see AGENTS.md); this file is the
+/// compiled-in copy used by the pure-Dart `lib/`.
+library;
+''';
+
+/// Header emitted at the top of [exampleOutputPath].
+const exampleHeader = '''
+/// GENERATED — do not edit. Edit the Markdown sources under
+/// `flutter_app/prompts/` and rerun
+/// `dart run scripts/gen_prompts.dart` from the repository root.
+///
+/// Prompts live outside Dart code (see the repository-root AGENTS.md).
+library;
+''';
+
+/// A mapping from one Markdown prompt file to one generated Dart constant.
+final class PromptSpec {
+  /// Creates a prompt spec.
+  const PromptSpec({
+    required this.source,
+    required this.constName,
+    this.requiredToken,
+  });
+
+  /// Markdown source path, relative to the repository root.
+  final String source;
+
+  /// Name of the generated Dart constant.
+  final String constName;
+
+  /// A token the prompt body must contain (e.g. the `{{cwd}}` placeholder).
+  final String? requiredToken;
+}
+
+/// The core package prompts, emitted into [rootOutputPath] in this order.
+const rootSpecs = <PromptSpec>[
+  PromptSpec(
+    source: 'prompts/compaction/summary_system.md',
+    constName: 'summarizationSystemPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/summary.md',
+    constName: 'summarizationPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/summary_update.md',
+    constName: 'updateSummarizationPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/turn_prefix.md',
+    constName: 'turnPrefixSummarizationPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/branch_summary.md',
+    constName: 'branchSummaryPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/branch_summary_preamble.md',
+    constName: 'branchSummaryPreamble',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/hide_judge.md',
+    constName: 'hideJudgeSystemPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/structured_checkpoint.md',
+    constName: 'structuredCheckpointPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/pinned_operative.md',
+    constName: 'pinnedOperativePrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/compaction/recall_hygiene.md',
+    constName: 'recallHygienePrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/cli/mode_code.md',
+    constName: 'cliCodeModePrompt',
+    requiredToken: '{{cwd}}',
+  ),
+  PromptSpec(
+    source: 'prompts/cli/mode_architect.md',
+    constName: 'cliArchitectModePrompt',
+    requiredToken: '{{cwd}}',
+  ),
+  PromptSpec(
+    source: 'prompts/cli/mode_review.md',
+    constName: 'cliReviewModePrompt',
+    requiredToken: '{{cwd}}',
+  ),
+  PromptSpec(
+    source: 'prompts/cli/mode_pi.md',
+    constName: 'cliPiModePrompt',
+    requiredToken: '{{cwd}}',
+  ),
+  PromptSpec(
+    source: 'prompts/context/project_context_read_full.md',
+    constName: 'projectContextReadFullPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/cli/messaging_section.md',
+    constName: 'cliMessagingSectionPrompt',
+    requiredToken: '{{mailbox}}',
+  ),
+  PromptSpec(
+    source: 'prompts/cli/finalize_gate.md',
+    constName: 'finalizeGateContractPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/inspect_image.md',
+    constName: 'inspectImageVisionSystemPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/edit.md',
+    constName: 'editToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/read.md',
+    constName: 'readToolDescriptionPrompt',
+    requiredToken: '{{maxLines}}',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/read_sqlite.md',
+    constName: 'readSqliteSectionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/ask.md',
+    constName: 'askToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/checkpoint.md',
+    constName: 'checkpointToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/request_secret.md',
+    constName: 'requestSecretToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/dynamic_message.md',
+    constName: 'dynamicMessageToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/lsp.md',
+    constName: 'lspToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/rewind.md',
+    constName: 'rewindToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/compact_expand.md',
+    constName: 'compactExpandToolDescriptionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/tool_calling.md',
+    constName: 'toolCallingInstructionsPrompt',
+    requiredToken: '{{tools}}',
+  ),
+  PromptSpec(
+    source: 'prompts/tools/task.md',
+    constName: 'taskToolDescriptionPrompt',
+    requiredToken: '{{agents}}',
+  ),
+  PromptSpec(
+    source: 'prompts/task/agent_task.md',
+    constName: 'taskAgentTaskPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/task/report_size_contract.md',
+    constName: 'taskReportSizeContractPrompt',
+    requiredToken: '{{budget}}',
+  ),
+  PromptSpec(
+    source: 'prompts/task/pure_chunk_contract.md',
+    constName: 'taskPureChunkContractPrompt',
+    requiredToken: '{{budget}}',
+  ),
+  PromptSpec(
+    source: 'prompts/task/agent_explore.md',
+    constName: 'taskAgentExplorePrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/task/agent_review.md',
+    constName: 'taskAgentReviewPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/task/agent_plan.md',
+    constName: 'taskAgentPlanPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/task/assignment.md',
+    constName: 'taskAssignmentPrompt',
+    requiredToken: '{{task}}',
+  ),
+  PromptSpec(
+    source: 'prompts/memory/memory_section.md',
+    constName: 'memorySectionPrompt',
+  ),
+  PromptSpec(
+    source: 'prompts/memory/extract_durable.md',
+    constName: 'memoryExtractDurablePrompt',
+    requiredToken: '{{span}}',
+  ),
+  PromptSpec(
+    source: 'prompts/task/schema_output.md',
+    constName: 'taskSchemaOutputPrompt',
+    requiredToken: '{{schema}}',
+  ),
+  PromptSpec(
+    source: 'prompts/task/schema_fix.md',
+    constName: 'taskSchemaFixPrompt',
+    requiredToken: '{{errors}}',
+  ),
+  PromptSpec(
+    source: 'prompts/ttsr/interrupt.md',
+    constName: 'ttsrInterruptPrompt',
+    requiredToken: '{{content}}',
+  ),
+  PromptSpec(
+    source: 'prompts/spill/user_read_instruction.md',
+    constName: 'userSpillInstructionPrompt',
+    requiredToken: '{{path}}',
+  ),
+];
+
+/// The example app prompts, emitted into [exampleOutputPath] in this order.
+const exampleSpecs = <PromptSpec>[
+  PromptSpec(
+    source: 'flutter_app/prompts/pocketforge_game.md',
+    constName: 'pocketForgeGamePrompt',
+  ),
+  PromptSpec(
+    source: 'flutter_app/prompts/sandbox_system.md',
+    constName: 'sandboxSystemPrompt',
+    requiredToken: '{{commands}}',
+  ),
+  PromptSpec(
+    source: 'flutter_app/prompts/on_device_no_tools_note.md',
+    constName: 'onDeviceNoToolsNote',
+    requiredToken: '{{engine}}',
+  ),
+  PromptSpec(
+    source: 'flutter_app/prompts/messaging_section.md',
+    constName: 'appMessagingSectionPrompt',
+    requiredToken: '{{mailbox}}',
+  ),
+];
+
+/// A Markdown prompt file loaded and validated for generation.
+final class LoadedPrompt {
+  /// Creates a loaded prompt.
+  const LoadedPrompt({
+    required this.spec,
+    required this.description,
+    required this.body,
+  });
+
+  /// The spec this prompt was loaded for.
+  final PromptSpec spec;
+
+  /// The frontmatter `description` (used as the constant's doc comment).
+  final String description;
+
+  /// The prompt body after frontmatter removal — the constant's value.
+  final String body;
+}
+
+/// Loads and validates the Markdown sources for [specs] under [repoRoot].
+Future<List<LoadedPrompt>> loadPrompts(
+  String repoRoot,
+  List<PromptSpec> specs,
+) async {
+  final prompts = <LoadedPrompt>[];
+  for (final spec in specs) {
+    final file = File('$repoRoot/${spec.source}');
+    if (!file.existsSync()) {
+      throw StateError('prompt source not found: ${spec.source}');
+    }
+    final (:frontmatter, :body) = parseFrontmatter(await file.readAsString());
+    final expectedName = spec.source
+        .split('/')
+        .last
+        .replaceFirst(RegExp(r'\.md$'), '');
+    if (frontmatter['name'] != expectedName) {
+      throw StateError(
+        '${spec.source}: frontmatter name must be "$expectedName", '
+        'got "${frontmatter['name']}"',
+      );
+    }
+    final description = frontmatter['description'];
+    if (description is! String || description.isEmpty) {
+      throw StateError('${spec.source}: missing frontmatter description');
+    }
+    // yaml 3.1.4 preserves the trailing newline of a multi-line `>` string;
+    // trim it so the generated doc comment doesn't gain a spurious empty
+    // line. The committed .g.dart files were generated with yaml 3.1.3
+    // which trimmed it implicitly.
+    final trimmedDescription = description.trimRight();
+    final requiredToken = spec.requiredToken;
+    if (requiredToken != null && !body.contains(requiredToken)) {
+      throw StateError(
+        '${spec.source}: prompt body must contain "$requiredToken"',
+      );
+    }
+    prompts.add(
+      LoadedPrompt(spec: spec, description: trimmedDescription, body: body),
+    );
+  }
+  return prompts;
+}
+
+/// Renders [value] as a single-line Dart single-quoted string literal.
+String dartStringLiteral(String value) {
+  final buffer = StringBuffer("'");
+  for (var i = 0; i < value.length; i++) {
+    switch (value[i]) {
+      case r'\':
+        buffer.write(r'\\');
+      case "'":
+        buffer.write(r"\'");
+      case r'$':
+        buffer.write(r'\$');
+      case '\n':
+        buffer.write(r'\n');
+      case '\r':
+        buffer.write(r'\r');
+      case '\t':
+        buffer.write(r'\t');
+      default:
+        buffer.write(value[i]);
+    }
+  }
+  buffer.write("'");
+  return buffer.toString();
+}
+
+List<String> _wrapDoc(String text, [int width = 76]) {
+  final lines = <String>[];
+  var current = '';
+  for (final word in text.split(' ')) {
+    if (current.isEmpty) {
+      current = word;
+    } else if (current.length + 1 + word.length <= width) {
+      current = '$current $word';
+    } else {
+      lines.add(current);
+      current = word;
+    }
+  }
+  if (current.isNotEmpty) lines.add(current);
+  return lines;
+}
+
+String _renderConstant(LoadedPrompt prompt) {
+  final buffer = StringBuffer();
+  for (final line in _wrapDoc(prompt.description)) {
+    buffer.writeln('/// $line');
+  }
+  buffer
+    ..writeln('///')
+    ..writeln('/// Source: `${prompt.spec.source}`.');
+  final literal = dartStringLiteral(prompt.body);
+  final oneLine = 'const ${prompt.spec.constName} = $literal;';
+  if (oneLine.length <= 80) {
+    buffer.writeln(oneLine);
+  } else {
+    buffer
+      ..writeln('const ${prompt.spec.constName} =')
+      ..writeln('    $literal;');
+  }
+  return buffer.toString();
+}
+
+/// Renders a complete `.g.dart` file: [header] followed by one constant per
+/// prompt. The output is stable under `dart format`.
+String renderPromptsFile(String header, List<LoadedPrompt> prompts) {
+  final buffer = StringBuffer(header);
+  for (final prompt in prompts) {
+    buffer
+      ..writeln()
+      ..write(_renderConstant(prompt));
+  }
+  return buffer.toString();
+}
+
+/// The generation targets, in order: core package, then the example app.
+/// The core target additionally compiles the bundled agent skills
+/// (`prompts/skills/<name>/SKILL.md`) into a `builtinSkillFiles` map.
+const targets = <({List<PromptSpec> specs, String output, String header})>[
+  (specs: rootSpecs, output: rootOutputPath, header: rootHeader),
+  (specs: exampleSpecs, output: exampleOutputPath, header: exampleHeader),
+];
+
+/// Renders the file content for one [target] under [repoRoot].
+Future<String> renderTarget(
+  String repoRoot,
+  ({List<PromptSpec> specs, String output, String header}) target,
+) async {
+  final prompts = await loadPrompts(repoRoot, target.specs);
+  final buffer = StringBuffer(renderPromptsFile(target.header, prompts));
+  if (target.output == rootOutputPath) {
+    buffer.write(await renderBuiltinSkills(repoRoot));
+  }
+  return buffer.toString();
+}
+
+/// Compiles every `prompts/skills/<name>/SKILL.md` into the
+/// `builtinSkillFiles` map constant (name → full file text, frontmatter
+/// included) the pure-Dart core embeds as its first-party skill source.
+Future<String> renderBuiltinSkills(String repoRoot) async {
+  final dir = Directory('$repoRoot/prompts/skills');
+  final names =
+      (dir.existsSync() ? dir.listSync() : <FileSystemEntity>[])
+          .whereType<Directory>()
+          .map((d) => p.basename(d.path))
+          .toList()
+        ..sort();
+  final buffer = StringBuffer('''
+/// Compiled-in built-in agent skills (issue #1151): every
+/// `prompts/skills/<name>/SKILL.md` becomes an entry of [builtinSkillFiles]
+/// (name → full SKILL.md text, YAML frontmatter included). Edit the Markdown
+/// sources and rerun `dart run scripts/gen_prompts.dart`.
+const builtinSkillFiles = <String, String>{''');
+  for (final name in names) {
+    final file = File('$repoRoot/prompts/skills/$name/SKILL.md');
+    if (!file.existsSync()) {
+      throw StateError('builtin skill source not found: ${file.path}');
+    }
+    final text = file.readAsStringSync();
+    final (:frontmatter, :body) = parseFrontmatter(text);
+    if (frontmatter['name'] != name) {
+      throw StateError(
+        'prompts/skills/$name/SKILL.md: frontmatter name must be "$name", '
+        'got "${frontmatter['name']}"',
+      );
+    }
+    if ('${frontmatter['description']}'.trim().isEmpty) {
+      throw StateError(
+        'prompts/skills/$name/SKILL.md: missing frontmatter description',
+      );
+    }
+    buffer
+      ..writeln()
+      ..writeln("  '$name':")
+      ..writeln('      ${dartStringLiteral(text)},');
+  }
+  buffer
+    ..writeln('};')
+    ..writeln();
+  return buffer.toString();
+}
+
+Future<void> main(List<String> args) async {
+  final checkOnly = args.contains('--check');
+  final repoRoot = Directory.current.path;
+  if (!File('$repoRoot/pubspec.yaml').existsSync()) {
+    stderr.writeln('gen_prompts: run from the repository root');
+    exit(64);
+  }
+  final stale = <String>[];
+  for (final target in targets) {
+    final content = await renderTarget(repoRoot, target);
+    final file = File('$repoRoot/${target.output}');
+    final current = file.existsSync() ? await file.readAsString() : null;
+    if (current == content) {
+      stdout.writeln('up to date: ${target.output}');
+    } else if (checkOnly) {
+      stale.add(target.output);
+    } else {
+      await file.create(recursive: true);
+      await file.writeAsString(content);
+      stdout.writeln('wrote: ${target.output}');
+    }
+  }
+  if (stale.isNotEmpty) {
+    stderr.writeln(
+      'stale generated prompt files '
+      '(run `dart run scripts/gen_prompts.dart`):',
+    );
+    for (final path in stale) {
+      stderr.writeln('  $path');
+    }
+    exit(1);
+  }
+}

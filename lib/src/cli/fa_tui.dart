@@ -1,0 +1,2777 @@
+import 'dart:async';
+import 'dart:math' as math;
+import 'dart:convert' show latin1, utf8;
+import 'dart:io'
+    show IOSink, Platform, Process, ProcessException, ProcessResult, stdin;
+
+// The composer's editor types come from the vendored tui_editor.dart
+// (issue #613): hosted dart_tui exports none, so this file compiles
+// against BOTH resolutions.
+import 'package:dart_tui/dart_tui.dart' hide stripAnsi;
+import 'package:meta/meta.dart';
+
+import 'composer_overlay.dart';
+import 'termios_guard.dart' show kTermiosClearArgs;
+import 'ansi_markdown.dart';
+import 'agent_hub_tui.dart';
+import 'model_picker_table.dart' show modelPickerFooterHint;
+import 'package:characters/characters.dart';
+import 'tui_editor.dart';
+import 'tui_hit_regions.dart';
+import 'tui_prompt.dart';
+import 'tui_status_line.dart'
+    show
+        StatusLineRoleKey,
+        StatusLineSnapshot,
+        TuiStatusLine,
+        kStatusLineRoles,
+        statusLineStyle;
+import 'tui_theme.dart';
+import 'tui_chrome.dart';
+import 'termios_guard.dart' show SttyRunner;
+import 'tui_repl.dart' show MenuItem, QueuedMessage, TuiProgramHooks, stripAnsi;
+import 'system_notice_render.dart';
+import '../viewport/follow_mode.dart';
+import 'tui_text_width.dart'
+    show tuiFitWidth, tuiGraphemeWidth, tuiPadRight, tuiTextWidth;
+import '../messaging/scheduled_messages.dart' show ScheduledMessageQueue;
+import 'paste_image.dart';
+import 'tui_key_hints.dart';
+import 'sigint_action.dart';
+import 'subagent_board.dart';
+
+// The kaomoji thinking-indicator data (issue #1374) is shared with the
+// app/web hosts — ONE pure-Dart source the busy row renders from. The
+// export keeps the face set/palette names visible to every importer of
+// this library (the part files use them through the import).
+import '../kaomoji_faces.dart';
+export '../kaomoji_faces.dart';
+
+part 'fa_tui_slash_menu.dart';
+part 'fa_tui_callbacks.dart';
+
+part 'fa_tui_messages.dart';
+part 'fa_tui_heartbeat.dart';
+part 'fa_tui_interrupt.dart';
+part 'fa_tui_hub.dart';
+part 'fa_tui_mouse.dart';
+part 'fa_tui_rows.dart';
+part 'fa_tui_paste.dart';
+part 'fa_tui_theme_swap.dart';
+part 'fa_tui_controller_io.dart';
+part 'fa_tui_picker.dart';
+part 'fa_tui_composer.dart';
+part 'fa_tui_viewport.dart';
+part 'fa_tui_kaomoji.dart';
+part 'fa_tui_busy.dart';
+part 'fa_tui_subagent_board.dart';
+
+// Record type aliases (issue #1997, crap4dart record gates): the update
+// pipeline and the composer/viewport geometry shapes are declared once,
+// here, and referenced by name — record literals stay legal values, and
+// `.$N` accesses destructure into locals at the boundary.
+
+/// The internal update-pipeline pair: the next model + an optional
+/// follow-up command. The public [FaTuiModel.update] override keeps the
+/// framework's exact positional `(Model, Cmd?)`; every internal handler
+/// declares this alias.
+typedef UiUpdate = (Model, Cmd?);
+
+/// The [UiUpdate] pair when the model is statically [FaTuiModel].
+typedef FaTuiUpdate = (FaTuiModel, Cmd?);
+
+/// Output-append result: the (possibly rewritten) lines and how many
+/// head lines the history trim dropped.
+typedef OutputAppend = (List<String>, int);
+
+/// The input text soft-wrapped, plus the cursor's row/column inside it.
+typedef WrappedInput = (List<String>, int, int);
+
+/// A menu item window (start inclusive, end exclusive).
+typedef MenuWindow = (int, int);
+
+/// The composer input window (visible rows, first painted row).
+typedef InputWindow = (int, int);
+
+/// A cursor position (row within the window, cell column).
+typedef CursorCell = (int, int);
+
+/// The held follow anchor after a head trim (anchor line, scroll offset).
+typedef HeldAnchor = (int, int);
+
+/// Hidden-rows accounting for the scroll indicators (above, below).
+typedef FoldAccount = (int above, int below);
+
+/// A waiting-row timer (due-at epoch ms, one-line preview).
+typedef WaitingTimer = ({int dueMs, String preview});
+
+/// One rendered status-band span (text, role style key).
+typedef StatusSpan = (String, StatusLineRoleKey);
+
+/// The queue block's progressive yield (visible, header, hint).
+typedef QueueYield = (int, bool, bool);
+
+/// Translates the (web-safe) headless test hooks into dart_tui program
+/// options: a scripted key byte stream replaces stdin, the rendered frames
+/// go to the given byte consumer, and the OS signal handler stays off (the
+/// test runner owns the signals). Empty without hooks.
+List<ProgramOption> _programHookOptions(TuiProgramHooks? hooks) {
+  if (hooks == null) return const [];
+  return [
+    if (hooks.input != null) withInput(hooks.input),
+    if (hooks.output != null) withOutput(IOSink(hooks.output!)),
+    if (hooks.width != null && hooks.height != null)
+      withWindowSize(hooks.width!, hooks.height!),
+    withoutSignalHandler(),
+  ];
+}
+
+/// The session TUI theme (issue #279) supplies every palette escape;
+/// width math in the view always uses the raw strings — escapes are
+/// added only at write time. Byte-identical to the historical site
+/// palette (teal #5eead4, indigo #818cf8) under the default theme.
+String _accent(String s) => tuiAccent(s);
+String _accent2(String s) => tuiAccent2(s);
+String _accent2Plain(String s) => tuiAccent2Soft(s);
+String _dim(String s) => tuiDim(s);
+
+/// The composer gutter / chrome border color (#806 band composer).
+String _borderMuted(String s) => FaThemeController.instance.borderMuted(s);
+
+/// The omp prompt gutter (band.ts `defaultPromptGutter`): the first
+/// composer row's leading cue in the border color; continuation rows
+/// indent by the same width (omp `gutter.continuation`).
+const String _composerGutter = '╰─ ';
+
+/// `tuiTextWidth('╰─ ')` — narrow-cell box glyphs + one space.
+const int _composerGutterWidth = 3;
+
+/// Memoized markdown+wrap pass over [FaTuiModel.outputLines]. Formatting is
+/// O(transcript) (regex-heavy markdown plus ANSI-safe wrapping) and used to
+/// run two to four times PER event (update handler, `_echoEndRow`, view),
+/// which made wheel scrolling and streaming visibly stutter. The result is
+/// shared across model copies and recomputed only when the source list
+/// (identity — every mutation path builds a new list) or the width changes,
+/// so scrolling and re-renders stay O(1) in markdown work. [lineStartRows]
+/// maps a raw line index to its first physical row so the sticky echo math
+/// is O(1) as well.
+final class _WrapCache {
+  /// The [FaTuiModel.outputLines] instance the pass ran on.
+  List<String>? source;
+  int width = -1;
+  List<String> rows = const [];
+
+  /// `lineStartRows[i]` = first wrapped row of raw line `i`; the final entry
+  /// is the total row count (sentinel for end-of-buffer calculations).
+  List<int> lineStartRows = const [0];
+
+  /// The persistent incremental formatter bound to [width]. An append now
+  /// costs O(delta) instead of one full markdown+wrap pass over the whole
+  /// bounded history on every coalesced streaming flush — measured at
+  /// 26.96 ms/pass over a 2000-line history before this (see
+  /// docs/performance-cli-tui.md). A width change starts a fresh session;
+  /// its rebuild path IS the legacy byte-exact pass.
+  TranscriptMarkdown? _tx;
+}
+
+/// Physical rows in [s] — identical to `s.split('\n').length`, minus the
+/// per-frame `List<String>` allocation. Used by the view assembly for cursor
+/// row math on every rendered frame.
+int _lineCount(String s) {
+  var n = 1;
+  var start = 0;
+  for (;;) {
+    final i = s.indexOf('\n', start);
+    if (i < 0) break;
+    n++;
+    start = i + 1;
+  }
+  return n;
+}
+
+/// Sentinel for nullable copyWith fields (distinguishes "keep" from "set
+/// null").
+const Object _unset = Object();
+
+/// The dart_tui model backing the Fa interactive REPL.
+final class FaTuiModel extends Model {
+  FaTuiModel({
+    required this.callbacks,
+    required this.isExited,
+    this.prompt,
+    this.outputLines = const [],
+    TuiLineEditor? editor,
+    this.scrollOffset = 0,
+    this.follow = const FollowMode.live(),
+    this.heldAnchorLine = -1,
+    this.menuOpen = false,
+    this.menuModelMode = false,
+    this.menuSelected = 0,
+    this.menuTokenStart = -1,
+    this.modelFilter = '',
+    this.menuItems = const [],
+    this.menuAllItems = const [],
+    this.pickerId = '',
+    this.pickerTitle = '',
+    this.termWidth = 80,
+    this.termHeight = 24,
+    this.busy = false,
+    this.busyStartedAtMs = -1,
+    this.busyPhase = '',
+    this.busySource = '',
+    this.busyLastEventMs = -1,
+    this.runStalled = false,
+    this.mouseCapture = true,
+    this.forceSyncUpdates = false,
+    this.spinnerFrame = 0,
+    this.kaomojiFace = 0,
+    int Function(int max)? kaomojiPick,
+    this.stickyLines = const [],
+    this.stickyIndex = -1,
+    this.stickyEchoLineCount = 0,
+    this.bootAnchorLine = 0,
+    this.queue = const [],
+    this.attachments = const [],
+    this.inputHistory = const [],
+    this.historyIndex = -1,
+    this.historyDraft,
+    this.scheduledCount = 0,
+    this.scheduledNextDueMs = -1,
+    this.jobBoardLines = const [],
+    this.subagentBoardRows = const [],
+    this.waitingJobs = const [],
+    this.waitingTimers = const [],
+    this.waitingLostJobs = 0,
+    this.scheduledTickPending = false,
+    this.frameNonce = 0,
+    this.hub,
+    SigintPolicy? sigintPolicy,
+    this.ctrlCArmed = false,
+    this.ctrlCGeneration = 0,
+    DateTime Function()? now,
+  }) : nowFn = now ?? DateTime.now,
+       kaomojiPick = kaomojiPick ?? _defaultKaomojiPick,
+       sigintPolicy = sigintPolicy ?? SigintPolicy(),
+       editor = editor ?? const TuiLineEditor.empty();
+
+  final FaTuiCallbacks callbacks;
+  final bool Function() isExited;
+
+  /// The interactive prompt zone (ask/secret/approval) rendered in place of
+  /// the input zone while the agent needs a decision from the user; null
+  /// outside prompt mode.
+  final TuiPromptState? prompt;
+
+  /// Completer for the active prompt zone, filled when it resolves so the
+  /// host's [FaTuiController.openPrompt] future can complete.
+  Completer<TuiPromptAnswer?>? _promptCompleter;
+
+  /// Issue #1067: when the last pasteboard probe fired — one probe per
+  /// paste gesture (window in `_pasteboardGestureWindowMs`).
+  int _pasteboardProbeFiredAtMs = -1;
+
+  final List<String> outputLines;
+
+  /// The readline-grade line editor (issue #275 scope 3): single source of
+  /// truth for the composer text + caret, carrying the per-session
+  /// kill-ring and grouped undo (E4: the ring survives submissions —
+  /// the model lives for the whole session).
+  final TuiLineEditor editor;
+
+  String get inputText => editor.text;
+  int get cursor => editor.cursor;
+
+  /// The open agents-hub overlay state (issue #277); null when closed.
+  final FaHubState? hub;
+
+  /// Fired on every WindowSizeMsg the model processes (gh-1433 E8): the
+  /// controller attaches a hook here so its width seam tracks the LIVE
+  /// program size. The boot model's `termWidth` is only a fallback —
+  /// without this hook a desktop window at any real size rendered the
+  /// hub's cards and overlays at the stale boot width.
+  void Function(int width, int height)? onResized;
+
+  /// The double-press Ctrl+C contract (issue #830). The host passes the
+  /// process-wide instance so the SIGINT path (bin/fah.dart) and this
+  /// KeyMsg path resolve ONE window state (ACX.5); the default builds a
+  /// policy on this model's own clock ([now]) so model-driven tests get
+  /// injectable time for free.
+  final SigintPolicy sigintPolicy;
+
+  /// Press 1 landed inside the window: the prompt-zone footer row shows
+  /// the dim [kCtrlCExitHint] instead of the status line until the next
+  /// keypress.
+  final bool ctrlCArmed;
+
+  /// Double-press window generation: bumped on every press-1 arm. The
+  /// expiry timer stamps its arm's generation, so a stale timer from a
+  /// previous arm can never kill a freshly re-armed window (issue #830
+  /// re-review regression fix — press 2 silently stopped exiting).
+  final int ctrlCGeneration;
+
+  /// Persistent viewport scroll offset (0 = top). Snapped to the bottom on
+  /// new output while [followTail] holds; kept (clamped) otherwise.
+  final int scrollOffset;
+
+  /// The follow-mode state (gh-1439): `live` snaps new output to the
+  /// bottom; `held` (user scrolled up) keeps the window anchored while
+  /// arrivals count into [FollowMode.unseen] — the `● N new` counter on
+  /// the rule row. Only USER scrolling changes it (wheel/PgUp detach,
+  /// wheel-to-bottom / PgDn into the near-bottom band re-arm — the shared
+  /// [FollowMode] classifier decides); transient viewport shrinkage
+  /// (picker menu, busy row, queue) never does. Held carries a
+  /// transcript-line anchor ([heldAnchorLine]) so trims and resizes
+  /// re-anchor the same logical position (E1/E2).
+  final FollowMode follow;
+
+  /// Auto-follow latch: new output snaps the viewport to the bottom. Only
+  /// USER scrolling changes it (wheel/arrows detach, scrolling back to the
+  /// exact bottom re-attaches) — transient viewport shrinkage (picker menu,
+  /// busy row, queue) must NOT detach it, which the old per-event
+  /// `offset >= bottom` check got wrong: opening a picker broke follow
+  /// until the user scrolled to the bottom by hand.
+  bool get followTail => follow.isLive;
+
+  /// While held: the transcript LINE anchored at the window's top edge
+  /// (gh-1439 E1/E2) — trims shift it by the cut, resizes recompute the
+  /// wrapped row through the new wrap, so the user keeps reading the same
+  /// logical position. -1 when live (no anchor).
+  final int heldAnchorLine;
+  final bool menuOpen;
+  final bool menuModelMode;
+  final int menuSelected;
+
+  /// Where the completed token starts inside [inputText] (issue #275):
+  /// 0 for a slash command line, the offset after '@' or the shell-word
+  /// start for path completion. -1 = no token (whole-input replace on
+  /// accept, the legacy slash/picker behavior).
+  final int menuTokenStart;
+  final String modelFilter;
+  final List<MenuItem> menuItems;
+
+  /// The picker's full unfiltered item list — the local type-to-filter base
+  /// for generic pickers (the `models` picker rebuilds via
+  /// [FaTuiCallbacks.buildModelMenu] instead). Empty outside picker mode.
+  final List<MenuItem> menuAllItems;
+
+  /// Identifies the active picker: 'models' for the model picker (typing
+  /// filters via [FaTuiCallbacks.buildModelMenu]), anything else for a
+  /// generic host picker (static items, selection via
+  /// [FaTuiCallbacks.onPickerSelected]). Empty outside picker mode.
+  final String pickerId;
+  final String pickerTitle;
+  final int termWidth;
+  final int termHeight;
+
+  /// Whether a run is streaming; drives the animated thinking indicator.
+  final bool busy;
+
+  /// When the current busy stretch started (epoch ms; -1 while idle) — the
+  /// busy row shows the elapsed seconds so a wedged endpoint is visible
+  /// instead of looking like a frozen UI.
+  final int busyStartedAtMs;
+
+  /// Post-answer phase label overriding the generic "Working…" while set
+  /// ("Compacting context…", "Extracting memory…"); cleared whenever a
+  /// busy stretch ends so the next run starts generic.
+  final String busyPhase;
+
+  /// Provenance tag of the current busy stretch ('run', 'submit', …).
+  final String busySource;
+
+  /// Last activity timestamp while busy (any non-tick message). Feeds the
+  /// "quiet Nm" hint and the watchdog.
+  final int busyLastEventMs;
+
+  /// Whether the run is currently wedged (issue #514): pushed by the
+  /// host's wedge watchdog (heartbeat silent past `steeringStaleAfter`)
+  /// — the busy row's `Stalled…` label reads this instead of guessing
+  /// from TUI output activity.
+  final bool runStalled;
+
+  /// Pending scheduled follow-up messages (`schedule_message` records this
+  /// instance can still deliver); 0 hides the indicator row (issue #115).
+  final int scheduledCount;
+
+  /// Earliest pending due time (epoch ms; -1 unknown) — rendered as the
+  /// "next in 25m" suffix.
+  final int scheduledNextDueMs;
+
+  /// The background-job board's live region (issue #429): summary lines +
+  /// live rows, dim, above the busy row. Empty hides the region.
+  final List<String> jobBoardLines;
+
+  /// The subagent status board's live region (gh-1415): one compact line
+  /// per subagent (state, name, age, cost), pre-rendered by the host's
+  /// TaskBoardRegion. Empty hides the region (quiet zero — AC4).
+  final List<SubagentBoardRow> subagentBoardRows;
+
+  /// The visible-waiting row state (issue #450): purposes of the running
+  /// background jobs and the armed self-wake timers (due epoch ms +
+  /// preview), pushed by the host on every waiter enter/leave. The row
+  /// renders only while idle — the busy row owns the screen while working.
+  final List<String> waitingJobs;
+  final List<WaitingTimer> waitingTimers;
+
+  /// Background jobs the previous run of this session left running — the
+  /// honesty note under the waiting row after a restart.
+  final int waitingLostJobs;
+
+  /// Whether a [ScheduledTickMsg] timer is outstanding (issue #213) — the
+  /// guard that keeps the countdown chain at one pending timer max.
+  final bool scheduledTickPending;
+
+  /// Clock seam (issue #213 tests): the scheduled-row ETA and the tick
+  /// delay read this instead of [DateTime.now] directly.
+  final DateTime Function() nowFn;
+
+  /// Whether the TUI captures the mouse (wheel scrolling) instead of
+  /// leaving it to the terminal's native text selection. Default on: the
+  /// session lives in the alternate screen with no terminal scrollback, so
+  /// without capture a two-finger scroll does nothing. Selection still
+  /// works through the bypass modifier (Shift); `FA_TUI_MOUSE=0` opts out.
+  final bool mouseCapture;
+
+  /// Force DEC 2026 synchronized output ON at boot (`FA_TUI_SYNC=1`):
+  /// [init] emits a synthetic capability report the program consumes
+  /// exactly like a terminal's DECRQM answer — public API on the hosted
+  /// package and the vendored fork alike, replacing the fork-only
+  /// `withSyncUpdates` ProgramOption (issue #613).
+  final bool forceSyncUpdates;
+
+  /// The busy-row tick counter: +1 per [SpinnerTickMsg] (100 ms apart).
+  /// No longer a frame index — the face lives in [kaomojiFace]; this
+  /// counter only drives the swap cadence ([kKaomojiSwapTicks], #1374).
+  final int spinnerFrame;
+
+  /// Index into [kKaomojiFaces] — the face the busy row shows. Picked
+  /// randomly at busy start and re-picked (never the same face) every
+  /// [kKaomojiSwapTicks] ticks (~0.9 s) while the run streams (issue
+  /// #1374). Not a rotation: the pick is random via [kaomojiPick].
+  final int kaomojiFace;
+
+  /// The face-picker seam (issue #1374 tests): returns an index in
+  /// `0…max-1`. Defaults to a process-random pick; tests inject a
+  /// deterministic function instead of seeding [math.Random] at the
+  /// call sites.
+  final int Function(int max) kaomojiPick;
+
+  /// The last submitted user echo (rule + first input line), pinned to the
+  /// top of the viewport while a run streams and the echo itself has
+  /// scrolled out of view — Copilot's sticky user message for long answers.
+  final List<String> stickyLines;
+
+  /// Index into [outputLines] where the sticky echo starts; -1 when unset.
+  final int stickyIndex;
+
+  /// History lines the echo occupies (rule + input lines + trailing blank),
+  /// set at submit time; the sticky pins only when these rows have fully
+  /// scrolled out of view.
+  final int stickyEchoLineCount;
+
+  /// The resumed boot's replay anchor (issue #446 wave-14): the LOGICAL
+  /// line index of the restored session's first row. While following and
+  /// the glass overflows, the window anchors here — the banner rides the
+  /// fold under the #827 indicator. 0 = no boot anchor (plain bottom
+  /// follow). Cleared by the first live submit and by any user scroll.
+  final int bootAnchorLine;
+
+  /// Messages typed while a run streams (kimi-cli's queue): Enter enqueues
+  /// a follow-up, ↑ pops the last one back into the input, ctrl+x deletes
+  /// it, ctrl+s steers everything into the running agent, and the host
+  /// drains them as separate turns afterwards. [QueuedMessage.steer] rows
+  /// interrupt at the next step boundary (the soft-yield steering path)
+  /// and render badged; plain rows wait for the run to settle.
+  final List<QueuedMessage> queue;
+
+  /// Clipboard images attached via Ctrl+V, waiting in the composer as
+  /// chips; consumed by the next plain submit (slash/bang commands keep
+  /// them), rendered above the input frame.
+  final List<TuiImageAttachment> attachments;
+
+  /// Submitted non-empty lines, oldest first (shell-style input history).
+  /// Slash and bang commands are not recorded — ↑ recalls MESSAGES.
+  final List<String> inputHistory;
+
+  /// The browsed history index, or -1 when editing fresh text (not
+  /// browsing). Any edit resets it to -1.
+  final int historyIndex;
+
+  /// The input stashed when history browsing started, restored when the
+  /// user browses back down past the newest entry.
+  final String? historyDraft;
+
+  /// Monotonic frame counter, bumped by every `copyWith` (i.e. every model
+  /// change). The view mixes it into the cursor line's invisible SGR suffix
+  /// so the row carrying the cursor-home escape differs on EVERY content
+  /// change — dart_tui's row diff only re-emits the home sequence when that
+  /// row changed, and a static suffix stranded the cursor mid-history after
+  /// a lone output append while idle (spinner ticks only vary it while
+  /// busy).
+  final int frameNonce;
+
+  /// Shared markdown+wrap memo (see [_WrapCache]); `copyWith` hands the same
+  /// instance to the next model version so unchanged content never
+  /// re-formats.
+  var _wrapCache = _WrapCache();
+
+  /// Formatted sticky-echo rows: view() runs on every painted frame, and
+  /// during streaming that means keystroke-rate forced paints — re-running
+  /// markdown formatting over the whole echoed prompt each time made
+  /// typing cost O(echo lines). The echo only changes when the user
+  /// submits, so the cache is keyed by its content and width.
+  List<String> _stickyFmtRows = const [];
+  List<String>? _stickyFmtSource;
+  int? _stickyFmtWidth;
+
+  /// Hit-regions of the LAST RENDERED frame + press/drag router (issue
+  /// #278): input plumbing, NOT model state; view() rebuilds the registry
+  /// (E2), copyWith carries all three (press survives copies, hint once).
+  TuiHitRegionRegistry _hitRegions = TuiHitRegionRegistry();
+  TuiMouseRouter _mouseRouter = TuiMouseRouter();
+
+  /// Whether the E4 degrade hint already printed this session.
+  bool _mouseHintShown = false;
+
+  List<String> _formattedStickyRows(int width) {
+    final src = stickyLines;
+    final cached = _stickyFmtRows;
+    final cachedSrc = _stickyFmtSource;
+    if (_stickyFmtWidth == width &&
+        cachedSrc != null &&
+        cachedSrc.length == src.length) {
+      var same = true;
+      for (var i = 0; i < src.length; i++) {
+        if (cachedSrc[i] != src[i]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return cached;
+    }
+    final md = AnsiMarkdown(width: width);
+    final rows = [for (final line in src) md.formatLine(line)];
+    _stickyFmtSource = List.of(src);
+    _stickyFmtWidth = width;
+    _stickyFmtRows = rows;
+    return rows;
+  }
+
+  /// Whether a turn echo is ARMED to pin: a run streams and an echo
+  /// exists; whether it pins is the frame plan's call — [_framePlanFor]
+  /// dedupes the pin against the painted window (#917). No scroll math.
+  bool get _stickyArmed => busy && stickyLines.isNotEmpty && stickyIndex >= 0;
+
+  /// The first wrapped row just past the pinned echo (rows are counted
+  /// wrapped — earlier lines may wrap — and the echo counts as out of a
+  /// window iff the window top is at or past this row). Served from the
+  /// shared wrap cache, refreshed here when stale. Comparing against the
+  /// RAW [stickyIndex] line instead once pinned a duplicate while the
+  /// message was still visible in the chat.
+  ///
+  /// Returns -1 when the cache holds no row starts (no geometry to dedupe
+  /// against) — callers keep the echo with the transcript then.
+  int _echoEndRow() {
+    _wrappedLines();
+    final starts = _wrapCache.lineStartRows;
+    if (starts.isEmpty) return -1;
+    final echoEndLine = (stickyIndex + stickyEchoLineCount).clamp(
+      0,
+      starts.length - 1,
+    );
+    return starts[echoEndLine];
+  }
+
+  /// The visible window of menu items (start inclusive, end exclusive).
+  MenuWindow _menuWindow() {
+    // Issue #706: the window must fit the glass. The classic fixed
+    // 6-row window plus its title/hint/footer chrome could exceed a
+    // short terminal; the frame then overran and the hard glass guard
+    // cropped the menu's TOP — the title and first items became
+    // selectable-but-invisible while the '↑ more' hint below stayed
+    // painted (list top unreachable). The cap starts from the classic
+    // reserve (progress indicator + frame rules + status = 4, one input
+    // row, the menu title, both scroll hints, the models-picker footer)
+    // and then shrinks until the rows the window will ACTUALLY render —
+    // counted by the same [_menuLines] math [_menuReservedLines] uses —
+    // fit under the 5 fixed chrome rows: a fixed reserve cannot know
+    // the group-header rows the slash menu interleaves (#275), and
+    // ignoring them let grouped menus reopen the top-crop. Floor 1
+    // keeps even a degenerate terminal functional (E3).
+    var maxVisible = (termHeight - 9).clamp(1, 6);
+    while (maxVisible > 1) {
+      final (start, end) = _windowFor(maxVisible);
+      if (5 + _menuLines(start, end) <= termHeight) break;
+      maxVisible--;
+    }
+    return _windowFor(maxVisible);
+  }
+
+  /// The item window a [maxVisible]-row cap would show (the pure half
+  /// of [_menuWindow]; the cap loop re-evaluates it as it shrinks).
+  MenuWindow _windowFor(int maxVisible) {
+    var start = 0;
+    if (menuItems.length > maxVisible) {
+      start = (menuSelected - (maxVisible ~/ 2)).clamp(
+        0,
+        menuItems.length - maxVisible,
+      );
+    }
+    final end = menuItems.length < start + maxVisible
+        ? menuItems.length
+        : start + maxVisible;
+    return (start, end);
+  }
+
+  /// Exact number of lines the open menu occupies in the view (including
+  /// the models-table footer hint row when a models-family picker is open).
+  int get _menuReservedLines {
+    if (!menuOpen || menuItems.isEmpty) return 0;
+    final (start, end) = _menuWindow();
+    return _menuLines(start, end);
+  }
+
+  /// Lines the window `[start, end)` renders: title + items + group
+  /// headers + '↑/↓ more' hints + the models-picker footer. The cap in
+  /// [_menuWindow] and the frame-height budget both pay THIS number, so
+  /// a window that fits the budget here cannot overrun the glass.
+  int _menuLines(int start, int end) {
+    var lines = 1 + (end - start); // title + items
+    lines += _groupHeadersIn(start, end); // section headers
+    if (start > 0) lines++; // '↑ more'
+    if (end < menuItems.length) lines++; // '↓ more'
+    if (_modelPickerFamilyOpen) lines++; // footer hint
+    return lines;
+  }
+
+  /// Group-header rows the visible window renders (one per group change,
+  /// issue #275) — the height math and the renderer must agree.
+  int _groupHeadersIn(int start, int end) {
+    var count = 0;
+    var last = '';
+    for (var i = start; i < end; i++) {
+      final group = menuItems[i].group;
+      if (group.isNotEmpty && group != last) count++;
+      last = group;
+    }
+    return count;
+  }
+
+  FaTuiModel copyWith({
+    TuiPromptState? prompt,
+    bool clearPrompt = false,
+    List<String>? outputLines,
+    String? inputText,
+    int? cursor,
+    TuiLineEditor? editor,
+    int? scrollOffset,
+    FollowMode? follow,
+    int? heldAnchorLine,
+    bool? menuOpen,
+    bool? menuModelMode,
+    int? menuSelected,
+    int? menuTokenStart,
+    String? modelFilter,
+    List<MenuItem>? menuItems,
+    List<MenuItem>? menuAllItems,
+    String? pickerId,
+    String? pickerTitle,
+    int? termWidth,
+    int? termHeight,
+    bool? busy,
+    int? busyStartedAtMs,
+    String? busyPhase,
+    String? busySource,
+    int? busyLastEventMs,
+    bool? mouseCapture,
+    bool? forceSyncUpdates,
+    int? spinnerFrame,
+    int? kaomojiFace,
+    List<String>? stickyLines,
+    int? stickyIndex,
+    int? stickyEchoLineCount,
+    int? bootAnchorLine,
+    List<QueuedMessage>? queue,
+    List<TuiImageAttachment>? attachments,
+    List<String>? inputHistory,
+    int? historyIndex,
+    int? scheduledCount,
+    int? scheduledNextDueMs,
+    List<String>? jobBoardLines,
+    List<SubagentBoardRow>? subagentBoardRows,
+    List<String>? waitingJobs,
+    List<WaitingTimer>? waitingTimers,
+    int? waitingLostJobs,
+    bool? scheduledTickPending,
+    bool? runStalled,
+    Object? historyDraft = _unset,
+    FaHubState? hub,
+    bool clearHub = false,
+    bool? ctrlCArmed,
+    int? ctrlCGeneration,
+  }) {
+    final copy = FaTuiModel(
+      callbacks: callbacks,
+      isExited: isExited,
+      prompt: clearPrompt ? null : (prompt ?? this.prompt),
+      outputLines: outputLines ?? this.outputLines,
+      editor:
+          editor ??
+          (inputText == null && cursor == null
+              ? this.editor
+              : this.editor.withBuffer(
+                  TuiLineBuffer(
+                    inputText ?? this.inputText,
+                    cursor ?? this.cursor,
+                  ),
+                )),
+      scrollOffset: scrollOffset ?? this.scrollOffset,
+      follow: follow ?? this.follow,
+      heldAnchorLine: heldAnchorLine ?? this.heldAnchorLine,
+      menuOpen: menuOpen ?? this.menuOpen,
+      menuModelMode: menuModelMode ?? this.menuModelMode,
+      menuSelected: menuSelected ?? this.menuSelected,
+      menuTokenStart: menuTokenStart ?? this.menuTokenStart,
+      modelFilter: modelFilter ?? this.modelFilter,
+      menuItems: menuItems ?? this.menuItems,
+      menuAllItems: menuAllItems ?? this.menuAllItems,
+      pickerId: pickerId ?? this.pickerId,
+      pickerTitle: pickerTitle ?? this.pickerTitle,
+      runStalled: runStalled ?? this.runStalled,
+      termWidth: termWidth ?? this.termWidth,
+      termHeight: termHeight ?? this.termHeight,
+      busy: busy ?? this.busy,
+      busyStartedAtMs: busyStartedAtMs ?? this.busyStartedAtMs,
+      busyPhase: busyPhase ?? this.busyPhase,
+      busySource: busySource ?? this.busySource,
+      busyLastEventMs: busyLastEventMs ?? this.busyLastEventMs,
+      mouseCapture: mouseCapture ?? this.mouseCapture,
+      forceSyncUpdates: forceSyncUpdates ?? this.forceSyncUpdates,
+      spinnerFrame: spinnerFrame ?? this.spinnerFrame,
+      kaomojiFace: kaomojiFace ?? this.kaomojiFace,
+      // copyWith cannot override the picker seam; this re-supplies the
+      // FIELD so an injected kaomojiPick survives every copy (dropping it
+      // would reset deterministic tests to the random default).
+      kaomojiPick: kaomojiPick,
+      stickyLines: stickyLines ?? this.stickyLines,
+      stickyIndex: stickyIndex ?? this.stickyIndex,
+      stickyEchoLineCount: stickyEchoLineCount ?? this.stickyEchoLineCount,
+      bootAnchorLine: bootAnchorLine ?? this.bootAnchorLine,
+      queue: queue ?? this.queue,
+      attachments: attachments ?? this.attachments,
+      inputHistory: inputHistory ?? this.inputHistory,
+      historyIndex: historyIndex ?? this.historyIndex,
+      scheduledCount: scheduledCount ?? this.scheduledCount,
+      scheduledNextDueMs: scheduledNextDueMs ?? this.scheduledNextDueMs,
+      jobBoardLines: jobBoardLines ?? this.jobBoardLines,
+      subagentBoardRows: subagentBoardRows ?? this.subagentBoardRows,
+      waitingJobs: waitingJobs ?? this.waitingJobs,
+      waitingTimers: waitingTimers ?? this.waitingTimers,
+      waitingLostJobs: waitingLostJobs ?? this.waitingLostJobs,
+      scheduledTickPending: scheduledTickPending ?? this.scheduledTickPending,
+      now: nowFn,
+      historyDraft: historyDraft == _unset
+          ? this.historyDraft
+          : historyDraft as String?,
+      hub: clearHub ? null : (hub ?? this.hub),
+      sigintPolicy: sigintPolicy,
+      ctrlCArmed: ctrlCArmed ?? this.ctrlCArmed,
+      ctrlCGeneration: ctrlCGeneration ?? this.ctrlCGeneration,
+      // Every copy is a new model state: bump the frame nonce so the view's
+      // cursor line always differs after a change (see [frameNonce]).
+      frameNonce: frameNonce + 1,
+    );
+    copy._wrapCache = _wrapCache;
+    copy._stickyFmtRows = _stickyFmtRows;
+    copy._stickyFmtSource = _stickyFmtSource;
+    copy._stickyFmtWidth = _stickyFmtWidth;
+    copy._promptCompleter = _promptCompleter;
+    copy._pasteboardProbeFiredAtMs = _pasteboardProbeFiredAtMs;
+    copy._hitRegions = _hitRegions;
+    copy._mouseRouter = _mouseRouter;
+    copy._mouseHintShown = _mouseHintShown;
+    // gh-1433 E8: the live-width seam must survive copies — update()
+    // returns a copyWith copy and the program swaps to it on almost
+    // every message (the busy-heartbeat alone re-copies); a dropped
+    // hook would freeze the hub cards at the boot width after the
+    // first resize.
+    copy.onResized = onResized;
+    return copy;
+  }
+
+  @override
+  Cmd? init() =>
+      forceSyncUpdates ? () => ModeReportMsg(mode: 2026, value: 1) : null;
+
+  /// Arms the one-shot minute-boundary repaint for the scheduled-follow-ups
+  /// countdown (issue #213, fix option A): the ETA renders in whole minutes
+  /// (`ScheduledMessageQueue.formatDelay`), so waking at the next wall-clock
+  /// minute boundary is exact — no sub-minute waste, no timers while nothing
+  /// is scheduled, and the "due now" flip appears within a minute.
+  Cmd _scheduleScheduledTick() {
+    final nowMs = nowFn().millisecondsSinceEpoch;
+    final delayMs = 60000 - (nowMs % 60000);
+    return () async {
+      await Future<void>.delayed(Duration(milliseconds: delayMs));
+      return const ScheduledTickMsg();
+    };
+  }
+
+  @override
+  (Model, Cmd?) update(Msg msg) {
+    // Activity heartbeat for the busy row: any real message while busy
+    // (stream deltas, tool rows, key input) proves the stretch is alive;
+    // only spinner ticks and busy bookkeeping are excluded.
+    final FaTuiModel self =
+        (busy &&
+            msg is! SpinnerTickMsg &&
+            msg is! BusyMsg &&
+            msg is! RunStalledMsg &&
+            msg is! ScheduledTickMsg)
+        ? copyWith(busyLastEventMs: DateTime.now().millisecondsSinceEpoch)
+        : this;
+    return self._updateWithHeartbeat(msg);
+  }
+
+  /// Scheduled/waiting dispatch group ([_updateWithHeartbeat] prefix):
+  /// host-pushed count/ETA updates, the minute-boundary tick, the job
+  /// board and the waiting row. Returns `null` when [msg] belongs to a
+  /// later group.
+  UiUpdate? _updateScheduled(Msg msg) {
+    if (msg is ScheduledStatusMsg) return _handleScheduledStatus(msg);
+    if (msg is ScheduledTickMsg) return _handleScheduledTick();
+    if (msg is JobBoardMsg) return _handleJobBoard(msg);
+    if (msg is SubagentBoardMsg) return _handleSubagentBoard(msg);
+    if (msg is WaitingStatusMsg) return _handleWaitingStatus(msg);
+    return null;
+  }
+
+  /// The scheduled follow-ups indicator is a host push for the count/ETA;
+  /// while a countdown is showing the model also arms a one-shot
+  /// minute-boundary tick (issue #213) so the idle "next in Nm" keeps
+  /// ticking — [scheduledTickPending] caps the chain at one timer.
+  UiUpdate _handleScheduledStatus(ScheduledStatusMsg msg) {
+    final next = copyWith(
+      scheduledCount: msg.count,
+      scheduledNextDueMs: msg.nextDueMs ?? -1,
+    );
+    if (next.scheduledCount > 0 &&
+        next.scheduledNextDueMs >= 0 &&
+        !scheduledTickPending) {
+      return (
+        next.copyWith(scheduledTickPending: true),
+        _scheduleScheduledTick(),
+      );
+    }
+    return (next, null);
+  }
+
+  /// The background-job board's live region (issue #429): the host pushes
+  /// pre-rendered lines; an empty list hides the region.
+  UiUpdate _handleJobBoard(JobBoardMsg msg) =>
+      (copyWith(jobBoardLines: msg.lines), null);
+
+  /// True while any countdown is on screen (issue #115 scheduled row, and
+  /// the waiting row's timer countdown — issue #450): the shared
+  /// minute-boundary tick chain repaints both.
+  bool get _hasCountdown =>
+      (scheduledCount > 0 && scheduledNextDueMs >= 0) ||
+      waitingTimers.isNotEmpty;
+
+  /// The minute-boundary countdown tick fired (issue #213): the row
+  /// recomputes from [nowFn] at render time, so the repaint alone refreshes
+  /// the ETA; re-arm while there is still a countdown to show ([_hasCountdown]).
+  UiUpdate _handleScheduledTick() {
+    final next = copyWith(scheduledTickPending: false);
+    if (!next._hasCountdown) {
+      return (next, null);
+    }
+    return (
+      next.copyWith(scheduledTickPending: true),
+      _scheduleScheduledTick(),
+    );
+  }
+
+  UiUpdate _handleOutputMsg(OutputMsg msg) {
+    // System-notice blocks and service lines (the compaction report
+    // header) render as dim blockquotes, not raw text.
+    final displayText = needsSystemNoticeRewrite(msg.text)
+        ? renderSystemNoticeLines(msg.text).join('\n')
+        : msg.text;
+    final (newLines, cut) = _appendOutput(
+      outputLines,
+      displayText,
+      msg.newline,
+    );
+    final next = copyWith(
+      outputLines: newLines,
+      // A head trim shifts every transcript index — the pin (#827).
+      bootAnchorLine: _bootAnchorShiftedBy(cut),
+      stickyIndex: _stickyShiftedBy(cut),
+    );
+    // Held (gh-1439): the append is COUNTED, never shown by force — the
+    // window re-anchors to the same transcript line (E1: a head trim
+    // shifts the anchor by the cut; the wrapped-row offset is recomputed
+    // from the anchor, not preserved raw). Live: today's behavior — the
+    // stream owns the window (issue #1348).
+    if (followTail) {
+      final nextWrapped = next._wrappedLines();
+      return (
+        next.copyWith(scrollOffset: next._followAnchor(nextWrapped)),
+        null,
+      );
+    }
+    final (anchorLine, anchorOffset) = _heldAnchorShiftedByCut(cut);
+    final reanchored = next.copyWith(
+      heldAnchorLine: anchorLine,
+      scrollOffset: anchorOffset,
+      follow: follow.appended(1),
+    );
+    return (reanchored, null);
+  }
+
+  /// Last-resort busy bracket: a row with zero activity for this long is a
+  /// wedge — every arm site has a matching release, so a fire means a bug.
+  /// The diagnostic log names the last armer.
+  static const busyWatchdogMs = 10 * 60 * 1000;
+
+  UiUpdate _handleDrainQueue(DrainQueueMsg msg) {
+    // The host drains queued messages as separate turns after the run
+    // settles; echo them into the history as they are handed out. Flush
+    // order is queue order (AC2).
+    final queued = queue;
+    msg.completer.complete([for (final m in queued) m.text]);
+    if (queued.isEmpty) return (this, null);
+    var lines = outputLines;
+    var echoCut = 0;
+    for (final message in queued) {
+      final (appended, cut) = _echoAppend(lines, message.text);
+      lines = appended;
+      echoCut += cut;
+    }
+    final cleared = copyWith(
+      queue: const [],
+      outputLines: lines,
+      // Echo-time head trims shift every anchored index (#827 review): the
+      // sticky pin from the running turn survives the drain. The boot
+      // anchor dissolves either way.
+      stickyIndex: _stickyShiftedBy(echoCut),
+      bootAnchorLine: 0,
+    );
+    final next = cleared.copyWith(
+      scrollOffset: cleared._followAnchor(cleared._wrappedLines()),
+      follow: const FollowMode.live(),
+      heldAnchorLine: -1,
+    );
+    return (next, null);
+  }
+
+  /// Picker dispatch: atomic open + the gh-1049 reveal hook (extracted so
+  /// `_updateAfterExitCheck` stays under the CRAP complexity threshold).
+  UiUpdate? _handlePickerMsg(Msg msg) {
+    if (msg is OpenPickerMsg) return _handleOpenPicker(msg);
+    if (msg is _RevealPickerRowsMsg) return _handleRevealPickerRows();
+    return null;
+  }
+
+  UiUpdate _handleClearQueue() {
+    if (queue.isEmpty) return (this, null);
+    return (copyWith(queue: const []), null);
+  }
+
+  /// Test seam: drives the composer prefill (`/skills` menu →
+  /// `sendInputText`) into the model without a running program, so the
+  /// message branch is exercisable headlessly.
+  @visibleForTesting
+  FaTuiModel setInputTextForTest(String text) {
+    final (model, _) = update(_SetInputTextMsg(text));
+    return model as FaTuiModel;
+  }
+
+  UiUpdate _updateAfterExitCheck(Msg msg) {
+    if (msg is _ModelsRefreshMsg) return _handleModelsRefresh();
+    if (msg is _ThemeChangedMsg) return _handleThemeChanged();
+    if (msg is _OpenModelMenuMsg) return _handleOpenModelMenu();
+    if (_handlePickerMsg(msg) case final picker?) return picker;
+    if (_handleHostStateMsg(msg) case final host?) return host;
+    if (msg is _QuitRequestedMsg) return (this, () => quit());
+    if (msg is ThemeSwappedMsg) return _handleThemeSwapped();
+    if (msg is PasteboardResultMsg) return _handlePasteboardResult(msg);
+    return _handleTerminalMsg(msg);
+  }
+
+  /// Terminal events: resizes, mouse wheel scrolling, pastes, keys.
+  /// Mouse and pastes route through the double-press window too (issue
+  /// #830 review): the contract says "any other key/input", and a paste
+  /// between two presses must never turn press 2 into an exit.
+  UiUpdate _handleTerminalMsg(Msg msg) {
+    if (msg is WindowSizeMsg) return _handleWindowSize(msg);
+    if (msg is MouseClickMsg) {
+      return _withFreshCtrlCWindow(msg, () => _handleMouseClick(msg));
+    }
+    if (msg is MouseMotionMsg) {
+      return _withFreshCtrlCWindow(msg, () => _handleMouseMotion(msg));
+    }
+    if (msg is MouseReleaseMsg) {
+      return _withFreshCtrlCWindow(msg, () => _handleMouseRelease(msg));
+    }
+    if (msg is MouseWheelMsg) {
+      return _withFreshCtrlCWindow(msg, () => _handleMouseWheel(msg));
+    }
+    if (msg is PasteMsg) {
+      return _withFreshCtrlCWindow(msg, () => _handlePaste(msg));
+    }
+    if (msg is PromptClipboardTextMsg) {
+      return _handlePromptClipboardText(msg);
+    }
+    return _handleKeyMsg(msg);
+  }
+
+  /// Key events: runes split, then every key through the mode-aware clusters.
+  UiUpdate _handleKeyMsg(Msg msg) {
+    // dart_tui's input decoder groups up to 4 ASCII bytes into a single rune,
+    // and the cursor would advance by 1 instead of the inserted text length.
+    // Split multi-character runes into individual key events so pasting plain
+    // text (or fast typing) does not scramble the input.
+    if (msg is KeyPressMsg &&
+        msg.keyEvent.code == KeyCode.rune &&
+        msg.keyEvent.text.length > 1) {
+      return _withFreshCtrlCWindow(msg, () => _handleMultiCharRunes(msg));
+    }
+
+    if (msg is KeyMsg) {
+      return _withFreshCtrlCWindow(
+        msg,
+        () => _handleKey(msg),
+        keepWindow: msg.key == 'ctrl+c',
+      );
+    }
+    return (this, null);
+  }
+
+  UiUpdate _handleModelsRefresh() {
+    // Only refresh while the model picker is actually open — the message
+    // also arrives when the slash menu (or no menu) is up and must not
+    // clobber its items.
+    if (_modelPickerOpen) return _refreshedModelMenu();
+    return (this, null);
+  }
+
+  /// Theme switched (issue #279): drop rendered-color caches and repaint.
+  /// The wrap cache holds text geometry only (colors apply at emit time),
+  /// so invalidation is a cache reset plus a redraw on the next frame
+  /// boundary — never a torn frame (E1).
+  UiUpdate _handleThemeChanged() {
+    final copy = copyWith(menuSelected: menuSelected);
+    copy._wrapCache = _WrapCache();
+    // The sticky echo caches formatted rows keyed on width+content —
+    // both unchanged by a theme switch — so drop it explicitly or the
+    // pinned lines keep the old palette until the next submit.
+    copy._stickyFmtSource = null;
+    return (copy, null);
+  }
+
+  /// Test seam: the private [_ThemeChangedMsg] (tests drive the model
+  /// update loop directly and cannot name the class).
+  static Msg themeChangedMsgForTest() => _ThemeChangedMsg();
+
+  /// Whether the open menu is the model picker (not the slash menu).
+  bool get _modelPickerOpen => menuOpen && menuModelMode;
+
+  /// Rebuilds the open model picker's items, keeping the selection in
+  /// bounds.
+  UiUpdate _refreshedModelMenu() {
+    final items = callbacks.buildModelMenu(modelFilter, termWidth);
+    final selected = items.isEmpty
+        ? 0
+        : menuSelected.clamp(0, items.length - 1);
+    return (copyWith(menuItems: items, menuSelected: selected), null);
+  }
+
+  UiUpdate _handleOpenModelMenu() {
+    final items = callbacks.buildModelMenu('', termWidth);
+    return (
+      copyWith(
+        menuOpen: true,
+        menuModelMode: true,
+        modelFilter: '',
+        menuItems: items,
+        // The models picker rebuilds via buildModelMenu — the generic
+        // pickers' local-filter base does not apply here.
+        menuAllItems: const [],
+        menuSelected: 0,
+        pickerId: 'models',
+        pickerTitle: '',
+      ),
+      null,
+    );
+  }
+
+  /// gh-1049 test hook: per-row reveal delay for the generic picker, read
+  /// from `FA_TUI_PICKER_REVEAL_MS`. 0/unset = the production atomic open.
+  ///
+  /// Unit-test seam: `Platform.environment` is immutable in-process, so
+  /// model-level tests set [pickerRevealDelayMsOverride] instead; null
+  /// falls through to the env var (the production default).
+  @visibleForTesting
+  static int? pickerRevealDelayMsOverride;
+
+  static int get _pickerRevealDelayMs =>
+      pickerRevealDelayMsOverride ??
+      int.tryParse(Platform.environment['FA_TUI_PICKER_REVEAL_MS'] ?? '') ??
+      0;
+
+  /// gh-1374 test hook: the in-process override of the `FA_KAOMOJI_FACE`
+  /// pin (env is immutable in-process; resolution — override ?? env,
+  /// clamped — lives in [_kaomojiFacePin] in fa_tui_kaomoji.dart). Null =
+  /// the production random pick.
+  @visibleForTesting
+  static int? kaomojiFacePinOverride;
+
+  UiUpdate _handleOpenPicker(OpenPickerMsg msg) {
+    final reveal = _pickerRevealOpen(msg);
+    if (reveal != null) return reveal;
+    return (
+      copyWith(
+        menuOpen: true,
+        menuModelMode: true,
+        modelFilter: '',
+        menuItems: msg.items,
+        menuAllItems: msg.items,
+        menuSelected: msg.initialIndex.clamp(
+          0,
+          msg.items.isEmpty ? 0 : msg.items.length - 1,
+        ),
+        pickerId: msg.pickerId,
+        pickerTitle: msg.title,
+      ),
+      null,
+    );
+  }
+
+  /// The progressive-reveal open (gh-1049 test hook), or null when the
+  /// hook is off (the production atomic open above) or the picker has a
+  /// single row. The first frame carries the title + ONE row, every later
+  /// frame adds one — the hostile frame-gap condition the PTY screen waits
+  /// must survive with content predicates. The selection stays clamped to
+  /// the FULL item list so the cursor lands on the initial row once it is
+  /// revealed.
+  UiUpdate? _pickerRevealOpen(OpenPickerMsg msg) {
+    final revealMs = _pickerRevealDelayMs;
+    if (revealMs <= 0 || msg.items.length <= 1) return null;
+    return (
+      copyWith(
+        menuOpen: true,
+        menuModelMode: true,
+        modelFilter: '',
+        menuItems: msg.items.take(1).toList(),
+        menuAllItems: msg.items,
+        menuSelected: msg.initialIndex.clamp(
+          0,
+          msg.items.isEmpty ? 0 : msg.items.length - 1,
+        ),
+        pickerId: msg.pickerId,
+        pickerTitle: msg.title,
+      ),
+      _schedulePickerReveal(revealMs),
+    );
+  }
+
+  Cmd _schedulePickerReveal(int delayMs) {
+    return () async {
+      await Future<void>.delayed(Duration(milliseconds: delayMs));
+      return const _RevealPickerRowsMsg();
+    };
+  }
+
+  /// Reveals the next picker row; re-arms while rows remain. A close, a
+  /// full reveal, or an ACTIVE TYPE-TO-FILTER stops the chain: the filter
+  /// owns [menuItems] (the rows are the filtered set) and the leg must
+  /// never clobber it with an unfiltered prefix (a reveal landing on a
+  /// closed picker is a no-op — the menu keys rebuilt/cleared [menuItems]
+  /// in between).
+  UiUpdate _handleRevealPickerRows() {
+    final all = menuAllItems;
+    if (!menuOpen || modelFilter.isNotEmpty || menuItems.length >= all.length) {
+      return (this, null);
+    }
+    final revealed = (menuItems.length + 1).clamp(0, all.length);
+    final model = copyWith(menuItems: all.take(revealed).toList());
+    // The row set is complete after this leg — nothing left to schedule.
+    if (revealed >= all.length) return (model, null);
+    return (model, _pickerRevealNextCmd());
+  }
+
+  /// The next reveal leg, or null when the hook switched off mid-run
+  /// (row-set completeness is the caller's check).
+  Cmd? _pickerRevealNextCmd() {
+    final revealMs = _pickerRevealDelayMs;
+    if (revealMs <= 0) return null;
+    return _schedulePickerReveal(revealMs);
+  }
+
+  UiUpdate _handleMultiCharRunes(KeyPressMsg msg) {
+    Model current = this;
+    Cmd? lastCmd;
+    for (final ch in msg.keyEvent.text.split('')) {
+      final (next, cmd) = current.update(
+        KeyPressMsg(TeaKey(code: KeyCode.rune, text: ch)),
+      );
+      current = next;
+      if (cmd != null) lastCmd = cmd;
+    }
+    return (current, lastCmd);
+  }
+
+  UiUpdate _handleKey(KeyMsg msg) {
+    // Hub overlay: a full-screen modal owns every key while open (before
+    // prompt/menu so the overlay is not shortcut through those zones).
+    if (hub != null) return _handleHubKey(msg);
+
+    // Prompt mode: route keys to the interactive prompt zone.
+    if (prompt != null) return _handlePromptKey(msg);
+
+    // Picker mode: arrows navigate, enter/tab select, esc closes.
+    if (menuOpen && menuModelMode) return _handlePickerKey(msg);
+
+    // Slash/menu mode: arrows navigate, enter/tab accept, esc closes, and
+    // typing keeps editing so `/models` can be typed in full. Path
+    // overlays (@token / !word) are passive — Tab accepts, Enter keeps
+    // submitting (issue #275 review).
+    if (menuOpen) {
+      if (menuTokenStart > 0) {
+        final pathKey = _handlePathMenuKey(msg);
+        if (pathKey != null) return pathKey;
+      } else {
+        return _handleSlashMenuKey(msg);
+      }
+    }
+
+    // Normal input editing.
+    return _handleControlKey(msg) ??
+        _handleJumpLiveKey(msg) ??
+        _handleScrollKey(msg) ??
+        _handleCursorNavKey(msg) ??
+        _handleEditKey(msg);
+  }
+
+  /// Normal-mode control keys (submit/steer/newline/interrupt/abort); null
+  /// when the key belongs to another cluster.
+  UiUpdate? _handleControlKey(KeyMsg msg) {
+    return _handlePasteImageKey(msg) ??
+        _handleSubmitKeys(msg) ??
+        _handleQueueKeys(msg) ??
+        _handleInterruptKeys(msg);
+  }
+
+  /// Normal-mode submit keys (enter/ctrl+s) and the newline-insertion
+  /// fallbacks (ctrl+o/ctrl+j); null when the key belongs to another cluster.
+  UiUpdate? _handleSubmitKeys(KeyMsg msg) {
+    switch (msg.key) {
+      case 'enter':
+        return _handleEnterKey();
+      case 'ctrl+s':
+        if (busy) {
+          // Marks the pending input as a steering row (AC2 badge has a
+          // production producer), then steers the whole queue — the
+          // steered payload is unchanged.
+          final pending = inputText.trim();
+          var model = this;
+          if (pending.isNotEmpty) {
+            final (enqueued, _) = model._enqueue(pending, steer: true);
+            model = enqueued;
+          }
+          return model._steerAll(includePending: false);
+        }
+        // Ctrl+S always submits, regardless of terminal Shift+Enter support.
+        final text = inputText.trim();
+        if (text.isEmpty) return (this, null);
+        return _submit(text);
+      case 'ctrl+o':
+      case 'ctrl+j':
+      case 'shift+enter':
+      case 'alt+enter':
+        // Fallback newline insertion (modifyOtherKeys Shift+Enter is mapped
+        // to Ctrl+O by the input preprocessor on supporting terminals;
+        // kitty-protocol terminals deliver Shift+Enter as a literal
+        // 'shift+enter' keystroke — it used to fall through and die as a
+        // no-op; legacy terminals without kitty/modifyOtherKeys send the
+        // ESC CR encoding, which decodes as 'alt+enter').
+        return _insertNewlineAtCursor();
+      default:
+        return null;
+    }
+  }
+
+  /// ONE implementation of a ctrl+c press for every key path (normal mode
+  /// and the hub overlay — issue #830) lives in fa_tui_interrupt.dart, as
+  /// do the other double-press members.
+
+  /// Queue-row keys while a run streams: ctrl+x deletes the last queued
+  /// row (issue #275 AC2). Idle ctrl+x is NOT handled here — it stays an
+  /// unhandled combo that must never insert its letter.
+  UiUpdate? _handleQueueKeys(KeyMsg msg) {
+    if (msg.key != 'ctrl+x') return null;
+    if (!busy || queue.isEmpty) return (this, null);
+    return (copyWith(queue: queue.sublist(0, queue.length - 1)), null);
+  }
+
+  /// Normal-mode Enter: submit, queue while busy, or Shift+Enter newline.
+  UiUpdate _handleEnterKey() {
+    // Enter submits; Shift+Enter inserts a newline. Terminals that do not
+    // distinguish Shift+Enter in the input stream use the host modifier
+    // check (Core Graphics on macOS, session-gated — issue #355).
+    if (callbacks.isShiftPressed?.call() ?? false) {
+      return _insertNewlineAtCursor();
+    }
+    final line = inputText.trim();
+    // Empty submits are NOT dropped: guided flows (custom provider
+    // setup) use "empty = keep the default" answers, and the host's
+    // line handler ignores stray empties outside a pending prompt.
+    if (busy &&
+        line.isNotEmpty &&
+        !line.startsWith('/') &&
+        !line.startsWith('!')) {
+      // While a run streams, plain messages queue up (kimi-cli); slash
+      // and bang commands execute immediately via the normal path.
+      return _enqueue(line);
+    }
+    return _submit(line);
+  }
+
+  /// Normal-mode history scroll keys; null when the key belongs to another
+  /// cluster.
+  UiUpdate? _handleScrollKey(KeyMsg msg) {
+    return _handleArrowScrollKey(msg) ?? _handlePageScrollKey(msg);
+  }
+
+  /// The ↑ arm of the arrow scroll cluster. Browsing: step to the older
+  /// entry (stop at the oldest). With an empty input ↑ first pops the
+  /// message queue, then browses the submitted-message history, else
+  /// nudges the viewport up one row.
+  UiUpdate _handleArrowScrollUp() {
+    if (historyIndex != -1) {
+      if (historyIndex > 0) {
+        final index = historyIndex - 1;
+        final entry = inputHistory[index];
+        return (
+          copyWith(historyIndex: index, inputText: entry, cursor: entry.length),
+          null,
+        );
+      }
+      return (this, null);
+    }
+    if (inputText.isEmpty) {
+      // With a non-empty queue, ↑ pops the last queued message back into
+      // the input for editing (kimi-cli).
+      if (queue.isNotEmpty) {
+        final popped = queue.last;
+        return (
+          copyWith(
+            queue: queue.sublist(0, queue.length - 1),
+            inputText: popped.text,
+            cursor: popped.text.length,
+          ),
+          null,
+        );
+      }
+      // Then the submitted-message history.
+      if (inputHistory.isNotEmpty) {
+        final index = inputHistory.length - 1;
+        final entry = inputHistory[index];
+        return (
+          copyWith(
+            historyIndex: index,
+            historyDraft: '',
+            inputText: entry,
+            cursor: entry.length,
+          ),
+          null,
+        );
+      }
+      return (_scrolledTo(scrollOffset - 1), null);
+    }
+    return (this, null);
+  }
+
+  /// Normal-mode arrow scroll keys (↑/↓); null when the key belongs to
+  /// another cluster. With an empty input ↑ first pops the message queue,
+  /// then browses the submitted-message history; ↓ walks it back.
+  /// Viewport scrolling lives on PgUp/PgDn (and the wheel when captured).
+  UiUpdate? _handleArrowScrollKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'up':
+        return _handleArrowScrollUp();
+      case 'down':
+        // Browsing: step to the newer entry; past the newest restores the
+        // (empty) draft.
+        if (historyIndex != -1) {
+          if (historyIndex < inputHistory.length - 1) {
+            final index = historyIndex + 1;
+            final entry = inputHistory[index];
+            return (
+              copyWith(
+                historyIndex: index,
+                inputText: entry,
+                cursor: entry.length,
+              ),
+              null,
+            );
+          }
+          final draft = historyDraft ?? '';
+          return (
+            copyWith(
+              historyIndex: -1,
+              historyDraft: null,
+              inputText: draft,
+              cursor: draft.length,
+            ),
+            null,
+          );
+        }
+        if (inputText.isEmpty) {
+          return (_scrolledTo(scrollOffset + 1), null);
+        }
+        return (this, null);
+      default:
+        return null;
+    }
+  }
+
+  /// Normal-mode page scroll keys (pgup/pgdown); null when the key belongs
+  /// to another cluster. gh-1439: PgUp parks beyond the near-bottom band
+  /// (disengages); PgDn re-engages when it lands inside the band (past
+  /// the newest content).
+  UiUpdate? _handlePageScrollKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'pgup':
+        return (
+          _scrolledTo(scrollOffset - _viewportHeight, pageGesture: true),
+          null,
+        );
+      case 'pgdown':
+        return (
+          _scrolledTo(scrollOffset + _viewportHeight, pageGesture: true),
+          null,
+        );
+      default:
+        return null;
+    }
+  }
+
+  /// gh-1439 re-engage key: End jumps to live when the composer is empty
+  /// (one action, count flushed). With composer text End stays the caret
+  /// key — the cluster below owns it.
+  UiUpdate? _handleJumpLiveKey(KeyMsg msg) {
+    if (msg.key != 'end' || inputText.isNotEmpty) return null;
+    return (_jumpToLive(), null);
+  }
+
+  /// Normal-mode cursor motion keys; null when the key belongs to another
+  /// cluster.
+  UiUpdate? _handleCursorNavKey(KeyMsg msg) {
+    final result =
+        _handleLeftRightKey(msg) ??
+        _handleWordNavKey(msg) ??
+        _handleHomeEndKey(msg);
+    if (result == null) return null;
+    // The completion token is cursor-anchored: motion re-evaluates the
+    // overlay (issue #275) — moving off a token closes it, moving onto
+    // one opens it.
+    final (navModel, navCmd) = result;
+    return (_updateMenuForInput(navModel as FaTuiModel), navCmd);
+  }
+
+  /// Normal-mode left/right arrow keys; null when the key belongs to
+  /// another cluster.
+  UiUpdate? _handleLeftRightKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'left':
+        return (copyWith(cursor: cursor > 0 ? cursor - 1 : 0), null);
+      case 'right':
+        return (
+          copyWith(cursor: cursor < inputText.length ? cursor + 1 : cursor),
+          null,
+        );
+      default:
+        return null;
+    }
+  }
+
+  /// Normal-mode word-motion keys; null when the key belongs to another
+  /// cluster. Word motion like pi's editor: alt+left/right jump by words.
+  UiUpdate? _handleWordNavKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'alt+left':
+        return (copyWith(cursor: _wordStartBefore(inputText, cursor)), null);
+      case 'alt+right':
+        return (copyWith(cursor: _wordEndAfter(inputText, cursor)), null);
+      default:
+        return null;
+    }
+  }
+
+  /// Normal-mode home/end keys; null when the key belongs to another
+  /// cluster.
+  UiUpdate? _handleHomeEndKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'home':
+      case 'ctrl+a': // readline — also what macOS Cmd+Left sends (^A)
+        return (copyWith(cursor: 0), null);
+      case 'end':
+      case 'ctrl+e': // readline — macOS Cmd+Right (^E)
+        return (copyWith(cursor: inputText.length), null);
+      default:
+        return null;
+    }
+  }
+
+  /// Normal-mode text-editing keys (deletion and character insert); catches
+  /// every key the other clusters did not claim.
+  UiUpdate _handleEditKey(KeyMsg msg) {
+    final result =
+        _handleBackspaceKey(msg) ??
+        _handleKillKey(msg) ??
+        _handleReadlineKey(msg) ??
+        _handleDeleteKey(msg) ??
+        _handleCharInsertKey(msg);
+    // Any real edit exits history browsing (the recalled entry becomes the
+    // new draft).
+    if (historyIndex == -1) return result;
+    final (model, cmd) = result;
+    return (
+      (model as FaTuiModel).copyWith(historyIndex: -1, historyDraft: null),
+      cmd,
+    );
+  }
+
+  /// Normal-mode backspace; null when the key belongs to another cluster.
+  UiUpdate? _handleBackspaceKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'backspace':
+        if (cursor == 0 || inputText.isEmpty) return (this, null);
+        return (
+          _updateMenuForInput(copyWith(editor: editor.backspace())),
+          null,
+        );
+      default:
+        return null;
+    }
+  }
+
+  /// Normal-mode kill keys on the editor's kill-ring (issue #275): ctrl+u
+  /// kills back to the line start, ctrl+w the word before the cursor.
+  /// Null when the key belongs to another cluster.
+  UiUpdate? _handleKillKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'ctrl+u':
+        // Kill from the cursor back to the start of the line (readline's
+        // unix-line-discard — also what most terminals send for Cmd+Backspace).
+        if (cursor == 0) return (this, null);
+        return (
+          _updateMenuForInput(copyWith(editor: editor.killToLineStart())),
+          null,
+        );
+      case 'ctrl+w':
+        if (cursor == 0) return (this, null);
+        return (
+          _updateMenuForInput(copyWith(editor: editor.killWordBefore())),
+          null,
+        );
+      default:
+        return null;
+    }
+  }
+
+  /// Readline single-key editing beyond kills (issue #275): ctrl+k kill to
+  /// line end, ctrl+y yank (consecutive ctrl+y walks the ring older),
+  /// ctrl+t transpose, ctrl+z grouped undo. Null when unclaimed.
+  UiUpdate? _handleReadlineKey(KeyMsg msg) {
+    final TuiLineEditor edited;
+    switch (msg.key) {
+      case 'ctrl+k':
+        if (cursor >= inputText.length) return (this, null);
+        edited = editor.killToLineEnd();
+      case 'ctrl+y':
+        if (!editor.canYank) return (this, null);
+        edited = editor.lastActionWasYank ? editor.yankOlder() : editor.yank();
+      case 'ctrl+t':
+        edited = editor.transpose();
+        if (identical(edited, editor)) return (this, null);
+      case 'ctrl+z':
+        if (!editor.canUndo) return (this, null);
+        edited = editor.undo();
+      default:
+        return null;
+    }
+    return (_updateMenuForInput(copyWith(editor: edited)), null);
+  }
+
+  /// Normal-mode forward delete; null when the key belongs to another
+  /// cluster.
+  UiUpdate? _handleDeleteKey(KeyMsg msg) {
+    switch (msg.key) {
+      case 'delete':
+        if (cursor >= inputText.length) return (this, null);
+        return (
+          _updateMenuForInput(copyWith(editor: editor.deleteForward())),
+          null,
+        );
+      default:
+        return null;
+    }
+  }
+
+  /// Whether [keystroke] carries a command modifier (ctrl/alt/meta/hyper/
+  /// super). The dart_tui decoder puts the BASE LETTER into `text` for
+  /// control bytes (0x01 → ctrl+a with text 'a'), so a catch-all insert
+  /// that trusts `text` prints the letter of every unhandled combo —
+  /// macOS Cmd+Left (sends ^A) typed "aaaa" in the composer. Shift is
+  /// deliberately NOT blocked: shifted letters arrive as plain runes in
+  /// legacy mode and as `shift+<key>` with text under the kitty protocol.
+  static bool _isCommandKeystroke(String keystroke) {
+    return keystroke.startsWith('ctrl+') ||
+        keystroke.startsWith('alt+') ||
+        keystroke.startsWith('meta+') ||
+        keystroke.startsWith('hyper+') ||
+        keystroke.startsWith('super+');
+  }
+
+  /// Normal-mode character insert: the editing cluster's catch-all for
+  /// single-character keys.
+  UiUpdate _handleCharInsertKey(KeyMsg msg) {
+    if (_isCommandKeystroke(msg.key)) return (this, null);
+    final text = msg.keyEvent.text;
+    if (text.isNotEmpty && text.length == 1) {
+      return (_updateMenuForInput(copyWith(editor: editor.insert(text))), null);
+    }
+    return (this, null);
+  }
+
+  /// Prompt-mode key routing: forwards the key to [handleTuiPromptKey] and
+  /// resolves the host completer when it produces an answer (closing the
+  /// prompt zone and handing control back to normal input).
+  UiUpdate _handlePromptKey(KeyMsg msg) {
+    // Ctrl+V inside a prompt sheet (provider key, secret, ask): the sheet owns
+    // typed input, so the terminal's paste gesture never reaches the composer's
+    // bracketed-paste path — and this key used to be a silent no-op, which read
+    // as "the token cannot be pasted here". Read the clipboard's TEXT and feed
+    // the sheet the same PromptPaste a terminal paste produces (masked in a
+    // secret field, CRLF-normalised). Without a wired reader the old no-op is
+    // preserved, so web/headless hosts keep behaving exactly as before.
+    if (msg.key == 'ctrl+v') {
+      final reader = callbacks.readClipboardText;
+      if (reader == null || prompt == null) return (this, null);
+      // The terminal's bracketed paste of this same gesture already landed (or
+      // the clipboard read is still in flight): one gesture, one insertion.
+      if (_pasteboardProbeInFlight()) return (this, null);
+      final armed = copyWith();
+      final gestureMs = nowFn().millisecondsSinceEpoch;
+      armed._pasteboardProbeFiredAtMs = gestureMs;
+      return (
+        armed,
+        () async => PromptClipboardTextMsg(await reader(), gestureMs),
+      );
+    }
+    final key = _promptKeyFromMsg(msg);
+    if (key == null) return (this, null);
+    final (state: next, resolved: answer) = handleTuiPromptKey(prompt!, key);
+    if (answer != null) {
+      _promptCompleter?.complete(answer);
+      _promptCompleter = null;
+      return (copyWith(clearPrompt: true), null);
+    }
+    return (copyWith(prompt: next), null);
+  }
+
+  /// Re-shapes a dart_tui [KeyMsg] into a transport-neutral [PromptKey] for
+  /// the pure-Dart prompt handler.
+  PromptKey? _promptKeyFromMsg(KeyMsg msg) {
+    return switch (msg.key) {
+      // dart_tui maps CR to 'enter' and LF to 'ctrl+j' — both mean Enter.
+      // A kitty-protocol Shift+Enter arrives as 'shift+enter' and still
+      // means confirm inside a prompt. ctrl+c is NOT mapped here: it stays
+      // the global interrupt/quit key.
+      'enter' ||
+      'ctrl+j' ||
+      'shift+enter' ||
+      'alt+enter' => const PromptEnter(),
+      'ctrl+r' => const PromptCtrlR(),
+      'ctrl+u' => const PromptCtrlU(),
+      'esc' => const PromptEscape(),
+      'tab' => const PromptTab(),
+      'backspace' => const PromptBackspace(),
+      _ => _promptNavKey(msg) ?? _promptChar(msg),
+    };
+  }
+
+  /// The arrow-key subset of the prompt keys.
+  PromptKey? _promptNavKey(KeyMsg msg) => switch (msg.key) {
+    'up' => const PromptArrowUp(),
+    'down' => const PromptArrowDown(),
+    'left' => const PromptArrowLeft(),
+    'right' => const PromptArrowRight(),
+    _ => null,
+  };
+
+  /// A printable character keystroke, unless it is a command chord.
+  PromptKey? _promptChar(KeyMsg msg) =>
+      !_isCommandKeystroke(msg.key) && msg.keyEvent.text.length == 1
+      ? PromptChar(msg.keyEvent.text)
+      : null;
+
+  static bool _isWordBreak(String ch) => ch == ' ' || ch == '\n' || ch == '\t';
+
+  FaTuiUpdate _insertNewlineAtCursor() {
+    return (copyWith(editor: editor.insert('\n')), null);
+  }
+
+  /// The user-message echo: a dim full-width rule above backgrounded input
+  /// lines (background stored UNPADDED — the view-time formatter pads it to
+  /// the then-current width, and the bg escape marks the lines as pre-styled
+  /// so the markdown formatter leaves them alone). Two blank lines follow:
+  /// the first is consumed by the run's first output line (thinking or the
+  /// `>_Fa` prefix), leaving one visible empty line after the user message.
+  ///
+  /// Chrome mode (issue #807) drops the rule — the omp bubble band IS the
+  /// turn separator — and wraps the input in [tuiUserBubble] (blank band
+  /// rows above/below, one leading space per row). The pre-styled contract
+  /// is shared: rows carry the bg SGR marker and the view re-pads/repaints.
+  OutputAppend _echoAppend(List<String> lines, String text) {
+    if (tuiChromeEnabled) {
+      final (appended, cut) = _appendOutput(
+        lines,
+        tuiUserBubble(text.split('\n')).join('\n'),
+        true,
+      );
+      final (rest, tailCut) = _appendOutput(appended, '', true);
+      return (rest, cut + tailCut);
+    }
+    final rule = _dim('─' * termWidth);
+    final styledInput = text.split('\n').map(tuiUserMessageLine).join('\n');
+    final (appended, cut) = _appendOutput(lines, '$rule\n$styledInput', true);
+    final (rest, tailCut) = _appendOutput(appended, '', true);
+    return (rest, cut + tailCut);
+  }
+
+  /// Appends [text] as a service line (dim hint/error) and keeps the
+  /// pinned-echo index accurate across a head-trim the append may fire
+  /// (issue #827).
+  FaTuiModel _appendServiceLine(String text) {
+    final (lines, cut) = _appendOutput(outputLines, text, true);
+    return copyWith(
+      outputLines: lines,
+      bootAnchorLine: _bootAnchorShiftedBy(cut),
+      stickyIndex: _stickyShiftedBy(cut),
+    );
+  }
+
+  /// Submits [text]: echoes the input into the history immediately (no rule
+  /// below — the run's thinking/answer flows directly under the user
+  /// message), clears the input, snaps the viewport to the bottom, and runs
+  /// the host callback.
+  FaTuiUpdate _submit(String text) {
+    // The TUI-side /mouse toggle executes locally (never reaches the host,
+    // never echoes into history) — including while a run streams, since
+    // slash commands bypass the busy queue.
+    final mouseCommand = _handleMouseCommand(text);
+    if (mouseCommand != null) return mouseCommand;
+    // Slash/bang commands execute instantly and never consume clipboard
+    // chips — they persist for the next real message (E2).
+    final keepAttachments = text.startsWith('/') || text.startsWith('!');
+    final images = keepAttachments
+        ? const <TuiImageAttachment>[]
+        : List<TuiImageAttachment>.of(attachments);
+    // Empty submits (guided-flow "keep the default" answers) skip the
+    // message echo — an empty backgrounded block would read as a glitch.
+    if (inputText.isEmpty) {
+      return (
+        copyWith(
+          inputText: '',
+          cursor: 0,
+          menuOpen: false,
+          menuTokenStart: -1,
+          attachments: keepAttachments ? null : const [],
+        ),
+        _submitCmd(text, images),
+      );
+    }
+    final (echoed, echoCut) = _echoAppend(outputLines, inputText);
+    // Shell-style input history: plain messages only (no slash/bang
+    // commands), consecutive duplicates collapsed, capped at 100.
+    final history = _recordInputHistory(inputHistory, text);
+    final (sticky, stickyEchoLineCount) = _pinnedEcho(inputText);
+    final cleared = copyWith(
+      inputText: '',
+      cursor: 0,
+      inputHistory: history,
+      historyIndex: -1,
+      historyDraft: null,
+      outputLines: echoed,
+      menuOpen: false,
+      menuTokenStart: -1,
+      stickyLines: sticky,
+      // The echo lands at the old length minus the cut the append may
+      // have fired — the sticky math shares the exact same index.
+      stickyIndex: outputLines.length - echoCut,
+      stickyEchoLineCount: stickyEchoLineCount,
+      // A live submit dissolves the boot anchor: the window returns to
+      // the live edge (issue #1348).
+      bootAnchorLine: 0,
+      attachments: keepAttachments ? null : const [],
+    );
+    return (
+      // A fresh submit always jumps to the bottom AND re-attaches follow:
+      // without it, a latch detached by an earlier scroll-up froze the
+      // stream off-screen (and the sticky echo never activated). #1348:
+      // the landing spot is the live edge — the echo sits at the BOTTOM
+      // above the composer, prior history directly above it.
+      cleared.copyWith(
+        scrollOffset: cleared._followAnchor(cleared._wrappedLines()),
+        follow: const FollowMode.live(),
+        heldAnchorLine: -1,
+      ),
+      _submitCmd(text, images),
+    );
+  }
+
+  /// The host-submit command both submit shapes end with.
+  Cmd _submitCmd(String text, List<TuiImageAttachment> images) => () async {
+    await callbacks.onSubmit(text, images: images);
+    return null;
+  };
+
+  /// The pinned echo for long answers (Copilot-style) and its echo-line
+  /// count: the first input line, truncated to the width with an ellipsis
+  /// marking any remainder — a multi-line message or one simply longer
+  /// than a row (a bare long line previously got visually cut without any
+  /// marker). The ellipsis is stored PLAIN: the sticky formatter paints it
+  /// with the current theme at emit time; a baked dim SGR would freeze the
+  /// old palette after a mid-session /theme switch (issue #279 E1).
+  /// Chrome mode pins the bubble's leading band rows (issue #807); the
+  /// echo grows by the second band row. Pinned rows are pre-styled bubble
+  /// rows, so the sticky painter re-themes them like any echo line.
+  OutputAppend _pinnedEcho(String text) {
+    final firstLine = text.split('\n').first;
+    // Cell-width math (issue #859 family): UTF-16 length both mis-measures
+    // wide glyphs and can split a surrogate pair mid-echo.
+    final budget = termWidth - 3;
+    final fits = tuiTextWidth(firstLine) <= budget || termWidth <= 3;
+    final shown = fits ? firstLine : tuiFitWidth(firstLine, budget);
+    final more = text.contains('\n') || !fits ? ' …' : '';
+    final sticky = tuiChromeEnabled
+        ? [tuiUserMessageLine(''), tuiUserMessageLine(' $shown$more')]
+        : [_dim('─' * termWidth), '${tuiUserMessageLine(shown)}$more'];
+    return (sticky, (tuiChromeEnabled ? 3 : 2) + text.split('\n').length);
+  }
+
+  /// The input history after recording [text]: plain messages only (no
+  /// slash/bang commands), consecutive duplicates collapsed, capped at 100.
+  /// Extracted from [_submit] to keep its CRAP in budget.
+  static List<String> _recordInputHistory(List<String> history, String text) {
+    final recordable =
+        text.isNotEmpty && !text.startsWith('/') && !text.startsWith('!');
+    if (!recordable || (history.isNotEmpty && history.last == text)) {
+      return history;
+    }
+    final next = [...history, text];
+    return next.length > 100 ? next.sublist(next.length - 100) : next;
+  }
+
+  /// Busy-mode Enter: queues the message (kimi-cli semantics — it is run as
+  /// a separate turn after the current one settles). Slash/bang commands go
+  /// through the normal submit path since they execute instantly.
+  /// [steer] marks the row as a steering interrupt (ctrl+s later flushes
+  /// the whole queue through the steering path); it renders badged.
+  FaTuiUpdate _enqueue(String text, {bool steer = false}) {
+    return (
+      copyWith(
+        inputText: '',
+        cursor: 0,
+        menuOpen: false,
+        menuTokenStart: -1,
+        queue: [
+          ...queue,
+          QueuedMessage(text, steer: steer),
+        ],
+      ),
+      null,
+    );
+  }
+
+  /// Busy-mode Ctrl+S: steers the queue into the running agent (each
+  /// message becomes a separate user turn), echoing them into the history
+  /// first. Steering rows go before follow-ups.
+  FaTuiUpdate _steerAll({bool includePending = true}) {
+    final messages = [
+      if (includePending && inputText.trim().isNotEmpty) inputText.trim(),
+      // Steering rows interrupt first; follow-ups keep queue order.
+      ...[for (final m in queue.where((m) => m.steer)) m.text],
+      ...[for (final m in queue.where((m) => !m.steer)) m.text],
+    ];
+    if (messages.isEmpty) return (this, null);
+    var lines = outputLines;
+    var echoCut = 0;
+    for (final message in messages) {
+      final (appended, cut) = _echoAppend(lines, message);
+      lines = appended;
+      echoCut += cut;
+    }
+    // A visible receipt: an echoed-but-unanswered message otherwise reads
+    // as "sent into the void" while the turn runs (or wedges on a dead
+    // endpoint).
+    final (receipted, receiptCut) = _appendOutput(
+      lines,
+      _dim('⤷ steered into the running turn — esc aborts'),
+      true,
+    );
+    lines = receipted;
+    echoCut += receiptCut;
+    // Steered messages are sent for real — they join the input history.
+    var history = inputHistory;
+    for (final message in messages) {
+      if (message.startsWith('/') || message.startsWith('!')) continue;
+      if (history.isEmpty || history.last != message) {
+        history = [...history, message];
+      }
+    }
+    if (history.length > 100) {
+      history = history.sublist(history.length - 100);
+    }
+    final cleared = copyWith(
+      inputText: '',
+      cursor: 0,
+      queue: const [],
+      inputHistory: history,
+      historyIndex: -1,
+      historyDraft: null,
+      outputLines: lines,
+      // Echo/receipt-time head trims shift every anchored index
+      // (#827 review): a boot anchor trimmed mid-region would re-qualify
+      // for the boot park at a foreign row; the running turn's sticky pin
+      // drifts the same way.
+      stickyIndex: _stickyShiftedBy(echoCut),
+      bootAnchorLine: _bootAnchorShiftedBy(echoCut),
+    );
+    return (
+      cleared.copyWith(
+        scrollOffset: cleared._followAnchor(cleared._wrappedLines()),
+        follow: const FollowMode.live(),
+        heldAnchorLine: -1,
+      ),
+      () async {
+        await callbacks.onSteer?.call(messages);
+        return null;
+      },
+    );
+  }
+
+  int _wordStartBefore(String text, int pos) {
+    var i = pos;
+    while (i > 0 && _isWordBreak(text[i - 1])) {
+      i--;
+    }
+    while (i > 0 && !_isWordBreak(text[i - 1])) {
+      i--;
+    }
+    return i;
+  }
+
+  int _wordEndAfter(String text, int pos) {
+    var i = pos;
+    while (i < text.length && _isWordBreak(text[i])) {
+      i++;
+    }
+    while (i < text.length && !_isWordBreak(text[i])) {
+      i++;
+    }
+    return i;
+  }
+
+  FaTuiModel _updateMenuForInput(FaTuiModel model) =>
+      updateMenuForInput(model, callbacks);
+
+  @override
+  View view() {
+    // Hub overlay: a full-screen modal frame replaces the whole view.
+    if (hub != null) {
+      return View(
+        content: renderHubFrame(
+          hub!,
+          width: termWidth,
+          height: _viewportHeight,
+          // Press 1 under the overlay (issue #830 review): the composer's
+          // status row is covered, so the armed hint takes the hub's own
+          // footer hint row until the window expires or input resets it.
+          footerHint: ctrlCArmed ? kCtrlCExitHint : null,
+        ),
+        cursor: null,
+        mouseMode: _viewMouseMode,
+      );
+    }
+    final b = StringBuffer();
+    final plan = _framePlanFor(termWidth, termHeight);
+    final height = plan.history;
+    // Every frame rebuilds the hit-region registry from the current
+    // layout — a resize re-derives every rect before the next click can
+    // land (issue #278, E2).
+    _hitRegions.clear();
+    final stickyRows = _writeStickyEcho(b, plan.sticky);
+
+    // Output history, padded to a fixed height. Markdown is formatted and
+    // ANSI-safely wrapped to physical rows (SGR-only output, escapes never
+    // cut at wrap points) so streamed text gains styling as closing markers
+    // arrive; the pass is memoized in the shared wrap cache, so a frame
+    // triggered by scrolling reuses the rows computed on the last change.
+    final wrapped = _wrappedLines();
+    // A following tail rides the CURRENT bottom (issue #496): when the
+    // frame squeezes, the viewport shrinks without any history append —
+    // only re-clamping here keeps the live edge (the sent echo) on screen
+    // instead of stranding the window at a stale offset. Issue #1348: the
+    // ride IS the live edge — the window pins to the bottom, so a fresh
+    // prompt lands above the composer with prior history above it.
+    final offset = followTail
+        ? _followOffset(wrapped)
+        : _clampScroll(scrollOffset, wrapped);
+    final historyRows = _writeHistoryRows(b, height, wrapped, offset);
+    _writeScrollIndicator(b, wrapped, offset);
+    _hitRegions.add(
+      TuiHitRegion(
+        x: 0,
+        y: stickyRows,
+        w: termWidth,
+        h: historyRows + 1,
+        kind: TuiRegionKind.scrollback,
+      ),
+    );
+    // The held-mode jump chip (gh-1439) — registered AFTER the scrollback
+    // rect so the chip wins the overlap.
+    _registerJumpLiveRegion(stickyRows, historyRows);
+
+    // Menu above input.
+    var row = stickyRows + historyRows + 1;
+    row += _writeMenu(b, row);
+
+    row += _writeBusyAndQueue(b, row, plan);
+
+    // Prompt mode: the prompt zone replaces the entire input zone below it,
+    // including the status line. The physical cursor stays HIDDEN the whole
+    // time: text inputs render their own inline reverse-video caret
+    // (_cursorInputRow), pickers and approvals need no caret at all — the
+    // old "home to the bottom of the frame" behavior left a stray bar
+    // sitting on the status line while the dialog had focus.
+    if (prompt != null) return _promptModeView(b);
+
+    // Band composer (#806): the status line attaches as the composer's
+    // TOP band (omp band.ts `statusAttachment: "top-band"`) and the
+    // legacy bottom rule + dim status footer retire. Prompt mode keeps
+    // the legacy layout — the prompt zone replaces the composer, and its
+    // status footer is not composer chrome.
+    final bandFrame = _bandAttached && prompt == null;
+    int cursorInputLine;
+    int cursorScreenCol;
+    if (bandFrame) {
+      row += _writeStatusBand(b);
+      (cursorInputLine, cursorScreenCol) = _writeInputLines(b, row, plan);
+    } else {
+      (cursorInputLine, cursorScreenCol) = _writeInputLines(b, row, plan);
+      b.writeln(_dim('─' * termWidth));
+      // The status line stays plain; the busy indicator lives above the input.
+      b.write(_statusRow());
+    }
+
+    // One snapshot serves both consumers: newline counting for the cursor
+    // row math (O(n) scan, ZERO allocations — the old split('\n') built a
+    // List<String> of every physical row on every frame just to take its
+    // length) and the frame body itself.
+    final body = _cropToGlass(b.toString());
+    // The first input row's screen row. Legacy: the tail is rule + input
+    // + bottom rule + status (the last row unterminated), so two painted
+    // rows sit below the input block. Band: the band sits ABOVE the
+    // input and the input's last row ends the frame unterminated — the
+    // first input row is the LAST `plan.input` rows of the body, nothing
+    // paints between band and input (the off-by-one homed the caret one
+    // row BELOW its text).
+    final inputStartRow = bandFrame
+        ? _lineCount(body) - plan.input
+        : _lineCount(body) - 2 - plan.input;
+    final cursorRow = inputStartRow + cursorInputLine;
+    // Band mode: the caret aligns with the text AFTER the gutter's cells
+    // (zero when the terminal is too narrow to afford the gutter).
+    final cursorX = bandFrame
+        ? cursorScreenCol + _activeGutterWidth
+        : cursorScreenCol;
+    // Pickers (models, sessions, mode, approval, provider, settings, wizard
+    // steps) never show the physical cursor: generic pickers ignore typing
+    // entirely, and the models picker's type-to-filter echoes into the
+    // picker title ([Select model: …]), not the input line — a caret in the
+    // empty input zone would blink nowhere near the text it "edits". The
+    // slash menu DOES edit the input line, so it keeps the cursor.
+    final pickerOpen = menuOpen && menuModelMode;
+    // The caret stays visible in the input zone while a run streams:
+    // typing mid-stream is first-class. Visibility itself is ONE rule —
+    // the View's cursor field: null hides the physical cursor via the
+    // program's DECTCEM (?25l), non-null shows it and the renderer re-homes
+    // it after every painting frame (forceHome on any written row/cell).
+    // The old escape-smuggled-in-content scheme never reached the wire:
+    // the cell renderer parses content into an SGR-only grid and dropped
+    // the DECTCEM, leaving the caret stranded on the last painted cell of
+    // every picker frame (#510).
+    return View(
+      content: body,
+      cursor: pickerOpen
+          ? null
+          : Cursor(x: cursorX, y: cursorRow, shape: CursorShape.bar),
+      mouseMode: _viewMouseMode,
+    );
+  }
+
+  /// The mouse mode every rendered [View] carries (mouse capture on =
+  /// cell-motion tracking for the wheel/click routing).
+  MouseMode get _viewMouseMode =>
+      mouseCapture ? MouseMode.cellMotion : MouseMode.none;
+
+  /// Prompt-mode frame tail: the prompt zone replaces the input zone and
+  /// the status row owns the bottom; no physical cursor anywhere.
+  View _promptModeView(StringBuffer b) {
+    for (final line in renderTuiPrompt(prompt!, termWidth)) {
+      b.writeln(line);
+    }
+    b.writeln(); // spacer
+    b.write(_statusRow());
+    return View(
+      content: _cropToGlass(b.toString()),
+      cursor: null,
+      mouseMode: _viewMouseMode,
+    );
+  }
+
+  /// Hard glass guard (#503): whatever the sections miscounted, the frame
+  /// must NEVER exceed the terminal — in a shorter terminal the rows past
+  /// the bottom clamp onto the last row and overwrite the status with
+  /// blanks (owner: status gone at 100x10). Drops the overflow from the
+  /// TOP (oldest history/padding — the most dispensable rows) so the
+  /// bottom chrome always lands on the glass. Frame rows are complete
+  /// self-contained lines by construction, so dropping leading lines is
+  /// ANSI-safe. Caveat: hit-regions shift by the dropped count on this
+  /// rare path; the next frame re-derives them.
+  String _cropToGlass(String body) {
+    final paintedRows = _lineCount(body);
+    if (paintedRows <= termHeight || termHeight <= 0) return body;
+    var idx = 0;
+    for (var d = paintedRows - termHeight; d > 0; d--) {
+      final nl = body.indexOf('\n', idx);
+      if (nl < 0) break;
+      idx = nl + 1;
+    }
+    return body.substring(idx);
+  }
+
+  /// The menu title row: '[Commands]' for the slash menu, otherwise the
+  /// picker title with the active filter.
+  String _menuTitle() {
+    if (!menuModelMode) return '[Commands]';
+    final title = pickerId == 'models' ? 'Select model' : pickerTitle;
+    return modelFilter.isNotEmpty ? '[$title: $modelFilter]' : '[$title]';
+  }
+
+  /// The slash/model/picker menu block above the input zone. A picker whose
+  /// filter matched nothing keeps its title row plus a dim '(no matches)'
+  /// hint — vanishing entirely would hide the query being edited.
+  int _writeMenu(StringBuffer b, int baseRow) {
+    if (!menuOpen) return 0;
+    if (menuItems.isEmpty) {
+      if (menuModelMode) {
+        b.writeln(_accent2(_menuTitle()));
+        b.writeln(_dim('  (no matches)'));
+        return 2;
+      }
+      return 0;
+    }
+    b.writeln(_accent2(_menuTitle()));
+    return 1 + _writeMenuItems(b, baseRow + 1);
+  }
+
+  /// Matches a code-fence opener/closer line exactly like the view-time
+  /// markdown walk (ansi_markdown.dart `_fenceRe`): parity over the
+  /// retained history must agree with what the renderer will compute.
+  static final RegExp _fenceLineStart = RegExp(r'^\s*```');
+
+  /// Appends [text] (split on `\n`; the first part merges into the last
+  /// line) to [lines], and returns `(result, headCut)` — [headCut] is the
+  /// number of lines every stored transcript index must shift by after
+  /// the bounded-history trim dropped lines from the head (one less when
+  /// the synthetic fence-repair line was prepended, since it occupies the
+  /// first retained slot), 0 when no trim fired. Every append path must
+  /// shift the anchored indices by it — the pinned sticky echo and the
+  /// boot anchor today (issue #827 review; #1348 retired the turn start).
+  static OutputAppend _appendOutput(
+    List<String> lines,
+    String text,
+    bool newline,
+  ) {
+    if (text.isEmpty && !newline) return (lines, 0);
+    final result = List.of(lines);
+    final parts = text.split('\n');
+    if (result.isEmpty) result.add('');
+    result[result.length - 1] += parts.first;
+    for (var i = 1; i < parts.length; i++) {
+      result.add(parts[i]);
+    }
+    if (newline) result.add('');
+    // A streamed paragraph with no trailing newline grows the last line
+    // without bound: minutes-long thinking bursts produced HUNDRED-KB
+    // lines, and TranscriptMarkdown's (throttled) tail passes re-format +
+    // re-wrap the WHOLE line each pass — the event loop stalled in bursts
+    // and typing froze. Cap the tail: hard-split an oversized last line
+    // into bounded chunks. Soft wrap renders them identically (the text
+    // continues at the same cell); only an inline span crossing the rare
+    // split point loses its styling into the next chunk.
+    const maxTailLineChars = 32 * 1024;
+    const tailChunkChars = 16 * 1024;
+    if (result.last.length > maxTailLineChars) {
+      final tail = result.last;
+      result
+        ..removeLast()
+        ..addAll([
+          for (var i = 0; i < tail.length; i += tailChunkChars)
+            tail.substring(i, (i + tailChunkChars).clamp(0, tail.length)),
+        ]);
+    }
+    return _trimHistoryHead(result);
+  }
+
+  /// Keep the history bounded — but AMORTIZED. Trimming back to exactly
+  /// maxLines on EVERY append drops the oldest line each flush, and a
+  /// changed first line breaks TranscriptMarkdown's boundary identity, so
+  /// once an answer crossed the cap every 50 ms streaming flush paid a
+  /// full O(history) formatAll+wrap pass (~27 ms at 2000 lines — over half
+  /// the flush budget): constant scroll/typing jank for long answers. A
+  /// slack window lets ordinary appends stay on the incremental path; one
+  /// batch rebuild per [trimSlack] dropped lines is imperceptible.
+  static OutputAppend _trimHistoryHead(List<String> result) {
+    const maxLines = 2000;
+    const trimSlack = 400;
+    if (result.length <= maxLines + trimSlack) return (result, 0);
+    // A cut landing inside a fenced code block leaves the retained
+    // history with an open fence: the block's closing ``` then toggles
+    // the walk OPEN and every markdown line after it renders verbatim
+    // (raw **/### walls after a long stream). Count fence lines in the
+    // DROPPED head — the state the rebuilt walk starts in — and prepend
+    // a synthetic closing fence when it is open. The same trick
+    // tui_replay.dart uses for truncated replays.
+    final cut = result.length - maxLines;
+    var open = false;
+    for (var i = 0; i < cut; i++) {
+      if (_fenceLineStart.hasMatch(result[i])) open = !open;
+    }
+    final trimmed = result.sublist(cut);
+    if (open) trimmed.insert(0, '```');
+    // The synthetic fence line occupies index 0, so every RETAINED line
+    // sits one slot lower than after a plain cut — the head shift for
+    // stored transcript indices is cut - 1 when the repair fires.
+    return (trimmed, open ? cut - 1 : cut);
+  }
+}
+
+/// Thin wrapper around [Program] that lets [AgentCli] push output and refresh
+/// the model picker without knowing dart_tui internals.
+/// Reference-counted busy accounting for the TUI spinner: nested
+/// acquire/release pairs (a submit bracket around the run's own bracket,
+/// slash commands mid-stream) collapse into ONE 0→1 / 1→0 edge for the
+/// model, so the elapsed timer and sticky echo survive re-entry, and an
+/// unpaired release clamps at zero instead of poisoning the count.
+/// One soft-wrapped composer row with the buffer offset (UTF-16 code units
+/// into the SOURCE line) where it starts — the cursor maps back through
+/// these offsets, so a resize re-wraps while the cursor stays on the same
+/// buffer position (issue #467 E3).
+final class WrappedComposerRow {
+  const WrappedComposerRow(this.text, this.startUnit);
+
+  /// The visible row (break-point spaces at its end dropped).
+  final String text;
+
+  /// Code units into the source logical line where this row begins.
+  final int startUnit;
+}
+
+/// Soft-wraps one logical composer line to [width]-terminal-cell rows
+/// (issue #467): word-boundary preferred, a word wider than the viewport
+/// hard-breaks (E1, no wrap-point loop), grapheme clusters never split
+/// across rows (E2 — the renderer measures cells, not code units, and a
+/// row overflowing its width makes the terminal hardware-wrap and desync
+/// the frame). Break-point space runs are dropped only where a row breaks;
+/// interior runs render verbatim. Always returns at least one row.
+List<WrappedComposerRow> wrapComposerRows(String line, int width) =>
+    _ComposerWrap(width < 1 ? 1 : width).run(line);
+
+/// Plain-row view of [wrapComposerRows].
+List<String> wrapComposerLine(String line, int width) => [
+  for (final row in wrapComposerRows(line, width)) row.text,
+];
+
+/// The greedy-wrap state machine behind [wrapComposerRows]. One mutable
+/// walker per line; kept as a class so every method stays inside the CRAP
+/// gate and the wrap rules read one per method.
+final class _ComposerWrap {
+  _ComposerWrap(this.width);
+
+  /// Row capacity in terminal cells.
+  final int width;
+
+  final rows = <WrappedComposerRow>[];
+  final _row = StringBuffer();
+  final _word = StringBuffer();
+  final _pending = StringBuffer(); // space run since the last word
+  int _rowCells = 0;
+  int _rowStartUnit = 0;
+  int _wordCells = 0;
+  int _wordStartUnit = 0;
+  int _unit = 0; // code units consumed from the line
+
+  List<WrappedComposerRow> run(String line) {
+    if (line.isEmpty) return [const WrappedComposerRow('', 0)];
+    for (final cluster in line.characters) {
+      if (cluster == ' ') {
+        _flushWord();
+        _pending.write(' ');
+      } else {
+        if (_word.isEmpty) _wordStartUnit = _unit;
+        _word.write(cluster);
+        _wordCells += tuiGraphemeWidth(cluster);
+      }
+      _unit += cluster.length;
+    }
+    _flushWord();
+    if (_row.isNotEmpty || rows.isEmpty) _emitRow();
+    return rows;
+  }
+
+  /// Rows that end the frame must be flushed verbatim; [_emitRow] is the
+  /// single place a row leaves the walker.
+  void _emitRow() {
+    rows.add(WrappedComposerRow(_row.toString(), _rowStartUnit));
+    _row.clear();
+    _rowCells = 0;
+  }
+
+  /// Lands the pending word on the current row, breaking the row (dropping
+  /// the pending space run) when the word does not fit, and hard-breaking
+  /// a word wider than the viewport (E1).
+  void _flushWord() {
+    if (_word.isEmpty) return;
+    if (_wordCells > width) {
+      _hardBreakWord();
+      return;
+    }
+    if (_rowCells == 0) {
+      _row.write(_word);
+      _rowCells = _wordCells;
+      _rowStartUnit = _wordStartUnit;
+    } else if (_rowCells + _pending.length + _wordCells <= width) {
+      _row
+        ..write(_pending)
+        ..write(_word);
+      _rowCells += _pending.length + _wordCells;
+    } else {
+      _emitRow();
+      _row.write(_word);
+      _rowCells = _wordCells;
+      _rowStartUnit = _wordStartUnit;
+    }
+    _word.clear();
+    _wordCells = 0;
+    _pending.clear();
+  }
+
+  /// E1: a word wider than the viewport slices into width-cell rows —
+  /// clusters are never cut, and every slice starts a fresh row so two
+  /// wrap points can never fight over the same cluster (no loop).
+  void _hardBreakWord() {
+    if (_rowCells > 0) _emitRow();
+    final clusters = _word.toString().characters.toList();
+    final slice = StringBuffer();
+    var sliceCells = 0;
+    var sliceStartUnit = _wordStartUnit;
+    var sliceUnits = 0;
+    for (final cluster in clusters) {
+      final cells = tuiGraphemeWidth(cluster);
+      if (sliceCells > 0 && sliceCells + cells > width) {
+        rows.add(WrappedComposerRow(slice.toString(), sliceStartUnit));
+        slice.clear();
+        sliceStartUnit += sliceUnits;
+        sliceCells = 0;
+        sliceUnits = 0;
+      }
+      slice.write(cluster);
+      sliceCells += cells;
+      sliceUnits += cluster.length;
+    }
+    // The trailing slice becomes the current row (later words may join it).
+    _row.write(slice);
+    _rowCells = sliceCells;
+    _rowStartUnit = sliceStartUnit;
+    _word.clear();
+    _wordCells = 0;
+    _pending.clear();
+  }
+}
+
+final class BusyDepth {
+  var _depth = 0;
+
+  /// The current nesting depth (0 = idle).
+  int get depth => _depth;
+
+  /// Records an acquire ([busy] true) or release; returns whether the model
+  /// needs a `BusyMsg` (only the 0→1 / 1→0 edge reaches it).
+  bool record(bool busy) {
+    final next = math.max(0, _depth + (busy ? 1 : -1));
+    final edge = (next > 0) != (_depth > 0);
+    _depth = next;
+    return edge;
+  }
+}
+
+final class FaTuiController {
+  FaTuiController({
+    required this.callbacks,
+    required this.isExited,
+    this.programHooks,
+    this.mouseCapture = true,
+    this.syncOutput,
+    this.sttyRunner,
+    SigintPolicy? sigintPolicy,
+  }) : sigintPolicy = sigintPolicy ?? SigintPolicy();
+
+  final FaTuiCallbacks callbacks;
+  final bool Function() isExited;
+
+  /// The double-press Ctrl+C window (issue #830) shared with the host's
+  /// SIGINT handler; defaults to a fresh policy when the host does not
+  /// pass one.
+  final SigintPolicy sigintPolicy;
+
+  /// Whether the TUI captures the mouse (wheel scrolling); when false the
+  /// terminal keeps its native text selection. See
+  /// [FaTuiModel.mouseCapture].
+  final bool mouseCapture;
+
+  /// DEC 2026 synchronized output tri-state: true forces BSU/ESU framing,
+  /// false forces legacy writes, null = auto-detect via DECRQM
+  /// (`FA_TUI_SYNC`, see [AgentCliConfig.tuiSyncOutput]).
+  final bool? syncOutput;
+
+  /// Headless test hooks (scripted key bytes, captured frames) — null in
+  /// production, where the program reads stdin and renders to stdout.
+  final TuiProgramHooks? programHooks;
+
+  /// Injected `stty` runner for the boot-time input-flag sanitize — same
+  /// seam as [sttySanitizeInput]'s runner. Tests model the tty with it
+  /// (issue #735); null in production uses the real subprocess. When set,
+  /// the no-tty gate is skipped: the injected runner IS the tty.
+  final SttyRunner? sttyRunner;
+
+  late final FaTuiModel _model = _buildBootModel();
+
+  /// Builds the boot model and attaches the live-size hook (gh-1433 E8):
+  /// the controller's width seam must track the program's WindowSizeMsg
+  /// stream — hub cards and overlays render at the LIVE window width,
+  /// and a mid-run resize applies to the next card without a restart.
+  FaTuiModel _buildBootModel() {
+    final model = FaTuiModel(
+      callbacks: callbacks,
+      isExited: isExited,
+      mouseCapture: mouseCapture,
+      forceSyncUpdates: syncOutput == true,
+      sigintPolicy: sigintPolicy,
+    );
+    model.onResized = (width, height) {
+      _liveTermWidth = width;
+      _liveTermHeight = height;
+    };
+    return model;
+  }
+
+  late final Program _program = Program(
+    options: [
+      withAltScreen(),
+      // Cursor visibility derives from View.cursor == null (one rule for
+      // every picker/wizard/prompt surface, #510): the program emits the
+      // DECTCEM hide/show OUT-OF-BAND — escapes inside frame content die
+      // in the cell renderer's SGR-only grid and never reach the wire.
+      withHideCursor(),
+      // Mouse modes are VIEW-driven per frame (the view emits
+      // cellMotion/none from mouseCapture) — never boot-static, so
+      // /mouse off can actually disarm the terminal (issue #278, AC4).
+      // Differential cell renderer (#274): cell-level diff + pure-scroll
+      // ops + BSU/ESU framing — the line renderer repaints every shifted
+      // row on scroll and has no atomic frames.
+      withCellRenderer(),
+      // FA_TUI_SYNC tri-state (issue #613): force-off drops the DEC 2026
+      // capability report at the program's public message gate; force-on
+      // is FaTuiModel.init's synthetic report; null = auto (DECRQM).
+      // Both work identically against hosted dart_tui and the vendored
+      // fork — no fork-only ProgramOptions.
+      if (syncOutput == false)
+        withFilter(
+          (_, msg) => msg is ModeReportMsg && msg.mode == 2026 ? null : msg,
+        ),
+      ..._programHookOptions(programHooks),
+    ],
+  );
+
+  /// Messages sent before [run] starts (e.g. the banner printed while the
+  /// controller is already wired into the IO but the program is not yet
+  /// listening). dart_tui drops sends that arrive before the event loop, so
+  /// they are replayed into the initial model at [run] time instead.
+  final List<Msg> _pending = [];
+  var _running = false;
+
+  /// Streaming text coalesces here and flushes on a short timer (or right
+  /// before any non-output message, to preserve ordering). A fast token
+  /// stream used to cost one model update — and one full markdown pass over
+  /// the whole output history — PER DELTA, saturating the event loop so
+  /// keystrokes queued up behind them (typing lag while a run streamed).
+  final _outputBuffer = StringBuffer();
+
+  /// Newlines handed to [sendOutput] so far — the transcript index the
+  /// next write lands on. The boot replay anchor captures this at its
+  /// call site; a model-side count would race the boot backlog drain.
+  int _sentNewlines = 0;
+  Timer? _outputFlushTimer;
+  // 16ms (~60 fps): frames are micro-cheap (traced p50 build 37µs on a
+  // huge session), so flushing thrice as often just makes streamed text
+  // — thinking included — appear smooth instead of in 50ms chunks.
+  static const _outputFlushInterval = Duration(milliseconds: 16);
+
+  FaTuiModel get model => _model;
+
+  /// The live terminal size, tracked from the program's WindowSizeMsg
+  /// stream (gh-1433 E8). Before the first resize lands (pre-[run]),
+  /// the boot model's pinned size is the fallback.
+  int? _liveTermWidth;
+  int? _liveTermHeight;
+
+  /// The live terminal width (the hub driver's block/overlay rendering
+  /// width; the picker table elision, #278). Mirrored by the web stub as
+  /// a constant 80.
+  int get termWidth => _liveTermWidth ?? _model.termWidth;
+
+  /// The live terminal height, same seam as [termWidth].
+  int get termHeight => _liveTermHeight ?? _model.termHeight;
+
+  /// The live spinner tick frame (gh-1446 AC5): the brand-zone animation
+  /// reads the SAME frame the busy ticker advances (100 ms chain); frozen
+  /// while idle — the snapshot builder gates the blank cell on busy state.
+  int get spinnerFrame => _model.spinnerFrame;
+
+  /// The brand-zone ring glyph (gh-1446 AC5): [spinnerFrame] mapped through
+  /// the preset's compile-time activity ring, resolved HERE at one seam —
+  /// no renderer reads a frame list and model text can never become a frame.
+  String get brandFrameGlyph {
+    final ring = FaThemeController.instance.symbols.activitySpinner;
+    if (ring.isEmpty) return ' ';
+    return ring[_model.spinnerFrame % ring.length];
+  }
+
+  void _send(Msg msg) {
+    if (msg is! OutputMsg) _flushOutput();
+    if (_running) {
+      _program.send(msg);
+    } else {
+      _pending.add(msg);
+    }
+  }
+
+  var _busyDepth = 0;
+
+  /// Toggles the animated thinking indicator while a run streams.
+  ///
+  /// Reference-counted: a second submit during a running turn (slash
+  /// commands work mid-stream) must NOT reset the elapsed timer + sticky
+  /// echo on re-enter, and its finally-branch must NOT switch the spinner
+  /// off while the first run is still streaming.
+  void sendBusy(bool busy, {String source = 'run'}) {
+    // Clamp at zero so an unpaired release cannot poison the count.
+    final depth = math.max(0, _busyDepth + (busy ? 1 : -1));
+    final wasBusy = _busyDepth > 0;
+    _busyDepth = depth;
+    // Only the 0→1 / 1→0 edges reach the model; a re-entrant submit
+    // (slash command mid-stream) keeps the spinner and elapsed timer.
+    if ((depth > 0) != wasBusy) _send(BusyMsg(busy, source: source));
+  }
+
+  /// Relabels the busy row while a run streams (silent post-answer phases:
+  /// auto-compaction, durable-memory extraction) WITHOUT restarting the
+  /// spinner loop or resetting the elapsed window — the user sees WHAT is
+  /// happening instead of a growing "Working… Ns" that reads like a hang.
+  void setBusyPhase(String phase) {
+    // Suppress post-run stragglers: at depth zero there is no live busy
+    // stretch to relabel, and a raw BusyMsg(true) reaching an idle model
+    // would resurrect the row (the model guards too — belt and braces for
+    // a bug class that already burned a night at 100% CPU).
+    if (_busyDepth <= 0) return;
+    _send(BusyMsg(true, phase: phase));
+  }
+
+  /// Pushes the pending scheduled follow-up count (`schedule_message`
+  /// records) so the indicator row tracks the queue live (issue #115).
+  void setScheduled(int count, int? nextDueMs) {
+    _send(ScheduledStatusMsg(count, nextDueMs));
+  }
+
+  /// Replaces the visible-waiting row state (issue #450) so an idle
+  /// terminal shows WHAT the agent waits for: running background jobs,
+  /// armed self-wake timers, and jobs a previous run lost.
+  void setWaiting({
+    required List<String> jobs,
+    required List<WaitingTimer> timers,
+    int lostJobs = 0,
+  }) {
+    _send(WaitingStatusMsg(jobs: jobs, timers: timers, lostJobs: lostJobs));
+  }
+
+  /// Pushes the run-liveness state (issue #514): `true` flips the busy row
+  /// to `Stalled…` while the wedge watchdog sees a stale heartbeat. No
+  /// busy guard — the model renders the label only while the row is up.
+  void setRunStalled(bool stalled) {
+    _send(RunStalledMsg(stalled));
+  }
+
+  /// Pushes the background-job board's live region (issue #429): summary
+  /// lines + live rows for the transient area above the busy row. An empty
+  /// list hides the region (everything settled).
+  void setJobBoard(List<String> lines) {
+    _send(JobBoardMsg(List.unmodifiable(lines)));
+  }
+
+  /// Pushes the subagent status board's live region (gh-1415): one compact
+  /// line per subagent (state, name, age, cost), pre-rendered by the
+  /// host's TaskBoardRegion. An empty list hides the region (quiet zero).
+  void setSubagentBoard(List<SubagentBoardRow> rows) {
+    _send(SubagentBoardMsg(List.unmodifiable(rows)));
+  }
+
+  /// Drains the queued messages (the model echoes them into the history) —
+  /// the host runs them as separate turns after the current one settles.
+  Future<List<String>> drainQueue() {
+    // No attached program: the model never sees the drain request, so the
+    // completer would park forever — nothing can be queued either.
+    if (!_running) return Future<List<String>>.value(const []);
+    final completer = Completer<List<String>>();
+    _send(DrainQueueMsg(completer));
+    return completer.future;
+  }
+
+  /// Clears the queued messages without running them (`/queue clear`,
+  /// issue #275). The strip disappearing is the user's confirmation.
+  void clearQueue() {
+    _send(const ClearQueueMsg());
+  }
+
+  /// SIGINT press 1 of the double-press contract (issue #830): the host
+  /// aborted the in-flight run itself and stays alive — the model clears
+  /// the idle composer and shows the dim `press ctrl+c again to exit`
+  /// footer hint until the next keypress.
+  void armInterruptHint() {
+    _send(const InterruptArmedMsg());
+  }
+
+  Future<void> run() async {
+    var model = _model;
+    // Pre-run output coalesces in the text buffer (issue #503); fold it
+    // into the pending queue as ONE OutputMsg so the drain below pays a
+    // single markdown+wrap pass for the whole boot transcript instead of
+    // one per writeln.
+    _flushOutput();
+    for (final msg in _pending) {
+      final (next, _) = model.update(msg);
+      model = next as FaTuiModel;
+    }
+    _pending.clear();
+    final savedTermios = await _sanitizeTermiosInput();
+    try {
+      // Flip `_running` only here — after every await, immediately before
+      // `_program.run` sets the Program's own gate. Earlier, an output flush
+      // landing during the termios probe went through `_program.send`, which
+      // DROPS pre-start sends — boot-time plugin output vanished on slow
+      // hosts (issue #538). Until here `_send` parks in `_pending`; drain now.
+      _flushOutput();
+      _running = true;
+      for (final msg in _pending) {
+        final (next, _) = model.update(msg);
+        model = next as FaTuiModel;
+      }
+      _pending.clear();
+      await _program.run(model);
+    } finally {
+      // gh-1248: program ended (quit/kill/throw) — stop arming flush timers into its dead send queue.
+      _running = false;
+      if (savedTermios != null) await _restoreTermios(savedTermios);
+    }
+  }
+
+  /// dart_tui's raw mode flips only Dart's echo/line flags (termios
+  /// ICANON/ECHO). Two input-processing flags stay on and corrupt raw
+  /// keystrokes: IXON (software flow control — Ctrl+S is the tty driver's
+  /// VSTOP byte: the keypress is swallowed and output suspends) and ICRNL
+  /// (CR→LF input translation — a host delivering Shift+Enter as the legacy
+  /// ESC CR wire, e.g. an IDE embedded terminal, gets it rewritten to
+  /// ESC LF before fa reads it, killing the alt+enter decode). Clear both
+  /// for the TUI's lifetime; returns the saved termios string for
+  /// [_restoreTermios], or null when there is no tty to fix.
+  Future<String?> _sanitizeTermiosInput() async {
+    // An injected runner (issue #735 tests) models the tty — skip the
+    // real-host gates; the runner is the terminal.
+    final injected = sttyRunner;
+    if (injected == null) {
+      if (Platform.isWindows) return null;
+      if (!stdin.hasTerminal) return null;
+    }
+    return sttySanitizeInput(
+      sttyDeviceFlag(),
+      runner: injected ?? ((args) => Process.run('stty', args)),
+    );
+  }
+
+  /// The BSD/GNU device flag for `stty` (`-f` on macOS, `-F` elsewhere).
+  static String sttyDeviceFlag() => Platform.isMacOS ? '-f' : '-F';
+
+  /// Clears the TUI-hostile termios input flags (IXON/IXOFF flow control,
+  /// ICRNL CR→LF translation) via `stty` and returns the saved termios
+  /// string. [runner] is injected so tests can avoid real subprocesses.
+  ///
+  /// Public (package-visible) only for testing; do not call directly.
+  static Future<String?> sttySanitizeInput(
+    String deviceFlag, {
+    required Future<ProcessResult> Function(List<String> args) runner,
+  }) async {
+    try {
+      final saved = await runner([deviceFlag, '/dev/tty', '-g']);
+      if (saved.exitCode != 0) return null;
+      // The raw-mode input-flag family kept clean for fa's lifetime
+      // (issue #735): shared with TermiosGuard so the boot sanitize and
+      // the after-tool re-assert can never drift apart. Why `-ixany` and
+      // the `discard ^-` unbind form: see kTermiosClearArgs.
+      final cleared = await runner([
+        deviceFlag,
+        '/dev/tty',
+        ...kTermiosClearArgs,
+      ]);
+      if (cleared.exitCode != 0) return null;
+      return (saved.stdout as String).trim();
+    } on ProcessException {
+      return null; // no stty on PATH — leave the tty untouched
+    }
+  }
+
+  static Future<void> _restoreTermios(String saved) async {
+    final deviceFlag = Platform.isMacOS ? '-f' : '-F';
+    try {
+      await Process.run('stty', [deviceFlag, '/dev/tty', saved]);
+    } on ProcessException {
+      // Nothing sensible left to do — the next shell's own reset covers it.
+    }
+  }
+}

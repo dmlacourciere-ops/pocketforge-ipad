@@ -1,0 +1,2111 @@
+/// The child-run engine of the `task` tool: builds a restricted child
+/// [Agent] per batch item, drives it to completion, validates structured
+/// output, and assembles the per-item result.
+///
+/// Ported (reduced) from oh-my-pi `packages/coding-agent/src/task/executor.ts`
+/// (`runSubprocess`) and `structured-subagent.ts`. v1 deliberately drops:
+///
+/// - the `yield` tool and its reminder loop — the child's final assistant
+///   text is the output;
+/// - workspace isolation (`isolated`, worktrees, patch capture) — the card's
+///   follow-up adds copy-based sandboxes;
+/// - the agent lifecycle registry (idle/parked/revival), artifacts dirs on
+///   disk, IRC peer messaging, plan-mode swap, and usage-cost plumbing;
+/// - omp's `schemaMode` permissive/strict split — per the card, an invalid
+///   final output gets exactly ONE fix retry, then the item becomes an error
+///   entry (omp's strict outcome).
+library;
+
+import 'dart:async';
+import 'dart:convert';
+
+import '../agent/auto_compactor.dart';
+import '../agent/agent.dart';
+import '../agent/misuse_breaker.dart';
+import '../agent/agent_loop.dart';
+import '../agent/agent_tool.dart';
+import '../agent/param_validator.dart';
+import '../agent/tool_registry.dart';
+import '../a2a/a2a_client.dart';
+import '../a2a/a2a_manager.dart';
+import '../cancel_token.dart';
+import '../compaction/compaction.dart';
+import '../compaction/context_pressure.dart';
+import '../compaction/context_window_registry.dart';
+import '../compaction/token_estimation.dart';
+import '../context.dart';
+import '../json_parse.dart';
+import '../model.dart';
+import '../model_roles/model_resolver.dart';
+import '../model_roles/roles_config.dart';
+import '../prompts/prompts.g.dart';
+import '../session/session_record.dart';
+import '../session/session_tree.dart';
+import '../types.dart';
+import 'agent_registry.dart';
+import 'child_session_io.dart';
+import 'deliverables.dart';
+import 'delivery_slo.dart';
+import 'output_manager.dart';
+import 'parallel.dart';
+import 'subagent.dart';
+import 'subagent_manager.dart';
+import 'subagent_scope.dart';
+import 'subagent_tools.dart';
+import 'task_types.dart';
+
+/// Lifecycle phases reported through [TaskSpawnProgressCallback].
+enum TaskSpawnPhase { running, completed, failed, aborted }
+
+/// Progress sink for spawn lifecycle transitions. Items without a report are
+/// still waiting on the session semaphore.
+typedef TaskSpawnProgressCallback =
+    void Function(int index, String id, TaskSpawnPhase phase);
+
+/// Runs `task` batch items as child [Agent]s under a session [Semaphore].
+///
+/// Guards (card §4): the child tool surface never contains `task` (no
+/// nested task calls — [TaskAgentRegistry.toolSurfaceFor]); the parent
+/// [CancelToken] aborts every in-flight child and every semaphore waiter; a
+/// child failure becomes a per-item error entry, never a batch failure
+/// ([runSpawn] never throws).
+final class TaskExecutor {
+  /// Creates a [TaskExecutor]. [childTools] is the parent tool pool children
+  /// draw their restricted surface from; [streamFunction]/[model] are the
+  /// parent wiring accessors children inherit unless their agent type's
+  /// [TaskAgentDefinition.modelRole] resolves through [rolesResolver]. Both
+  /// resolve at spawn time so a host's live credential (re-auth, provider
+  /// switch) reaches children — see [TaskToolConfig.streamFunction].
+  TaskExecutor({
+    required this.childTools,
+    required this.streamFunction,
+    required this.model,
+    required this.registry,
+    required this.semaphore,
+    required this.store,
+    this.rolesResolver,
+    this.subagentManager,
+    this.a2aManager,
+    this.childSessionFactory,
+    this.childSessionOpener,
+    this.compactionEngine,
+    this.contextWindowRegistry,
+    this.contextWindowCap,
+    this.misuseBreaker = true,
+    this.deliverableRedactor,
+    this.resultPublisher,
+    this.replyAutoSpill,
+    this.deliverableArtifactSink,
+    this.deliverableArtifactSource,
+  });
+
+  /// Publishes a resumed child's settled result through the session's
+  /// async-result channel (gh-1951 AC3/AC6): the same envelope a
+  /// background spawn gets, wired by `TaskToolConfig` from the job
+  /// registry. Null = no publish (bare executor constructions keep
+  /// today's behavior; the resumed run's answer is still stored under the
+  /// child id and the registry row still settles).
+  final TaskResultPublisher? resultPublisher;
+
+  /// The auto-spill kill switch (gh-1956, `subagents.replyAutoSpill`):
+  /// live getter consulted per delivery and per child-prompt build. Null
+  /// or true = auto-spill on (the default); false = pure-chunk behavior.
+  final bool Function()? replyAutoSpill;
+
+  /// The durable-artifact sink (gh-1956, AC6): one append row per spill.
+  /// Best-effort — a failed row never corrupts the in-session delivery.
+  final Future<void> Function(Map<String, dynamic> artifact)?
+  deliverableArtifactSink;
+
+  /// The durable-artifact source backing resume-time restore (gh-1956,
+  /// AC6): the spilled artifacts of the parent session, read back by the
+  /// host before the first post-resume delivery.
+  final Future<List<Map<String, dynamic>>> Function()?
+  deliverableArtifactSource;
+
+  /// Pre-persistence redaction gate for deliverable artifacts (issue
+  /// #1829, I3): the same pipeline tool results pass. Null = the host runs
+  /// no redactor (artifact text passes unredacted, like tool results on
+  /// such a host).
+  final String Function(String text)? deliverableRedactor;
+
+  /// The session's durable-deliverable capture (issue #1829). One instance
+  /// per executor — it owns the chunk ledgers. Null without a
+  /// [subagentManager] — no handles to record on and no budget to honor.
+  late final DeliverableCapture? _capture = _buildCapture();
+
+  DeliverableCapture? _buildCapture() {
+    final manager = subagentManager;
+    if (manager == null) return null;
+    return DeliverableCapture(
+      store: store,
+      manager: manager,
+      redact: deliverableRedactor,
+      autoSpill: replyAutoSpill,
+      persistArtifact: deliverableArtifactSink,
+      restoreArtifacts: deliverableArtifactSource,
+    );
+  }
+
+  /// The tool-misuse circuit breaker switch (issue #862, default true):
+  /// every spawned child agent gets a breaker wired into its loop.
+  final bool misuseBreaker;
+
+  /// The parent tool pool (already minus any host-hidden tools).
+  final List<AgentTool> childTools;
+
+  /// Inherited provider adapter accessor (see [StreamFunction]); resolved
+  /// per spawn.
+  final StreamFunction Function() streamFunction;
+
+  /// Inherited model accessor; resolved per spawn.
+  final Model Function() model;
+
+  /// Agent-type resolution.
+  final TaskAgentRegistry registry;
+
+  /// The session semaphore bounding concurrent children.
+  final Semaphore semaphore;
+
+  /// The session output store (`agent://` backing).
+  final AgentOutputStore store;
+
+  /// Optional role resolver supplying cheap models per role (omp's `@smol`).
+  final ModelRolesResolver? rolesResolver;
+
+  /// Optional retained-subagent registry (Phase 3a). When present, every
+  /// spawn registers/updates a [SubagentHandle].
+  final SubagentManager? subagentManager;
+
+  /// Optional A2A remote-agent manager (Phase 5a). When present, items
+  /// whose agent type is `a2a:<name>` run against the remote agent instead
+  /// of a local child.
+  final A2aManager? a2aManager;
+
+  /// Optional child-session factory (Phase 3a+): when present,
+  /// [_persistChildSession] creates a real JSONL session for each completed
+  /// child and writes its transcript into it.
+  final Future<Session> Function(String parentSessionId, String childId)?
+  childSessionFactory;
+
+  /// The shared per-model context-window registry (gh-1742 invariant 2):
+  /// when present, every child resolves its compaction window and its
+  /// loop-guard basis from the SAME registered value the main agent and
+  /// the ctx meter use — a live detection or `/model-edit` published
+  /// after the session booted reaches children spawned afterwards.
+  /// Null = the carried `model.contextWindow` (legacy behavior).
+  final ContextWindowRegistry? contextWindowRegistry;
+
+  /// The owner context-window cap (`agent.contextWindowCap`,
+  /// issues #273/#729) applied to children too (gh-1742): the cap wins in
+  /// whichever direction it points, same as the main agent.
+  final int? contextWindowCap;
+
+  /// Optional child-session opener (issue #222): when present, [resumeChild]
+  /// reopens a retained child's JSONL session from
+  /// [SubagentHandle.sessionId] and continues the run in the SAME file —
+  /// same session, same mailbox id, same display name, never a `name-2`
+  /// clone. Null disables resume (the tools advertise the missing
+  /// `child-resume` capability up front).
+  final ChildSessionOpener? childSessionOpener;
+
+  /// Compaction engine for proactive child compaction (issue #439); null
+  /// resolves to the AutoCompactor default (structured).
+  final CompactionEngine? compactionEngine;
+
+  /// Runs one batch item to completion. Never throws: cancellation and
+  /// failure are reported as [TaskSingleResult] error entries.
+  Future<TaskSingleResult> runSpawn({
+    required TaskItem item,
+    required int index,
+    required String context,
+    String? preallocatedId,
+    CancelToken? cancelToken,
+    TaskSpawnProgressCallback? onProgress,
+  }) async {
+    final id = preallocatedId ?? store.allocateId(taskItemNameBase(item));
+    final agentName = taskItemAgentName(item);
+    final stopwatch = Stopwatch();
+    // Per-child cancel source (issue #332): blocking-batch children have no
+    // TaskJob by design, so explicit cancellation (`task_cancel` /
+    // `/tasks cancel`) reaches them through THIS source. The parent token
+    // fans out onto it, keeping whole-batch abort semantics identical.
+    final childCancel = CancelTokenSource();
+    _inFlightCancels[id] = childCancel;
+    if (cancelToken != null) {
+      unawaited(
+        cancelToken.onCancel.then(
+          (_) => childCancel.cancel(cancelToken.cancelReason),
+        ),
+      );
+    }
+    try {
+      await semaphore.acquire(childCancel.token);
+      // Cancelled while queued (or pre-cancelled): never START the child —
+      // Agent.abort() before the run's first await would be lost, hanging
+      // a stream that waits for its cancel token.
+      childCancel.token.throwIfCancelled();
+    } on CancelledException catch (error) {
+      _inFlightCancels.remove(id);
+      return _failure(
+        index,
+        id,
+        agentName,
+        item,
+        stopwatch,
+        'aborted while waiting for a concurrency slot: $error',
+        aborted: true,
+      );
+    }
+    // Per-spawn "current subagent" scope: the child-only reply/agent_message
+    // tools resolve their handle through it (Phase 3b), and shared tools
+    // with self-mailbox semantics (schedule_message) resolve the caller's
+    // mailbox through it (gh-970). Re-entrant when the same executor runs
+    // children sequentially (blocking batch mode). The zone — not the id
+    // stack — is the authoritative identity: with several background
+    // children running on this one executor, the stack's head is "the child
+    // that started last", which mislabeled every sender envelope (gh-970).
+    _currentSubagentIds.add(id);
+    try {
+      stopwatch.start();
+      return await runWithSubagentScope(
+        id,
+        () => _run(
+          item,
+          index,
+          id,
+          agentName,
+          context,
+          childCancel.token,
+          stopwatch,
+          onProgress,
+        ),
+      );
+    } on CancelledException catch (error) {
+      onProgress?.call(index, id, TaskSpawnPhase.aborted);
+      await _updateSubagentStatus(
+        id,
+        SubagentStatus.aborted,
+        error: 'aborted: ${error.reason ?? 'cancelled'}',
+      );
+      return _failure(
+        index,
+        id,
+        agentName,
+        item,
+        stopwatch,
+        'aborted: ${error.reason ?? 'cancelled'}',
+        aborted: true,
+      );
+    } on Object catch (error) {
+      onProgress?.call(index, id, TaskSpawnPhase.failed);
+      await _updateSubagentStatus(id, SubagentStatus.failed, error: '$error');
+      return _failure(index, id, agentName, item, stopwatch, '$error');
+    } finally {
+      _currentSubagentIds.remove(id);
+      _inFlightCancels.remove(id);
+      stopwatch.stop();
+      semaphore.release();
+    }
+  }
+
+  /// Stack of in-flight child ids for this executor. The LAST entry is the
+  /// innermost running child; children run sequentially inside one executor
+  /// call, and concurrent runSpawn calls each push/pop their own id. This is
+  /// bookkeeping for [isInFlight] only — identity resolution must go through
+  /// the zone ([activeSubagentId]): the stack's head is shared by all
+  /// concurrent children, so it names the child that STARTED last, not the
+  /// one executing (gh-970).
+  final _currentSubagentIds = <String>[];
+
+  /// Resolves the identity of the child whose run encloses the caller: the
+  /// zone-published scope of the running child, falling back to the stack
+  /// head for callers outside any scoped run. The zone is authoritative —
+  /// see [_currentSubagentIds].
+  String? currentSubagentId() =>
+      activeSubagentId() ??
+      (_currentSubagentIds.isEmpty ? null : _currentSubagentIds.last);
+
+  /// Ids with a resume run in flight — the in-process half of the
+  /// duplicate-resume guard (the handle's running status is the other).
+  final _resumesInFlight = <String>{};
+
+  /// Per-child cancel sources for every id in flight on THIS executor
+  /// (issue #332): blocking-batch spawns and resumes run inline — they have
+  /// NO TaskJob by design, so the session job registry cannot cancel (or
+  /// even see) them. Explicit cancellation (`task_cancel` / `/tasks
+  /// cancel`) consults [isInFlight]/[cancelInFlight] BEFORE letting a
+  /// caller tombstone a registry row: a row with a LIVE inline runner must
+  /// never be settled 'aborted' out from under the running child.
+  final _inFlightCancels = <String, CancelTokenSource>{};
+
+  /// Whether [id] has a live runner on this executor right now — a
+  /// blocking-batch spawn (queued on the semaphore or running) or an
+  /// in-flight resume.
+  bool isInFlight(String id) =>
+      _currentSubagentIds.contains(id) ||
+      _resumesInFlight.contains(id) ||
+      _inFlightCancels.containsKey(id);
+
+  /// Eagerly restores the durable deliverable artifacts of the parent
+  /// session (gh-1956, AC6). The capture also restores lazily before its
+  /// first delivery decision; hosts may kick this at boot so an early
+  /// parent-side `agent://` resolution already sees the re-seeded
+  /// artifacts. No-op without a capture.
+  Future<void> ensureDeliverablesRestored() =>
+      _capture?.ensureRestored() ?? Future<void>.value();
+
+  /// Requests the in-flight child [id] to abort: its run settles through
+  /// the NORMAL path (aborted for a spawn, failed-resumable for a resume),
+  /// so the registry row always ends up telling the truth. Returns false
+  /// when no live runner for [id] exists on this executor.
+  bool cancelInFlight(String id) {
+    if (!isInFlight(id)) return false;
+    _inFlightCancels[id]?.cancel('cancelled by task_cancel');
+    return true;
+  }
+
+  /// Resumes a failed/idle/completed child IN ITS OWN SESSION (issue
+  /// #222): the prior transcript is reloaded from the child's JSONL file,
+  /// the follow-up [message] is prompted on top, and new records append to
+  /// the SAME file — same session id, same mailbox id, same display name,
+  /// never a `name-2` clone.
+  ///
+  /// Guards: a running child (or an in-flight resume) is rejected (E4);
+  /// aborted children take no resume; a missing/unreadable session file is
+  /// a named error, never a silently minted new session (E3); a failing
+  /// resume (e.g. the provider role is still quota-limited) returns the
+  Future<void> resumeChild(String id, String message) async {
+    final managerOrNull = subagentManager;
+    final (manager, handle) = _assertResumable(
+      id,
+      managerOrNull,
+      managerOrNull?[id],
+    );
+    final stopwatch = Stopwatch()..start();
+    // Issue #332: a resume runs inline (no TaskJob), so it gets a cancel
+    // source like a blocking spawn — `task_cancel` / `/tasks cancel` abort
+    // the live resume instead of tombstoning the row over it. Registered
+    // BEFORE the warm-wake window: from here on the row reads running, so
+    // concurrent task_send routes through the inbox instead of racing the
+    // boot.
+    final resumeCancel = CancelTokenSource();
+    _resumesInFlight.add(id);
+    _currentSubagentIds.add(id);
+    _inFlightCancels[id] = resumeCancel;
+    Agent? child;
+    void Function()? untrackUsage;
+    StreamSubscription<void>? inboxWakeSub;
+    var semaphoreAcquired = false;
+    List<SubagentMessage> mail = const [];
+    // gh-1951 AC6: a reply acked in a PREVIOUS life whose completion never
+    // surfaced it (kill mid-run) is carried onto this resume — persisted
+    // as a complete artifact so the completion surfaces it out of band
+    // (I4), and snapshotted as the result's reply when this run records
+    // none of its own. Inside the try: a persist failure fails the resume
+    // with a NAMED error — never a silent loss.
+    String? pendingReply;
+    try {
+      // gh-1951 AC6 + review round 2: PEEK the carried reply BEFORE the
+      // handle is mutated — the carried artifact persists from the
+      // snapshot FIRST, and the handle clears only after that persist
+      // succeeded. A throwing host redactor fails the resume with the
+      // reply still on the handle AND durably recorded, so a retry
+      // task_resume finds it again (at-least-once; never a silent loss).
+      // The single running update below is the pre-existing call: the
+      // first cut added an identical duplicate above it, doubling the
+      // SubagentEvent and appending two distinct (re-stamped)
+      // registry snapshots per resume.
+      pendingReply = manager.peekPendingReply(id);
+      if (pendingReply != null) {
+        _capture?.persistCarriedReply(id, pendingReply);
+        manager.clearPendingReply(id);
+      }
+      await manager.update(
+        id,
+        status: SubagentStatus.running,
+        clearError: true,
+      );
+
+      // Warm wake (issue #647): the message lands in the child's inbox
+      // FIRST (durable, instant), then the resume run's first action drains
+      // the inbox — consumption never waits out the session boot. The
+      // drained mail becomes the prompt with its sender attributed; if the
+      // resume fails the mail goes back to the inbox (at-least-once).
+      await manager.enqueueMessage(
+        id,
+        SubagentMessage(
+          fromId: manager.selfId,
+          text: message,
+          sentAt: DateTime.now().toUtc().toIso8601String(),
+        ),
+        // The parent's steering IS the child's next prompt: verbatim, so
+        // the over-window guard still sees its true size (an 8000-char
+        // mailbox cap would silently truncate it and slip an oversized
+        // request past the guard).
+        capText: false,
+      );
+      mail = await manager.drainMessages(id);
+      final since = mail.isEmpty ? null : DateTime.tryParse(mail.first.sentAt);
+      deliveryStage(id, 'consumed', since: since);
+      final promptText = mail.isEmpty
+          ? message
+          : mail.map((m) => 'from ${m.fromId}: ${m.text}').join('\n');
+      final session = await _resumeSession(id, handle);
+      final prior = await session.buildContextMessages();
+      _childSessions[id] = session;
+      _childSessionWrites[id] = await _appendedMessageCount(session);
+      deliveryStage(id, 'wake', since: since);
+      await semaphore.acquire();
+      semaphoreAcquired = true;
+      final resumeRegistry = _childToolRegistry(
+        _resolveDefinition(handle.agentType),
+      );
+      final (built, wakeSub, wiring) = _buildResumeChild(
+        id: id,
+        handle: handle,
+        manager: manager,
+        toolRegistry: resumeRegistry,
+      );
+      child = built;
+      inboxWakeSub = wakeSub;
+      final agent = child;
+      unawaited(resumeCancel.token.onCancel.then((_) => agent.abort()));
+      untrackUsage = _trackChildUsage(id, child, from: prior.length);
+      child.state.messages = prior;
+      // Issue #383 heartbeat: the same in-flight liveness as a fresh
+      // spawn - completed provider responses touch the handle. The
+      // seeded prior transcript is excluded (from: prior.length), and
+      // the stale previous run's live snapshot resets to zero up front.
+      manager.touch(id, tokens: 0, requests: 0);
+      _attachLivenessTouch(id, child, manager, from: prior.length);
+      // Issue #439 compact-then-deliver: a resume is how the parent steers
+      // an idle/at-wall child. When prior + incoming crosses the threshold,
+      // compact BEFORE the first request so the guard never hard-fails a
+      // deliverable message; then ride every boundary like a fresh spawn.
+      // probe: true (issue #1924) — the resume is the parent's recovery
+      // funnel, so it ignores the failure latch for THIS one pass.
+      await _compactChildIfNeeded(
+        id,
+        child,
+        wiring: wiring,
+        incomingTokens: estimateRequestTokens([UserMessage.text(promptText)]),
+        probe: true,
+      );
+      agent.prepareNextTurn = (nextTurn) async {
+        // gh-1948: resumed children ride the same per-boundary transcript
+        // flush as fresh spawns (see _buildChild).
+        unawaited(_flushChildTranscript(id, agent));
+        return _compactChildAtBoundary(id, agent, wiring, nextTurn);
+      };
+      // The resume run's tool calls resolve the child identity through the
+      // same scope a fresh spawn publishes (gh-970) — reply/agent_message
+      // and schedule_message attribute to THIS child, never a concurrent
+      // sibling on the shared executor stack.
+      await runWithSubagentScope(id, () => agent.prompt(promptText));
+      deliveryStage(id, 'reply', since: since);
+      resumeCancel.token.throwIfCancelled();
+      // The agent loop surfaces provider failures as an error-tagged final
+      // assistant message, not a throw — the same check `_run` relies on.
+      final finalText = _finalAssistantText(child);
+      // gh-1951 AC3: the resumed run's final answer IS the child's latest
+      // result — it replaces the spawn-time output under the child id, so
+      // `agent://<id>` resolves the answer the parent's completion notice
+      // points at.
+      final (cappedText, cappedTruncated) = _capOutput(finalText);
+      store.put(id, cappedText);
+      // Issue #862 review (round 2): the resume output carries the same
+      // loud duplicate-registration warning as a fresh spawn — a resumed
+      // child's second life must not re-wire the leak silently.
+      _surfaceDuplicateRegistrationNotes(
+        resumeRegistry.duplicateNotes,
+        id,
+        existingOutput: cappedText,
+      );
+      await _flushChildTranscript(id, child);
+      // Turn-boundary billing already added each finished turn (issue
+      // #332); the completion update bills only what is left and settles
+      // the row. The prior transcript stays out of the count — its usage
+      // is already on the handle.
+      _billChildUsage(id, child);
+      await manager.update(
+        id,
+        status: SubagentStatus.completed,
+        modelId: wiring.model.id,
+      );
+      // gh-1951 AC3: the resumed completion rides the SAME async-result
+      // envelope a background spawn gets — the final answer (or the
+      // run's explicit reply), the deliverable pointers, and — AC6 — a
+      // pending reply carried over from a killed previous life.
+      final usage = _usageStats(child, from: prior.length);
+      final reply = handle.lastReply ?? pendingReply;
+      final deliverables = List<DeliverableRecord>.of(handle.deliverables);
+      resultPublisher?.call(
+        TaskSingleResult(
+          index: 0,
+          id: id,
+          agent: handle.agentType,
+          task: handle.task,
+          status: TaskSpawnStatus.completed,
+          output: store.get(id) ?? cappedText,
+          truncated: cappedTruncated,
+          duration: stopwatch.elapsed,
+          tokens: usage.tokens,
+          requests: usage.requests,
+          model: wiring.model.id,
+          reply: reply,
+          deliverables: deliverables,
+          stubFallback: _stubFallbackNote(
+            handle,
+            reply: reply,
+            deliverables: deliverables,
+          ),
+        ),
+      );
+    } on CancelledException catch (error) {
+      stopwatch.stop();
+      await _requeueResumeMail(id, manager, mail);
+      if (child != null) unawaited(_flushChildTranscript(id, child));
+      // A cancelled resume settles failed-resumable (NOT aborted): the
+      // child keeps its progress and a later task_resume can continue it.
+      final cancelError = 'resume cancelled: ${error.reason ?? 'cancelled'}';
+      await _updateSubagentStatus(
+        id,
+        SubagentStatus.failed,
+        error: cancelError,
+      );
+      _publishFailedResume(
+        handle,
+        pendingReply: pendingReply,
+        stopwatch: stopwatch,
+        error: cancelError,
+      );
+      throw StateError('resume of "$id" cancelled');
+    } on Object catch (error) {
+      stopwatch.stop();
+      await _requeueResumeMail(id, manager, mail);
+      if (child != null) unawaited(_flushChildTranscript(id, child));
+      if (child != null) _billChildUsage(id, child);
+      await _updateSubagentStatus(id, SubagentStatus.failed, error: '$error');
+      _publishFailedResume(
+        handle,
+        pendingReply: pendingReply,
+        stopwatch: stopwatch,
+        error: '$error',
+      );
+      throw StateError('$error');
+    } finally {
+      if (child != null) _billChildUsage(id, child);
+      untrackUsage?.call();
+      unawaited(inboxWakeSub?.cancel());
+      _usageCursors.remove(id);
+      if (semaphoreAcquired) semaphore.release();
+      _resumesInFlight.remove(id);
+      _currentSubagentIds.remove(id);
+      _inFlightCancels.remove(id);
+    }
+  }
+
+  /// The FAILED resume completion (gh-1951 AC5/AC6): the parent's notice
+  /// names the error and carries any pending reply — a resume that dies
+  /// mid-flight never settles silently on the parent side.
+  void _publishFailedResume(
+    SubagentHandle handle, {
+    required String? pendingReply,
+    required Stopwatch stopwatch,
+    required String error,
+  }) {
+    final deliverables = List<DeliverableRecord>.of(handle.deliverables);
+    resultPublisher?.call(
+      TaskSingleResult(
+        index: 0,
+        id: handle.id,
+        agent: handle.agentType,
+        task: handle.task,
+        status: TaskSpawnStatus.failed,
+        output: '',
+        truncated: false,
+        duration: stopwatch.elapsed,
+        tokens: 0,
+        requests: 0,
+        model: handle.modelId ?? model().id,
+        error: error,
+        reply: handle.lastReply ?? pendingReply,
+        deliverables: deliverables,
+        stubFallback: _stubFallbackNote(
+          handle,
+          reply: handle.lastReply ?? pendingReply,
+          deliverables: deliverables,
+        ),
+      ),
+    );
+  }
+
+  /// Appends the loud duplicate-registration warning to the child's stored
+  /// output artifact (issue #862 review, round 2). Read-modify-write:
+  /// [AgentOutputStore.put] replaces, and the spawn-time output under the
+  /// child's id must survive the resumed second life (round-3 review).
+  /// Single source of the warning text for BOTH child-result paths — the
+  /// spawn path passes its capped output as [existingOutput], the resume
+  /// path reads what the spawn stored (round-4 review).
+  void _surfaceDuplicateRegistrationNotes(
+    List<String> duplicateNotes,
+    String id, {
+    String? existingOutput,
+  }) {
+    if (duplicateNotes.isEmpty) return;
+    final existing = existingOutput ?? store.get(id);
+    store.put(
+      id,
+      '${existing == null || existing.isEmpty ? '' : '$existing\n\n'}'
+      '[fah] warning: duplicate tool registration in the child surface '
+      '(child-specific tool won): '
+      '${duplicateNotes.join(' | ')}',
+    );
+  }
+
+  /// Failure-path requeue of warm-wake mail (issue #647): the drained
+  /// messages return to the child's inbox so the next resume still
+  /// delivers them. Fire-and-forget — a fabric hiccup here must not mask
+  /// the original failure.
+  Future<void> _requeueResumeMail(
+    String id,
+    SubagentManager manager,
+    List<SubagentMessage> mail,
+  ) async {
+    for (final m in mail) {
+      try {
+        await manager.enqueueMessage(
+          id,
+          SubagentMessage(fromId: m.fromId, text: m.text, sentAt: m.sentAt),
+        );
+      } on Object {
+        // Best-effort by contract.
+      }
+    }
+  }
+
+  /// Issue #439: proactive child compaction at the turn boundary. Returns
+  /// the update that swaps the loop onto the compacted projection, or null
+  /// when nothing compacted (the loop keeps its own context).
+  Future<AgentLoopTurnUpdate?> _compactChildAtBoundary(
+    String id,
+    Agent child,
+    ({Model model, StreamFunction stream}) wiring,
+    NextTurnContext nextTurn,
+  ) async {
+    final compacted = await _compactChildIfNeeded(id, child, wiring: wiring);
+    if (!compacted) return null;
+    return AgentLoopTurnUpdate(
+      context: Context(
+        systemPrompt: nextTurn.context.systemPrompt,
+        // The copy matters: the loop appends to its context list.
+        messages: List.of(child.state.messages),
+        tools: nextTurn.context.tools,
+      ),
+    );
+  }
+
+  /// The shared compaction core (issue #439): stamps the child's context
+  /// pressure on its handle, and when the pressure crosses the threshold,
+  /// flushes the transcript and runs ONE [AutoCompactor] pipeline — the
+  /// same engine the main loop uses. Best-effort by contract: a failed
+  /// pass changes nothing and the over-window guard stays the last resort.
+  ///
+  /// gh-1742: the pressure is RECONCILED with the provider-reported usage
+  /// (`max(estimate, observed input+cacheRead)` — invariant 1), the
+  /// window resolves from the shared registry (invariant 2), and an
+  /// observed-over-headroom crossing runs the pass FORCED (invariant 4 /
+  /// AC5) so the compactor's own estimate-basis re-check cannot skip it.
+  Future<bool> _compactChildIfNeeded(
+    String id,
+    Agent child, {
+    required ({Model model, StreamFunction stream}) wiring,
+    int incomingTokens = 0,
+    bool probe = false,
+  }) async {
+    final manager = subagentManager;
+    if (manager == null || childSessionFactory == null) return false;
+    final window = _childContextWindow(wiring.model);
+    if (window <= 0) return false;
+    final settings = CompactionSettings.forWindow(window);
+    final transcriptEst = estimateRequestTokens(
+      child.state.messages,
+      systemPrompt: child.state.systemPrompt,
+      tools: child.state.tools,
+    );
+    // Provider truth: the last completed request's accepted context
+    // (E1: null without a usable report — estimate-only, legacy shape).
+    final observed = lastObservedContextTokens(child.state.messages);
+    final est = transcriptEst + incomingTokens;
+    final decision = assessContextPressure(
+      estimatedTokens: est,
+      observedTokens: observed,
+      contextWindow: window,
+      settings: settings,
+    );
+    // Pressure stamp: the reconciled transcript-basis pressure (estimate
+    // plus the trailing incoming prompt), what task_status shows.
+    manager.notePressure(
+      id,
+      estTokens: reconcileContextTokens(
+        estimatedTokens: transcriptEst + incomingTokens,
+        observedTokens: observed,
+      ),
+      windowTokens: window,
+      observedTokens: observed,
+      windowVerified: contextWindowRegistry?.isVerified(wiring.model) ?? false,
+    );
+    if (!decision.triggered) return false;
+    // Issue #1924 bounded-failure latch: after [_maxChildCompactionFailures]
+    // consecutive failed passes, boundary passes stop — every further pass
+    // is a heavy LLM call the broken surface will burn at every boundary
+    // (the #1914-shape silent no-op loop). The parent-visible stamp is on
+    // the handle; pressure stamps keep flowing so the parent watches the
+    // wall approach and can resume (probe: true — the recovery funnel
+    // attempts ONE pass) or respawn the child (a fresh run resets).
+    if (!probe &&
+        (_childCompactionFailures[id] ?? 0) >= _maxChildCompactionFailures) {
+      return false;
+    }
+    final runForced = _updateForcedLatch(
+      id,
+      observed,
+      needsForce: decision.needsForce,
+      observedTriggered: decision.observedTriggered,
+    );
+    await _flushChildTranscript(id, child);
+    final session = _childSessions[id];
+    if (session == null) return false;
+    final before = est - incomingTokens;
+    final pass = await _runChildCompactionPass(
+      session: session,
+      child: child,
+      window: window,
+      settings: settings,
+      wiring: wiring,
+      runForced: runForced,
+    );
+    if (!pass.ok) {
+      _noteChildCompactionFailure(id, 'pass failed: ${pass.error}');
+      return false; // The guard remains the last resort.
+    }
+    final after = estimateRequestTokens(
+      child.state.messages,
+      systemPrompt: child.state.systemPrompt,
+      tools: child.state.tools,
+    );
+    if (after < before) {
+      // Post-compaction invariant (#387): the flush cursor restarts at the
+      // projected length so later flushes append only new messages.
+      _childSessionWrites[id] = child.state.messages.length;
+      _childCompactionFailures.remove(id);
+      manager.noteCompactionHealth(id);
+      manager.recordCompaction(id, freedTokens: before - after);
+      return true;
+    }
+    if (pass.attempted) {
+      // An ATTEMPTED pass that freed nothing is the #1914 shape (repeated
+      // cut point): count it as failed. A gate-DECLINED no-op
+      // (`attempted == false` — the engine's own shouldCompact re-check
+      // sees the transcript under the trigger, e.g. the resume probe
+      // where only + incomingTokens crossed it) is healthy: no stamp, no
+      // count, the guard remains the last resort.
+      _noteChildCompactionFailure(
+        id,
+        'pass freed nothing (repeated cut point?)',
+      );
+    }
+    return false;
+  }
+
+  /// Consecutive failed child compaction passes (issue #1924), per child
+  /// id. Reset at the start of every fresh spawn run and on every
+  /// successful pass; survives resumes so a broken surface cannot be
+  /// hammered once per boundary.
+  final _childCompactionFailures = <String, int>{};
+
+  /// The bounded-failure budget (issue #1924): three consecutive failed
+  /// passes latch the child off until its next run.
+  static const int _maxChildCompactionFailures = 3;
+
+  /// Counts one failed pass and stamps the actionable parent-visible error
+  /// on the handle (issue #1924): from the FIRST failure the parent sees
+  /// the running count; at the budget the stamp names the latch.
+  void _noteChildCompactionFailure(String id, String cause) {
+    final failures = (_childCompactionFailures[id] ?? 0) + 1;
+    _childCompactionFailures[id] = failures;
+    subagentManager?.noteCompactionHealth(
+      id,
+      error:
+          'child compaction failed $failures consecutive passes '
+          '($cause)${failures >= _maxChildCompactionFailures ? ' — latched: no further boundary passes this run' : ''}; '
+          'the context keeps growing toward the window; parent: '
+          'task_resume this child (the resume probes one compaction '
+          'pass) or respawn the task',
+    );
+  }
+
+  /// The forced-channel latch (gh-1742): an observation already reacted to
+  /// never re-forces until a strictly higher one arrives — the stale
+  /// pre-compaction anchor rides the kept tail after a fold, and a
+  /// constant over-line observation must not re-run forced passes every
+  /// boundary. An observation back UNDER the line (the honest post-fold
+  /// report) resets the latch — reset = lower the anchor while keeping
+  /// the latch armed, so the next re-crossing must still be
+  /// strictly-greater to fire again. The anchor lives for the child's
+  /// whole retained lifetime (resumable children keep their id, and the
+  /// executor's other per-child maps evict nothing either), so it dies
+  /// with the executor rather than at some child-end event that does
+  /// not exist.
+  ///
+  /// Returns whether the pass must run FORCED (null observations never
+  /// force).
+  bool _updateForcedLatch(
+    String id,
+    int? observed, {
+    required bool needsForce,
+    required bool observedTriggered,
+  }) {
+    if (observed == null) return false;
+    final latch = _forcedObservedAt[id];
+    var runForced = false;
+    if (needsForce && _isNewAnchor(latch, observed, higher: true)) {
+      _forcedObservedAt[id] = observed;
+      runForced = true;
+    } else if (!observedTriggered &&
+        _isNewAnchor(latch, observed, higher: false)) {
+      _forcedObservedAt[id] = observed;
+    }
+    return runForced;
+  }
+
+  /// Whether [observed] clears the latch anchor: strictly higher re-forces,
+  /// strictly lower resets (gh-1742). No anchor admits anything.
+  static bool _isNewAnchor(int? latch, int observed, {required bool higher}) {
+    if (latch == null) return true;
+    return higher ? observed > latch : observed < latch;
+  }
+
+  /// Runs ONE [AutoCompactor] pipeline for the child — the same engine the
+  /// main loop uses. Best-effort by contract: a failed pass reports
+  /// `(ok: false, error: …)` and nothing changes; `attempted` reports
+  /// whether the engine actually attempted a pass (issue #1924 review
+  /// round 1) — a gate-declined no-op is a healthy non-attempt.
+  Future<({bool ok, bool attempted, String? error})> _runChildCompactionPass({
+    required Session session,
+    required Agent child,
+    required int window,
+    required CompactionSettings settings,
+    required ({Model model, StreamFunction stream}) wiring,
+    required bool runForced,
+  }) async {
+    final hooks = _SilentCompactionHooks();
+    try {
+      final smol = rolesResolver?.resolveRole(smolModelRole);
+      await AutoCompactorFactory(
+        session: session,
+        state: child.state,
+        window: window,
+        settings: settings,
+        sources: AutoCompactorSources(
+          smolStream: smol?.stream,
+          // Invariant 2 (gh-1742 review round 1, comment 6): compaction
+          // LLM calls ride the smol model WITH the registered window —
+          // the roles-config Model carries the stale catalog value (the
+          // copilot-1M-vs-256k shape), so the checkpoint payload budget
+          // and summarizer window must come from the registry truth.
+          smolModel: smol == null
+              ? null
+              : withRegisteredContextWindow(smol.model, contextWindowRegistry),
+          mainStream: wiring.stream,
+          mainModel: wiring.model,
+        ),
+        hooks: hooks,
+        engine: compactionEngine ?? CompactionEngine.structured,
+        force: runForced,
+      ).run();
+    } on Object catch (error) {
+      return (ok: false, attempted: hooks.attempted, error: '$error');
+    }
+    return (ok: true, attempted: hooks.attempted, error: null);
+  }
+
+  /// The observed-over-headroom latch per child id (see the forced-channel
+  /// latch in [_compactChildIfNeeded]).
+  final _forcedObservedAt = <String, int>{};
+
+  /// The child's compaction/loop-guard window (gh-1742 invariant 2): the
+  /// shared registry's value for this model identity when one was
+  /// published, else the carried window — then the owner cap applied in
+  /// whichever direction it points (issues #273/#729).
+  int _childContextWindow(Model model) => effectiveContextWindow(
+    contextWindowRegistry?.windowFor(model) ?? model.contextWindow,
+    contextWindowCap,
+  );
+
+  /// Resume guards (E4 + a2a): everything resumable must be a local,
+  /// non-running, non-aborted child; violations throw named errors so the
+  /// CLI surface can explain the refusal.
+  (SubagentManager, SubagentHandle) _assertResumable(
+    String id,
+    SubagentManager? manager,
+    SubagentHandle? handle,
+  ) {
+    if (manager == null || handle == null) {
+      throw StateError('no subagent with id "$id"');
+    }
+    if (handle.status == SubagentStatus.running ||
+        handle.status == SubagentStatus.queued ||
+        _resumesInFlight.contains(id)) {
+      throw StateError(
+        'subagent "$id" is already running — duplicate resume rejected',
+      );
+    }
+    if (handle.status == SubagentStatus.aborted) {
+      throw StateError('subagent "$id" is aborted and cannot be resumed');
+    }
+    if (handle.agentType.startsWith('a2a:')) {
+      throw StateError(
+        'subagent "$id" (${handle.agentType}) runs on a remote a2a server — '
+        'it has no local session to resume; follow up with a new task item '
+        '(agent ${handle.agentType}) carrying your message in its task text',
+      );
+    }
+    return (manager, handle);
+  }
+
+  /// Reopens the child's JSONL session for a resume: the still-open
+  /// executor session wins; otherwise the injected [childSessionOpener]
+  /// reads [SubagentHandle.sessionId]. A missing file is a NAMED error
+  /// (E3) — resume never silently mints a new session.
+  Future<Session> _resumeSession(String id, SubagentHandle handle) async {
+    // A failure-path transcript flush is fire-and-forget: wait out the
+    // pending chain so the session is attached before we try to reopen it.
+    await _childFlushChains[id];
+    final open = _childSessions[id];
+    if (open != null) return open;
+    final opener = childSessionOpener;
+    if (opener == null) {
+      throw StateError(
+        'this host cannot reopen child sessions (capability: '
+        'child-session-open) — cannot resume "$id"',
+      );
+    }
+    final path = handle.sessionId;
+    try {
+      return await opener(path);
+    } on Object catch (error) {
+      throw StateError(
+        'child session file for "$id" is unreadable at $path ($error) — '
+        'resume refused; spawn a fresh agent with task instead of silently '
+        'cloning',
+      );
+    }
+  }
+
+  /// Builds the resume-run child agent over the seeded prior transcript
+  /// and attaches its inbox wake subscription (the event-poked fast half
+  /// of the #647 delivery SLO). Extracted from [resumeChild] to keep its
+  /// CRAP in budget.
+  (
+    Agent,
+    StreamSubscription<SubagentEvent>,
+    ({Model model, StreamFunction stream}),
+  )
+  _buildResumeChild({
+    required String id,
+    required SubagentHandle handle,
+    required SubagentManager manager,
+    required ToolRegistry toolRegistry,
+  }) {
+    final definition = _resolveDefinition(handle.agentType);
+    final wiring = _resolveChildWiring(definition);
+    final child = Agent(
+      model: wiring.model,
+      // gh-1742 review round 1, comment 2: the same owner clamp the spawn
+      // path passes (see _buildChild) — a resumed child's guard basis
+      // stays the capped one too.
+      contextWindowCap: contextWindowCap,
+      // The ORIGINAL batch context rides along (persisted on the handle):
+      // the transcript does not carry the system prompt, so a resume that
+      // rebuilt the prompt without it would silently drop the batch's
+      // shared background.
+      systemPrompt: _buildSystemPrompt(
+        definition,
+        handle.context,
+        replyBudget: manager.maxReplyChars,
+      ),
+      streamFunction: wiring.stream,
+      toolRegistry: toolRegistry,
+      externalSteeringSource: () => _inboxSteeringMessages(id),
+      externalSteeringProbe: () => manager.hasPendingMessages(id),
+      // Issue #862: children get the same misuse circuit breaker as the
+      // parent loop — the luna death was a child.
+      toolMisuseBreaker: misuseBreaker ? ToolMisuseBreaker() : null,
+    );
+    final agent = child;
+    // Issue #1829 Core flow B: same truncated-call capture as a fresh
+    // spawn — a resumed child's lost reply is recovered identically.
+    child.onTruncatedToolCall = (call) async {
+      // gh-1956 review: awaited by the loop — the salvage persist
+      // re-seeds the durable ids before its own id allocation.
+      await _capture?.captureSalvaged(id, call);
+    };
+    final inboxWakeSub = manager.events.listen((event) {
+      if (event.handle.id == id && event.message != null) {
+        agent.pokeSteering();
+      }
+    });
+    return (child, inboxWakeSub, wiring);
+  }
+
+  /// The number of transcript messages already appended to [session] —
+  /// the flush-counter seed for a resume so only NEW messages append.
+  Future<int> _appendedMessageCount(Session session) async {
+    final branch = await session.getBranch();
+    return branch.whereType<MessageRecord>().length;
+  }
+
+  Future<TaskSingleResult> _run(
+    TaskItem item,
+    int index,
+    String id,
+    String agentName,
+    String context,
+    CancelToken? cancelToken,
+    Stopwatch stopwatch,
+    TaskSpawnProgressCallback? onProgress,
+  ) async {
+    // Phase 5a: `a2a:<name>` items run against the remote agent.
+    if (agentName.startsWith('a2a:')) {
+      return _runA2a(
+        item,
+        index,
+        id,
+        agentName.substring(4),
+        stopwatch,
+        cancelToken,
+        onProgress,
+      );
+    }
+    final definition = _resolveDefinition(agentName);
+    onProgress?.call(index, id, TaskSpawnPhase.running);
+
+    // Register in the retained-subagent manager (Phase 3a).
+    final retained = subagentManager;
+    if (retained != null) {
+      await retained.register(
+        id: id,
+        name: taskItemNameBase(item),
+        agentType: agentName,
+        task: item.task,
+        // Persisted so a later resume (issue #222) can re-render the batch
+        // context into the child's system prompt.
+        context: context,
+      );
+      await retained.update(id, status: SubagentStatus.running);
+    }
+
+    final wiring = _resolveChildWiring(definition);
+    final childRegistry = _childToolRegistry(definition);
+    final (child, inboxWakeSub) = _buildChild(
+      id: id,
+      systemPrompt: _buildSystemPrompt(
+        definition,
+        context,
+        replyBudget: subagentManager?.maxReplyChars,
+      ),
+      toolRegistry: childRegistry,
+      wiring: wiring,
+      cancelToken: cancelToken,
+    );
+    // Issue #332: usage is billed to the registry row at every TURN
+    // BOUNDARY, not only at completion — a host restart mid-run then
+    // persists a 'running' row that already carries the child's usage, so
+    // rehydrate can tell a never-started row from a mid-run one.
+    final untrackUsage = _trackChildUsage(id, child);
+    // Issue #1924: a fresh run gets a fresh compaction-failure budget —
+    // the latch is per-run, never per-child-lifetime.
+    _childCompactionFailures.remove(id);
+    // Crash-resilient transcript: the real JSONL session is created lazily
+    // on the FIRST transcript flush — never at spawn time. Subagents that
+    // finish with no transcript leave no session file behind.
+    try {
+      await child.prompt(await _buildUserPrompt(item, id));
+      unawaited(_flushChildTranscript(id, child));
+      cancelToken?.throwIfCancelled();
+      return await _completeChildRun(
+        child,
+        item: item,
+        index: index,
+        id: id,
+        agentName: agentName,
+        wiring: wiring,
+        childRegistry: childRegistry,
+        stopwatch: stopwatch,
+        onProgress: onProgress,
+        cancelToken: cancelToken,
+      );
+    } finally {
+      // Last-chance usage bill (idempotent — the cursor makes a second
+      // call a no-op) so aborted/failed children keep the usage they
+      // earned, then stop tracking. The last-chance transcript flush:
+      // whatever the child produced before an abort/failure lands in its
+      // session file. Fire-and-forget — the completion must reach the
+      // parent without waiting on file writes.
+      _billChildUsage(id, child);
+      untrackUsage?.call();
+      unawaited(inboxWakeSub?.cancel());
+      _usageCursors.remove(id);
+      unawaited(_flushChildTranscript(id, child));
+    }
+  }
+
+  /// The completion half of [_run], extracted to keep both halves inside
+  /// the CRAP budget: schema application, output capping, deliverable
+  /// out-of-band pointers (issue #1829), the tier-2 stub fallback, and the
+  /// final registry status write.
+  Future<TaskSingleResult> _completeChildRun(
+    Agent child, {
+    required TaskItem item,
+    required int index,
+    required String id,
+    required String agentName,
+    required ({Model model, StreamFunction stream}) wiring,
+    required ToolRegistry childRegistry,
+    required Stopwatch stopwatch,
+    required TaskSpawnProgressCallback? onProgress,
+    required CancelToken? cancelToken,
+  }) async {
+    final finalText = _finalAssistantText(child);
+    final (storedContent, structured) = await _applyOutputSchema(
+      child,
+      item,
+      finalText,
+      cancelToken,
+    );
+
+    final capped = _capOutput(storedContent);
+    // Issue #862 review: a duplicate registration in the child surface
+    // (the luna wiring bug) degraded into a note - surface it loudly on
+    // the spawn result instead of letting it sit in the registry. The
+    // warning text is single-sourced in the shared helper so both child
+    // -result paths can't drift.
+    store.put(id, capped.$1);
+    _surfaceDuplicateRegistrationNotes(
+      childRegistry.duplicateNotes,
+      id,
+      existingOutput: capped.$1,
+    );
+    // The stored artifact IS the source of truth for the result output:
+    // base content, or base + the single-sourced warning. The duplicate
+    // -note path may have rewritten it, hence the re-read.
+    final output = store.get(id);
+    if (output == null) {
+      throw StateError('task output for $id missing right after store.put');
+    }
+    final usage = _usageStats(child);
+
+    final failed = structured?.status == StructuredValidationStatus.invalid;
+    // `failed` implies `structured != null` (status is non-null there);
+    // `?.` keeps it null-safe without re-asserting in two call sites.
+    final schemaViolation = failed
+        ? 'schema_violation: ${structured?.error}'
+        : null;
+    onProgress?.call(
+      index,
+      id,
+      failed ? TaskSpawnPhase.failed : TaskSpawnPhase.completed,
+    );
+
+    // Phase 3b: the child's explicit reply (if any) rides the result; a
+    // missing reply is surfaced via completedWithoutReply.
+    final handle = subagentManager?[id];
+    final reply = handle?.lastReply;
+
+    // Issue #1829: deliverable pointers ride the completion OUT OF BAND,
+    // independent of any later model-written recovery stub (I4): a stub
+    // overwrites lastReply, never the recorded artifacts.
+    final deliverables = List<DeliverableRecord>.of(
+      handle?.deliverables ?? const [],
+    );
+    final stubFallback = _stubFallbackNote(
+      handle,
+      reply: reply,
+      deliverables: deliverables,
+    );
+
+    // Update the retained-subagent handle with the final status. Usage
+    // was billed incrementally at turn boundaries (plus the final delta
+    // here) - never in one completion lump.
+    final retained = subagentManager;
+    if (retained != null) {
+      _billChildUsage(id, child);
+      await retained.update(
+        id,
+        status: failed ? SubagentStatus.failed : SubagentStatus.completed,
+        modelId: wiring.model.id,
+        error: schemaViolation,
+      );
+    }
+
+    return TaskSingleResult(
+      index: index,
+      id: id,
+      agent: agentName,
+      task: item.task,
+      status: failed ? TaskSpawnStatus.failed : TaskSpawnStatus.completed,
+      output: output,
+      truncated: capped.$2,
+      duration: stopwatch.elapsed,
+      tokens: usage.tokens,
+      requests: usage.requests,
+      model: wiring.model.id,
+      error: schemaViolation,
+      structuredOutput: structured,
+      reply: reply,
+      deliverables: deliverables,
+      stubFallback: stubFallback,
+    );
+  }
+
+  /// Tier-2 fallback note (issue #1829, AC11): when a deliverable call was
+  /// recorded truncated and the child finished WITHOUT a usable reply —
+  /// completed-without-reply, schema-invalid, or a hard failure — the
+  /// result names the transcript honestly instead of a silent stub. The
+  /// note references the CHILD ID (stable, resolvable via the registry /
+  /// task_status) rather than [SubagentHandle.sessionId]: the real session
+  /// path attaches asynchronously with the first transcript flush, so at
+  /// result-build time it is usually still the placeholder.
+  String? _stubFallbackNote(
+    SubagentHandle? handle, {
+    required String? reply,
+    required List<DeliverableRecord> deliverables,
+  }) {
+    if (handle == null ||
+        !handle.hadTruncatedDeliverable ||
+        (reply != null && reply.trim().isNotEmpty)) {
+      return null;
+    }
+    return 'the child attempted a report that was cut off by the output '
+        'token limit and finished without a usable reply; its transcript '
+        'is recoverable from the child session (child id: ${handle.id})'
+        '${deliverables.isEmpty ? ' — no salvageable report text was captured' : ''}';
+  }
+
+  /// Builds the child agent and attaches its manager wiring: the inbox
+  /// wake subscription (event-poked for same-host mail — the fast half of
+  /// the #647 delivery SLO, the steering probe is the cross-process
+  /// fallback), the liveness touch (#383), boundary compaction (#439) and
+  /// cancel propagation. Extracted from [_run] to keep its CRAP in budget.
+  (Agent, StreamSubscription<SubagentEvent>?) _buildChild({
+    required String id,
+    required String systemPrompt,
+    required ToolRegistry toolRegistry,
+    required ({Model model, StreamFunction stream}) wiring,
+    required CancelToken? cancelToken,
+  }) {
+    final retained = subagentManager;
+    final child = Agent(
+      model: wiring.model,
+      // gh-1742 review round 1, comment 2: the child loop shares the
+      // owner clamp the main loop runs — its over-window guard and the
+      // gh-1409 operative-pin budget measure against
+      // effectiveContextWindow(model.contextWindow, contextWindowCap),
+      // the SAME basis _childContextWindow resolves for compaction. A
+      // registry raise (served > catalog) must not fork the two bases.
+      contextWindowCap: contextWindowCap,
+      systemPrompt: systemPrompt,
+      streamFunction: wiring.stream,
+      toolRegistry: toolRegistry,
+      // The child's inbox: messages from the parent/siblings (and other Fa
+      // instances sharing the messaging root) arrive at turn boundaries.
+      externalSteeringSource: retained == null
+          ? null
+          : () => _inboxSteeringMessages(id),
+      // The delivery SLO (issue #647): inbox mail must soft-yield a long
+      // tool call within 2s. The probe is the slow (cross-process) fallback;
+      // the manager-event subscription below pokes the same path instantly
+      // for same-host mail.
+      externalSteeringProbe: retained == null
+          ? null
+          : () => retained.hasPendingMessages(id),
+      // Issue #862: children get the same misuse circuit breaker as the
+      // parent loop — the luna death was a child.
+      toolMisuseBreaker: misuseBreaker ? ToolMisuseBreaker() : null,
+    );
+    // Issue #1829 Core flow B: an output-truncated reply/agent_message
+    // call is captured as a partial artifact (never executed — I2); the
+    // pointer rides the child completion out of band.
+    child.onTruncatedToolCall = (call) async {
+      // gh-1956 review: awaited by the loop — the salvage persist
+      // re-seeds the durable ids before its own id allocation.
+      await _capture?.captureSalvaged(id, call);
+    };
+    final inboxWakeSub = subagentManager?.events.listen((event) {
+      if (event.handle.id == id && event.message != null) {
+        child.pokeSteering();
+      }
+    });
+    // Issue #383 heartbeat: in-flight liveness - every completed provider
+    // response touches the handle, so the parent's digest sees fresh
+    // last-activity and live request/token counts while the child runs.
+    _attachLivenessTouch(id, child, subagentManager);
+    // Issue #439: threshold-based proactive compaction at every child turn
+    // boundary — the main loop's discipline (#387/#388) applied to
+    // children, so the over-window guard stays the last resort. The loop
+    // runs the hook BEFORE the steering poll, so a queued `task_send` is
+    // delivered on the compacted context, in-order (E1/E2).
+    // gh-1948: the hook also flushes the transcript incrementally, so a
+    // RUNNING background child's JSONL exists and grows mid-flight —
+    // `task_observe` resolves and reads it instead of crashing on the
+    // placeholder path. Fire-and-forget: the flush is serialized per child
+    // and must never block the next provider request.
+    child.prepareNextTurn = (nextTurn) async {
+      unawaited(_flushChildTranscript(id, child));
+      return _compactChildAtBoundary(id, child, wiring, nextTurn);
+    };
+    if (cancelToken != null) {
+      unawaited(cancelToken.onCancel.then((_) => child.abort()));
+    }
+    return (child, inboxWakeSub);
+  }
+
+  /// Builds the child's tool registry from the agent-type surface plus the
+  /// child-only reply/agent_message tools (Phase 3b) when a manager backs
+  /// this executor. Extracted from [_run] to keep its CRAP in budget.
+  ToolRegistry _childToolRegistry(TaskAgentDefinition definition) {
+    final toolRegistry = ToolRegistry(
+      registry.toolSurfaceFor(definition, childTools),
+    );
+    if (subagentManager != null) {
+      for (final tool in subagentMonitoringTools(
+        manager: subagentManager,
+        currentSubagentId: currentSubagentId,
+        capture: () => _capture,
+      ).where((t) => childInjectedToolNames.contains(t.name))) {
+        toolRegistry.register(tool);
+      }
+    }
+    return toolRegistry;
+  }
+
+  /// Runs one `a2a:<name>` item against a remote agent (Phase 5a). Maps the
+  /// A2A task lifecycle onto the local result shape; registers the child in
+  /// the retained-subagent registry so `task_status`/`task_send` work
+  /// uniformly.
+  Future<TaskSingleResult> _runA2a(
+    TaskItem item,
+    int index,
+    String id,
+    String serverName,
+    Stopwatch stopwatch,
+    CancelToken? cancelToken,
+    TaskSpawnProgressCallback? onProgress,
+  ) async {
+    final manager = a2aManager;
+    if (manager == null || manager[serverName] == null) {
+      final available =
+          manager?.servers.keys.join(', ') ?? 'a2a not configured';
+      return _failure(
+        index,
+        id,
+        'a2a:$serverName',
+        item,
+        stopwatch,
+        'unknown a2a server "$serverName" — available: $available',
+      );
+    }
+    onProgress?.call(index, id, TaskSpawnPhase.running);
+    final retained = subagentManager;
+    if (retained != null) {
+      await retained.register(
+        id: id,
+        name: taskItemNameBase(item),
+        agentType: 'a2a:$serverName',
+        task: item.task,
+      );
+      await retained.update(id, status: SubagentStatus.running);
+    }
+    try {
+      final remoteTask = await manager.send(
+        serverName,
+        await _a2aPrompt(item, id),
+      );
+      // Poll to a terminal state (input-required also settles — the parent
+      // can task_send the answer).
+      final settled = await manager.waitForTask(
+        serverName,
+        remoteTask.id,
+        onUpdate: (task) => cancelToken?.throwIfCancelled(),
+      );
+      return await _a2aResult(
+        item,
+        index,
+        id,
+        serverName,
+        settled,
+        stopwatch,
+        onProgress,
+      );
+    } on CancelledException {
+      rethrow;
+    } on Object catch (error) {
+      onProgress?.call(index, id, TaskSpawnPhase.failed);
+      await _updateSubagentStatus(id, SubagentStatus.failed, error: '$error');
+      return _failure(index, id, 'a2a:$serverName', item, stopwatch, '$error');
+    }
+  }
+
+  /// Maps a settled remote task onto the per-item result: stores the
+  /// rendered artifacts, updates the retained-subagent handle, and renders
+  /// the [TaskSingleResult]. Extracted from [_runA2a] to keep its CRAP
+  /// within the ratchet budget.
+  Future<TaskSingleResult> _a2aResult(
+    TaskItem item,
+    int index,
+    String id,
+    String serverName,
+    A2aTask settled,
+    Stopwatch stopwatch,
+    TaskSpawnProgressCallback? onProgress,
+  ) async {
+    final failed = settled.state == A2aTaskState.failed;
+    final aborted = settled.state == A2aTaskState.canceled;
+    final capped = _capOutput(A2aManager.renderArtifacts(settled));
+    store.put(id, capped.$1);
+    onProgress?.call(
+      index,
+      id,
+      failed || aborted ? TaskSpawnPhase.failed : TaskSpawnPhase.completed,
+    );
+    await subagentManager?.update(
+      id,
+      status: _a2aSubagentStatus(settled.state),
+      modelId: 'a2a:$serverName',
+      error: failed ? 'remote task failed' : null,
+    );
+    return TaskSingleResult(
+      index: index,
+      id: id,
+      agent: 'a2a:$serverName',
+      task: item.task,
+      status: _a2aSpawnStatus(settled.state),
+      output: capped.$1,
+      truncated: capped.$2,
+      duration: stopwatch.elapsed,
+      tokens: 0,
+      requests: 1,
+      model: 'a2a:$serverName',
+      error: failed ? 'remote task failed' : null,
+    );
+  }
+
+  /// The A2A task state → spawn status mapping (result shape).
+  static TaskSpawnStatus _a2aSpawnStatus(A2aTaskState state) {
+    if (state == A2aTaskState.canceled) return TaskSpawnStatus.aborted;
+    if (state == A2aTaskState.failed) return TaskSpawnStatus.failed;
+    return TaskSpawnStatus.completed;
+  }
+
+  /// The A2A task state → retained-subagent status mapping (registry shape).
+  static SubagentStatus _a2aSubagentStatus(A2aTaskState state) {
+    if (state == A2aTaskState.inputRequired) return SubagentStatus.idle;
+    if (state == A2aTaskState.canceled) return SubagentStatus.aborted;
+    if (state == A2aTaskState.failed) return SubagentStatus.failed;
+    return SubagentStatus.completed;
+  }
+
+  /// The remote agent's prompt: the item task plus the pending inter-agent
+  /// messages, mirroring the local child's user prompt.
+  Future<String> _a2aPrompt(TaskItem item, String subagentId) async {
+    final buffer = StringBuffer(item.task.trim());
+    final retained = subagentManager;
+    if (retained != null) {
+      final queued = await retained.drainMessages(subagentId);
+      for (final message in queued) {
+        buffer.writeln();
+        buffer.writeln('from ${message.fromId}: ${message.text.trim()}');
+      }
+    }
+    return buffer.toString();
+  }
+
+  /// Schema validation when the item carries an `outputSchema`: the content
+  /// to store plus the structured output (both pass-through when the item
+  /// has no schema). Extracted from [_run] to keep its CRAP in budget.
+  Future<(String, StructuredTaskOutput?)> _applyOutputSchema(
+    Agent child,
+    TaskItem item,
+    String finalText,
+    CancelToken? cancelToken,
+  ) async {
+    final outputSchema = item.outputSchema;
+    if (outputSchema == null) return (finalText, null);
+    final validation = await _validateStructured(
+      child: child,
+      outputSchema: outputSchema,
+      finalText: finalText,
+      cancelToken: cancelToken,
+    );
+    return (validation.outputContent, validation.structured);
+  }
+
+  /// The child's inbox as steering messages (the agent loop polls this at
+  /// every turn boundary): each pending inter-agent message becomes a user
+  Future<List<Message>> _inboxSteeringMessages(String subagentId) async {
+    final manager = subagentManager;
+    if (manager == null) return const [];
+    final queued = await manager.drainMessages(subagentId);
+    if (queued.isNotEmpty) {
+      deliveryStage(
+        subagentId,
+        'consumed',
+        since: DateTime.tryParse(queued.first.sentAt),
+      );
+    }
+    return [
+      for (final message in queued)
+        UserMessage.text('from ${message.fromId}: ${message.text.trim()}'),
+    ];
+  }
+
+  /// Resolves [agentName] to its definition or throws listing the available
+  /// agent types.
+  TaskAgentDefinition _resolveDefinition(String agentName) {
+    final definition = registry.resolve(agentName);
+    if (definition == null) {
+      throw StateError(
+        'Unknown agent type "$agentName" — available: '
+        '${registry.agents.map((a) => a.name).join(', ')}',
+      );
+    }
+    return definition;
+  }
+
+  /// Cheap-role resolution (omp's agent `model` frontmatter): an
+  /// explicitly configured role wins; anything else inherits the parent
+  /// wiring — including a role that would merely ride the default chain,
+  /// whose rebuilt model would strand the parent's runtime-resolved
+  /// output-cap ladder entry (endpoint detection, `/model` edits) behind
+  /// a stale catalog default (issue #302).
+  ///
+  /// gh-1742 (invariant 2): the resolved model carries the REGISTERED
+  /// context window for its identity, so the child loop's over-window
+  /// guard and the compaction threshold divide by the same honest number
+  /// the main agent and the ctx meter resolve. The owner cap rides the
+  /// child `Agent` itself (`_buildChild`/`_buildResumeChild` pass
+  /// `contextWindowCap`), so both bases clamp through
+  /// [effectiveContextWindow] by construction — a registry raise cannot
+  /// fork the guard from compaction.
+  ({Model model, StreamFunction stream}) _resolveChildWiring(
+    TaskAgentDefinition definition,
+  ) {
+    final rolesResolver = this.rolesResolver;
+    if (rolesResolver == null) {
+      return (
+        model: withRegisteredContextWindow(model(), contextWindowRegistry),
+        stream: streamFunction(),
+      );
+    }
+    final role = definition.modelRole ?? subagentModelRole;
+    // A pinned role always resolves (pinsRole ⇒ chainFor non-null); an
+    // unpinned one resolves to null here, keeping the parent wiring.
+    final resolved =
+        rolesResolver.config.pinsRole(
+          role,
+          cwd: rolesResolver.cwd,
+          homeDir: rolesResolver.homeDir,
+        )
+        ? rolesResolver.resolveRole(role)
+        : null;
+    if (resolved != null) {
+      return (
+        model: withRegisteredContextWindow(
+          resolved.model,
+          contextWindowRegistry,
+        ),
+        stream: resolved.stream,
+      );
+    }
+    return (
+      model: withRegisteredContextWindow(model(), contextWindowRegistry),
+      stream: streamFunction(),
+    );
+  }
+
+  /// The child's system prompt: the definition's prompt plus the shared
+  /// batch context under a `# CONTEXT` heading.
+  String _buildSystemPrompt(
+    TaskAgentDefinition definition,
+    String context, {
+    int? replyBudget,
+  }) {
+    final systemPrompt = StringBuffer(definition.systemPrompt.trim());
+    if (context.trim().isNotEmpty) {
+      systemPrompt
+        ..writeln()
+        ..writeln()
+        ..writeln('# CONTEXT')
+        ..write(context.trim());
+    }
+    // Issue #1829 Core flow C + gh-1956: children with the
+    // reply/agent_message surface get the report-size contract with the
+    // live budget — the auto-spill contract by default, the pure-chunk
+    // contract under the kill switch.
+    if (replyBudget != null) {
+      systemPrompt
+        ..writeln()
+        ..writeln()
+        ..write(
+          deliverableChunkContract(
+            replyBudget,
+            autoSpill: replyAutoSpill?.call() ?? true,
+          ),
+        );
+    }
+    return systemPrompt.toString();
+  }
+
+  /// The child's assignment prompt, with the schema instructions appended
+  /// when the item carries an `outputSchema`, and any queued inter-agent
+  /// messages (Phase 3b) delivered as a `# MESSAGES` section.
+  Future<String> _buildUserPrompt(TaskItem item, [String? subagentId]) async {
+    final userPrompt = StringBuffer(
+      taskAssignmentPrompt.replaceAll('{{task}}', item.task.trim()),
+    );
+    final retained = subagentManager;
+    if (subagentId != null && retained != null) {
+      final queued = await retained.drainMessages(subagentId);
+      if (queued.isNotEmpty) {
+        userPrompt
+          ..writeln()
+          ..writeln()
+          ..writeln('# MESSAGES');
+        for (final message in queued) {
+          userPrompt.writeln('from ${message.fromId}: ${message.text.trim()}');
+        }
+      }
+    }
+    if (item.outputSchema != null) {
+      userPrompt
+        ..writeln()
+        ..writeln()
+        ..write(
+          taskSchemaOutputPrompt.replaceAll(
+            '{{schema}}',
+            const JsonEncoder.withIndent('  ').convert(item.outputSchema),
+          ),
+        );
+    }
+    return userPrompt.toString();
+  }
+
+  /// Next message index to bill per child id — the additive cursor that
+  /// keeps turn-boundary billing and the completion bill from
+  /// double-counting the same turn (issue #332).
+  final _usageCursors = <String, int>{};
+
+  /// Starts turn-boundary usage billing for [child] (issue #332): every
+  /// finished turn is added onto the registry row immediately, so a host
+  /// restart mid-run leaves a persisted 'running' row that already carries
+  /// the child's usage (previously usage was recorded only at completion,
+  /// making every interrupted row look never-started). [from] skips the
+  /// seeded prior transcript on a resume (its usage is already on the
+  /// handle). Returns the unsubscribe function, or null when no manager.
+  void Function()? _trackChildUsage(String id, Agent child, {int from = 0}) {
+    if (subagentManager == null) return null;
+    _usageCursors[id] = from;
+    return child.subscribe((event, _) {
+      if (event is TurnEndEvent) _billChildUsage(id, child);
+    });
+  }
+
+  /// Issue #383 heartbeat: subscribes the child to in-flight liveness -
+  /// every completed provider response touches the registry handle, so
+  /// the parent's digest sees fresh last-activity and live request/token
+  /// counts while the child runs. [from] indexes into the message list so
+  /// a resumed child reports only NEW responses, never the seeded
+  /// transcript. The listener dies with the child agent; no
+  /// unsubscription needed. Null manager is a no-op.
+  static void _attachLivenessTouch(
+    String id,
+    Agent child,
+    SubagentManager? manager, {
+    int from = 0,
+  }) {
+    if (manager == null) return;
+    child.subscribe((event, cancelToken) async {
+      if (event is MessageEndEvent && event.message is AssistantMessage) {
+        final usage = _usageStats(child, from: from);
+        manager.touch(id, tokens: usage.tokens, requests: usage.requests);
+      }
+    });
+  }
+
+  /// Adds the child's usage BEYOND the per-id cursor onto its registry
+  /// row. Idempotent: a second call without new turns bills nothing.
+  void _billChildUsage(String id, Agent child) {
+    final manager = subagentManager;
+    if (manager == null) return;
+    final usage = _usageStats(child, from: _usageCursors[id] ?? 0);
+    if (usage.requests == 0) return;
+    _usageCursors[id] = child.state.messages.length;
+    unawaited(
+      manager.update(id, tokens: usage.tokens, requests: usage.requests),
+    );
+  }
+
+  /// Token/request totals across the child's assistant messages — from
+  /// [from] on (index into the message list), so a resumed child reports
+  /// only its NEW usage instead of re-counting the seeded transcript.
+  static ({int tokens, int requests}) _usageStats(Agent child, {int from = 0}) {
+    var tokens = 0;
+    var requests = 0;
+    final messages = child.state.messages;
+    for (var i = from; i < messages.length; i++) {
+      final message = messages[i];
+      if (message is AssistantMessage) {
+        requests++;
+        tokens +=
+            message.usage.input +
+            message.usage.output +
+            message.usage.cacheWrite;
+      }
+    }
+    return (tokens: tokens, requests: requests);
+  }
+
+  /// Parses the child's final output as JSON and validates it against
+  /// [outputSchema]. On failure the child gets exactly ONE fix retry with
+  /// the full issue list (omp gives the model every problem at once), then
+  /// the outcome is terminal (card §3).
+  Future<({StructuredTaskOutput structured, String outputContent})>
+  _validateStructured({
+    required Agent child,
+    required Object outputSchema,
+    required String finalText,
+    CancelToken? cancelToken,
+  }) async {
+    final rejected = _rejectUnusableSchema(outputSchema, finalText);
+    if (rejected != null) return rejected;
+
+    var text = finalText;
+    var retried = false;
+    while (true) {
+      final attempt = _validateOnce(text, outputSchema);
+      if (attempt.errors.isEmpty) {
+        return (
+          structured: StructuredTaskOutput(
+            status: StructuredValidationStatus.valid,
+            data: attempt.data,
+          ),
+          // Store the typed object itself so its fields stay addressable
+          // via `agent://<id>/<dot.path>` (omp stores the finalized JSON).
+          outputContent: const JsonEncoder.withIndent(
+            '  ',
+          ).convert(attempt.data),
+        );
+      }
+      if (retried) {
+        return (
+          structured: StructuredTaskOutput(
+            status: StructuredValidationStatus.invalid,
+            data: attempt.data,
+            error: attempt.errors.join('; '),
+          ),
+          outputContent: text,
+        );
+      }
+      retried = true;
+      await child.prompt(
+        taskSchemaFixPrompt.replaceAll(
+          '{{errors}}',
+          attempt.errors.map((e) => '- $e').join('\n'),
+        ),
+      );
+      cancelToken?.throwIfCancelled();
+      text = _finalAssistantText(child);
+    }
+  }
+
+  /// Rejects schemas that are neither a JSON Schema object nor `true`
+  /// (`false` rejects every output, anything else is unsupported). Returns
+  /// the terminal outcome, or `null` when the schema is usable.
+  static ({StructuredTaskOutput structured, String outputContent})?
+  _rejectUnusableSchema(Object outputSchema, String finalText) {
+    if (outputSchema is! Map && outputSchema != true) {
+      if (outputSchema == false) {
+        return (
+          structured: const StructuredTaskOutput(
+            status: StructuredValidationStatus.invalid,
+            error: 'boolean false schema rejects all outputs',
+          ),
+          outputContent: finalText,
+        );
+      }
+      return (
+        structured: StructuredTaskOutput(
+          status: StructuredValidationStatus.unavailable,
+          error:
+              'unsupported outputSchema (${outputSchema.runtimeType}); '
+              'expected a JSON Schema object or true',
+        ),
+        outputContent: finalText,
+      );
+    }
+    return null;
+  }
+
+  /// One parse + validate pass over [text] (omp's per-attempt validation).
+  static ({Object? data, List<String> errors}) _validateOnce(
+    String text,
+    Object outputSchema,
+  ) {
+    final data = _extractJsonValue(text);
+    if (data == null) {
+      return (
+        data: null,
+        errors: const ['the final output contains no JSON document'],
+      );
+    }
+    if (outputSchema is Map) {
+      return (
+        data: data,
+        errors: validateJsonValue(
+          value: data,
+          schema: outputSchema.cast<String, dynamic>(),
+        ),
+      );
+    }
+    // outputSchema == true: any parseable JSON document is accepted.
+    return (data: data, errors: const []);
+  }
+
+  /// The concatenated text of the child's last assistant message.
+  /// Stop-reason mapping (omp's abort/error handling): `error` throws, and
+  /// the caller turns it into a per-item error entry; an empty transcript
+  /// throws as well.
+  String _finalAssistantText(Agent child) {
+    AssistantMessage? last;
+    for (final message in child.state.messages) {
+      if (message is AssistantMessage) last = message;
+    }
+    if (last == null) {
+      throw StateError('subagent produced no assistant message');
+    }
+    switch (last.stopReason) {
+      case StopReason.aborted:
+        throw CancelledException(last.errorMessage ?? 'subagent aborted');
+      case StopReason.error:
+        throw StateError(last.errorMessage ?? 'subagent failed');
+      default:
+        break;
+    }
+    return [
+      for (final block in last.content)
+        if (block is TextContent) block.text,
+    ].join('\n').trim();
+  }
+
+  TaskSingleResult _failure(
+    int index,
+    String id,
+    String agentName,
+    TaskItem item,
+    Stopwatch stopwatch,
+    String error, {
+    bool aborted = false,
+  }) {
+    // Capture happens mid-run: a failed run can already carry salvaged
+    // deliverable artifacts and an explicit reply (issue #1829 review —
+    // a failed completion is still a completion; the pointers ride it).
+    final handle = subagentManager?[id];
+    final reply = handle?.lastReply;
+    final deliverables = List<DeliverableRecord>.of(
+      handle?.deliverables ?? const [],
+    );
+    final stubFallback = _stubFallbackNote(
+      handle,
+      reply: reply,
+      deliverables: deliverables,
+    );
+    return TaskSingleResult(
+      index: index,
+      id: id,
+      agent: agentName,
+      task: item.task,
+      status: aborted ? TaskSpawnStatus.aborted : TaskSpawnStatus.failed,
+      output: '',
+      truncated: false,
+      duration: stopwatch.elapsed,
+      tokens: 0,
+      requests: 0,
+      model: model().id,
+      error: error,
+      reply: reply,
+      deliverables: deliverables,
+      stubFallback: stubFallback,
+    );
+  }
+
+  /// Caps raw output at [maxTaskOutputLines] / [maxTaskOutputBytes] (omp's
+  /// per-subagent truncation; omp writes the uncapped output to disk, our
+  /// in-memory store keeps the capped form).
+  static (String, bool) _capOutput(String content) {
+    var result = content;
+    var truncated = false;
+    final lines = result.split('\n');
+    if (lines.length > maxTaskOutputLines) {
+      result = lines.take(maxTaskOutputLines).join('\n');
+      truncated = true;
+    }
+    final bytes = utf8.encode(result);
+    if (bytes.length > maxTaskOutputBytes) {
+      result = utf8.decode(
+        bytes.sublist(0, maxTaskOutputBytes),
+        allowMalformed: true,
+      );
+      truncated = true;
+    }
+    return (result, truncated);
+  }
+
+  /// Extracts the first parseable JSON document from [text]: the whole text,
+  /// then the last fenced code block, then the outermost `{…}`/`[…]` span
+  /// (omp's yield payload assembly, reduced to text output).
+  static Object? _extractJsonValue(String text) {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return null;
+    return _tryParseJson(trimmed) ??
+        _jsonFromLastFence(trimmed) ??
+        _jsonFromOutermostSpan(trimmed);
+  }
+
+  /// The first parseable JSON document inside a fenced code block, trying
+  /// the last fence first.
+  static Object? _jsonFromLastFence(String trimmed) {
+    final fence = RegExp('```(?:json|JSON)?\\s*\\r?\\n([\\s\\S]*?)```');
+    final matches = fence.allMatches(trimmed).toList();
+    for (final match in matches.reversed) {
+      final captured = match.group(1);
+      final value = captured == null ? null : _tryParseJson(captured.trim());
+      if (value != null) return value;
+    }
+    return null;
+  }
+
+  /// The first parseable JSON document spanning the outermost `{…}` or
+  /// `[…]` of [trimmed].
+  static Object? _jsonFromOutermostSpan(String trimmed) {
+    for (final pair in const [('{', '}'), ('[', ']')]) {
+      final start = trimmed.indexOf(pair.$1);
+      final end = trimmed.lastIndexOf(pair.$2);
+      if (start >= 0 && end > start) {
+        final value = _tryParseJson(trimmed.substring(start, end + 1));
+        if (value != null) return value;
+      }
+    }
+    return null;
+  }
+
+  static Object? _tryParseJson(String text) {
+    try {
+      return parseJsonWithRepair(text);
+    } on FormatException {
+      return null;
+    }
+  }
+
+  /// Sessions of in-flight children (id → session once created). Fire-and-
+  /// forget creation via [_ensureChildSession]; flushes append incrementally.
+  final _childSessions = <String, Session>{};
+
+  /// How many transcript messages were flushed per child id (incremental
+  /// appends only new messages beyond this counter).
+  final _childSessionWrites = <String, int>{};
+
+  /// Per-child serialization chain for transcript flushes — concurrent
+  /// fire-and-forget flushes would otherwise interleave session records.
+  final _childFlushChains = <String, Future<void>>{};
+
+  /// Appends the child's NEW transcript messages (beyond the flush counter)
+  /// to its session file, serialized per child so concurrent flushes never
+  /// interleave records. Idempotent — safe to call at every turn boundary
+  /// and in a finally block (the last-chance flush for aborts/failures).
+  Future<void> _flushChildTranscript(String id, Agent child) async {
+    final chain = _childFlushChains[id] ?? Future<void>.value();
+    final next = chain.then((_) => _flushChildTranscriptNow(id, child));
+    _childFlushChains[id] = next;
+    await next;
+  }
+
+  Future<void> _flushChildTranscriptNow(String id, Agent child) async {
+    // Lazy-create the JSONL session on the FIRST flush — never on spawn.
+    // Subagents that finish with no transcript never leave an empty file.
+    var session = _childSessions[id];
+    if (session == null) {
+      final factory = childSessionFactory;
+      final manager = subagentManager;
+      if (factory == null || manager == null) return;
+      try {
+        session = await factory(manager.parentSessionId, id);
+        _childSessions[id] = session;
+        manager.attachSession(id, (await session.getMetadata()).path);
+      } on Object {
+        // Session creation is best-effort; flushes become no-ops when it fails.
+        return;
+      }
+    }
+    final messages = child.state.messages;
+    final written = _childSessionWrites[id] ?? 0;
+    try {
+      for (var i = written; i < messages.length; i++) {
+        await session.appendMessage(messages[i]);
+      }
+      _childSessionWrites[id] = messages.length;
+    } on Object {
+      // A failed flush must not affect the child's result.
+    }
+  }
+
+  /// Best-effort subagent status update (no-op when no manager).
+  Future<void> _updateSubagentStatus(
+    String id,
+    SubagentStatus status, {
+    String? error,
+  }) async {
+    await subagentManager?.update(id, status: status, error: error);
+  }
+}
+
+/// Silent compaction hooks: a child has no TUI — the handle's compaction
+/// receipt ([SubagentManager.recordCompaction]) is the observability
+/// surface (issue #439).
+final class _SilentCompactionHooks extends AutoCompactorHooks {
+  _SilentCompactionHooks();
+
+  /// Whether the engine ATTEMPTED any pass (issue #1924 review round 1):
+  /// a gate-declined no-op (`shouldCompact` re-check declines — e.g. the
+  /// resume probe where only `+ incomingTokens` crossed the trigger while
+  /// the transcript sits under it) fires NO pass and NO attempt — the
+  /// caller must never read that healthy no-op as a failed pass.
+  bool attempted = false;
+
+  @override
+  void onPass(AutoCompactorPass pass) {
+    attempted = true;
+  }
+
+  @override
+  void onRetry(int attempt, int maxAttempts, Duration backoff, Object error) {}
+
+  @override
+  void onDone(int passes, int tokens) {
+    if (passes > 0) attempted = true;
+  }
+
+  @override
+  void onBothRolesFailed(Object lastError) {}
+}

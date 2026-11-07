@@ -1,0 +1,74 @@
+// Manual diagnostic probe (not part of any CI gate): boots a real PTY
+// CLI against the mock server and dumps the idle + busy screens.
+//
+// Integration-tagged like every other pty_harness consumer (issue #553
+// taxonomy — it spawns a real process, so it is excluded from the
+// pre-commit/unit gates): `dart test test/integration/zz_probe_test.dart
+// --tags integration`. Untagged, it executed inside every unit shard,
+// where the 30s default timeout fired on loaded runners and the timeout's
+// teardown race in the PTY native layer took whole shards down (tcache
+// abort — hostile-env job, 2026-10-03).
+@Tags(['io', 'integration'])
+@Timeout(Duration(minutes: 4))
+library;
+
+import 'dart:io';
+
+import 'package:fa_llm_mock/fa_llm_mock.dart';
+import 'package:test/test.dart';
+
+import 'pty_harness.dart';
+
+void main() {
+  test('probe: dump the idle + busy screen at 80x24', () async {
+    final tempHome = Directory.systemTemp.createTempSync('fa_probe_');
+    final workspace = Directory('/tmp').createTempSync('faprobe');
+    addTearDown(() => workspace.deleteSync(recursive: true));
+    final server = await MockLlmServer.start()
+      ..enqueueToolCall('bash', '{"command": "sleep 6"}')
+      ..enqueueText('probe done');
+    addTearDown(server.stop);
+    File('${tempHome.path}/.fah/config.yaml')
+      ..createSync(recursive: true)
+      ..writeAsStringSync('''
+provider: openai-completions
+model: mock-model
+baseUrl: ${server.baseUrl}
+mode: code
+approvalMode: yolo
+allowedTools: []
+''');
+
+    final harness = await FaCliHarness.spawn(
+      workingDirectory: workspace.path,
+      extraEnv: {'HOME': tempHome.path},
+      columns: 80,
+      rows: 24,
+    );
+    addTearDown(() async {
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    await harness.waitForBoot();
+    String dump(String tag) {
+      // ignore: avoid_print
+      print('=== $tag ===');
+      // ignore: avoid_print
+      harness.viewportLines.asMap().forEach((i, l) {
+        // ignore: avoid_print
+        print('${i.toString().padLeft(2)}|$l|');
+      });
+      return harness.screenText;
+    }
+
+    dump('idle boot');
+    harness.sendText('hello probe');
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    harness.sendEnter();
+    await Future<void>.delayed(const Duration(milliseconds: 800));
+    dump('mid-run +2s');
+    await Future<void>.delayed(const Duration(seconds: 7));
+    dump('settled');
+  });
+}

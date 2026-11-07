@@ -1,0 +1,237 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:typed_data';
+
+import 'package:flutter/widgets.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+
+import 'approval_ui.dart';
+
+/// One message in the chat transcript the [FaChatScreen] renders.
+///
+/// Moved out of the app's agent service so hosts can adapt any backend
+/// (the Fa AgentService, the YoClip studio backend, tests) to the shared
+/// chat UI.
+final class FaChatMessage {
+  /// Creates a chat message.
+  FaChatMessage({
+    required this.role,
+    required this.content,
+    this.attachments = const [],
+    this.toolName,
+    this.isError = false,
+    this.data,
+  });
+
+  /// `user` | `assistant` | `tool` | `system` | `widget`.
+  final String role;
+
+  /// Plain-text (markdown for assistant messages) content. Mutable so
+  /// streaming backends can append deltas to the message already in the
+  /// transcript (see `_currentAssistantMessage` in Fa's AgentService).
+  String content;
+
+  /// The user message's attachments, oldest first (issue #461). The tile
+  /// renders an inline thumbnail per entry with [bytes], a labeled
+  /// `[image unavailable]` placeholder when only a raster-image [path] is
+  /// known (bytes dropped from the record), and a file chip otherwise.
+  final List<FaChatAttachment> attachments;
+
+  /// Tool name for `tool` messages (rendered collapsed by default).
+  final String? toolName;
+
+  /// Whether this message reports a failure (tool result or provider error).
+  final bool isError;
+
+  /// Opaque host payload (dynamic-message widget id); fa_ui never
+  /// interprets it.
+  final Object? data;
+}
+
+/// One attachment of a user message: [bytes] when the record carries the
+/// inline image part, plus the sandbox [path] it was staged under
+/// (`uploads/…`, null for bytes sent without a path — in-app screenshots).
+typedef FaChatAttachment = ({Uint8List? bytes, String? path});
+
+/// The transcript index of the LIVE thinking block (issue #1374): the
+/// NEWEST `thinking`-role message while the run streams, -1 when idle.
+/// One agentic run leaves SEVERAL finished thinking notes in the
+/// transcript (one per LLM turn) — a `isStreaming`-only gate animated
+/// every one of them (a ticker + SVG re-parse each); only the live
+/// block may animate.
+int liveThinkingMessageIndex(FaChatService service) =>
+    service.isStreaming
+        ? service.messages.lastIndexWhere((m) => m.role == 'thinking')
+        : -1;
+
+/// The live thinking block itself. Candidates compare with [identical]
+/// against the SAME [FaChatService.messages] list the tile was built
+/// from; surfaces that rebuild the [FaChatMessage] (the chat screen's
+/// metadata mapping) gate through [liveThinkingMessageIndex] instead.
+FaChatMessage? liveThinkingMessage(FaChatService service) {
+  final index = liveThinkingMessageIndex(service);
+  return index < 0 ? null : service.messages[index];
+}
+
+/// A file staged in the composer before sending: written into the agent
+/// sandbox and referenced by path.
+typedef FaStagedAttachment = ({String path, Uint8List bytes, String mimeType});
+
+/// The stand-in text for an assistant message the model left empty (no text
+/// blocks at all) — shown instead of a blank bubble.
+const emptyResponsePlaceholder = '(empty response — try again)';
+
+/// The backend surface the shared chat UI needs.
+///
+/// Implement it over your agent backend (Fa's `AgentService` already
+/// satisfies every member; other hosts write a thin adapter). The chat
+/// listens via [Listenable] and re-reads [messages] on every notify.
+abstract interface class FaChatService implements FaApprovalModeController {
+  /// The transcript, oldest first; re-read on every change notification.
+  List<FaChatMessage> get messages;
+
+  /// The sandbox filesystem markdown images / media in the transcript
+  /// resolve against (see `SandboxImageResolver`). Null for hosts without a
+  /// sandbox — the chat then renders image/media placeholders.
+  ExecutionEnv? get sandboxEnv;
+
+  /// Whether the agent is mid-run (drives the stop button / typing state).
+  bool get isStreaming;
+
+  /// The last provider/runtime error, surfaced as a system line; null when
+  /// the last run succeeded.
+  String? get error;
+
+  /// Steer-queue previews shown above the composer while streaming.
+  List<String> get pendingSteerTexts;
+
+  /// Sends a plain user message.
+  Future<void> sendText(String text);
+
+  /// Sends staged attachments with an optional caption.
+  Future<void> sendAttachments({
+    required List<FaStagedAttachment> attachments,
+    String text,
+  });
+
+  /// Stages raw bytes under [name] in the agent sandbox; returns the path.
+  Future<String> stageAttachment({
+    required String name,
+    required Uint8List bytes,
+  });
+
+  /// Removes a staged attachment the user discarded before sending.
+  Future<void> discardStagedAttachment(String path);
+
+  /// Aborts the active run (drives the stop button).
+  void abort();
+
+  /// Full transcript as markdown (the copy-session toolbar action).
+  String transcriptMarkdown();
+
+  /// UI hooks the host wires to the sheets in this package. All harness
+  /// types — see `approval_ui.dart`, `ask_ui.dart`,
+  /// `secret_request_sheet.dart`.
+  ApprovalPrompt? get approvalPromptHandler;
+  set approvalPromptHandler(ApprovalPrompt? handler);
+  AskCallback? get askHandler;
+  set askHandler(AskCallback? handler);
+  RequestSecretCallback? get secretRequestHandler;
+  set secretRequestHandler(RequestSecretCallback? handler);
+
+  /// UI hook for a mid-run password ask (issue #367): the bash tool calls
+  /// it when the detector sees a prompt; the sheet's value is streamed to
+  /// the live process stdin. `null` -> the ask resolves as declined (the
+  /// tool writes a bare newline), the safe headless default.
+  PasswordPromptCallback? get passwordPromptHandler;
+  set passwordPromptHandler(PasswordPromptCallback? handler);
+
+  /// Jump-to-message executor: scrolls the transcript so the message with
+  /// [messageId] is in view. The chat screen installs the handler; null
+  /// outside a scrolling chat surface (tests, embedded previews).
+  void Function(String messageId)? get scrollToMessageHandler;
+  set scrollToMessageHandler(void Function(String messageId)? handler);
+
+  /// The approval manager (mode selector in the composer menu).
+  @override
+  ApprovalManager get approval;
+
+  /// Applies a new approval mode.
+  @override
+  void setApprovalMode(ApprovalMode mode);
+
+  /// The live trajectory ledger: a [TrajectorySnapshot] per change, in
+  /// append order — one snapshot per finalized session record and per
+  /// streaming agent event. Hosts implement it by feeding a core
+  /// [TrajectorySnapshotBuilder] (session records through `append`, agent
+  /// events through `applyEvent`) — see [TrajectoryServiceFeed] for a
+  /// ready-made producer. Hosts without a ledger turn
+  /// `FaChatFeatures.trajectory` off instead (a never-emitting stream
+  /// would only leave the panel loading).
+  Stream<TrajectorySnapshot> get trajectory;
+
+  /// Hidden-range drill-in (issue #385 F4): resolves the records a
+  /// compacted ledger row covers, straight from the session file, as
+  /// bounded previews. Default `null` — hosts opt in by overriding; the
+  /// trajectory shows the drill-in tab only when this is non-null.
+  Future<List<TrajectoryHiddenRecordPreview>> Function(
+    TrajectoryCompactedRecord record,
+  )?
+  get resolveHiddenRecords => null;
+
+  /// Transcript records sitting ABOVE the loaded window: `null` while the
+  /// count is still being computed, `0` once the whole transcript is
+  /// loaded, `N` — the number a "Load earlier" banner shows before
+  /// tapping [loadOlderHistory] pages the next chunk in. Hosts without
+  /// history paging return `0` (the banner never renders).
+  int? get historyAboveCount;
+
+  /// Pages the next chunk of older transcript history into view. No-op
+  /// while a page load is running or everything is already loaded.
+  Future<void> loadOlderHistory();
+
+  /// The last [loadOlderHistory] failure for the history banner's retry
+  /// state: null when nothing failed or a retry succeeded. Hosts without
+  /// history paging always return null.
+  String? get historyLoadError;
+
+  /// Whether a history page load ([loadOlderHistory] or
+  /// [loadNewerHistory]) is in flight: the banners render a spinner and
+  /// ignore taps while true (issue #135 E6).
+  bool get historyLoading;
+
+  /// The exact total transcript-record count once the background count
+  /// landed - the N of the terminal "Beginning of session (1 of N)"
+  /// banner; `null` until then.
+  int? get historyTotalCount;
+
+  /// Whether newer transcript records sit below the loaded window (the
+  /// "Load newer" banner's visibility signal - true even while the exact
+  /// count is still unknown, e.g. right after a jump). Hosts without
+  /// history paging return `false`.
+  bool get historyHasNewer;
+
+  /// Transcript records BELOW the loaded window (deep paging evicted the
+  /// newest side): `null` while unknown, `0` at the live tail, `N` -
+  /// what a "Load newer" banner shows before tapping [loadNewerHistory]
+  /// pages the next chunk back in. Visibility comes from
+  /// [historyHasNewer], not from this count.
+  int? get historyBelowCount;
+
+  /// Brings the transcript back to the LIVE TAIL after deep paging - the
+  /// page-down path. Jumps in one bounded step (no chunk-by-chunk crawl)
+  /// and MUST work while the agent is streaming: paging newer is a view
+  /// operation, and a run actively appending below a deep-paged window is
+  /// exactly when the "Load newer" banner gets tapped (issue #1159).
+  /// Reaching the tail clears [historyHasNewer] and dismisses the banner.
+  /// No-op while a page load is already running.
+  Future<void> loadNewerHistory();
+
+  /// Jump-to-message (issue #135 AC6): brings the transcript row
+  /// [messageId] into the loaded window, paging older history in when
+  /// the target sits above the loaded range. Returns whether the target
+  /// is now loaded; the caller (the chat screen) then scrolls to it.
+  Future<bool> jumpToMessage(String messageId);
+}

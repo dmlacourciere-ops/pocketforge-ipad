@@ -1,0 +1,1803 @@
+/// Approval prompt and TUI rendering split from [AgentCli] to keep
+/// agent_cli.dart under the repo's 2800-line size gate.
+part of 'agent_cli.dart';
+
+/// Implementation members of [AgentCli] for approval prompts.
+extension ApprovalCommands on AgentCli {
+  /// Answers any pending approval/ask prompt defensively so a tool call
+  /// never waits on an answer that cannot arrive.
+  void _cancelPendingAnswers() {
+    _pendingApprovalAnswer?.complete('n');
+    _pendingApprovalAnswer = null;
+    _pendingAskAnswer?.complete(null);
+    _pendingAskAnswer = null;
+  }
+
+  Future<ApprovalDecision> _promptForApproval(ApprovalRequest request) async {
+    // TUI mode: prompt through the on-screen approval zone (y/a/n keys).
+    final tui = _tuiController;
+    if (_useTui && tui != null) return _promptForApprovalTui(tui, request);
+    return _promptForApprovalLine(request);
+  }
+
+  /// The TUI branch of [_promptForApproval]: the on-screen approval zone;
+  /// a cancel (Esc) or an unexpected answer type denies. A typed note rides
+  /// along as steering feedback so the model sees it at the next step.
+  Future<ApprovalDecision> _promptForApprovalTui(
+    FaTuiController tui,
+    ApprovalRequest request,
+  ) async {
+    final result = await _openHerdrPrompt(
+      tui,
+      ApprovalPromptSpec(request: request),
+    );
+    if (result is! ApprovalPromptAnswer) return ApprovalDecision.deny;
+    _steerApprovalNote(result.note.trim(), request);
+    _noteApproveAlwaysAnswer(result.value);
+    return result.value;
+  }
+
+  /// Steers a typed approval note along as steering feedback so the model
+  /// sees it at the next step; an empty note rides nothing (split out of
+  /// [_promptForApprovalTui] to keep it under the CRAP ratchet).
+  void _steerApprovalNote(String note, ApprovalRequest request) {
+    if (note.isNotEmpty) {
+      _agent.steer(
+        UserMessage.text(
+          'Note from the user while approving "${request.toolName}": $note',
+        ),
+      );
+    }
+  }
+
+  /// Persists the "always" preference change when [decision] is
+  /// [ApprovalDecision.approveAlways] (both prompt surfaces).
+  void _noteApproveAlwaysAnswer(ApprovalDecision decision) {
+    if (decision == ApprovalDecision.approveAlways) {
+      config.onApprovalChanged?.call();
+    }
+  }
+
+  /// The line-mode branch of [_promptForApproval]: prints the prompt lines
+  /// and waits for [_handleLine] to route the answer line (or an interrupt
+  /// to answer "no").
+  Future<ApprovalDecision> _promptForApprovalLine(
+    ApprovalRequest request,
+  ) async {
+    // Tool calls prepare sequentially (even in parallel batches), so at most
+    // one prompt is pending; complete a stray one defensively.
+    _pendingApprovalAnswer?.complete('n');
+    final pending = Completer<String>();
+    _pendingApprovalAnswer = pending;
+    _writeApprovalPromptLines(request);
+    final interruptSub = io.interrupts.listen((_) {
+      if (!pending.isCompleted) pending.complete('n');
+    });
+    final answer = await pending.future;
+    await interruptSub.cancel();
+    if (identical(_pendingApprovalAnswer, pending)) {
+      _pendingApprovalAnswer = null;
+    }
+    final decision = _approvalDecisionFor(answer);
+    _noteApproveAlwaysAnswer(decision);
+    return decision;
+  }
+
+  /// The three `[approval]` prompt lines (reason, tool + args, choices).
+  void _writeApprovalPromptLines(ApprovalRequest request) {
+    io.writeln('[approval] ${request.reason}');
+    io.writeln(
+      '[approval] tool: ${request.toolName} (${request.tier.name} tier) — '
+      '${formatArgs(request.arguments)}',
+    );
+    io.writeln(
+      '[approval] allow? [y]es once / [n]o / [a]lways for '
+      '"${request.toolName}"',
+    );
+  }
+
+  /// Maps the typed approval answer to a decision; anything unrecognized
+  /// denies (safe default).
+  ApprovalDecision _approvalDecisionFor(String answer) =>
+      switch (answer.toLowerCase()) {
+        'y' || 'yes' => ApprovalDecision.approveOnce,
+        'a' || 'always' => ApprovalDecision.approveAlways,
+        _ => ApprovalDecision.deny,
+      };
+
+  /// Reads one input line for the ask menu. Resolves to `null` on cancel
+  /// (Ctrl-C interrupt or input shutdown), which the menu maps to "ask
+  /// cancelled by user".
+  Future<String?> _nextAskLine() async {
+    // Ask forces its tool batch to sequential execution, so at most one
+    // prompt is pending; complete a stray one defensively as cancelled.
+    final stray = _pendingAskAnswer;
+    if (stray != null && !stray.isCompleted) stray.complete(null);
+    final pending = Completer<String?>();
+    _pendingAskAnswer = pending;
+    final interruptSub = io.interrupts.listen((_) {
+      if (!pending.isCompleted) pending.complete(null);
+    });
+    final line = await pending.future;
+    await interruptSub.cancel();
+    if (identical(_pendingAskAnswer, pending)) {
+      _pendingAskAnswer = null;
+    }
+    return line;
+  }
+
+  /// against a second `/provider custom` while one is running). While true,
+  /// input lines buffer here instead of steering or starting runs.
+
+  /// outruns the flow); consumed by the next `_promptLine` call.
+
+  /// Answers an `ask` question set by walking [questions] one at a time.
+  Future<List<AskAnswer>?> _answerAskQuestions(
+    List<AskQuestion> questions,
+  ) async {
+    // TUI mode: each question runs through the on-screen prompt zone.
+    final tui = _tuiController;
+    if (_useTui && tui != null) return _answerAskQuestionsTui(tui, questions);
+    return _walkAskAnswers(_askOneQuestion, questions);
+  }
+
+  /// Walks [questions] one at a time through [answerOne]; the first
+  /// cancel (`null`) aborts the whole batch. Shared by the line-mode and
+  /// TUI branches of [_answerAskQuestions] (extracted so the TUI branch
+  /// stays under the CRAP ratchet).
+  Future<List<AskAnswer>?> _walkAskAnswers(
+    Future<AskAnswer?> Function(AskQuestion question, int index, int total)
+    answerOne,
+    List<AskQuestion> questions,
+  ) async {
+    final answers = <AskAnswer>[];
+    for (var i = 0; i < questions.length; i++) {
+      final answer = await answerOne(questions[i], i, questions.length);
+      if (answer == null) return null;
+      answers.add(answer);
+    }
+    return answers;
+  }
+
+  /// The TUI branch of [_answerAskQuestions]: walks [questions] through the
+  /// on-screen prompt zone; any cancel (Esc on the zone) or unexpected
+  /// answer type aborts the whole batch, matching line mode.
+  Future<List<AskAnswer>?> _answerAskQuestionsTui(
+    FaTuiController tui,
+    List<AskQuestion> questions,
+  ) => _walkAskAnswers(
+    (question, index, total) =>
+        _answerOneAskQuestionTui(tui, question, index, total),
+    questions,
+  );
+
+  /// One TUI ask question: the prompt-zone answer, or null when cancelled
+  /// (or the zone resolved with an unexpected type).
+  Future<AskAnswer?> _answerOneAskQuestionTui(
+    FaTuiController tui,
+    AskQuestion question,
+    int index,
+    int total,
+  ) async {
+    final result = await _openHerdrPrompt(
+      tui,
+      AskPromptSpec(
+        header: 'Ask',
+        question: question.question,
+        index: index,
+        total: total,
+        options: question.options,
+        multiSelect: question.multiSelect,
+        recommended: question.recommended,
+      ),
+    );
+    return result is AskPromptAnswer ? result.value : null;
+  }
+
+  /// Answers a `request_secret` call: prompts the user for the credential
+  /// value via the same input mechanism as ask. Returns `null` on cancel
+  /// (the agent sees "user declined"). The value is injected into the live
+  /// shell env via the session-correlation env decorator so `$NAME` works
+  /// in subsequent bash commands, and registered with the secret redactor.
+  Future<RequestSecretResult?> _answerSecretRequest(
+    String name,
+    String reason,
+  ) async {
+    final tui = _tuiController;
+    if (_useTui && tui != null) return _answerSecretTui(tui, name, reason);
+    return _answerSecretLineMode(name, reason);
+  }
+
+  /// The TUI branch of [_answerSecretRequest].
+  Future<RequestSecretResult?> _answerSecretTui(
+    FaTuiController tui,
+    String name,
+    String reason,
+  ) async {
+    final result = await _openHerdrPrompt(
+      tui,
+      SecretPromptSpec(name: name, reason: reason),
+    );
+    if (result is! SecretPromptAnswer) return null;
+    // The sheet lets the user edit the suggested name — store and register
+    // under the name the grant actually carries.
+    final grantedName = result.value.name;
+    _runtimeSecrets[grantedName] = result.value.value;
+    config.onSecretGranted?.call(grantedName, result.value.value);
+    return result.value;
+  }
+
+  /// The line-mode branch of [_answerSecretRequest].
+  Future<RequestSecretResult?> _answerSecretLineMode(
+    String name,
+    String reason,
+  ) async {
+    io.writeln('[secret] $name needed: $reason');
+    io.write('[secret] Enter value for $name (empty = decline): ');
+    final line = await _nextAskLine();
+    if (line == null || line.trim().isEmpty) return null;
+    final value = line.trim();
+    _runtimeSecrets[name] = value;
+    config.onSecretGranted?.call(name, value);
+    return RequestSecretResult(name: name, value: value, persisted: false);
+  }
+
+  /// Answers a mid-run password ask (issue #367: `sudo`/`ssh` prompting on
+  /// the live process stdin): the TUI reuses the masked secret-mode input
+  /// (`TextPromptSpec.secret`), line mode mirrors the secret line flow.
+  /// `null` = declined; the bash tool then fails the command with the ask
+  /// surfaced, never hanging and never echoing the value.
+  Future<String?> _answerPasswordPrompt(String promptLine) async {
+    final tui = _tuiController;
+    if (_useTui && tui != null) {
+      final result = await _openHerdrPrompt(
+        tui,
+        TextPromptSpec(header: 'Password', question: promptLine, secret: true),
+      );
+      return result is TextPromptAnswer ? result.value : null;
+    }
+    io.writeln('[password] $promptLine');
+    io.write('[password] Enter password (empty = decline): ');
+    final line = await _nextAskLine();
+    final value = line?.trim();
+    return value == null || value.isEmpty ? null : value;
+  }
+
+  /// env vars so `$NAME` works in bash tool executions.
+
+  /// Renders one question as a numbered menu (+ "(Recommended)" marker) and
+  /// reads the answer: a number selects an option, `m` opens the
+  /// multi-select toggle (multiSelect questions only), empty input switches
+  /// to free-text entry, any other non-number text is taken as the free-text
+  /// answer directly, and `!` cancels the whole ask.
+  Future<AskAnswer?> _askOneQuestion(
+    AskQuestion question,
+    int index,
+    int total,
+  ) async {
+    _printAskQuestion(question, index, total);
+    if (question.options.isEmpty) return _readFreeTextAnswer();
+    final multiHint = question.multiSelect ? ', m = multi-select' : '';
+    io.writeln(
+      '[ask] 1-${question.options.length} = select$multiHint, '
+      'empty = your own answer, ! = cancel',
+    );
+    return _askSelectOption(question);
+  }
+
+  /// The question header and numbered option list (recommended flagged) —
+  /// the lines come from [askQuestionLines].
+  void _printAskQuestion(AskQuestion question, int index, int total) {
+    for (final line in askQuestionLines(question, index, total)) {
+      io.writeln(line);
+    }
+  }
+
+  /// The single-select loop: a number picks an option, empty input falls
+  /// through to free-text, `m` enters multi-select, `!` cancels.
+  Future<AskAnswer?> _askSelectOption(AskQuestion question) async {
+    while (true) {
+      final line = await _nextAskLine();
+      if (line == null || line == '!') return null;
+      if (line.isEmpty) return _readFreeTextAnswer();
+      if (question.multiSelect && line.toLowerCase() == 'm') {
+        return _askMultiSelect(question);
+      }
+      final parsed = _parseOptionAnswer(question, line);
+      if (parsed.answer != null) return parsed.answer;
+      io.writeln('[ask] no option ${parsed.number} — try again');
+    }
+  }
+
+  /// Parses one select-loop line: a valid number becomes a selection, a
+  /// non-number becomes free text, and an out-of-range number comes back as
+  /// ([AskAnswer?].answer = null, number) so the loop can complain and
+  /// retry.
+  ({AskAnswer? answer, int? number}) _parseOptionAnswer(
+    AskQuestion question,
+    String line,
+  ) {
+    final number = int.tryParse(line);
+    if (number == null) return (answer: AskAnswer.text(line), number: null);
+    if (number >= 1 && number <= question.options.length) {
+      return (
+        answer: AskAnswer.selection([question.options[number - 1].label]),
+        number: number,
+      );
+    }
+    return (answer: null, number: number);
+  }
+
+  /// The multi-select toggle loop: numbers toggle options, `d` (or empty
+  /// input) confirms — falling back to free-text entry when nothing is
+  /// selected — and `!` cancels.
+  Future<AskAnswer?> _askMultiSelect(AskQuestion question) async {
+    final selected = <int>{};
+    while (true) {
+      io.writeln(
+        '[ask] multi-select: numbers toggle, d = done, ! = cancel '
+        '(selected: ${pickedLabel(selected)})',
+      );
+      final line = await _nextAskLine();
+      if (line == null || line == '!') return null;
+      if (line.isEmpty || line.toLowerCase() == 'd') {
+        return _finishMultiSelect(question, selected);
+      }
+      if (_toggleMultiSelectParts(question, selected, line)) {
+        io.writeln('[ask] invalid selection "$line" — try again');
+      }
+    }
+  }
+
+  /// Done with multi-select: the toggled options as a selection, or
+  /// free-text entry when nothing is selected.
+  Future<AskAnswer?> _finishMultiSelect(
+    AskQuestion question,
+    Set<int> selected,
+  ) async {
+    if (selected.isNotEmpty) {
+      return AskAnswer.selection([
+        for (final i in selected.toList()..sort()) question.options[i].label,
+      ]);
+    }
+    return _readFreeTextAnswer();
+  }
+
+  /// Toggles every number in [line] (space/comma separated). Returns whether
+  /// any part was invalid.
+  bool _toggleMultiSelectParts(
+    AskQuestion question,
+    Set<int> selected,
+    String line,
+  ) {
+    for (final part in line.split(RegExp(r'[\s,]+'))) {
+      final number = int.tryParse(part);
+      if (number == null || number < 1 || number > question.options.length) {
+        return true;
+      }
+      if (!selected.remove(number - 1)) selected.add(number - 1);
+    }
+    return false;
+  }
+
+  /// Free-text entry for the ask menu; an empty line cancels the whole ask.
+  Future<AskAnswer?> _readFreeTextAnswer() async {
+    io.writeln('[ask] type your answer (empty = cancel):');
+    final text = await _nextAskLine();
+    if (text == null || text.isEmpty) return null;
+    return AskAnswer.text(text);
+  }
+
+  void _handleApprovalMode(String rest) {
+    if (rest.isEmpty) {
+      io.writeln('approval mode: ${_approval.mode.label}');
+      io.writeln('approval modes: always-ask, write, yolo, $kAutopilotLabel');
+      final allowed = _approval.alwaysAllowedTools;
+      io.writeln(
+        'always-allowed tools: ${allowed.isEmpty ? '(none)' : allowed.join(', ')}',
+      );
+      return;
+    }
+    final mode = approvalModeFromLabel(rest);
+    if (mode == null) {
+      io.writeln(
+        'unknown approval mode: $rest '
+        '(want always-ask|write|yolo|$kAutopilotLabel)',
+      );
+      return;
+    }
+    _approval.mode = mode;
+    io.writeln('approval mode set to ${mode.label}');
+    config.onApprovalChanged?.call();
+  }
+
+  void _handleAllow(String rest) {
+    if (rest.isEmpty) {
+      final allowed = _approval.alwaysAllowedTools;
+      io.writeln(
+        'always-allowed tools: ${allowed.isEmpty ? '(none)' : allowed.join(', ')}',
+      );
+      return;
+    }
+    final name = rest.split(RegExp(r'\s+')).first;
+    final known = _agent.state.tools.any((tool) => tool.name == name);
+    if (!known) {
+      io.writeln('unknown tool: $name');
+      return;
+    }
+    _approval.allowAlways(name);
+    io.writeln('"$name" always allowed (persisted)');
+    config.onApprovalChanged?.call();
+  }
+
+  Future<void> _switchMode(String name) async {
+    final mode = _modes[name];
+    if (mode == null) {
+      io.writeln('unknown mode: $name');
+      return;
+    }
+    _currentMode = mode;
+    _applyPromptComposition();
+    io.writeln('switched mode to ${mode.name}');
+    config.onModeChanged?.call(mode.name);
+  }
+
+  /// Renders the model-roles no-silent-degrade note: every retry, key
+  /// rotation, and chain failover is announced inline, and the display
+  /// model tracks the active chain entry.
+  void _onRolesNotice(FallbackNotice notice) {
+    io.writeln('[roles] ${notice.describe()}');
+    final resolved = config.modelRolesResolver?.resolveRole(defaultModelRole);
+    if (resolved != null) _agent.state.model = resolved.model;
+  }
+
+  /// Runs a raw shell command prefixed with `!` through [config.env] and
+  /// prints its stdout/stderr/exit code directly. The agent only SEES that
+  /// it happened: the run is told via a steering system-notice (mid-run it
+  /// lands at the next turn boundary, idle it joins the next prompt) — a
+  /// bare local exec used to be invisible to the model entirely.
+  Future<void> _runShellCommand(String command) async {
+    final result = await config.env.exec(command);
+    var exitCode = 0;
+    final output = StringBuffer();
+    switch (result) {
+      case Ok(:final value):
+        if (value.stdout.isNotEmpty) {
+          io.write(value.stdout);
+          if (!value.stdout.endsWith('\n')) io.write('\n');
+        }
+        if (value.stderr.isNotEmpty) io.writeln(value.stderr);
+        if (value.exitCode != 0) {
+          io.writeln('exit code: ${value.exitCode}');
+        }
+        exitCode = value.exitCode;
+        output
+          ..write(value.stdout)
+          ..write(value.stderr);
+      case Err(:final error):
+        io.writeln('shell error: ${error.message}');
+        exitCode = -1;
+        output.write(error.message);
+    }
+    _agent.steer(
+      UserMessage.text(_shellRunNotice(command, exitCode, output.toString())),
+    );
+  }
+
+  /// The steering notice that tells the model the user ran a local shell
+  /// command (compact: output is tail-capped so a chatty `!` cannot blow
+  /// up the context).
+  String _shellRunNotice(String command, int exitCode, String rawOutput) {
+    final trimmed = rawOutput.trim();
+    final tail = trimmed.length <= 1200
+        ? trimmed
+        : '…${trimmed.substring(trimmed.length - 1200)}';
+    final buffer = StringBuffer()
+      ..writeln('<system-notice>')
+      ..writeln(
+        'The user ran a local shell command (the `!` prefix — executed '
+        'by the host, not by you; you did not run it):',
+      )
+      ..writeln('`$command`')
+      ..writeln('exit code: $exitCode');
+    if (tail.isNotEmpty) {
+      buffer
+        ..writeln('output (tail):')
+        ..writeln('```')
+        ..writeln(tail)
+        ..writeln('```');
+    }
+    buffer.writeln('</system-notice>');
+    return buffer.toString();
+  }
+
+  /// A compact status bar shown above every idle prompt: cwd, model, tokens,
+  /// cost, and turn count.
+  String _statusLine() {
+    final model = _agent.state.model;
+    final total = _usage.total;
+    // Hide the price when the model carries no cost data — a permanent
+    // "$0.0000" reads as a bug (and we genuinely don't know the price).
+    final cost = total.cost.total;
+    final costPart = cost > 0 ? ' · \$${cost.toStringAsFixed(4)}' : '';
+    final cwd = _env.cwd;
+    // Live context pressure: provider-reported usage up to the last reported
+    // turn plus an estimate of the trailing messages (what the NEXT request
+    // carries) — moves mid-run as tool results and the stream land, instead
+    // of freezing at the last turn's prompt size.
+    final contextTokens = _liveContextTokens();
+    // Live token counter: settled turns plus the in-flight stream estimate.
+    var totalTokens = total.totalTokens;
+    final streaming = _agent.state.streamingMessage;
+    if (streaming != null) totalTokens += estimateTokens(streaming);
+    final window = _effectiveContextWindow;
+    final pct = window > 0 ? (contextTokens / window * 100).round() : 0;
+    // kimi's toolbar badge: active background agents, when any. Variant A
+    // (agents visualization): named live badges — up to 3 active children
+    // with type and elapsed seconds, then a +N overflow counter.
+    final badge = _agentsBadge();
+    // gh-1762: the classic footer's rate part — the session average at
+    // turn granularity, moving at the same settle boundaries as
+    // tok/turn/cost. The LIVE rate stays on the band + snapshot: the
+    // classic row must not mutate between frame ticks (#467).
+    final ratePart = _statusRatePart();
+    // Mid-run fold badge (issue #438 AC3): «compacted and still working»
+    // must be distinguishable from «hung» at a glance — the badge shows
+    // while the run continues after an auto-compaction and clears when
+    // the turn settles. Multiple folds in one run count (E2). It LEADS the
+    // row: narrow terminals truncate the tail, and the transient service
+    // state matters more than the static cwd.
+    final foldBadge = _autoFoldCount == 0
+        ? ''
+        : '[auto-compacted${_autoFoldCount > 1 ? ' ×$_autoFoldCount' : ''}'
+              ' · continuing] · ';
+    var line =
+        '$foldBadge$cwd · ctx $pct% '
+        '(${_formatTokenCount(contextTokens)}/${_formatTokenCount(window)}) · '
+        '${_formatTokenCount(totalTokens)}tok'
+        '$costPart · turn ${_usage.turns}$ratePart$badge · '
+        '${_statusProviderLabel(model)}/${model.id}'
+        '${_quotaBadgeSuffix(model.provider)}';
+    return line;
+  }
+
+  /// The gh-1762 classic-footer rate part: ` · avg 38` — the session
+  /// average at TURN granularity ([LiveTokenRateMeter.settledAverageTokensPerSecond]),
+  /// so the part moves at the same settle boundaries as the tok/turn
+  /// figures and the classic status row stays frame-stable between ticks
+  /// (the #467 grid contract: mid-run the busy ticker is the ONLY row
+  /// that may change — a live rate in this row re-renders every frame
+  /// and breaks the PTY grid pins). The live rate is the band's surface
+  /// (per-frame by design) and the snapshot seam; before the first
+  /// settled turn this part is empty — the row reads byte-identically to
+  /// v0 (AC2: never a `0 t/s`, and the average appears with the first
+  /// completed turn).
+  String _statusRatePart() {
+    final avg = _meter.settledAverageTokensPerSecond(_usage.total.output);
+    return avg != null && avg > 0 ? ' · avg ${formatTokenRate(avg)}' : '';
+  }
+
+  /// The status-line quota badge (issue #823 AC5): `' [OR $48/$150 · 11d]'`
+  /// when fresh, `' [OR …]'` while cold, and empty when the config opts
+  /// out (default OFF, OQ2), the provider has no quota source, the state
+  /// is unmetered (silent), or the cached state is a terminal unknown —
+  /// failure reasons live in `/quota`, not the chrome (review round 1).
+  /// Cache-only peek: cold kicks a background fetch without blocking (E1).
+  String _quotaBadgeSuffix(String providerId) {
+    if (!config.quotaBadge ||
+        providerId.isEmpty ||
+        !quotaService.hasSource(providerId)) {
+      return '';
+    }
+    final result = quotaService.peek(providerId);
+    if (result != null && result.quota == null) return '';
+    final badgeText = formatQuotaBadge(
+      shortName: _quotaBadgeTag(providerId),
+      quota: result?.quota,
+      now: DateTime.now().toUtc(),
+    );
+    return badgeText.isEmpty ? '' : ' $badgeText';
+  }
+
+  /// The 2-letter quota badge tag for a provider id. `openrouter` brands
+  /// as `OR` (the contract's example tag), `codemie` as `CM`; anything
+  /// unmapped falls back to its first two letters uppercased.
+  static const _quotaBadgeTags = {'openrouter': 'OR', 'codemie': 'CM'};
+
+  String _quotaBadgeTag(String providerId) =>
+      _quotaBadgeTags[providerId] ??
+      (providerId.length < 2
+          ? providerId.toUpperCase()
+          : providerId.substring(0, 2).toUpperCase());
+
+  /// The host-built status-bar snapshot (issue #806, the S3 band
+  /// attachment): everything the TUI's status band renders from,
+  /// resolved per frame tick host-side — the TUI layer stays fetch-free
+  /// and subprocess-free (the #802 invariant). Segments with no host
+  /// data (pr — the watcher seam is a later story — and session name)
+  /// stay null and hide; git arrives through the #920 TTL probe below.
+  StatusLineSnapshot _statusLineSnapshot() {
+    final total = _usage.total;
+    final cost = total.cost.total;
+    final model = _agent.state.model;
+    return StatusLineSnapshot(
+      cwd: _env.cwd,
+      homeDir: config.homeDir,
+      modelName: model.id,
+      // `provider / model` in the band (issue #920) — the same label the
+      // legacy footer renders.
+      providerName: _statusProviderLabel(model),
+      approvalMode: _approval.mode.label,
+      agentLoadMode: config.agentLoadMode,
+      git: _statusGitProbe.current(_env.cwd),
+      contextTokens: _liveContextTokens(),
+      contextWindow: _effectiveContextWindow,
+      tokensIn: total.input,
+      tokensOut: total.output,
+      cacheRead: total.cacheRead,
+      cacheWrite: total.cacheWrite,
+      // Unpriced/zero-cost models hide the spend segment (E2) — same
+      // policy as the legacy footer's costPart.
+      costUsd: cost > 0 ? cost : null,
+      // gh-1762: the live rate is a STREAMING metric — null the moment
+      // the run settles (the architecture contract: null when idle, never
+      // a stale `0 t/s`). During tool-execution gaps inside a run the
+      // window keeps decaying toward hidden on its own (AC7).
+      tokensPerSecond: isBusy ? _meter.tokensPerSecond : null,
+      // The session average is a persistent stat (like token_out): shown
+      // whenever the ledger + active-stream time exist.
+      tokensPerSecondAvg: _meter.tokensPerSecondAvg(total.output),
+      sessionId: _session?.cachedId,
+      idle: !isBusy,
+      // gh-1446 AC5: the brand zone's ring frame, resolved from the
+      // compile-time activity ring off the controller's live tick frame —
+      // blank while idle (the `>_ Fa` final state) and never model text.
+      brandFrame: isBusy ? _tuiController?.brandFrameGlyph : null,
+      // gh-1556: the deadline countdown chip's LIVE remaining budget (the
+      // band re-renders per frame tick; -1 hides the segment when unarmed
+      // — byte-identical legacy chrome).
+      deadlineRemainingMs: _deadline.isArmed ? _deadline.remainingMs : -1,
+    );
+  }
+
+  /// Status-bar provider label: the saved custom entry's name when the
+  /// model's endpoint belongs to one — the user picked "z.ai"/"codemie",
+  /// while the model's `provider` field carries the catalog protocol kind
+  /// ("openai") that means nothing to them. Falls back to the catalog
+  /// provider name when no saved entry matches the endpoint.
+  String _statusProviderLabel(Model model) {
+    final entries = config.customProviders?.entries;
+    if (entries == null) return model.provider;
+    // The explicitly ACTIVE saved entry wins over the endpoint scan:
+    // two entries can share one baseUrl (two accounts on the same
+    // host — kimi-ira1 + kimi_me), and the first-match scan would
+    // label the model with the OTHER account's name.
+    final active = _activeCustomName;
+    if (active != null) {
+      for (final entry in entries) {
+        if (entry.name == active &&
+            _sameEndpoint(entry.baseUrl, model.baseUrl)) {
+          return entry.name;
+        }
+      }
+    }
+    return _endpointEntryLabel(entries, model) ?? model.provider;
+  }
+
+  /// The saved entry name for [model]'s endpoint. A restored session
+  /// has no [_activeCustomName], but the persisted roles chain pins
+  /// the endpoint's apiKeyName — it identifies WHICH of several
+  /// same-endpoint accounts was picked. Without a pin the first
+  /// endpoint match labels the model (legacy behavior).
+  String? _endpointEntryLabel(List<CustomProviderEntry> entries, Model model) {
+    final pinnedKey = _chainKeyNameFor(model.provider, model.baseUrl);
+    String? first;
+    for (final entry in entries) {
+      if (!_sameEndpoint(entry.baseUrl, model.baseUrl)) continue;
+      if (pinnedKey != null && entry.keyName == pinnedKey) {
+        return entry.name;
+      }
+      first ??= entry.name;
+    }
+    return first;
+  }
+
+  /// The apiKeyName the default roles chain pins for
+  /// ([provider], [baseUrl]) — null without a resolver or a pinned key.
+  String? _chainKeyNameFor(String provider, String baseUrl) {
+    final resolver = config.modelRolesResolver;
+    if (resolver == null) return null;
+    final refs =
+        resolver.config.chainFor(
+          defaultModelRole,
+          cwd: config.env.cwd,
+          homeDir: config.homeDir,
+        ) ??
+        const <ModelRef>[];
+    for (final ref in refs) {
+      final refBase = ref.baseUrl;
+      if (ref.provider == provider &&
+          refBase != null &&
+          _sameEndpoint(refBase, baseUrl)) {
+        return ref.apiKeyName;
+      }
+    }
+    return null;
+  }
+
+  /// Test hook for [_statusProviderLabel] on the current model.
+  @visibleForTesting
+  String statusProviderLabelForTest() =>
+      _statusProviderLabel(_agent.state.model);
+
+  /// Test hook for the status row as the TUI renders it (issue #653 —
+  /// the fold badge must clear at settle, error settles included).
+  @visibleForTesting
+  String statusLineForTest() => _statusLine();
+
+  /// Test hook for the host-built band snapshot (gh-1762 — the rate
+  /// fields ride the same per-tick projection the band renders from).
+  @visibleForTesting
+  StatusLineSnapshot statusLineSnapshotForTest() => _statusLineSnapshot();
+
+  /// Endpoint equality ignoring a trailing slash (saved entries and pinned
+  /// chains disagree on it routinely).
+  bool _sameEndpoint(String a, String b) {
+    String norm(String u) => u.endsWith('/') ? u.substring(0, u.length - 1) : u;
+    return norm(a) == norm(b);
+  }
+
+  /// Live context pressure for the status line: what the NEXT request
+  /// carries, in the SAME basis the loop's over-window guard and the
+  /// compaction threshold enforce ([estimateRequestTokens]) —
+  /// provider-reported usage up to the last reported turn plus an estimate
+  /// of the trailing messages, and, when no usage anchor prices them in
+  /// (fresh/resumed session, provider without usage reporting), the
+  /// system-prompt and tool-schema overhead every request carries.
+  /// The SETTLED part is memoized on the message list length + last
+  /// instance ([SettledContextEstimate]); the in-flight stream message is
+  /// estimated per call and never touches the memo. Keying the settled
+  /// memo on the stream's growing length would invalidate it on EVERY
+  /// delta — a full O(context) re-scan dozens of times per second (the
+  /// "typing lag").
+  ///
+  /// The memoized request overhead for [_liveContextTokens] (fields live
+  /// on [AgentCli] — extensions can't declare them): recomputed only when
+  /// the system prompt instance or the tool set changes.
+  int _requestOverheadTokens(String systemPrompt, List<Tool> tools) {
+    final key = [for (final tool in tools) identityHashCode(tool)];
+    final cached = _overheadToolKey;
+    if (identical(_overheadPromptKey, systemPrompt) &&
+        cached != null &&
+        cached.length == key.length) {
+      var same = true;
+      for (var i = 0; i < key.length; i++) {
+        if (cached[i] != key[i]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return _overheadTokens;
+    }
+    _overheadTokens = estimateRequestOverheadTokens(systemPrompt, tools);
+    _overheadPromptKey = systemPrompt;
+    _overheadToolKey = key;
+    return _overheadTokens;
+  }
+
+  int _liveContextTokens() {
+    final state = _agent.state;
+    final messages = state.messages;
+    final streaming = state.streamingMessage;
+    final estimate = _ctxEstimate.settledEstimate(messages);
+    var tokens = estimate.tokens;
+    if (estimate.lastUsageIndex == null) {
+      tokens += _requestOverheadTokens(state.systemPrompt, state.tools);
+    }
+    if (streaming != null) tokens += estimateTokens(streaming);
+    return tokens;
+  }
+
+  /// Live agents badge for the status line: active subagent handles with
+  /// their type and elapsed time (e.g. `bg:explore:A1(12s),+2`), or empty.
+  String _agentsBadge() {
+    final badge = formatActiveAgentsBadge(_subagentManager.handles);
+    if (badge.isNotEmpty) return ' · $badge';
+    final queuedJobs = _taskConfig.jobManager.jobs
+        .where((job) => job.status == TaskJobStatus.queued)
+        .length;
+    return queuedJobs > 0 ? ' · bg:$queuedJobs' : '';
+  }
+
+  /// Compact token counts like pi's `275k` / `1M`.
+  static String _formatTokenCount(int value) {
+    if (value >= 1000000) {
+      final m = value / 1000000;
+      return '${m.toStringAsFixed(m >= 10 ? 0 : 1)}M';
+    }
+    if (value >= 1000) {
+      final k = value / 1000;
+      return '${k.toStringAsFixed(k >= 100 ? 0 : 1)}k';
+    }
+    return '$value';
+  }
+
+  /// Prints a divider, the status bar, and the input prompt. Used whenever the
+  /// REPL becomes idle after a command or a run. In TUI mode the prompt is
+  /// already part of the rendered frame, so this is a no-op there.
+  void _writeIdlePrompt() {
+    if (_useTui) return;
+    if (!_exited) {
+      io.writeln(_style.dim('─' * 60));
+      io.writeln(_style.dim(_statusLine()));
+      io.write(_style.bold(_style.cyan(prompt)));
+    }
+  }
+
+  /// Prompt-based slash menu for terminals that cannot enter raw/ANSI mode.
+  /// Shows a numbered list of commands and skills, and reads the user's
+  /// choice from the same [lineIterator] that drives the REPL loop. A skill
+  /// choice resolves to `/skill:<name>` (line mode has no input field to
+  /// pre-fill, so the skill runs immediately, without args).
+  Future<String?> _showLineModeMenu(StreamIterator<String> lineIterator) async {
+    for (final line in lineModeMenuLines(_style, skills: _enabledSkills)) {
+      io.writeln(line);
+    }
+    io.write('Pick a command (number or name), or press Enter to cancel: ');
+    if (!await lineIterator.moveNext()) return null;
+    final trimmed = lineIterator.current.trim();
+    if (trimmed.isEmpty) return null;
+    final choice = _resolveMenuChoice(trimmed);
+    if (choice == null) io.writeln('unknown choice: $trimmed');
+    return choice;
+  }
+
+  String? _resolveMenuChoice(String trimmed) =>
+      resolveLineModeMenuChoice(trimmed, _enabledSkills);
+
+  /// The numbered command list of the line-mode menu.
+  void _printHelp({String filter = ''}) {
+    // `/help hotkeys` (issue #809): the keybinding reference generated from
+    // the keyHint registry. New surface — the TUI prints the markdown shape
+    // (the transcript renderer box-grids it with theme colors), line mode
+    // stays plain ASCII; existing `/help` output is byte-unchanged.
+    final lower = filter.trim().toLowerCase();
+    if (lower == 'hotkeys' || lower == 'keys' || lower == 'keybindings') {
+      for (final line in tuiHotkeyTableLines(
+        markdown: _useTui,
+        darwin: tuiKeyHintDarwin,
+      )) {
+        io.writeln(line);
+      }
+      return;
+    }
+    for (final line in helpLines(
+      filter: filter,
+      pluginSlashCommands: _pluginSlashCommands,
+      templates: _templates,
+      style: _style,
+      skills: _enabledSkills,
+    )) {
+      io.writeln(line);
+    }
+  }
+
+  void _printStats() {
+    final total = _usage.total;
+    io.writeln('turns: ${_usage.turns}');
+    io.writeln('input tokens: ${total.input}');
+    io.writeln('output tokens: ${total.output}');
+    io.writeln('cache read tokens: ${total.cacheRead}');
+    io.writeln('cache write tokens: ${total.cacheWrite}');
+    io.writeln('total tokens: ${total.totalTokens}');
+    io.writeln('cost: \$${total.cost.total.toStringAsFixed(4)}');
+  }
+
+  /// Called when a background `task` job settles (omp's async-result flow):
+  /// renders a transcript notification and injects the result back into the
+  /// parent conversation — steered mid-run, or as a fresh re-wake run while
+  /// idle (omp's idle flush via `agent.prompt`).
+  void _onTaskJobCompleted(TaskJob job) {
+    // Event-driven waiting-row leave (issue #450): the settled child no
+    // longer counts as awaited (issue #520 AC3).
+    unawaited(_waiting.push());
+    _onTaskJobSettledBlock(job);
+    final result = job.result;
+    final seconds = result == null
+        ? ''
+        : ' in ${(result.duration.inMilliseconds / 1000).toStringAsFixed(1)}s';
+    io.writeln(
+      _style.dim(
+        '[task] ${job.id} (${job.agent}) ${job.status.name}$seconds — '
+        'agent://${job.id}',
+      ),
+    );
+    // gh-1589: same settle→reaction fence as the shell-job settle — after
+    // the run's exit wrap-up, a task completion is bookkeeping only.
+    if (_exited || _reactionRunsSealed) return;
+    final message = taskAsyncResultNotice(job);
+    if (isBusy) {
+      // Mid-run: the steering queue delivers it at the next step boundary
+      // (omp's non-interrupting aside between requests).
+      _agent.steer(UserMessage.text(message));
+    } else {
+      _startRun(message);
+    }
+  }
+
+  /// `/tasks [cancel <id>]` — lists the session's background agents and
+  /// background shell jobs with their states (kimi's TaskList surface;
+  /// cancelling a running job aborts its child run / stops the process,
+  /// which then settles as aborted).
+  void _listTaskJobs(String rest) {
+    final parts = rest
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((p) => p.isNotEmpty)
+        .toList();
+    final verb = parts.isEmpty ? '' : parts.first;
+    if (verb == 'cancel') {
+      _cancelTaskJob(parts);
+      return;
+    }
+    final jobs = _taskConfig.jobManager.jobs;
+    final shellJobs = _shellJobs.jobs;
+    if (jobs.isEmpty && shellJobs.isEmpty) {
+      io.writeln('no background jobs this session');
+      return;
+    }
+    if (jobs.isNotEmpty) {
+      // Issue #222 AC5: the supersedes chain from the retained-subagent
+      // registry folds respawn generations into ONE logical /tasks entry.
+      final handles = _taskConfig.subagentManager?.handles ?? const [];
+      final supersedesOf = <String, String>{
+        for (final handle in handles)
+          if (handle.supersedes != null) handle.id: handle.supersedes!,
+      };
+      // Issue #439: the child's context pressure rides the row.
+      final pressureNotes = <String, String>{
+        for (final handle in handles)
+          if (handle.contextPressureText != null)
+            handle.id: handle.contextPressureText!,
+      };
+      for (final line in taskJobLines(
+        jobs,
+        dim: _style.dim,
+        supersedesOf: supersedesOf,
+        pressureNotes: pressureNotes,
+      )) {
+        io.writeln(line);
+      }
+    }
+    if (shellJobs.isNotEmpty) {
+      io.writeln('background shell jobs:');
+      for (final entry in shellJobs) {
+        io.writeln(_shellJobLine(entry));
+      }
+    }
+  }
+
+  /// One `/tasks` row for a background shell job (issue #366): the command
+  /// preview in the detail zone (issue #599 — a multi-line command would
+  /// tear the row), the job id kept as the dim suffix, the log path
+  /// relativized (`.fah/bash_jobs/…` tail) — all inside the width budget.
+  String _shellJobLine(ShellJobEntry entry) {
+    final trailer = entry.isRunning
+        ? entry.id
+        : '${entry.id} exited(${entry.exitCode ?? '?'})';
+    final log = briefPath(entry.logPath, cwd: _env.cwd, home: config.homeDir);
+    final row = layoutToolRow(
+      ToolRowSegments(
+        glyph: _shellJobGlyph(entry),
+        label: 'bash',
+        detail: shellJobCommandPreview(entry.command),
+        elapsed: '$trailer (log: $log)',
+      ),
+      _rowWidth - 2,
+    );
+    return '  ${tuiToolRow(row, _shellJobState(entry))}';
+  }
+
+  /// The job lifecycle → row state (issue #444): running accent rail,
+  /// clean exit the settled muted rail, non-zero the failed error tint.
+  ToolRowState _shellJobState(ShellJobEntry entry) => entry.isRunning
+      ? ToolRowState.running
+      : (entry.exitCode == 0 ? ToolRowState.settled : ToolRowState.failed);
+
+  /// Running `●`, clean `✓`, failed `✗`.
+  String _shellJobGlyph(ShellJobEntry entry) =>
+      entry.isRunning ? '●' : (entry.exitCode == 0 ? '✓' : '✗');
+
+  /// `/tasks cancel <id>`: aborts the job's child run / stops the process.
+  void _cancelTaskJob(List<String> parts) {
+    if (parts.length < 2) {
+      io.writeln('usage: /tasks cancel <id>');
+      return;
+    }
+    _cancelTaskJobById(parts[1]);
+  }
+
+  /// Cancels the task job or stops the shell job named [id], or reports it
+  /// as unknown.
+  void _cancelTaskJobById(String id) {
+    final job = _taskConfig.jobManager.job(id);
+    if (job != null) {
+      job.cancel();
+      // Same as the tool-side twin: a yield-converted job's live runner
+      // sits inline on the executor (its token never reached the child).
+      _taskConfig.executor.cancelInFlight(id);
+      io.writeln('cancelled ${job.id}');
+      return;
+    }
+    final shellOutput = _cancelShellJobById(id, _shellJobs);
+    if (shellOutput != null) {
+      io.writeln(shellOutput);
+      return;
+    }
+    // Issue #332: no live task job and no shell job. Route through the
+    // SAME helper the `task_cancel` tool uses, so wording can never
+    // diverge from the tool-side twin: a LIVE inline child (blocking
+    // batch / resume — no TaskJob by design) is aborted through the
+    // executor's in-flight cancel source, never tombstoned while it runs;
+    // an orphaned registry row is tombstoned aborted; anything else
+    // reports honestly.
+    unawaited(
+      cancelSubagentWithoutJob(
+        id: id,
+        manager: _taskConfig.subagentManager,
+        executor: _taskConfig.executor,
+        source: '/tasks cancel',
+      ).then(io.writeln),
+    );
+  }
+
+  /// Stops the shell job [id] and returns the message to print, or null if
+  /// there is no such shell job.
+  String? _cancelShellJobById(String id, ShellJobRegistry jobs) {
+    final shellJob = jobs.job(id);
+    if (shellJob == null) return null;
+    if (!shellJob.isRunning) {
+      return '$id already finished (exit code ${shellJob.exitCode})';
+    }
+    unawaited(shellJob.stop());
+    return 'stopped ${shellJob.id}';
+  }
+
+  Future<void> _onAgentEvent(AgentEvent event, CancelToken cancelToken) async {
+    _lastAgentEventAt = DateTime.now(); // #437 steering heartbeat
+    // Run-lifecycle forensics to fa.log: one line per phase transition, so
+    // a wedged "Working…"/"Compacting…" row can be attributed to the exact
+    // phase (provider turn vs named tool vs run) that never finished.
+    _logEventForensics(event);
+    await _persistEventLiveness(event);
+    await _persistIncremental(event);
+    // Reasoning-phase liveness (gh-1198 tier 2 + gh-1430): a request
+    // going out arms the silent-window watch AND the stream heartbeat
+    // (line mode/headless with the thinking stream off); tier 2 treats
+    // ANY event as visible progress, while the heartbeat classifies —
+    // rendered output disarms it, unrendered stream events prove
+    // aliveness (the headless thinking-delta window the bench round-4
+    // kills lived in).
+    if (event is ModelRequestEvent) {
+      _waiting.reasoningRequestStarted();
+    } else {
+      _waiting.reasoningProgress(event);
+    }
+    // gh-1680 cap notice: a repair fired by the provider's message cap
+    // names the cap and the refused count — never a silent surgery.
+    if (event is MessageCapRepairEvent) {
+      io.writeln(
+        _style.dim(
+          '[message cap] provider refused the request at '
+          '${event.messageCount} messages'
+          '${event.learnedCap == null ? '' : ' (cap ${event.learnedCap})'}'
+          '${event.compacted ? ' — context compacted, retrying once' : ' — coalescing the request, retrying once'}',
+        ),
+      );
+    }
+    await handleAgentEvent(
+      event,
+      onMessageLifecycle: _onMessageLifecycle,
+      onMessageUpdate: _onMessageUpdate,
+      onToolExecutionStart: _onToolExecutionStart,
+      onToolExecutionEnd: _onToolExecutionEnd,
+      onTurnEnd: (message) {
+        _usage.add(message.usage);
+        // gh-1762: the provider's real output tokens recalibrate the
+        // char→token factor for the next message's live estimate (AC4).
+        _meter.calibrate(message.usage.output);
+      },
+      onModelRequest: _onModelRequest,
+      onTaskLedger: _onTaskLedger,
+    );
+  }
+
+  /// fa.log forensics for the phase-transition events (the plain
+  /// diagnostic cases of [_onAgentEvent]; the record-persisting cases
+  /// live in [_persistEventLiveness] — split to keep both sides under
+  /// the crap4dart CRAP ceiling, gh-1449 rework round 3).
+  void _logEventForensics(AgentEvent event) {
+    switch (event) {
+      case AgentStartEvent():
+        _logDiagnostic('run start sid=$_logSid');
+      case TurnStartEvent():
+        _logDiagnostic('turn start sid=$_logSid');
+      case ToolExecutionStartEvent(:final toolName):
+        _logDiagnostic('tool start sid=$_logSid name=$toolName');
+      case ToolExecutionEndEvent(:final toolName, :final isError):
+        _logDiagnostic('tool end sid=$_logSid name=$toolName error=$isError');
+      case TurnEndEvent(:final message):
+        _logDiagnostic('turn end sid=$_logSid stop=${message.stopReason.name}');
+      case AgentEndEvent():
+        _logDiagnostic('run end sid=$_logSid');
+      default:
+      // The record-persisting cases (tool-call heartbeats, stuck calls,
+      // pairing repairs, message-cap repairs) log where the record is
+      // written (see [_persistEventLiveness]) — nothing extra here.
+    }
+  }
+
+  /// Session-record side of the liveness events (heartbeats, stuck calls,
+  /// orphan-report batches): each case logs its own diagnostic line so the
+  /// original intra-event order (log → persist → terminal print) is
+  /// preserved.
+  Future<void> _persistEventLiveness(AgentEvent event) async {
+    switch (event) {
+      case ToolCallHeartbeatEvent(
+        :final toolCallId,
+        :final toolName,
+        :final args,
+        :final elapsed,
+        :final outputBytes,
+        :final attempt,
+      ):
+        // Liveness heartbeat (gh-1054): the session record keeps the trace
+        // fresh for external watchers; the terminal stays quiet (the busy
+        // row already names the running tool).
+        _logDiagnostic(
+          'tool heartbeat sid=$_logSid name=$toolName '
+          'elapsed=${elapsed.inSeconds}s out=${outputBytes}B '
+          'attempt=$attempt',
+        );
+        await _persistToolLivenessRecord(toolHeartbeatRecordType, {
+          'tool': toolName,
+          'toolCallId': toolCallId,
+          'elapsedMs': elapsed.inMilliseconds,
+          'outputBytes': outputBytes,
+          'attempt': attempt,
+          'args': _stuckArgsSummary(args),
+        });
+      case ToolCallStuckEvent(
+        :final toolCallId,
+        :final toolName,
+        :final elapsed,
+        :final action,
+        :final detail,
+      ):
+        _logDiagnostic(
+          'tool stuck sid=$_logSid name=$toolName action=${action.name} '
+          'elapsed=${elapsed.inSeconds}s',
+        );
+        await _persistToolLivenessRecord(toolStuckRecordType, {
+          'tool': toolName,
+          'toolCallId': toolCallId,
+          'elapsedMs': elapsed.inMilliseconds,
+          'action': action.label,
+          'detail': detail,
+        });
+        // The terminal line shows the same detail the record carries —
+        // redacted the same way (the detail embeds captured output).
+        final shownDetail = config.redactionPipeline?.redact(detail) ?? detail;
+        io.writeln(
+          '[stuck-call] $toolName: ${action.label} after '
+          '${elapsed.inSeconds}s${shownDetail.isEmpty ? '' : ' — $shownDetail'}',
+        );
+      case ToolCallBudgetEvent(
+        :final toolCallId,
+        :final toolName,
+        :final elapsed,
+        :final rung,
+        :final action,
+        :final steeringCount,
+        :final detail,
+      ):
+        // Foreground budget (issue #1786): every rung lands here, so no
+        // escalation is silent. An `offer` arms the one-key `b` accept;
+        // any terminal action (background/abort) clears it.
+        _logDiagnostic(
+          'tool budget sid=$_logSid name=$toolName rung=${rung.label} '
+          'action=${action.label} elapsed=${elapsed.inSeconds}s '
+          'steering=$steeringCount',
+        );
+        await _persistToolLivenessRecord(foregroundBudgetRecordType, {
+          'tool': toolName,
+          'toolCallId': toolCallId,
+          'elapsedMs': elapsed.inMilliseconds,
+          'rung': rung.label,
+          'action': action.label,
+          'steeringCount': steeringCount,
+          'detail': detail,
+        });
+        if (action == ForegroundBudgetAction.offer) {
+          budgetOfferSurfaced(toolCallId);
+        } else {
+          budgetOfferCleared();
+        }
+        // The terminal line carries the deterministic announcement (the
+        // detail IS the `[foreground-budget] …` line) — redacted the same
+        // way the stuck case redacts captured output.
+        final shownBudgetDetail =
+            config.redactionPipeline?.redact(detail) ?? detail;
+        io.writeln(
+          '[foreground-budget] $toolName: ${action.label} after '
+          '${elapsed.inSeconds}s'
+          '${shownBudgetDetail.isEmpty ? '' : ' — $shownBudgetDetail'}',
+        );
+      case ToolPairingRepairEvent(:final report):
+        // gh-1449 AC6: a batch of FIRST-TIME orphan notes is persisted as
+        // the hidden `orphan_report` record — a resumed session seeds its
+        // one-shot latch from these, so the same orphan never re-reports.
+        // Re-drops of already-reported orphans write nothing.
+        if (report.notedOrphanKeys.isNotEmpty) {
+          await _persistToolLivenessRecord(
+            orphanReportRecordType,
+            orphanReportRecordData(report.notedOrphanKeys.toSet()),
+          );
+        }
+      case MessageCapRepairEvent(:final messageCount, :final learnedCap):
+        // gh-1680: the cap repair is a loop-side (not session) event; the
+        // fa.log line is its durable trace.
+        _logDiagnostic(
+          'message-cap repair sid=$_logSid messages=$messageCount '
+          'cap=$learnedCap',
+        );
+      default:
+    }
+  }
+
+  /// Message lifecycle for assistant turns: a start re-arms the
+  /// once-per-message prefix and flushes any narration orphaned by tool
+  /// results that never rendered; an end flushes the stream and reports
+  /// the stop reason.
+  void _onMessageLifecycle(Message message, {required bool start}) {
+    if (message is! AssistantMessage) return;
+    if (start) {
+      _assistantPrefixPrinted = false;
+      // gh-1762: fresh per-message estimate baseline for the meter's
+      // end-of-message top-up.
+      _meter.startMessage();
+      // AC3 orphan safety: post-tool narration held by a message whose
+      // tool result never rendered flushes here — nothing swallowed, and
+      // it lands BEFORE the new message's content (positional).
+      _flushPostToolText();
+      return;
+    }
+    // gh-1762: providers that arrive whole (no deltas — several
+    // OpenAI-compat paths) still yield a live rate: the unobserved
+    // remainder lands as one arrival burst (AC6). Streamed messages
+    // top up ~0 (the deltas already counted the chars).
+    _meter.endMessage(estimateTokens(message));
+    _onAssistantMessageEnd(message);
+  }
+
+  /// Tool-call start bookkeeping (issue #366 grammar): records file-path
+  /// args into [_touchedPaths] so path-gated skills (`paths:` frontmatter)
+  /// join the prompt on the next turn, stamps [_toolStarts] for the end
+  /// row's detail + elapsed zone, arms the liveness watch, and — TUI only —
+  /// paints the running card. Line mode and headless print NOTHING here
+  /// since gh-1931: the end row is the single render per call.
+  void _onToolExecutionStart(
+    String toolCallId,
+    String toolName,
+    Map<String, dynamic> args,
+  ) {
+    for (final key in const ['path', 'file', 'filePath', 'target']) {
+      final value = args[key];
+      if (value is String && value.isNotEmpty) _touchedPaths.add(value);
+    }
+    final detail = toolRowDetail(
+      toolName,
+      args,
+      cwd: _env.cwd,
+      home: config.homeDir,
+    );
+    _toolStarts[toolCallId] = (DateTime.now(), detail, args);
+    // gh-1933 AC4: thinking streamed right before this call collapses
+    // its row first — the running card starts on a fresh line.
+    if (_useTui) _closeThinkingWindow();
+    // Per-call liveness (gh-1055): headless/line mode watch the foreground
+    // call and speak up when it runs long. TUI mode is skipped inside —
+    // its waiting row already covers it.
+    _waiting.toolCallStarted(toolCallId, toolName, detail);
+    // TUI chrome (issue #807): the phase-tinted card replaces the compact
+    // row — omp's card grammar keeps fa's detail extraction. The TUI
+    // transcript grammar is a non-goal for gh-1931 (AC2): the running card
+    // still paints here.
+    if (_useTui && tuiChromeEnabled) {
+      io.writeln(
+        tuiToolCard(
+          ToolCardSegments(title: toolName, description: detail),
+          TuiCardPhase.running,
+          _rowWidth,
+        ).join('\n'),
+      );
+      return;
+    }
+    // gh-1931 (AC1/AC3): line mode and headless render ONE row per call —
+    // the end row (`_onToolExecutionEnd`) already carries the detail
+    // (command), the status glyph and the elapsed cell, so the start row
+    // here was a pure duplicate print of every command. The start stays
+    // recorded above ([_toolStarts] feeds the end row's detail/elapsed)
+    // and the waiting coordinator still watches the call for liveness.
+  }
+
+  /// The row budget: the live TUI width, or UNBOUNDED for
+  /// line-mode/headless — the log line carries the FULL command (issue
+  /// #638 AC3); only the real viewport clips.
+  int get _rowWidth => _tuiController?.termWidth ?? 0;
+
+  /// Streaming deltas: answer text and — when the surface streams it —
+  /// dimmed thinking as the progress signal. Where the answer goes
+  /// depends on the surface: the TUI streams raw into its history
+  /// (rendered at view time); raw-mode passthrough streams deltas live
+  /// (byte-identical output AND live); the styled modes (ansi/plain)
+  /// buffer the answer and render it through the markdown policy at
+  /// message end (issue #774) — line mode and headless cannot repaint, so
+  /// a half-streamed table or fence would print raw mid-flight; the whole
+  /// message renders once, correctly. The LOG face (gh-1433) never
+  /// buffers: a headless run's log is its UI, and a log that reveals the
+  /// answer only at message end is not a narrative.
+  bool get _buffersAnswer =>
+      !_logFidelity.liveText &&
+      _markdownSurface.mode != MarkdownSurfaceMode.raw;
+
+  /// Whether this surface streams thinking deltas live: the TUI always
+  /// has; the LOG face does by default since gh-1433 (the log is the
+  /// UI); interactive line mode stays at the gh-1198 opt-in
+  /// (`--stream-thinking` flag or `output.streamThinking`), with
+  /// `--no-stream-thinking` silencing the log face for the run.
+  bool get _streamsThinking => _logFidelity.streamThinking;
+
+  /// Rendered deltas pass through the SAME redaction pipeline as tool
+  /// results (gh-1433 AC5): thinking may echo secrets from tool output,
+  /// and the log face widens that content's exposure from the local
+  /// session JSONL to every log consumer. The pipeline is live-mutable,
+  /// so the check happens at RENDER time (E6) — a secret registered
+  /// mid-run is masked in every delta rendered after it.
+  String _redactRendered(String text) =>
+      config.redactionPipeline?.redact(text) ?? text;
+
+  void _onMessageUpdate(AssistantMessageEvent assistantMessageEvent) {
+    // gh-1762: the meter counts every delta as it arrives — text,
+    // thinking, and tool-call argument fragments alike — regardless of
+    // what the surface renders (a buffered or unstreamed-thinking face
+    // still prints on the model's side). O(1) per chunk.
+    final deltaChars = switch (assistantMessageEvent) {
+      TextDeltaEvent(:final delta) => delta.length,
+      ThinkingDeltaEvent(:final delta) => delta.length,
+      ToolCallDeltaEvent(:final delta) => delta.length,
+      _ => 0,
+    };
+    if (deltaChars > 0) _meter.observeDelta(deltaChars);
+    if (assistantMessageEvent is ToolCallStartEvent ||
+        assistantMessageEvent is ToolCallEndEvent) {
+      // gh-1933 AC4: the stream moved past the thinking block — collapse
+      // it before the call rows (no-op when no window is open).
+      _closeThinkingWindow();
+      _onToolCallGate(assistantMessageEvent);
+      return;
+    }
+    if (assistantMessageEvent is TextDeltaEvent) {
+      _onTextDelta(assistantMessageEvent);
+      return;
+    }
+    if (assistantMessageEvent is ThinkingDeltaEvent && _streamsThinking) {
+      _onThinkingDelta(assistantMessageEvent);
+    }
+  }
+
+  /// The AC3 hold open/close (gh-1433, non-TUI): every tool-call block
+  /// of the current message opens a narration segment, and the block's
+  /// [ToolCallEndEvent] stamps it with the call id the execution events
+  /// carry — so a 2+ tool-call message flushes each segment after ITS
+  /// OWN result row. TUI keeps today's behavior (its transcript card
+  /// grammar is a non-goal here). Split out of [_onMessageUpdate] so the
+  /// dispatcher stays under the CRAP ratchet (gh-1433 rework: the AC3
+  /// hold branches tipped it over).
+  void _onToolCallGate(AssistantMessageEvent assistantMessageEvent) {
+    if (_useTui) return;
+    if (assistantMessageEvent is ToolCallStartEvent) {
+      _postToolHolds.add(_PostToolNarrationHold());
+      return;
+    }
+    if (assistantMessageEvent is ToolCallEndEvent) {
+      for (final hold in _postToolHolds.reversed) {
+        if (hold.toolCallId == null) {
+          hold.toolCallId = assistantMessageEvent.toolCall.id;
+          return;
+        }
+      }
+      // Degenerate stream (End without Start): the narration after it
+      // still holds — open a pre-stamped segment.
+      _postToolHolds.add(
+        _PostToolNarrationHold()
+          ..toolCallId = assistantMessageEvent.toolCall.id,
+      );
+    }
+  }
+
+  /// The text-delta paths (gh-1433): live surfaces stream (or hold while
+  /// a tool-call block is open), the styled surfaces buffer for their
+  /// end-of-message markdown render. Split out of [_onMessageUpdate] so
+  /// the dispatcher stays under the CRAP ratchet.
+  void _onTextDelta(TextDeltaEvent assistantMessageEvent) {
+    final delta = assistantMessageEvent.delta;
+    if (_useTui || !_buffersAnswer) {
+      // Live surfaces.
+      if (!_useTui && _postToolHolds.isNotEmpty) {
+        _postToolHolds.last.text.write(delta);
+        return;
+      }
+      if (_flushWhitespaceHold(delta)) return;
+      // gh-1933 AC4: the collapsed thinking row lands before the answer.
+      if (_useTui) _closeThinkingWindow();
+      if (_streamedThinking && !_streamedText) io.write('\n');
+      _writeAssistantPrefix();
+      io.write(_redactRendered(delta));
+    } else {
+      // The buffered surfaces keep the same separation rule (E1): a
+      // `\n` lands the moment the first answer delta follows streamed
+      // thinking, so the end-of-message render starts on a fresh line.
+      if (_streamedThinking && !_streamedText) io.write('\n');
+      _assistantText.write(delta);
+    }
+    _streamedText = true;
+  }
+
+  /// The thinking-delta path (gh-1433): reasoning models stream long
+  /// thinking before any text; showing it dimmed under the user message
+  /// is the TUI's progress signal — and, since gh-1433, the DEFAULT of
+  /// the log face too (the post-hoc log is the UI): line mode keeps the
+  /// gh-1198 opt-in. The delta is dimmed VERBATIM — no per-delta
+  /// inline markdown: a markdown span split across deltas can never pair
+  /// anyway (each fragment opens+closes its own SGR pair), and the
+  /// per-delta escape density used to be the TUI's worst quadratic input
+  /// (a long thinking burst froze the whole UI — see
+  /// AnsiMarkdown.inlineFormatMaxChars). Split out of [_onMessageUpdate]
+  /// so the dispatcher stays under the CRAP ratchet.
+  ///
+  /// gh-1933 AC4: on the TUI chrome face the per-delta stream collapses
+  /// into ONE `> Thought for Ns` row — the deltas buffer into the open
+  /// window (persisted in full regardless; only the RENDER collapses),
+  /// and the row emits when the window closes (first answer/tool-call
+  /// delta or message end) with the streamed window's duration. The
+  /// other faces keep today's byte shape.
+  void _onThinkingDelta(ThinkingDeltaEvent assistantMessageEvent) {
+    if (_useTui && tuiChromeEnabled) {
+      final window =
+          _thinkingWindow ??=
+              (startedAt: DateTime.now(), buffer: StringBuffer());
+      window.buffer.write(_redactRendered(assistantMessageEvent.delta));
+      return;
+    }
+    io.write(_style.dim(_redactRendered(assistantMessageEvent.delta)));
+    _streamedThinking = true;
+  }
+
+  /// Closes the open thinking window, emitting the collapsed
+  /// `> Thought for Ns` row (plus the full dim text when
+  /// [transcriptExpandDetails] is on — the `/transcript expand all`
+  /// state). A closed window paints nothing.
+  void _closeThinkingWindow() {
+    final window = _thinkingWindow;
+    if (window == null) return;
+    _thinkingWindow = null;
+    final seconds = DateTime.now().difference(window.startedAt).inSeconds;
+    final rows = thinkingCollapsedRows(
+      text: window.buffer.toString(),
+      seconds: seconds,
+      expanded: transcriptExpandDetails,
+    );
+    for (final row in rows) {
+      io.writeln(_style.dim(_redactRendered(row)));
+    }
+  }
+
+  /// The E1 whitespace hold: whitespace-only deltas before the first real
+  /// text of a live face buffer until a real delta arrives (then the hold
+  /// flushes ahead of it) or the message ends (then the hold DROPS — a
+  /// whitespace-only narration block paints nothing). Returns true when
+  /// [delta] was absorbed by the hold.
+  bool _flushWhitespaceHold(String delta) {
+    if (_useTui) return false;
+    final hold = _whitespaceHold;
+    if (hold != null) {
+      if (delta.trim().isEmpty) {
+        hold.write(delta);
+        return true;
+      }
+      // First real text: the held whitespace belongs in front of it.
+      io.write(hold.toString());
+      _whitespaceHold = null;
+      return false;
+    }
+    if (delta.trim().isEmpty && !_streamedText) {
+      _whitespaceHold = StringBuffer(delta);
+      return true;
+    }
+    return false;
+  }
+
+  /// Drops a still-whitespace-only hold at message end (E1) — nothing
+  /// was streamed, so the separators of a real text stream must not
+  /// fire either.
+  void _discardWhitespaceHoldAtEnd() {
+    final hold = _whitespaceHold;
+    if (hold == null) return;
+    _whitespaceHold = null;
+    if (hold.toString().trim().isEmpty) return;
+    // A real delta slipped in without a flush (defensive — the hold
+    // flushes at the first real delta): it is content, stream it.
+    io.write(hold.toString());
+    _streamedText = true;
+  }
+
+  /// Flushes EVERY held narration segment (gh-1433 AC3), in stream
+  /// order, and closes the hold — the orphan nets: a message whose tool
+  /// result never renders (non-toolUse end) and the next message's
+  /// start. Per-result flushes go through [_flushPostToolTextFor].
+  void _flushPostToolText() {
+    if (_postToolHolds.isEmpty) return;
+    final holds = List.of(_postToolHolds);
+    _postToolHolds.clear();
+    for (final hold in holds) {
+      _emitHeldNarration(hold.text.toString());
+    }
+  }
+
+  /// Flushes the AC3 narration the current message held behind THE tool
+  /// call [toolCallId], after that call's result row, in position —
+  /// later calls keep their own segments, so a 2+ tool-call message
+  /// never drifts its narration across results. No matching segment
+  /// (a call with no trailing narration) paints nothing.
+  void _flushPostToolTextFor(String toolCallId) {
+    for (var i = 0; i < _postToolHolds.length; i++) {
+      if (_postToolHolds[i].toolCallId != toolCallId) continue;
+      final hold = _postToolHolds.removeAt(i);
+      _emitHeldNarration(hold.text.toString());
+      return;
+    }
+  }
+
+  /// Emits one held narration block with the presentation
+  /// [_flushPostToolText] always applied: the E1 whitespace rule
+  /// (whitespace-only narration never paints a line by itself —
+  /// mid-stream it is real spacing, leading it stays pending until a
+  /// real delta or the message end decides) and the thinking-stream
+  /// separator.
+  void _emitHeldNarration(String held) {
+    if (held.isEmpty) return;
+    if (held.trim().isEmpty) {
+      if (_streamedText) {
+        io.write(held);
+      } else {
+        _whitespaceHold ??= StringBuffer(held);
+      }
+      return;
+    }
+    if (_streamedThinking && !_streamedText) io.write('\n');
+    _streamedText = true;
+    io.write(_redactRendered(held));
+  }
+
+  /// End of an assistant message: flush the stream newline, then report the
+  /// stop reason (errors, aborts, silent truncations, empty responses).
+  void _onAssistantMessageEnd(AssistantMessage message) {
+    // AC3 orphan safety: a message that ends WITHOUT a tool execution
+    // following (any non-toolUse stop) can never render the result row its
+    // held narration waits for — flush it HERE, in the message's own
+    // position, before the stop-reason line. A toolUse message keeps the
+    // hold: its tools execute AFTER this end, and the result row flushes
+    // the narration itself (positional). The next-message-start flush
+    // stays as the second net.
+    if (message.stopReason != StopReason.toolUse) _flushPostToolText();
+    _flushAssistantStreamAtEnd();
+    switch (message.stopReason) {
+      case StopReason.error:
+        // The CLI auto-reauthorizes CodeMie sessions after expiry; skip the
+        // generic error line here so [_runPrompt] can print the actionable
+        // prompt and launch the browser SSO flow instead.
+        if (authExpiredProvider(message.errorMessage ?? '') == 'codemie') {
+          return;
+        }
+        // The over-window guard is a routine checkpoint, not a failure:
+        // the request was refused BEFORE sending and auto-compaction
+        // recovers right after — print a calm yellow note instead of the
+        // scary red error line (the continuation note follows when the
+        // compaction succeeds).
+        if (isContextWindowExhaustedError(message.errorMessage)) {
+          io.writeln(
+            tuiWarning(
+              'note: Context window exhausted — the request was not sent; '
+              'auto-compacting…',
+            ),
+          );
+          return;
+        }
+        io.writeln(
+          _keyStatusView.errorLine(
+            message.errorMessage ?? 'unknown error',
+            _agent.state.model.baseUrl,
+          ),
+        );
+      case StopReason.aborted:
+        // A TTSR abort is a rule trigger, not a failure — the
+        // controller already announced it (omp renders a
+        // notification instead of the aborted stop reason).
+        if (!(_ttsr?.isAbortPending ?? false)) {
+          io.writeln('aborted: ${message.errorMessage ?? 'aborted'}');
+        }
+      default:
+        _noteQuietMessageEnd(message);
+    }
+  }
+
+  /// Closes the streamed-delta presentation at message end: the TUI/raw
+  /// surfaces reset their streamed state after the trailing newline; the
+  /// styled surfaces render the buffered answer once (#774), then reset —
+  /// and a pure-thinking message (no answer deltas, e.g. a tool-call
+  /// turn) just closes the dimmed stream line. Split out of
+  /// [_onAssistantMessageEnd] so the stop-reason dispatch stays under the
+  /// CRAP ratchet (gh-1198: the thinking-reset branches tipped it over).
+  void _flushAssistantStreamAtEnd() {
+    if (_useTui || !_buffersAnswer) {
+      // gh-1933 AC4: the collapsed thinking row emits before any trailing
+      // newline — a pure-thinking message still renders its one row.
+      if (_useTui) _closeThinkingWindow();
+      // E1: a whitespace-only narration hold decides at message end —
+      // still whitespace-only, it paints nothing (and the separators of
+      // a real text stream must not fire for it).
+      _discardWhitespaceHoldAtEnd();
+      if (_streamedText || _streamedThinking) {
+        // The trailing newline of the streamed text belongs to the
+        // primary channel (write), not to diagnostics (writeln) — a
+        // headless host routes only writeln to stderr.
+        io.write('\n');
+        _streamedText = false;
+        _streamedThinking = false;
+      }
+      return;
+    }
+    // The buffered faces keep the E1 hold decision too (nothing painted).
+    _discardWhitespaceHoldAtEnd();
+    if (_streamedText) {
+      // The rendered message lands on the primary channel (write), not
+      // diagnostics (writeln) — a headless host routes only writeln to
+      // stderr, keeping write the only stdout content. Raw mode streams
+      // deltas live above, so this branch only runs for ansi/plain.
+      io.write(_markdownSurface.render(_assistantText.toString()));
+      io.write('\n');
+      _assistantText.clear();
+      _streamedText = false;
+      // The thinking deltas streamed dimmed while the answer buffered
+      // (gh-1198): the stream line closed above the render — reset here,
+      // exactly like the streaming surfaces do.
+      _streamedThinking = false;
+    } else if (_streamedThinking) {
+      // A pure-thinking message (e.g. a tool-call turn) on a buffered
+      // surface: close the dimmed stream line and reset.
+      io.write('\n');
+      _streamedThinking = false;
+    }
+  }
+
+  /// The non-error/non-abort stop reasons: a tolerated silent truncation
+  /// warning, or a note when the turn produced neither text nor tool calls.
+  void _noteQuietMessageEnd(AssistantMessage message) {
+    // A tolerated silent truncation (no finish_reason) is flagged
+    // on the message — tell the user the reply may be cut off.
+    if (message.errorMessage != null) {
+      io.writeln(_style.dim('(${message.errorMessage})'));
+      return;
+    }
+    // A turn that ends with neither text nor tool calls leaves the
+    // user staring at silence (seen with OpenRouter free models
+    // that burn the whole completion on reasoning). Say so.
+    final hasText = message.content.any(
+      (c) => c is TextContent && c.text.trim().isNotEmpty,
+    );
+    final hasToolCalls = message.content.any((c) => c is ToolCall);
+    if (!hasText && !hasToolCalls) {
+      io.writeln(
+        _style.dim(
+          '(empty response: the model returned no text — '
+          'it may be rate-limited or reasoning-only)',
+        ),
+      );
+    }
+  }
+
+  /// Tool end row in the compact grammar (issue #366): `✓ label · detail
+  /// Ns` — the detail stamped at start (the TUI running card's
+  /// description; since gh-1931 this row is the ONLY non-TUI render per
+  /// call), plus the elapsed. Errors render `✗` with the result's first
+  /// line as a full-bright snippet (the one place the muted detail role
+  /// gives way to readability).
+  void _onToolExecutionEnd(
+    String toolCallId,
+    String toolName,
+    ToolExecutionResult result, {
+    required bool isError,
+  }) {
+    final (started, startDetail, startArgs) =
+        _toolStarts.remove(toolCallId) ??
+        (null, '', const <String, dynamic>{});
+    _waiting.toolCallEnded(toolCallId);
+    // No offer may outlive its call (issue #1786): the call ending is the
+    // last chance to clear a stale outstanding `b` affordance.
+    budgetOfferCleared();
+    final elapsed = started == null
+        ? ''
+        : '${DateTime.now().difference(started).inSeconds}s';
+    final state = isError ? ToolRowState.failed : ToolRowState.done;
+    // TUI chrome (issue #807): the settled card carries the phase tint,
+    // the RIGHT-ALIGNED elapsed zone, and the gh-1933 v2 content (read
+    // lines-read, edit/write diffstat, bash intent + output count + dim
+    // command preview) — the SAME derivation the replay paints
+    // ([settledCallCardRows], parity by construction). Line mode,
+    // headless, and the chrome kill switch keep the legacy row
+    // byte-identically (AC5).
+    if (_useTui && tuiChromeEnabled) {
+      io.writeln(
+        settledCallCardRows(
+          toolName: toolName,
+          args: startArgs,
+          resultContent: result.content,
+          isError: isError,
+          width: _rowWidth,
+          elapsed: elapsed.isEmpty ? null : elapsed,
+          cwd: _env.cwd,
+          home: config.homeDir,
+        ).join('\n'),
+      );
+      return;
+    }
+    var detail = startDetail;
+    if (isError) {
+      // The failure text is the news: keep it bright, not muted.
+      detail = failureFirstLine(result.content);
+    }
+    io.writeln(
+      tuiToolRow(
+        layoutToolRow(
+          ToolRowSegments(
+            glyph: isError ? '✗' : '✓',
+            label: toolName,
+            detail: detail,
+            elapsed: elapsed,
+          ),
+          _rowWidth - 2,
+        ),
+        state,
+      ),
+    );
+    // AC3: the result row rendered — the narration the message held
+    // behind THIS tool call lands here, in position (later calls of the
+    // same message flush after their own result rows).
+    _flushPostToolTextFor(toolCallId);
+  }
+
+  /// Prints the `>_Fa ` prefix once per assistant message, before the first
+  /// text delta. TUI-only: headless and line-mode output stay plain (a piped
+  /// headless response must remain the bare assistant text).
+  void _writeAssistantPrefix() {
+    if (!_useTui || _assistantPrefixPrinted) return;
+    io.write(tuiFaMark());
+    _assistantPrefixPrinted = true;
+  }
+}
+
+/// The status bar's git probe (issue #920). A process-wide instance is
+/// right — one CLI process serves one band, and the probe is a read-only
+/// refresher (outside the shell stream, never a recorded command).
+final StatusLineGitProbe _statusGitProbe = StatusLineGitProbe();

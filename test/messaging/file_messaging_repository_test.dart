@@ -1,0 +1,852 @@
+@TestOn('vm')
+library;
+
+import 'dart:convert';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+void main() {
+  late MemoryExecutionEnv env;
+  late FileMessagingRepository repo;
+
+  const messagesRoot = '/sessions/--work--/messages';
+
+  AgentMessage msg({
+    String id = 'm1',
+    String from = 'main',
+    String to = 'a1',
+    String text = 'hello',
+    String sentAt = '2026-01-01T00:00:00Z',
+    int hops = 2,
+  }) => AgentMessage(
+    id: id,
+    fromId: from,
+    toId: to,
+    text: text,
+    sentAt: sentAt,
+    hops: hops,
+  );
+
+  setUp(() {
+    env = MemoryExecutionEnv(cwd: '/work');
+    repo = FileMessagingRepository(
+      env: env,
+      root: messagesRoot,
+      homeDir: '/home/user',
+      decodeSessionCwd: decodeSessionCwd,
+    );
+  });
+
+  group('FileMessagingRepository', () {
+    test(
+      'send + peek delivers to the recipient inbox without consuming',
+      () async {
+        await repo.send(msg());
+        final first = await repo.peek('a1');
+        expect(first, hasLength(1));
+        expect(first.single.fromId, 'main');
+        expect(first.single.text, 'hello');
+        expect(first.single.hops, 2);
+        // Peek again — still there.
+        expect(await repo.peek('a1'), hasLength(1));
+        // Another agent sees nothing.
+        expect(await repo.peek('b2'), isEmpty);
+      },
+    );
+
+    test('drain consumes: messages land in read/ and never reappear', () async {
+      await repo.send(msg(id: 'm1', text: 'one'));
+      await repo.send(msg(id: 'm2', text: 'two'));
+      final drained = await repo.drain('a1');
+      expect(drained.map((m) => m.text), ['one', 'two']);
+      expect(await repo.drain('a1'), isEmpty);
+      // The read/ archive kept both.
+      final readDir = (await env.listDir('$messagesRoot/a1/read')).getOrThrow();
+      expect(readDir, hasLength(2));
+    });
+
+    test('inbox order is arrival order (filename sort)', () async {
+      // Ids deliberately out of alphabetical order vs insertion order.
+      await repo.send(msg(id: '20260101_0003_z', text: 'third'));
+      await repo.send(msg(id: '20260101_0001_x', text: 'first'));
+      await repo.send(msg(id: '20260101_0002_y', text: 'second'));
+      final drained = await repo.drain('a1');
+      expect(drained.map((m) => m.text), ['first', 'second', 'third']);
+    });
+
+    test('agent ids are sanitized for the filesystem', () async {
+      expect(
+        FileMessagingRepository.sanitizeAgentId('explore:a1'),
+        'explore_a1',
+      );
+      await repo.send(msg(to: 'explore:a1'));
+      expect(await repo.peek('explore:a1'), hasLength(1));
+      // Same agent resolves to the same inbox regardless of addressing form.
+      expect(await repo.peek('explore_a1'), hasLength(1));
+    });
+
+    test('directory lists agents that have mail', () async {
+      expect(await repo.directory(), isEmpty);
+      await repo.send(msg(to: 'a1'));
+      await repo.send(msg(to: 'b2'));
+      await repo.drain('a1');
+      final dir = await repo.directory();
+      expect(dir.map((e) => e.id), containsAll(['a1', 'b2']));
+      expect(dir.every((e) => e.slug == '--work--'), isTrue);
+      expect(dir.every((e) => e.cwd == '/work'), isTrue);
+    });
+
+    test(
+      'directory falls back to the directory name when .id is missing',
+      () async {
+        await env.createDir('$messagesRoot/no-id/inbox', recursive: true);
+        final dir = await repo.directory();
+        expect(dir.map((e) => e.id), contains('no-id'));
+        expect(dir.firstWhere((e) => e.id == 'no-id').slug, '--work--');
+      },
+    );
+
+    test('a torn write never poisons the inbox', () async {
+      await repo.send(msg(id: 'm9', text: 'good'));
+      (await env.writeFile(
+        '$messagesRoot/a1/inbox/20260102_bad.json',
+        '{broken',
+      )).getOrThrow();
+      final drained = await repo.drain('a1');
+      // The broken file sorts after m9's name? Force order: m9 id sorts
+      // before 20260102 only when named so — just assert the good one came
+      // through and nothing threw.
+      expect(drained.any((m) => m.text == 'good'), isTrue);
+    });
+
+    test('two repository instances share mail through one root', () async {
+      // Two "Fa instances": separate repo objects, same env + root.
+      final instanceA = FileMessagingRepository(
+        env: env,
+        root: messagesRoot,
+        decodeSessionCwd: decodeSessionCwd,
+      );
+      final instanceB = FileMessagingRepository(
+        env: env,
+        root: messagesRoot,
+        decodeSessionCwd: decodeSessionCwd,
+      );
+      await instanceA.send(msg(id: 'm1', from: 'a1', to: 'main', text: 'ping'));
+      final inbox = await instanceB.drain('main');
+      expect(inbox.single.text, 'ping');
+      await instanceB.send(msg(id: 'm2', from: 'main', to: 'a1', text: 'pong'));
+      expect((await instanceA.drain('a1')).single.text, 'pong');
+    });
+
+    test('newMessageId is unique and time-ordered', () {
+      final ids = [for (var i = 0; i < 100; i++) newMessageId()];
+      expect(ids.toSet(), hasLength(100));
+      final sorted = [...ids]..sort();
+      expect(ids, sorted);
+    });
+
+    test('register announces a zero-mail mailbox in the directory', () async {
+      expect(await repo.directory(), isEmpty);
+      await repo.register('sess1/main');
+      final dir = await repo.directory();
+      expect(dir.map((e) => e.id), ['sess1/main']);
+      expect(dir.single.slug, '--work--');
+      expect(dir.single.cwd, '/work');
+      // Idempotent and non-destructive.
+      await repo.send(msg());
+      await repo.register('sess1/main');
+      expect(await repo.peek('a1'), hasLength(1));
+      final later = await repo.directory();
+      expect(later.map((e) => e.id), containsAll(['sess1/main', 'a1']));
+    });
+
+    test('broad-scan finds mailboxes in sibling cwd-slug dirs', () async {
+      final foreignRoot = '/sessions/--other--/messages';
+      final foreignRepo = FileMessagingRepository(
+        env: env,
+        root: foreignRoot,
+        decodeSessionCwd: decodeSessionCwd,
+      );
+      await repo.send(msg(id: 'm1', from: 'other', to: 'main', text: 'own'));
+      await foreignRepo.send(
+        msg(id: 'm2', from: 'other', to: 'foreign-agent', text: 'foreign'),
+      );
+
+      final dir = await repo.directory();
+      final byId = {for (final e in dir) e.id: e};
+      expect(byId.keys, containsAll(['main', 'foreign-agent']));
+      expect(byId['main']?.cwd, '/work');
+      expect(byId['main']?.slug, '--work--');
+      expect(byId['foreign-agent']?.cwd, '/other');
+      expect(byId['foreign-agent']?.slug, '--other--');
+    });
+
+    test(
+      'register writes the messages-registry.json with correct shape',
+      () async {
+        await repo.register('sess1/main');
+        final registryText = (await env.readTextFile(
+          '/home/user/.fah/messages-registry.json',
+        )).getOrThrow();
+        final registry = jsonDecode(registryText) as Map<String, dynamic>;
+        expect(registry['sess1/main'], {'slug': '--work--', 'cwd': '/work'});
+      },
+    );
+
+    test('register with a session name persists it in the registry', () async {
+      await repo.register('sess1/main', sessionName: 'goal_builder');
+      final registryText = (await env.readTextFile(
+        '/home/user/.fah/messages-registry.json',
+      )).getOrThrow();
+      final registry = jsonDecode(registryText) as Map<String, dynamic>;
+      expect(registry['sess1/main'], {
+        'slug': '--work--',
+        'cwd': '/work',
+        'name': 'goal_builder',
+      });
+    });
+
+    test('register without a name keeps the legacy registry shape', () async {
+      await repo.register('sess1/main');
+      final registryText = (await env.readTextFile(
+        '/home/user/.fah/messages-registry.json',
+      )).getOrThrow();
+      final registry = jsonDecode(registryText) as Map<String, dynamic>;
+      expect(registry['sess1/main'], {'slug': '--work--', 'cwd': '/work'});
+    });
+
+    test('directory reports the session name from the .name marker', () async {
+      await repo.register('sess1/main', sessionName: 'goal_builder');
+      final entry = (await repo.directory()).firstWhere(
+        (e) => e.id == 'sess1/main',
+      );
+      expect(entry.name, 'goal_builder');
+    });
+
+    test('a mailbox registered without a name reports a null name', () async {
+      await repo.register('main');
+      final entry = (await repo.directory()).firstWhere((e) => e.id == 'main');
+      expect(entry.name, isNull);
+    });
+
+    test('re-registering with a new name updates the marker', () async {
+      await repo.register('sess1/main', sessionName: 'old_name');
+      await repo.register('sess1/main', sessionName: 'goal_builder');
+      final entry = (await repo.directory()).firstWhere(
+        (e) => e.id == 'sess1/main',
+      );
+      expect(entry.name, 'goal_builder');
+    });
+
+    test('registry upserts multiple agent ids', () async {
+      await repo.register('main');
+      await repo.register('explore:a1');
+      final registryText = (await env.readTextFile(
+        '/home/user/.fah/messages-registry.json',
+      )).getOrThrow();
+      final registry = jsonDecode(registryText) as Map<String, dynamic>;
+
+      expect(registry['main'], {'slug': '--work--', 'cwd': '/work'});
+      expect(registry['explore:a1'], {'slug': '--work--', 'cwd': '/work'});
+    });
+
+    test(
+      'registry stores the exact cwd of a hyphenated workspace (gh-1744)',
+      () async {
+        // The ticket's failing workspace: round-tripping the cwd through
+        // the slug used to write the non-existent /Users/y/_w/postal/nl.
+        const slug = '--Users-Yury_Bakhmutski-_w-postal%2Dnl--';
+        final dashedEnv = MemoryExecutionEnv(
+          cwd: '/Users/Yury_Bakhmutski/_w/postal-nl',
+        );
+        final dashed = FileMessagingRepository(
+          env: dashedEnv,
+          root: '/sessions/$slug/messages',
+          homeDir: '/home/user',
+          decodeSessionCwd: decodeSessionCwd,
+        );
+        await dashed.register('sess1/main');
+        final registryText = (await dashedEnv.readTextFile(
+          '/home/user/.fah/messages-registry.json',
+        )).getOrThrow();
+        final registry = jsonDecode(registryText) as Map<String, dynamic>;
+        expect(registry['sess1/main'], {
+          'slug': slug,
+          'cwd': '/Users/Yury_Bakhmutski/_w/postal-nl',
+        });
+      },
+    );
+
+    test(
+      'directory prefers the exact registry cwd over the lossy decode (gh-1744)',
+      () async {
+        // A legacy lossy slug folder: its decode names a directory that
+        // does not exist. The registry's exact cwd must win so the wake
+        // launcher gets a spawnable working directory.
+        const legacySlug = '--Users-Yury_Bakhmutski-_w-postal-nl--';
+        final mailboxDir = '/sessions/$legacySlug/messages/sess1_main';
+        await env.createDir('$mailboxDir/inbox', recursive: true);
+        (await env.writeFile('$mailboxDir/.id', 'sess1/main')).getOrThrow();
+        (await env.writeFile(
+          '/home/user/.fah/messages-registry.json',
+          jsonEncode({
+            'sess1/main': {
+              'slug': legacySlug,
+              'cwd': '/Users/Yury_Bakhmutski/_w/postal-nl',
+            },
+          }),
+        )).getOrThrow();
+
+        final entry = (await repo.directory()).singleWhere(
+          (e) => e.id == 'sess1/main',
+        );
+        expect(entry.cwd, '/Users/Yury_Bakhmutski/_w/postal-nl');
+      },
+    );
+
+    test(
+      'directory falls back to the slug decode when the registry has no cwd',
+      () async {
+        const legacySlug = '--Users-Yury_Bakhmutski-_w-postal-nl--';
+        final mailboxDir = '/sessions/$legacySlug/messages/sess1_main';
+        await env.createDir('$mailboxDir/inbox', recursive: true);
+        (await env.writeFile('$mailboxDir/.id', 'sess1/main')).getOrThrow();
+        (await env.writeFile(
+          '/home/user/.fah/messages-registry.json',
+          jsonEncode({
+            'sess1/main': {'slug': legacySlug},
+          }),
+        )).getOrThrow();
+
+        final entry = (await repo.directory()).singleWhere(
+          (e) => e.id == 'sess1/main',
+        );
+        expect(entry.cwd, '/Users/Yury_Bakhmutski/_w/postal/nl');
+      },
+    );
+
+    test(
+      'directory tolerates a non-map registry entry (gh-1744 review)',
+      () async {
+        // A registry that is valid JSON but whose entry is not an object
+        // (another tool corrupted it) must not kill the whole listing with
+        // a NoSuchMethodError — the slug decode answers instead.
+        const legacySlug = '--Users-Yury_Bakhmutski-_w-postal-nl--';
+        final mailboxDir = '/sessions/$legacySlug/messages/sess1_main';
+        await env.createDir('$mailboxDir/inbox', recursive: true);
+        (await env.writeFile('$mailboxDir/.id', 'sess1/main')).getOrThrow();
+        (await env.writeFile(
+          '/home/user/.fah/messages-registry.json',
+          jsonEncode({'sess1/main': 'corrupted by another tool'}),
+        )).getOrThrow();
+
+        final entry = (await repo.directory()).singleWhere(
+          (e) => e.id == 'sess1/main',
+        );
+        expect(entry.cwd, '/Users/Yury_Bakhmutski/_w/postal/nl');
+      },
+    );
+
+    test(
+      'directory tolerates a non-map registry document (gh-1744 review)',
+      () async {
+        // Same shape-error class one level up: a registry whose TOP LEVEL
+        // is not an object escapes `on FormatException` with a TypeError —
+        // the listing must survive it through the slug decode fallback.
+        const legacySlug = '--Users-Yury_Bakhmutski-_w-postal-nl--';
+        final mailboxDir = '/sessions/$legacySlug/messages/sess1_main';
+        await env.createDir('$mailboxDir/inbox', recursive: true);
+        (await env.writeFile('$mailboxDir/.id', 'sess1/main')).getOrThrow();
+        (await env.writeFile(
+          '/home/user/.fah/messages-registry.json',
+          '["corrupted by another tool"]',
+        )).getOrThrow();
+
+        final entry = (await repo.directory()).singleWhere(
+          (e) => e.id == 'sess1/main',
+        );
+        expect(entry.cwd, '/Users/Yury_Bakhmutski/_w/postal/nl');
+      },
+    );
+
+    test(
+      'register rewrites a non-map registry document (gh-1744 review)',
+      () async {
+        // _recordRegistry reads the same file: a non-map document must be
+        // treated as "nothing usable" (fresh registry), not crash the
+        // registration.
+        (await env.writeFile(
+          '/home/user/.fah/messages-registry.json',
+          '["corrupted by another tool"]',
+        )).getOrThrow();
+
+        await repo.register('main');
+        final registryText = (await env.readTextFile(
+          '/home/user/.fah/messages-registry.json',
+        )).getOrThrow();
+        expect(jsonDecode(registryText), {
+          'main': {'slug': '--work--', 'cwd': '/work'},
+        });
+      },
+    );
+
+    test('directory tolerates a missing session root', () async {
+      final isolated = FileMessagingRepository(
+        env: MemoryExecutionEnv(),
+        root: '/nowhere/--work--/messages',
+        decodeSessionCwd: decodeSessionCwd,
+      );
+      expect(await isolated.directory(), isEmpty);
+    });
+
+    test(
+      'touch writes a heartbeat that directory reports as lastActivity',
+      () async {
+        await repo.send(msg(to: 'a1'));
+        // Backdate the mail: without a heartbeat the mailbox would look stale.
+        final twoHoursAgo = DateTime.now().toUtc().subtract(
+          const Duration(hours: 2),
+        );
+        env.setMtime(
+          '$messagesRoot/a1/inbox/m1.json',
+          twoHoursAgo.millisecondsSinceEpoch,
+        );
+        await repo.touch('a1');
+        final entry = (await repo.directory()).single;
+        expect(entry.lastActivity, isNotNull);
+        // The heartbeat is the activity source — fresher than the mail and
+        // inside the live window.
+        expect(entry.lastActivity!.isAfter(twoHoursAgo), isTrue);
+        expect(MailboxEntry.isLive(entry.lastActivity), isTrue);
+      },
+    );
+
+    test('touch announces an unknown mailbox in the directory', () async {
+      expect(await repo.directory(), isEmpty);
+      await repo.touch('fresh/main');
+      final dir = await repo.directory();
+      expect(dir.map((e) => e.id), ['fresh/main']);
+      expect(dir.single.lastActivity, isNotNull);
+    });
+
+    test('register publishes capabilities into the directory', () async {
+      const capabilities = [
+        AgentCapability(name: 'yoclip.render', description: 'Render to MP4'),
+        AgentCapability(name: 'yoclip.screenshot', payload: 'scene=<id>'),
+      ];
+      await repo.register(
+        'p1/main',
+        sessionName: 'studio',
+        capabilities: capabilities,
+      );
+      final entry = (await repo.directory()).single;
+      expect(entry.capabilities, capabilities);
+      expect(entry.presence, isNull);
+      // The marker is a JSON list of the capability payloads.
+      final marker = (await env.readTextFile(
+        '$messagesRoot/p1_main/.capabilities',
+      )).valueOrNull;
+      expect(marker, isNotNull);
+      expect(jsonDecode(marker!), [
+        {'name': 'yoclip.render', 'description': 'Render to MP4'},
+        {'name': 'yoclip.screenshot', 'payload': 'scene=<id>'},
+      ]);
+    });
+
+    test('re-registering with no capabilities clears them', () async {
+      await repo.register(
+        'p1/main',
+        capabilities: const [AgentCapability(name: 'x.y')],
+      );
+      expect((await repo.directory()).single.capabilities, [
+        AgentCapability(name: 'x.y'),
+      ]);
+      await repo.register('p1/main');
+      expect((await repo.directory()).single.capabilities, isEmpty);
+    });
+
+    test('touch busy sets presence, fresh marker only', () async {
+      await repo.register('p1/main');
+      await repo.touch('p1/main', busy: true);
+      expect((await repo.directory()).single.presence, AgentPresence.busy);
+      // An idle touch clears the marker.
+      await repo.touch('p1/main');
+      expect((await repo.directory()).single.presence, isNull);
+      // A stale marker (crashed process, never touched again) is ignored.
+      await repo.touch('p1/main', busy: true);
+      final stale = DateTime.now()
+          .subtract(FileMessagingRepository.busyFreshWindow)
+          .subtract(const Duration(seconds: 5));
+      await env.writeFile(
+        '$messagesRoot/p1_main/.presence',
+        'busy ${stale.millisecondsSinceEpoch}',
+      );
+      expect((await repo.directory()).single.presence, isNull);
+    });
+
+    test('malformed presence marker never breaks the directory', () async {
+      await repo.register('p1/main');
+      await env.writeFile('$messagesRoot/p1_main/.presence', 'garbage');
+      expect((await repo.directory()).single.presence, isNull);
+    });
+
+    test('capability marker with a malformed entry tolerates it', () async {
+      await repo.register('p1/main');
+      await env.writeFile(
+        '$messagesRoot/p1_main/.capabilities',
+        '[{"description":"no name"},{"name":"ok.k"},{"name":42}]',
+      );
+      expect((await repo.directory()).single.capabilities, [
+        AgentCapability(name: 'ok.k'),
+      ]);
+    });
+
+    test(
+      'directory lastActivity is the newest file across inbox and read',
+      () async {
+        await repo.send(msg(id: 'm1', to: 'a1'));
+        await repo.send(msg(id: 'm2', to: 'a1'));
+        await repo.drain('a1'); // Both land in read/, inbox is empty.
+        final threeDaysAgo = DateTime.now().toUtc().subtract(
+          const Duration(days: 3),
+        );
+        env.setMtime(
+          '$messagesRoot/a1/read/m1.json',
+          threeDaysAgo.millisecondsSinceEpoch,
+        );
+        env.setMtime(
+          '$messagesRoot/a1/read/m2.json',
+          threeDaysAgo.millisecondsSinceEpoch,
+        );
+        final entry = (await repo.directory()).single;
+        expect(entry.lastActivity, isNotNull);
+        // The .id marker is identity, not activity — excluded from the scan.
+        final age = DateTime.now().toUtc().difference(entry.lastActivity!);
+        expect(age.inDays, greaterThanOrEqualTo(2));
+        expect(MailboxEntry.isLive(entry.lastActivity), isFalse);
+      },
+    );
+
+    test(
+      'directory skips reserved directories (_scheduled, dot-dirs)',
+      () async {
+        await repo.send(msg(to: 'a1'));
+        await env.createDir('$messagesRoot/_scheduled', recursive: true);
+        env.writeFile('$messagesRoot/_scheduled/20260101_x.json', '{}');
+        await env.createDir('$messagesRoot/.hidden/inbox', recursive: true);
+        final ids = (await repo.directory()).map((e) => e.id).toList();
+        expect(ids, ['a1']);
+      },
+    );
+
+    test(
+      'MailboxEntry.isLive: null is live, staleness respects the window',
+      () {
+        final now = DateTime.utc(2026, 1, 1, 12);
+        expect(MailboxEntry.isLive(null, now: now), isTrue);
+        expect(
+          MailboxEntry.isLive(
+            now.subtract(const Duration(minutes: 14)),
+            now: now,
+          ),
+          isTrue,
+        );
+        expect(
+          MailboxEntry.isLive(
+            now.subtract(const Duration(minutes: 16)),
+            now: now,
+          ),
+          isFalse,
+        );
+        expect(
+          MailboxEntry.isLive(
+            now.subtract(const Duration(hours: 2)),
+            now: now,
+            window: const Duration(hours: 3),
+          ),
+          isTrue,
+        );
+      },
+    );
+  });
+
+  // Cross-project delivery: a mailbox registered under a DIFFERENT cwd slug
+  // must receive mail in ITS messages root — the recipient drains only its
+  // own root, so sender-rooted delivery silently vanishes (the peer fa in
+  // another project never sees the message). Resolution (issue #516): a
+  // LIVE registration (fresh heartbeat) wins over any existing directory;
+  // stale-only — the messages-registry.json slug hint, then a broad scan
+  // of sibling slugs for a mailbox whose .id marker matches; unknown ids
+  // stay local.
+  group('cross-project send routing', () {
+    test('registry-known foreign slug receives the message', () async {
+      await env.writeFile(
+        '/home/user/.fah/messages-registry.json',
+        jsonEncode({
+          '01a044d9/main': {'slug': '--other-project--', 'cwd': '/other'},
+        }),
+      );
+      await env.createDir(
+        '/sessions/--other-project--/messages/01a044d9_main/inbox',
+      );
+      await repo.send(msg(to: '01a044d9/main', text: 'cross'));
+      final there =
+          (await env.listDir(
+            '/sessions/--other-project--/messages/01a044d9_main/inbox',
+          )).valueOrNull ??
+          const [];
+      expect(there.where((e) => e.kind == FileKind.file), hasLength(1));
+      // NOT in our own root — sender-rooted delivery is the bug.
+      expect(await repo.peek('01a044d9/main'), isEmpty);
+    });
+
+    test(
+      'broad scan finds a foreign mailbox without a registry entry',
+      () async {
+        await env.createDir(
+          '/sessions/--other-project--/messages/01a044d9_main/inbox',
+        );
+        await env.writeFile(
+          '/sessions/--other-project--/messages/01a044d9_main/.id',
+          '01a044d9/main',
+        );
+        await repo.send(msg(to: '01a044d9/main', text: 'scan'));
+        final there =
+            (await env.listDir(
+              '/sessions/--other-project--/messages/01a044d9_main/inbox',
+            )).valueOrNull ??
+            const [];
+        expect(there.where((e) => e.kind == FileKind.file), hasLength(1));
+        expect(await repo.peek('01a044d9/main'), isEmpty);
+      },
+    );
+
+    test('unknown ids stay in the local root', () async {
+      await repo.send(msg(to: 'local-child', text: 'local'));
+      expect(await repo.peek('local-child'), hasLength(1));
+    });
+  });
+
+  group('orphan mailbox reclaim (truncated-id sends)', () {
+    const selfId = '01a060f2-7d4b-73b3-a360-bdf56e8a3a14/main';
+    final orphanDir = '$messagesRoot/01a060f2_main/inbox';
+
+    Future<void> seedOrphan({String file = '1788717144722510_0001_a.json'}) =>
+        () async {
+          await env.createDir(orphanDir);
+          await env.writeFile(
+            '$orphanDir/$file',
+            jsonEncode(msg(to: '01a060f2/main').toJson()),
+          );
+        }();
+
+    test(
+      'moves pending mail into the real inbox and removes the orphan',
+      () async {
+        await repo.touch(selfId);
+        await seedOrphan();
+
+        final moved = await reclaimOrphanMailboxMail(
+          env: env,
+          root: messagesRoot,
+          agentId: selfId,
+        );
+
+        expect(moved, 1);
+        final pending = await repo.peek(selfId);
+        expect(pending, hasLength(1));
+        expect(pending.single.text, 'hello');
+        expect(
+          (await env.exists('$messagesRoot/01a060f2_main')).valueOrNull,
+          isNot(true),
+        );
+      },
+    );
+
+    test('is a no-op when there is no orphan mailbox', () async {
+      await repo.touch(selfId);
+      final moved = await reclaimOrphanMailboxMail(
+        env: env,
+        root: messagesRoot,
+        agentId: selfId,
+      );
+      expect(moved, 0);
+    });
+
+    test('never touches unrelated mailboxes', () async {
+      await repo.touch(selfId);
+      // A DIFFERENT session's main mailbox (not a prefix of selfId).
+      await env.createDir('$messagesRoot/buddy_main/inbox');
+      await env.writeFile(
+        '$messagesRoot/buddy_main/inbox/x.json',
+        jsonEncode(msg(to: 'buddy/main').toJson()),
+      );
+
+      final moved = await reclaimOrphanMailboxMail(
+        env: env,
+        root: messagesRoot,
+        agentId: selfId,
+      );
+
+      expect(moved, 0);
+      expect(
+        (await env.exists('$messagesRoot/buddy_main/inbox/x.json')).valueOrNull,
+        isTrue,
+      );
+    });
+
+    test('keeps both files on a filename collision', () async {
+      await repo.touch(selfId);
+      await seedOrphan(file: 'dup.json');
+      await env.writeFile(
+        '$messagesRoot/${FileMessagingRepository.sanitizeAgentId(selfId)}/'
+        'inbox/dup.json',
+        jsonEncode(msg(id: 'm2', to: selfId).toJson()),
+      );
+
+      final moved = await reclaimOrphanMailboxMail(
+        env: env,
+        root: messagesRoot,
+        agentId: selfId,
+      );
+
+      expect(moved, 1);
+      final pending = await repo.peek(selfId);
+      expect(pending, hasLength(2));
+    });
+  });
+
+  // Issue #516: delivery resolved a mailbox by EXISTING DIRECTORY, not by
+  // the agent's LIVE registration — 31 messages for a support agent live
+  // under flutter_agent landed in a corpse mailbox left under demo_widget
+  // by an older run. The fixture reproduces the incident: a stale mailbox
+  // (no heartbeat) under the OLD project slug sorts before the LIVE
+  // mailbox under the current one, so the legacy first-existing-dir scan
+  // picked the corpse.
+  group('live registration wins over a stale cross-root mailbox (#516)', () {
+    const targetId = '01a060f2-7d4b-73b3-a360-bdf56e8a3a14/main';
+    const staleDir =
+        '/sessions/--git-demo-widget--/messages/'
+        '01a060f2-7d4b-73b3-a360-bdf56e8a3a14_main';
+    const liveRoot = '/sessions/--git-flutter-agent--/messages';
+
+    Future<void> seedStaleCorpse({bool withMail = false}) async {
+      await env.createDir('$staleDir/inbox', recursive: true);
+      await env.writeFile('$staleDir/.id', targetId);
+      if (withMail) {
+        // Real sends name the file after the message id (see _fileName).
+        const first = '1788717144722510_0001_a';
+        const second = '1788717144722510_0002_b';
+        await env.writeFile(
+          '$staleDir/inbox/$first.json',
+          jsonEncode(msg(id: first, to: targetId, text: 's1').toJson()),
+        );
+        await env.writeFile(
+          '$staleDir/inbox/$second.json',
+          jsonEncode(msg(id: second, to: targetId, text: 's2').toJson()),
+        );
+      }
+    }
+
+    FileMessagingRepository liveRepo() => FileMessagingRepository(
+      env: env,
+      root: liveRoot,
+      decodeSessionCwd: decodeSessionCwd,
+    );
+
+    test(
+      'AC1: send lands in the live project root, never the corpse',
+      () async {
+        await seedStaleCorpse();
+        final recipient = liveRepo();
+        await recipient.register(targetId);
+
+        await repo.send(msg(id: 'm1', to: targetId, text: 'where are you?'));
+
+        final liveMail = await recipient.peek(targetId);
+        expect(liveMail, hasLength(1));
+        expect(liveMail.single.text, 'where are you?');
+        final corpseInbox =
+            (await env.listDir('$staleDir/inbox')).valueOrNull ?? const [];
+        expect(corpseInbox.where((e) => e.kind == FileKind.file), isEmpty);
+      },
+    );
+
+    test(
+      'AC1b: a stale registry entry cannot outrank the live registration',
+      () async {
+        await seedStaleCorpse();
+        await env.writeFile(
+          '/home/user/.fah/messages-registry.json',
+          jsonEncode({
+            targetId: {'slug': '--git-demo-widget--', 'cwd': '/demo'},
+          }),
+        );
+        final recipient = liveRepo();
+        await recipient.register(targetId);
+
+        await repo.send(msg(id: 'm1', to: targetId, text: 'registry vs live'));
+
+        expect(await recipient.peek(targetId), hasLength(1));
+        final corpseInbox =
+            (await env.listDir('$staleDir/inbox')).valueOrNull ?? const [];
+        expect(corpseInbox.where((e) => e.kind == FileKind.file), isEmpty);
+      },
+    );
+
+    test(
+      'AC2: registering under a new root drains the stale inbox once',
+      () async {
+        await seedStaleCorpse(withMail: true);
+        final recipient = liveRepo();
+
+        await recipient.register(targetId);
+        final drained = await recipient.drain(targetId);
+        expect(drained, hasLength(2));
+        expect(drained.map((m) => m.id).toString(), contains('0001_a'));
+        expect(drained.map((m) => m.id).toString(), contains('0002_b'));
+        // The corpse is gone — no future delivery can pick it (issue #516).
+        expect((await env.exists(staleDir)).valueOrNull, isNot(true));
+        // Subsequent sends route to the live root.
+        await repo.send(msg(id: 'm2', to: targetId, text: 'after migration'));
+        expect(await recipient.peek(targetId), hasLength(1));
+      },
+    );
+
+    test('register never steals the inbox of a live twin root', () async {
+      // Same id LIVE under the old root: another process owns that inbox
+      // and drains it — migration must skip it.
+      final twin = FileMessagingRepository(
+        env: env,
+        root: '/sessions/--git-demo-widget--/messages',
+        decodeSessionCwd: decodeSessionCwd,
+      );
+      await twin.register(targetId);
+      await env.writeFile(
+        '$staleDir/inbox/twin.json',
+        jsonEncode(msg(id: 't1', to: targetId, text: 'twin mail').toJson()),
+      );
+      final recipient = liveRepo();
+
+      await recipient.register(targetId);
+
+      expect(await twin.peek(targetId), hasLength(1));
+      expect((await env.exists(staleDir)).valueOrNull, isTrue);
+      expect(await recipient.drain(targetId), isEmpty);
+    });
+
+    test('AC1c: the live OWN root outranks a foreign corpse', () async {
+      await seedStaleCorpse();
+      // The recipient is live HERE (this repository's own project root).
+      await repo.touch(targetId);
+
+      await repo.send(msg(id: 'm1', to: targetId, text: 'home is here'));
+
+      expect(await repo.peek(targetId), hasLength(1));
+      final corpseInbox =
+          (await env.listDir('$staleDir/inbox')).valueOrNull ?? const [];
+      expect(corpseInbox.where((e) => e.kind == FileKind.file), isEmpty);
+    });
+  });
+}

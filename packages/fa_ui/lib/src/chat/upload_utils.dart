@@ -1,0 +1,116 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+// The shared `sanitizeUploadName` moved to the pure core (issue #313) so
+// the extension service worker stages with the exact same semantics;
+// re-exported here to keep the fa_ui import surface stable.
+export 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show sanitizeUploadName;
+
+import 'dart:typed_data';
+
+/// One file picked for upload into the sandbox filesystem. [name] is the
+/// browser-provided name (or relative path); [bytes] is the full content.
+typedef UploadFile = ({String name, Uint8List bytes});
+
+/// The image MIME types that may be inlined as image content (chat
+/// attachments for hosted vision providers, and the on-device
+/// transformers.js vision path).
+///
+/// Deliberately an ALLOWLIST, not `mimeType.startsWith('image/')`: SVG is
+/// markup (`image/svg+xml`), not a raster image — inlining it feeds
+/// undecodable bytes to image decoders (and, on-device, to ONNX Runtime's
+/// `RawImage`, which poisons the WebGPU session). Only formats every
+/// consumer can actually decode qualify.
+const kInlineImageMimeTypes = {
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+};
+
+/// Whether [mimeType] is an inline-able raster image type (see
+/// [kInlineImageMimeTypes]). SVG and any other `image/*` type are NOT —
+/// they travel as plain file references.
+bool isInlineImageMimeType(String mimeType) =>
+    kInlineImageMimeTypes.contains(mimeType.toLowerCase());
+
+/// Guesses a MIME type from a file [name]'s extension; anything
+/// unrecognized (including `.svg`) is `application/octet-stream`, which
+/// never inlines as an image. The audio/video/pdf rows exist for the
+/// type-aware attachment chips (issue #1979 AC8) and the outgoing
+/// message's MIME metadata — they never qualify for image inlining.
+String mimeTypeForUploadName(String name) {
+  final lower = name.toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.pdf')) return 'application/pdf';
+  if (lower.endsWith('.mp3')) return 'audio/mpeg';
+  if (lower.endsWith('.m4a')) return 'audio/mp4';
+  if (lower.endsWith('.wav')) return 'audio/wav';
+  if (lower.endsWith('.flac')) return 'audio/flac';
+  if (lower.endsWith('.aac')) return 'audio/aac';
+  if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return 'audio/ogg';
+  if (lower.endsWith('.opus')) return 'audio/opus';
+  if (lower.endsWith('.mp4')) return 'video/mp4';
+  if (lower.endsWith('.mov')) return 'video/quicktime';
+  if (lower.endsWith('.webm')) return 'video/webm';
+  if (lower.endsWith('.avi')) return 'video/x-msvideo';
+  if (lower.endsWith('.mkv')) return 'video/x-matroska';
+  if (lower.endsWith('.mpeg') || lower.endsWith('.mpg')) return 'video/mpeg';
+  return 'application/octet-stream';
+}
+
+/// Maximum total bytes accepted in one upload batch: 25 MB.
+///
+/// The whole sandbox FS is snapshotted into IndexedDB as base64-in-JSON on
+/// every change; the cap keeps snapshots (and the structured-clone payload)
+/// comfortably inside browser quotas.
+const int kMaxUploadBatchBytes = 25 * 1024 * 1024;
+
+/// Maximum number of pending attachment chips in the composer at once
+/// (picker batch, paste spam, multi-file drops). Beyond the cap the extra
+/// files are skipped with a notice (issue #465 E2).
+const int kMaxPendingAttachments = 10;
+
+/// Returns an error message when [files] exceed [maxBytes] in total, else
+/// `null`. Checked before anything is written so an oversized batch never
+/// lands partially.
+///
+/// The message is user-facing (callers show it in a SnackBar); pass
+/// [message] to produce a localized copy — e.g.
+/// `(total, max) => FaChatStrings.of(context).uploadTooLarge(max, total)` —
+/// the default keeps the English text for callers that cannot localize yet.
+String? uploadBatchSizeError(
+  List<UploadFile> files, {
+  int maxBytes = kMaxUploadBatchBytes,
+  String Function(String total, String max)? message,
+}) {
+  var total = 0;
+  for (final file in files) {
+    total += file.bytes.length;
+    if (total > maxBytes) {
+      final totalMb = _formatMb(total);
+      final maxMb = _formatMb(maxBytes);
+      return message?.call(totalMb, maxMb) ??
+          'Upload is too large: $totalMb exceeds the $maxMb per-batch limit.';
+    }
+  }
+  return null;
+}
+
+String _formatMb(int bytes) =>
+    '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+
+/// Formats a byte count as a short human-readable string.
+String formatFileSize(int bytes) {
+  if (bytes < 1024) return '$bytes B';
+  if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  if (bytes < 1024 * 1024 * 1024) {
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+  return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+}

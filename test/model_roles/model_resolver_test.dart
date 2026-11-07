@@ -1,0 +1,1132 @@
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+import 'package:yaml/yaml.dart';
+
+AssistantMessage _msg(
+  Model model, {
+  String text = '',
+  StopReason stop = StopReason.stop,
+  String? error,
+}) {
+  return AssistantMessage(
+    content: text.isEmpty ? const [] : [TextContent(text: text)],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: Usage.zero,
+    stopReason: stop,
+    errorMessage: error,
+    timestamp: DateTime.utc(2026),
+  );
+}
+
+List<AssistantMessageEvent> _okTurn(Model model, String text) {
+  final empty = _msg(model);
+  final full = _msg(model, text: text);
+  return [
+    StartEvent(partial: empty),
+    TextDeltaEvent(contentIndex: 0, delta: text, partial: full),
+    DoneEvent(reason: StopReason.stop, message: full),
+  ];
+}
+
+List<AssistantMessageEvent> _rateLimitTurn(Model model) {
+  return [
+    StartEvent(partial: _msg(model)),
+    ErrorEvent(
+      reason: StopReason.error,
+      error: _msg(model, stop: StopReason.error, error: '429: rate limited'),
+    ),
+  ];
+}
+
+/// A fake `streamFactory` for [ModelRolesResolver]: scripted turns per
+/// model id, recording the call order.
+class _FactoryFake {
+  final Map<String, List<List<AssistantMessageEvent>>> scripts;
+  final calls = <String>[];
+
+  _FactoryFake(this.scripts);
+
+  StreamFunction call(String kind, String apiKey) {
+    return (model, context, {cancelToken}) {
+      calls.add(model.id);
+      final queue = scripts[model.id]!;
+      final stream = AssistantMessageEventStream();
+      for (final event in queue.removeAt(0)) {
+        stream.push(event);
+      }
+      stream.end();
+      return stream;
+    };
+  }
+}
+
+StreamFunction _neverStream(String kind, String apiKey) {
+  return (model, context, {cancelToken}) =>
+      throw StateError('no stream expected');
+}
+
+void main() {
+  group('provider catalog', () {
+    test('catalogProvider resolves names and the legacy alias', () {
+      expect(catalogProvider('anthropic')!.kind, 'anthropic');
+      expect(catalogProvider('openai-completions')!.name, 'openrouter');
+      expect(catalogProvider(' OpenRouter ')!.name, 'openrouter');
+      expect(catalogProvider('bogus'), isNull);
+    });
+
+    test('buildCatalogModel applies catalog defaults and overrides', () {
+      final model = buildCatalogModel('anthropic', 'claude-x');
+      expect(model.api, 'anthropic-messages');
+      expect(model.provider, 'anthropic');
+      expect(model.baseUrl, 'https://api.anthropic.com');
+      expect(model.contextWindow, 200000);
+      final custom = buildCatalogModel(
+        'google',
+        'gemini-x',
+        baseUrl: 'https://proxy.example',
+        contextWindow: 500,
+        maxTokens: 100,
+      );
+      expect(custom.baseUrl, 'https://proxy.example');
+      expect(custom.contextWindow, 500);
+      expect(custom.maxTokens, 100);
+      expect(
+        () => buildCatalogModel('bogus', 'x'),
+        throwsA(isA<ConfigException>()),
+      );
+    });
+
+    test('projectHeader rides the built model (issue #1941)', () {
+      final model = buildCatalogModel(
+        'openai',
+        'codemie-model',
+        baseUrl: 'https://codemie.lab.epam.com/code-assistant-api/v1',
+        projectHeader: 'demo-project',
+      );
+      expect(model.headers?['x-codemie-project'], 'demo-project');
+      // Absent keeps the headers NULL (byte-identical non-CodeMie builds).
+      final plain = buildCatalogModel('openai', 'plain-model');
+      expect(plain.headers, isNull);
+    });
+
+    test('buildCliDefaultModel carries projectHeader (issue #1941)', () {
+      final model = buildCliDefaultModel(
+        'openai-completions',
+        modelId: 'codemie-model',
+        baseUrl: 'https://codemie.lab.epam.com/code-assistant-api/v1',
+        projectHeader: 'demo-project',
+      );
+      expect(model.headers?['x-codemie-project'], 'demo-project');
+      final plain = buildCliDefaultModel(
+        'openai-completions',
+        modelId: 'plain-model',
+      );
+      expect(plain.headers, isNull);
+    });
+
+    test('buildCliDefaultModel builds only from an explicit model id', () {
+      // Providers carry NO default model (silent defaults picked paid
+      // flagships behind the user's back): every provider without
+      // --model throws.
+      final anthropic = buildCliDefaultModel(
+        'anthropic',
+        modelId: 'claude-sonnet-4-5',
+      );
+      expect(anthropic.id, 'claude-sonnet-4-5');
+      expect(anthropic.api, 'anthropic-messages');
+      final google = buildCliDefaultModel('google', modelId: 'gemini-2.5-pro');
+      expect(google.id, 'gemini-2.5-pro');
+      expect(google.contextWindow, 1000000);
+      final openrouter = buildCliDefaultModel(
+        'openai-completions',
+        modelId: 'anthropic/claude-sonnet-4',
+      );
+      expect(openrouter.provider, 'openrouter');
+      expect(openrouter.baseUrl, 'https://openrouter.ai/api/v1');
+      final custom = buildCliDefaultModel(
+        'openai-completions',
+        modelId: 'x',
+        baseUrl: 'https://proxy.example/v1',
+      );
+      expect(custom.provider, 'openai');
+      expect(custom.baseUrl, 'https://proxy.example/v1');
+      final dial = buildCliDefaultModel('dial', modelId: 'gpt-4o');
+      expect(dial.provider, 'dial');
+      expect(dial.baseUrl, 'https://ai-proxy.lab.epam.com');
+      final zai = buildCliDefaultModel('zai', modelId: 'glm-5.3-flash');
+      expect(zai.id, 'glm-5.3-flash');
+      expect(zai.provider, 'zai');
+      expect(zai.api, 'openai-completions');
+      expect(zai.baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+      // No provider has a universal default anymore.
+      for (final kind in [
+        'anthropic',
+        'google',
+        'openai-completions',
+        'dial',
+        'zai',
+        'minimax',
+        'copilot',
+      ]) {
+        expect(
+          () => buildCliDefaultModel(kind),
+          throwsA(isA<ConfigException>()),
+          reason: kind,
+        );
+      }
+      expect(
+        () => buildCliDefaultModel('bogus', modelId: 'x'),
+        throwsA(isA<ConfigException>()),
+      );
+    });
+
+    test(
+      'providerStreamFunction builds adapters and rejects unknown kinds',
+      () {
+        for (final kind in const [
+          'openai-completions',
+          'anthropic',
+          'google',
+          'dial',
+        ]) {
+          expect(providerStreamFunction(kind, 'k'), isA<StreamFunction>());
+        }
+        expect(
+          () => providerStreamFunction('bogus', 'k'),
+          throwsA(isA<ConfigException>()),
+        );
+      },
+    );
+  });
+
+  group('ModelRolesResolver', () {
+    final config = ModelRolesConfig(
+      roles: const {
+        'default': [
+          ModelRef(provider: 'anthropic', modelId: 'claude-main'),
+          ModelRef(provider: 'openai', modelId: 'gpt-backup'),
+        ],
+        'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+      },
+      pathOverrides: const [
+        PathRoleOverride(
+          pattern: '/special',
+          roles: {
+            'default': [ModelRef(provider: 'google', modelId: 'gemini-scoped')],
+          },
+        ),
+      ],
+    );
+
+    test('resolves the role chain into catalog models and key rings', () {
+      final resolver = ModelRolesResolver(
+        config: config,
+        secrets: const {
+          'ANTHROPIC_API_KEY': 'a-key',
+          'ANTHROPIC_API_KEY_2': 'a-key-2',
+          'OPENAI_API_KEY': 'o-key',
+        },
+        streamFactory: _neverStream,
+      );
+      final chain = resolver.chainFor('default')!;
+      expect(chain, hasLength(2));
+      expect(chain.first.model.id, 'claude-main');
+      expect(chain.first.model.api, 'anthropic-messages');
+      expect(chain.first.keyRing.length, 2); // rotation stack collected
+      expect(chain.last.keyRing.baseName, 'OPENAI_API_KEY');
+    });
+
+    test('a chain entry authHeader reaches the built model (issue #964 '
+        'IT-1)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'default': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'gw-model',
+                baseUrl: 'https://gateway.example.com/v1',
+                authHeader: 'x-api-key',
+              ),
+            ],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'gw-key'},
+        streamFactory: _neverStream,
+      );
+      final model = resolver.chainFor('default')!.single.model;
+      expect(model.authHeader, 'x-api-key');
+    });
+
+    test('a chain entry project reaches the built model (issue #1941 '
+        'IT-1)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'default': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'codemie-model',
+                baseUrl: 'https://codemie.lab.epam.com/code-assistant-api/v1',
+                project: 'demo-project',
+              ),
+            ],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'cm-key'},
+        streamFactory: _neverStream,
+      );
+      final model = resolver.chainFor('default')!.single.model;
+      // The chain SERVES from this entry — without the header every
+      // failover request bills the user's DEFAULT project.
+      expect(model.headers?['x-codemie-project'], 'demo-project');
+      // Absence stays byte-identical: no header on a plain ref.
+      final plain = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [ModelRef(provider: 'openai', modelId: 'plain')],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'k'},
+        streamFactory: _neverStream,
+      ).chainFor('default')!.single.model;
+      expect(plain.headers, isNull);
+    });
+
+    test('the registry leg inherits the saved entry’s project (issue '
+        '#1941 review)', () {
+      final entry = CustomProviderEntry(
+        name: 'codemie.lab.epam.com',
+        apiType: 'openai',
+        baseUrl: 'https://codemie.lab.epam.com/code-assistant-api/v1',
+        modelId: 'codemie-model',
+        project: 'demo-project',
+      );
+      // A ref naming the ENTRY (registry leg) with no explicit project
+      // inherits the entry's pick — the rebuild must not drop it.
+      final inherited = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'default': [
+              ModelRef(provider: 'codemie.lab.epam.com', modelId: 'm'),
+            ],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'k'},
+        customProviders: [entry],
+        streamFactory: _neverStream,
+      ).chainFor('default')!.single.model;
+      expect(inherited.headers?['x-codemie-project'], 'demo-project');
+      // An explicit ref project wins over the entry's.
+      final explicit = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'default': [
+              ModelRef(
+                provider: 'codemie.lab.epam.com',
+                modelId: 'm',
+                project: 'other-project',
+              ),
+            ],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'k'},
+        customProviders: [entry],
+        streamFactory: _neverStream,
+      ).chainFor('default')!.single.model;
+      expect(explicit.headers?['x-codemie-project'], 'other-project');
+    });
+
+    test('1554/AC1 — chain entry timeout fields ride the built model, '
+        'labeled with the role; per-field absence stays null', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'default': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'local-slow',
+                baseUrl: 'http://127.0.0.1:8080/v1',
+                streamIdleTimeout: const Duration(seconds: 1800),
+              ),
+            ],
+            'smol': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'cloud-fast',
+                connectTimeout: const Duration(seconds: 30),
+                streamIdleTimeout: const Duration(seconds: 60),
+              ),
+            ],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'k'},
+        streamFactory: _neverStream,
+      );
+      final defaultModel = resolver.chainFor('default')!.single.model;
+      // The scoped window rides the model for the streams of THIS role…
+      expect(defaultModel.streamIdleTimeout, const Duration(seconds: 1800));
+      expect(defaultModel.timeoutScopeLabel, 'role default override');
+      // …per FIELD: an entry overriding only the idle leg leaves the
+      // connect leg at the lower layers (null here — falls through).
+      expect(defaultModel.connectTimeout, isNull);
+      // Another role's entry carries ITS OWN windows (the same model can
+      // never be shared) — the AC1 two-roles-two-windows precondition.
+      final smolModel = resolver.chainFor('smol')!.single.model;
+      expect(smolModel.connectTimeout, const Duration(seconds: 30));
+      expect(smolModel.streamIdleTimeout, const Duration(seconds: 60));
+      expect(smolModel.timeoutScopeLabel, 'role smol override');
+    });
+
+    test('1554/AC1 — a chain entry without timeout fields builds the '
+        'byte-identical model (no label, no windows)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'default': [ModelRef(provider: 'openai', modelId: 'plain')],
+          },
+        ),
+        secrets: const {'OPENAI_API_KEY': 'k'},
+        streamFactory: _neverStream,
+      );
+      final model = resolver.chainFor('default')!.single.model;
+      expect(model.connectTimeout, isNull);
+      expect(model.streamIdleTimeout, isNull);
+      expect(model.timeoutScopeLabel, isNull);
+    });
+
+    test('path-scoped overrides pin the chain for a matching cwd', () {
+      final resolver = ModelRolesResolver(
+        config: config,
+        secrets: const {'GOOGLE_API_KEY': 'g-key'},
+        cwd: '/special/project',
+        streamFactory: _neverStream,
+      );
+      expect(resolver.chainFor('default')!.single.model.id, 'gemini-scoped');
+    });
+
+    test('entries with missing keys are skipped, never silently', () {
+      final resolver = ModelRolesResolver(
+        config: config,
+        secrets: const {'OPENAI_API_KEY': 'o-key'},
+        streamFactory: _neverStream,
+      );
+      final chain = resolver.chainFor('default')!;
+      expect(chain.single.model.id, 'gpt-backup');
+      expect(
+        resolver.skippedEntries['default']!.single,
+        contains('claude-main'),
+      );
+      expect(
+        resolver.skippedEntries['default']!.single,
+        contains('ANTHROPIC_API_KEY'),
+      );
+    });
+
+    test('a role whose entries all miss keys throws ConfigException', () {
+      final resolver = ModelRolesResolver(
+        config: config,
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      expect(
+        () => resolver.chainFor('smol'),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('no usable chain entry'),
+          ),
+        ),
+      );
+    });
+
+    test('unknown providers in a chain are skipped with a named reason '
+        '(gh-760 E3)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [ModelRef(provider: 'bogus', modelId: 'x')],
+          },
+        ),
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      // Degrade, never brick: the unknown entry is skipped like a
+      // missing-key entry (reported in skippedEntries) — the throw only
+      // fires because nothing usable remains, and names the reasons.
+      expect(
+        () => resolver.chainFor('default'),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('no usable chain entry'),
+          ),
+        ),
+      );
+      expect(
+        resolver.skippedEntries['default']!.join(' '),
+        contains('unknown provider'),
+      );
+    });
+
+    test('a chain with an unknown provider falls back to its known '
+        'entries (gh-760 E3)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(provider: 'from-the-future', modelId: 'x'),
+              ModelRef(provider: 'anthropic', modelId: 'claude-smol'),
+            ],
+          },
+        ),
+        secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+        streamFactory: _neverStream,
+      );
+      final entries = resolver.chainFor('default');
+      expect(entries, hasLength(1));
+      expect(entries!.single.model.provider, 'anthropic');
+      expect(
+        resolver.skippedEntries['default']!.join(' '),
+        contains('unknown provider'),
+      );
+    });
+
+    test('a chain whose entries are all unknown providers reports the '
+        'reasons in the no-usable-entry error', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(provider: 'bogus', modelId: 'x'),
+              ModelRef(provider: 'also-bogus', modelId: 'y'),
+            ],
+          },
+        ),
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      expect(
+        () => resolver.chainFor('default'),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            allOf([
+              contains('no usable chain entry'),
+              contains('unknown provider'),
+            ]),
+          ),
+        ),
+      );
+    });
+
+    test('all-unknown-provider chains throw the DEGRADE subtype (gh-760 '
+        'review)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [ModelRef(provider: 'from-the-future', modelId: 'x')],
+          },
+        ),
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      expect(
+        () => resolver.chainFor('default'),
+        throwsA(isA<UnknownProviderRoleException>()),
+      );
+    });
+
+    test('a KNOWN provider missing its key throws the DEGRADE subtype '
+        '(gh-1570 incident: a recoverable missing key must never '
+        'hard-exit the binary)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(provider: 'anthropic', modelId: 'claude-smol'),
+            ],
+          },
+        ),
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      try {
+        resolver.chainFor('default');
+        fail('expected chainFor to throw');
+      } on UnknownProviderRoleException {
+        fail(
+          'missing keys on a KNOWN provider is not version skew — '
+          'it must not classify as UnknownProviderRoleException',
+        );
+      } on UnusableRoleChainException catch (error) {
+        // gh-1570 review (incident 2026-10-12): the aggregate
+        // no-usable-entry outcome is RECOVERABLE — set the key, reboot.
+        // The degradable subtype is what the boot boundary catches and
+        // degrades on (naming the skipped entries), never _fail.
+        expect(error.message, contains('missing API key'));
+        expect(error.message, contains('claude-smol'));
+      }
+    });
+
+    test('a model id CONTAINING the marker words is not misclassified as '
+        'version skew (gh-760 review: typed classification, no substring '
+        'matching)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(provider: 'anthropic', modelId: 'unknown provider test'),
+            ],
+          },
+        ),
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      try {
+        resolver.chainFor('default');
+        fail('expected chainFor to throw');
+      } on UnknownProviderRoleException {
+        fail(
+          'the skip reason embedding a user-controlled model id must '
+          'not classify a known provider as version skew',
+        );
+      } on UnusableRoleChainException {
+        // Expected: the degradable no-usable-entry shape (gh-1570) — the
+        // user-controlled id must still not classify as version skew.
+      }
+    });
+
+    test('a key stored under the PREVIOUS release slot name still resolves '
+        'after the record-scoped derivation moves (gh-1570 incident REG)', () {
+      // The incident: fa 1.0.556 → 1.0.564 moved the record-scoped slot
+      // derivation, so the pinned slot FA_KEY_API_KIMI_COM_KIMI_IRA went
+      // empty while the key sat on the host-scoped slot
+      // FA_KEY_API_KIMI_COM — and the boot called the key missing. A slot
+      // name is a cross-version contract: an empty pin falls back to the
+      // endpoint's own slot family (canonical first), and the boot
+      // migrates the stranded value onto the canonical slot.
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(
+                provider: 'kimi',
+                modelId: 'kimi-for-coding',
+                baseUrl: 'https://api.kimi.com/coding/v1',
+                apiKeyName: 'FA_KEY_API_KIMI_COM_KIMI_IRA',
+              ),
+            ],
+          },
+        ),
+        secrets: const {
+          // Only the PRE-update (host-scoped) slot holds the key.
+          'FA_KEY_API_KIMI_COM': 'legacy-kimi-key',
+        },
+        streamFactory: _neverStream,
+      );
+      final entries = resolver.chainFor('default');
+      expect(entries, isNotNull);
+      expect(entries, hasLength(1));
+      expect(entries!.single.keyRing.baseName, 'FA_KEY_API_KIMI_COM');
+      expect(entries.single.keyRing.currentCredential.value, 'legacy-kimi-key');
+      expect(resolver.skippedEntries['default'], isEmpty);
+    });
+
+    test('a roles entry naming an adapter KIND resolves (gh-760 review)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(provider: 'chatgpt-codex', modelId: 'gpt-5-codex'),
+            ],
+          },
+        ),
+        secrets: const {'CHATGPT_OAUTH_CREDENTIALS': 'creds'},
+        streamFactory: _neverStream,
+      );
+      final entries = resolver.chainFor('default');
+      expect(entries, hasLength(1));
+      expect(entries!.single.model.provider, 'chatgpt');
+    });
+
+    test('resolveRole is null when neither role nor default is configured', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+          },
+        ),
+        secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+        streamFactory: _neverStream,
+      );
+      expect(resolver.resolveRole('default'), isNull);
+      expect(resolver.resolveRole('smol'), isNotNull);
+    });
+
+    test('unset roles resolve through the default chain (inheritance)', () {
+      final resolver = ModelRolesResolver(
+        config: config,
+        secrets: const {
+          'ANTHROPIC_API_KEY': 'a-key',
+          'OPENAI_API_KEY': 'o-key',
+        },
+        streamFactory: _neverStream,
+      );
+      final plan = resolver.resolveRole('plan')!;
+      expect(plan.model.id, 'claude-main');
+    });
+
+    test('chain entries carry thinkingLevel onto the built model (IT-1)', () {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(
+                provider: 'anthropic',
+                modelId: 'claude-main',
+                thinkingLevel: 'high',
+              ),
+            ],
+            'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+          },
+        ),
+        secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+        streamFactory: _neverStream,
+      );
+      // The declared entry carries its level…
+      expect(resolver.chainFor('default')!.single.model.thinkingLevel, 'high');
+      // …an undeclared entry stays null (legacy shape, AC5).
+      expect(resolver.chainFor('smol')!.single.model.thinkingLevel, isNull);
+    });
+
+    test(
+      'an unset role inherits the default chain INCLUDING its level (E3)',
+      () {
+        final resolver = ModelRolesResolver(
+          config: ModelRolesConfig(
+            roles: const {
+              'default': [
+                ModelRef(
+                  provider: 'anthropic',
+                  modelId: 'claude-main',
+                  thinkingLevel: 'medium',
+                ),
+              ],
+            },
+          ),
+          secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+          streamFactory: _neverStream,
+        );
+        expect(resolver.chainFor('plan')!.single.model.thinkingLevel, 'medium');
+      },
+    );
+
+    test('applyToAgent runs the agent through the role chain', () async {
+      final good = buildCatalogModel('openai', 'gpt-backup');
+      final main = buildCatalogModel('anthropic', 'claude-main');
+      final fake = _FactoryFake({
+        // Both stacked keys 429: key rotation (free) precedes model
+        // fallback (omp order).
+        'claude-main': [_rateLimitTurn(main), _rateLimitTurn(main)],
+        'gpt-backup': [_okTurn(good, 'backup answered')],
+        'gpt-smol': [
+          _okTurn(buildCatalogModel('openai', 'gpt-smol'), 'smol answered'),
+        ],
+      });
+      final notices = <FallbackNotice>[];
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(provider: 'anthropic', modelId: 'claude-main'),
+              ModelRef(provider: 'openai', modelId: 'gpt-backup'),
+            ],
+            // A distinct key stack: benches on the anthropic ring must not
+            // starve the smol role.
+            'smol': [ModelRef(provider: 'openai', modelId: 'gpt-smol')],
+          },
+          retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        ),
+        secrets: const {
+          'ANTHROPIC_API_KEY': 'a-key',
+          'ANTHROPIC_API_KEY_2': 'a-key-2',
+          'OPENAI_API_KEY': 'o-key',
+        },
+        onNotice: notices.add,
+        streamFactory: fake.call,
+      );
+      final agent = Agent(
+        toolRegistry: ToolRegistry(const []),
+        streamFunction: _neverStream('unused', 'unused'),
+      );
+
+      resolver.applyToAgent(agent);
+      expect(agent.state.model.id, 'claude-main');
+      await agent.prompt('hi');
+
+      expect(fake.calls, ['claude-main', 'claude-main', 'gpt-backup']);
+      final assistant = agent.state.messages.last as AssistantMessage;
+      expect(assistant.model, 'gpt-backup');
+      expect(assistant.stopReason, StopReason.stop);
+      expect(notices.map((n) => n.kind), [
+        FallbackNoticeKind.keyRotation,
+        FallbackNoticeKind.modelFallback,
+      ]);
+
+      // A run on another role uses that role's chain.
+      resolver.applyToAgent(agent, role: 'smol');
+      await agent.prompt('again');
+      expect(fake.calls.last, 'gpt-smol');
+      expect((agent.state.messages.last as AssistantMessage).model, 'gpt-smol');
+    });
+
+    test('setDefaultChain re-pins the default role', () {
+      final resolver = ModelRolesResolver(
+        config: config,
+        secrets: const {
+          'ANTHROPIC_API_KEY': 'a-key',
+          'OPENAI_API_KEY': 'o-key',
+        },
+        streamFactory: _neverStream,
+      );
+      expect(resolver.resolveRole('default')!.model.id, 'claude-main');
+      resolver.setDefaultChain(const [
+        ModelRef(provider: 'openai', modelId: 'gpt-new'),
+      ]);
+      final resolved = resolver.resolveRole('default')!;
+      expect(resolved.model.id, 'gpt-new');
+      expect(() => resolver.setDefaultChain(const []), throwsArgumentError);
+    });
+
+    test('describeRoles renders chains with the active marker', () async {
+      final fake = _FactoryFake({
+        'claude-main': [
+          _rateLimitTurn(buildCatalogModel('anthropic', 'claude-main')),
+        ],
+        'gpt-backup': [
+          _okTurn(buildCatalogModel('openai', 'gpt-backup'), 'ok'),
+        ],
+      });
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: config.roles,
+          retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        ),
+        secrets: const {
+          'ANTHROPIC_API_KEY': 'a-key',
+          'OPENAI_API_KEY': 'o-key',
+        },
+        streamFactory: fake.call,
+      );
+      final before = resolver.describeRoles();
+      expect(before, contains('default:'));
+      expect(before, contains('anthropic/claude-main'));
+      expect(before, contains('openai/gpt-backup'));
+      expect(before, contains('smol:'));
+      // plan is unset and inherits default.
+      expect(before, contains('plan (inherits default):'));
+
+      final agent = Agent(
+        toolRegistry: ToolRegistry(const []),
+        streamFunction: _neverStream('unused', 'unused'),
+      );
+      resolver.applyToAgent(agent);
+      await agent.prompt('hi');
+      final after = resolver.describeRoles();
+      expect(after, contains('* openai/gpt-backup'));
+      expect(after, contains('cooldown'));
+    });
+
+    group('FA_PROVIDER_* boot pin (the bin/fah.dart wiring)', () {
+      test(
+        'the env provider becomes the default role for all unpinned roles',
+        () {
+          // The exact sequence bin/fah.dart performs when FA_PROVIDER_* is
+          // set and a roles: section is active: seed the declared key var,
+          // pin the default role to a single-entry chain on the env
+          // provider — the same selection a `/provider <name>` switch makes.
+          final rolesConfig = ModelRolesConfig(
+            roles: const {
+              'default': [
+                ModelRef(provider: 'anthropic', modelId: 'claude-old'),
+              ],
+              'smol': [ModelRef(provider: 'anthropic', modelId: 'claude-smol')],
+            },
+          );
+          final resolver = ModelRolesResolver(
+            config: rolesConfig,
+            secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+            streamFactory: _neverStream,
+          );
+          const keyVar = 'ZAI_API_KEY';
+          resolver.addSecret(keyVar, 'z-key');
+          resolver.setDefaultChain([
+            const ModelRef(
+              provider: 'zai',
+              modelId: 'glm-5.3',
+              baseUrl: 'https://relay.internal/v1',
+              apiKeyName: keyVar,
+            ),
+          ]);
+
+          // default/slow/plan are unpinned — they inherit the pinned
+          // default and land on the env provider.
+          for (final role in ['default', 'slow', 'plan']) {
+            final resolved = resolver.resolveRole(role);
+            expect(resolved, isNotNull, reason: role);
+            expect(resolved!.model.provider, 'zai', reason: role);
+            expect(resolved.model.id, 'glm-5.3', reason: role);
+            expect(
+              resolved.model.baseUrl,
+              'https://relay.internal/v1',
+              reason: role,
+            );
+          }
+          // smol is pinned explicitly by roles: — it keeps its chain.
+          expect(resolver.resolveRole('smol')!.model.provider, 'anthropic');
+        },
+      );
+
+      test(
+        'a keyless declaration cannot pin a chain (roles keep selection)',
+        () {
+          final resolver = ModelRolesResolver(
+            config: ModelRolesConfig(
+              roles: const {
+                'default': [
+                  ModelRef(provider: 'anthropic', modelId: 'claude-old'),
+                ],
+              },
+            ),
+            secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+            streamFactory: _neverStream,
+          );
+          // No key env var declared AND no keyless pin → bin/fah.dart
+          // skips the pin: the roles default survives untouched.
+          expect(resolver.resolveRole('default')!.model.provider, 'anthropic');
+        },
+      );
+
+      test('a keyless pin resolves with NO credential — localhost preconfig '
+          'beats saved roles (gh-1570 AC8/UT-8)', () {
+        // The exact sequence bin/fah.dart performs for a KEYLESS
+        // FA_PROVIDER_* declaration (no apiKeyEnvVar — a localhost
+        // bench endpoint): pin the default role to a keyless single-entry
+        // chain. The saved roles config must NOT win — the bench
+        // measures the preconfigured provider.
+        final resolver = ModelRolesResolver(
+          config: ModelRolesConfig(
+            roles: const {
+              'default': [
+                ModelRef(provider: 'anthropic', modelId: 'claude-old'),
+              ],
+            },
+          ),
+          secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+          streamFactory: _neverStream,
+        );
+        resolver.setDefaultChain([
+          const ModelRef(
+            provider: 'anthropic',
+            modelId: 'claude-sonnet-4-5',
+            baseUrl: 'http://localhost:8080/v1',
+            keyless: true,
+          ),
+        ]);
+
+        for (final role in ['default', 'slow', 'plan']) {
+          final resolved = resolver.resolveRole(role);
+          expect(resolved, isNotNull, reason: role);
+          expect(resolved!.model.provider, 'anthropic', reason: role);
+          expect(resolved.model.baseUrl, 'http://localhost:8080/v1');
+        }
+        // The keyless entry carries the EMPTY credential — the wrapper
+        // hands the ring's current credential to the stream factory per
+        // attempt (byte-parity with the non-roles keyless boot), never
+        // the saved roles provider's key.
+        final entries = resolver.chainFor('default')!;
+        expect(entries, hasLength(1));
+        expect(
+          entries.single.keyRing.currentCredential.value,
+          '',
+          reason: 'keyless = empty key to the stream factory',
+        );
+        final streamFn = entries.single.streamForKey(
+          entries.single.keyRing.currentCredential.value,
+        );
+        expect(streamFn, isNotNull);
+      });
+
+      test(
+        'the preconfig input modalities reach the pinned chain model (#638)',
+        () {
+          final rolesConfig = ModelRolesConfig(
+            roles: const {
+              'default': [
+                ModelRef(provider: 'anthropic', modelId: 'claude-old'),
+              ],
+            },
+          );
+          final resolver = ModelRolesResolver(
+            config: rolesConfig,
+            secrets: const {'ANTHROPIC_API_KEY': 'a-key'},
+            streamFactory: _neverStream,
+          );
+          const keyVar = 'ZAI_CODE_KEY';
+          resolver.addSecret(keyVar, 'z-key');
+          resolver.setDefaultChain([
+            const ModelRef(
+              provider: 'zai',
+              modelId: 'glm-5.3-flash',
+              baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+              apiKeyName: keyVar,
+              input: ['text', 'image'],
+            ),
+          ]);
+
+          final resolved = resolver.resolveRole('default')!;
+          // Explicit declaration wins over the zai catalog's text-only
+          // spec — the image gate opens (issue #638 AC1).
+          expect(resolved.model.input, ['text', 'image']);
+        },
+      );
+    });
+
+    group('ModelRef.input', () {
+      test('fromYaml parses the modality list and names bad entries', () {
+        final ref = ModelRef.fromYaml(
+          loadYaml(
+            'provider: zai\nmodel: glm-5.3-flash\ninput: [text, image]\n',
+          ),
+        );
+        expect(ref.input, ['text', 'image']);
+
+        expect(
+          () => ModelRef.fromYaml(
+            loadYaml('provider: zai\nmodel: glm-5.3\ninput: [text, video]\n'),
+          ),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              allOf(contains('input'), contains('video')),
+            ),
+          ),
+        );
+      });
+    });
+  });
+
+  group('custom-endpoint key resolution (gh-1000 AC5)', () {
+    const kimiUrl = 'https://api.kimi.com/coding/v1';
+    const scopedName = 'FA_KEY_API_KIMI_COM';
+
+    ModelRolesResolver resolverWith(
+      Map<String, String> secrets, {
+      String baseUrl = kimiUrl,
+    }) {
+      return ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'smol': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'k3-256k',
+                baseUrl: baseUrl,
+              ),
+            ],
+          },
+        ),
+        secrets: secrets,
+        streamFactory: _neverStream,
+      );
+    }
+
+    test('a custom-endpoint chain entry resolves its endpoint-scoped key', () {
+      final chain = resolverWith({
+        scopedName: 'sk-store',
+        // A foreign OPENAI_API_KEY must NOT serve the custom endpoint
+        // before the endpoint-scoped slot (issue #40 ordering).
+        'OPENAI_API_KEY': 'sk-openai',
+      }).chainFor('smol')!;
+      expect(chain, hasLength(1));
+      expect(chain.single.keyRing.baseName, scopedName);
+      expect(chain.single.keyRing.currentCredential.value, 'sk-store');
+    });
+
+    test('the catalog env name still backstops a custom endpoint', () {
+      final chain = resolverWith({
+        'OPENAI_API_KEY': 'sk-openai',
+      }).chainFor('smol')!;
+      expect(chain.single.keyRing.baseName, 'OPENAI_API_KEY');
+    });
+
+    test('a missing key names the endpoint-scoped store fix', () {
+      final resolver = resolverWith(const {});
+      expect(
+        () => resolver.chainFor('smol'),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('smol'), contains('/key set $scopedName')),
+          ),
+        ),
+      );
+      expect(
+        resolver.skippedEntries['smol']!.single,
+        contains('/key set $scopedName'),
+      );
+    });
+
+    test('a default-endpoint entry with a trailing slash keeps the '
+        'catalog env key (no scoped slot)', () {
+      // The catalog default with a trailing slash IS the default endpoint —
+      // one endpoint-equality rule with key_status (round-3 review).
+      final chain = resolverWith({
+        'OPENAI_API_KEY': 'sk-openai',
+      }, baseUrl: 'https://api.openai.com/v1/').chainFor('smol')!;
+      expect(chain.single.keyRing.baseName, 'OPENAI_API_KEY');
+    });
+
+    test('a missing key on an explicitly pinned ref names THAT slot', () {
+      // The ref pins FA_KEY_..._KIMI_ME: the hint must name the pinned
+      // slot, not the endpoint-scoped default (wrong-slot guidance is the
+      // AC2 violation gh-1000 forbids; round-3 review).
+      const pinned = 'FA_KEY_API_KIMI_COM_KIMI_ME';
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: {
+            'smol': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'k3-256k',
+                baseUrl: kimiUrl,
+                apiKeyName: pinned,
+              ),
+            ],
+          },
+        ),
+        secrets: const {},
+        streamFactory: _neverStream,
+      );
+      expect(
+        () => resolver.chainFor('smol'),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('/key set $pinned'),
+          ),
+        ),
+      );
+    });
+  });
+}

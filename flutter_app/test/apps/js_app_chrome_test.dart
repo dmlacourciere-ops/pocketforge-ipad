@@ -1,0 +1,265 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:fa/apps/apps_store.dart';
+import 'package:fa/apps/js_app_view.dart';
+import 'package:fa/l10n/app_localizations.dart';
+import 'package:fa/ui/app_theme.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+import '../native_test_guard.dart';
+
+/// Skip value stamped on this file's engine-dependent tests: every one
+/// boots a real JS engine (issue #184). Resolved once per isolate.
+final _engineSkip = quickJsBridgeAvailable ? false : kQuickJsBridgeUnavailable;
+
+/// Coverage for the JsAppView display chrome: `chrome: 'header'` (default)
+/// keeps the AppBar with the permissions/reload actions; `chrome: 'full'`
+/// drops the AppBar and moves both actions into a floating overlay menu.
+///
+/// The view starts from the deterministic start-error state (manifest.json
+/// exists, widget.js is missing — the engine fails while reading the source,
+/// before ever touching the JS backend); the reload test then fixes the app
+/// and boots the REAL JavaScriptCore backend via the menu's Reload action.
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  const widgetJs =
+      '(function(){ jsr.render({type:"text",data:"reloaded"}); })();';
+
+  Future<MemoryExecutionEnv> brokenAppEnv() async {
+    final env = MemoryExecutionEnv();
+    // Only the manifest — no widget.js: a deterministic start error.
+    await env.writeFile('apps/demo/manifest.json', '{}');
+    return env;
+  }
+
+  Future<void> pumpView(
+    WidgetTester tester,
+    MemoryExecutionEnv env, {
+    Map<String, Object?> manifest = const {'id': 'demo', 'name': 'Demo'},
+  }) async {
+    final permissions = await AppPermissionsStore.load(env);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildFahTheme(),
+        locale: const Locale('en'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        home: JsAppView(
+          app: JsAppInfo.fromManifest(
+            manifest,
+            bundled: false,
+            fallbackId: 'demo',
+          ),
+          env: env,
+          permissionsStore: permissions,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+  }
+
+  Future<void> openChromeMenu(WidgetTester tester) async {
+    await tester.tap(find.byIcon(Icons.more_vert));
+    await tester.pumpAndSettle();
+  }
+
+  // Display-chrome coverage: the deterministic start error fails the
+  // engine while it is still READING the source — the native JS bridge is
+  // never dlopened, so these run on every host (issue #569: the floating
+  // menu used to hide behind the engine skip and measure 0% coverage).
+  group('full-chrome menu (engine-free)', () {
+
+    testWidgets('header chrome keeps the AppBar with permissions and reload', (
+      tester,
+    ) async {
+      final env = await brokenAppEnv();
+      await pumpView(tester, env);
+
+      expect(find.byType(AppBar), findsOneWidget);
+      expect(find.text('Demo'), findsOneWidget);
+      expect(find.byIcon(Icons.shield_outlined), findsOneWidget);
+      expect(find.byIcon(Icons.refresh), findsOneWidget);
+      // No floating overlay menu in header mode.
+      expect(find.byIcon(Icons.more_vert), findsNothing);
+      expect(find.byType(PopupMenuButton<String>), findsNothing);
+    });
+
+    testWidgets('full chrome hides the AppBar and floats a controls menu', (
+      tester,
+    ) async {
+      final env = await brokenAppEnv();
+      await pumpView(
+        tester,
+        env,
+        manifest: const {'id': 'demo', 'name': 'Demo', 'chrome': 'full'},
+      );
+
+      expect(find.byType(AppBar), findsNothing);
+      expect(find.byIcon(Icons.shield_outlined), findsNothing);
+      expect(find.byIcon(Icons.refresh), findsNothing);
+      expect(find.byIcon(Icons.more_vert), findsOneWidget);
+
+      await openChromeMenu(tester);
+      expect(find.text('App permissions'), findsOneWidget);
+      expect(find.text('Reload app'), findsOneWidget);
+      expect(find.text('Close app'), findsOneWidget);
+    });
+
+    testWidgets('full chrome menu close pops the app route', (tester) async {
+      final env = await brokenAppEnv();
+      final permissions = await AppPermissionsStore.load(env);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildFahTheme(),
+          locale: const Locale('en'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Builder(
+            builder: (context) => Scaffold(
+              body: Center(
+                child: TextButton(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => JsAppView(
+                        app: JsAppInfo.fromManifest(
+                          const {
+                            'id': 'demo',
+                            'name': 'Demo',
+                            'chrome': 'full',
+                          },
+                          bundled: false,
+                          fallbackId: 'demo',
+                        ),
+                        env: env,
+                        permissionsStore: permissions,
+                      ),
+                    ),
+                  ),
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('open'));
+      await tester.pumpAndSettle();
+      expect(find.byIcon(Icons.more_vert), findsOneWidget);
+
+      await openChromeMenu(tester);
+      await tester.tap(find.text('Close app'));
+      await tester.pumpAndSettle();
+
+      // Back on the home page: the full-chrome app is closed (its canvas
+      // swallowed the iOS edge swipe, so the menu close is the only exit).
+      expect(find.text('open'), findsOneWidget);
+      expect(find.byIcon(Icons.more_vert), findsNothing);
+    });
+
+    testWidgets('full chrome menu opens the permissions dialog', (
+      tester,
+    ) async {
+      final env = await brokenAppEnv();
+      await pumpView(
+        tester,
+        env,
+        manifest: const {'id': 'demo', 'name': 'Demo', 'chrome': 'full'},
+      );
+
+      await openChromeMenu(tester);
+      await tester.tap(find.text('App permissions'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(AppPermissionsDialog), findsOneWidget);
+      // One SwitchListTile per hardcoded toggle in AppPermissionsDialog
+      // (network, llm, homekit, health, contacts, calendar, microphone,
+      // notifications, media, keys, theme — the 11th added with the theme
+      // API in #188). Keep in sync with js_app_view.dart.
+      expect(find.byType(SwitchListTile), findsNWidgets(11));
+
+      await tester.tap(find.text('Done'));
+      await tester.pumpAndSettle();
+      expect(find.byType(AppPermissionsDialog), findsNothing);
+    });
+  });
+
+  // The reload path boots the REAL JavaScriptCore/QuickJS backend —
+  // engine-dependent, skipped on hosts without the native bridge.
+  group('JS engine (native quickjs/JavaScriptCore bridge)', () {
+    testWidgets('full chrome menu reload restarts the app', (tester) async {
+      final env = await brokenAppEnv();
+      await pumpView(
+        tester,
+        env,
+        manifest: const {'id': 'demo', 'name': 'Demo', 'chrome': 'full'},
+      );
+      expect(find.textContaining('Failed to start Demo'), findsOneWidget);
+
+      // Fix the app, then reload through the overlay menu. The real JS backend
+      // boots on the real event loop, so this runs inside runAsync with manual
+      // pumps (the fake-zone settle would hang on the engine's periodic timer).
+      await tester.runAsync(() async {
+        await env.writeFile('apps/demo/widget.js', widgetJs);
+        await tester.tap(find.byIcon(Icons.more_vert));
+        await tester.pump();
+        await tester.pump(const Duration(seconds: 1));
+        await tester.tap(find.text('Reload app'));
+        await tester.pump();
+        for (var i = 0; i < 20; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await tester.pump();
+          if (find.text('reloaded').evaluate().isNotEmpty) break;
+        }
+      });
+      expect(find.text('reloaded'), findsOneWidget);
+      expect(find.textContaining('Failed to start Demo'), findsNothing);
+
+      // Unmount so the engine is disposed before teardown.
+      await tester.runAsync(() async {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+      await tester.pump();
+    });
+
+    testWidgets('overlapping reloads settle on one rendered app', (
+      tester,
+    ) async {
+      final env = await brokenAppEnv();
+      await pumpView(
+        tester,
+        env,
+        manifest: const {'id': 'demo', 'name': 'Demo', 'chrome': 'full'},
+      );
+      await tester.runAsync(() async {
+        await env.writeFile('apps/demo/widget.js', widgetJs);
+        // Two reload taps back to back: the superseded restart must bail out
+        // (and dispose what it built) instead of racing the newer one.
+        for (var i = 0; i < 2; i++) {
+          await tester.tap(find.byIcon(Icons.more_vert));
+          await tester.pump();
+          await tester.pump(const Duration(seconds: 1));
+          await tester.tap(find.text('Reload app'));
+          await tester.pump();
+        }
+        for (var i = 0; i < 30; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 100));
+          await tester.pump();
+          if (find.text('reloaded').evaluate().isNotEmpty) break;
+        }
+      });
+      expect(find.text('reloaded'), findsOneWidget);
+      // AC2: the spinner must settle once the winning engine renders — no
+      // stuck progress indicator from the superseded restart chain.
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      await tester.runAsync(() async {
+        await tester.pumpWidget(const SizedBox.shrink());
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      });
+    });
+  }, skip: _engineSkip);
+}

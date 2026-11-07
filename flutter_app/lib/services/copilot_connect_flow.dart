@@ -1,0 +1,132 @@
+// l10n:ignore-file — OAuth flow screens — en-only by design
+import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
+import 'package:flutter/material.dart';
+
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/services/keychain_store.dart';
+import 'package:fa/services/last_connection.dart';
+import 'package:fa/services/provider_registry.dart';
+import 'package:fa/services/session_keys_store.dart';
+import 'package:fa_llm/fa_llm.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show fetchModelsForEndpoint, fetchModelsForEndpointReport;
+import 'package:fa_ui/fa_ui.dart'
+    show
+        CopilotConnectCallbacks,
+        CopilotConnectResult,
+        FaUiSso,
+        showCopilotConnectSheet,
+        showFahErrorSnack;
+
+/// The production Copilot connect callbacks — the real GitHub device flow
+/// plus the live `/models` fetch of the resolved endpoint (the Copilot
+/// token exchange runs inside the dialect; no default model exists). The
+/// sheet prefers the report form (gh-1990): an empty answer names its
+/// branch (exchange status / HTTP status / filter counts + the remediation
+/// hint) instead of the generic failure string. Top-level (not a closure
+/// inside [runCopilotConnectFlow]) so the report callback stays
+/// unit-testable through the models-dispatch test seam.
+@visibleForTesting
+CopilotConnectCallbacks defaultCopilotCallbacks() => CopilotConnectCallbacks(
+  requestDeviceCode: requestCopilotDeviceCode,
+  pollAccessToken: (deviceCode) =>
+      pollCopilotAccessToken(deviceCode: deviceCode.deviceCode),
+  fetchLogin: (token) => fetchGithubLogin(githubToken: token),
+  fetchModels: (token, baseUrl) async => (await fetchModelsForEndpoint(
+    baseUrl,
+    apiKey: token,
+    provider: 'copilot',
+  )).$1,
+  fetchModelsReport: (token, baseUrl) async {
+    final report = await fetchModelsForEndpointReport(
+      baseUrl,
+      apiKey: token,
+      provider: 'copilot',
+    );
+    // reasonText joins the remediation hint (gh-1990); null exactly when
+    // the dialect named nothing.
+    return (
+      report.info.$1,
+      report.diagnostic == null ? null : report.reasonText,
+    );
+  },
+);
+
+/// Runs the full GitHub Copilot connect flow: the device-flow sheet (real
+/// fa_llm wiring unless [callbacks] is injected — the device flow needs no
+/// callback server, so it works on every platform including iOS), then
+/// registry entry + key persistence + reconfigure:
+///
+/// 1. The GitHub token is stored entry-scoped (`FA_KEY_COPILOT_<NAME>`) in
+///    the Keychain when available, else the saved-keys store.
+/// 2. A [CustomProvider] named `copilot-<login>` is added — or, when an
+///    entry with the same name and endpoint already exists (re-auth), only
+///    that entry's key is refreshed (its model choice is kept).
+/// 3. The service reconfigures with `providerKind: 'copilot'` and the
+///    connection becomes the last connection (boot restore).
+///
+/// Returns `true` when the flow completed and the service was reconfigured,
+/// `false` when the user cancelled or the platform cannot run it.
+Future<bool> runCopilotConnectFlow({
+  required BuildContext context,
+  required ProviderRegistry registry,
+  required AgentService? service,
+  required LastConnectionStore lastConnectionStore,
+  SessionKeysStore? sessionKeysStore,
+  KeychainStore? keychainStore,
+  CopilotConnectCallbacks? callbacks,
+}) async {
+  final sessionKeys = sessionKeysStore ?? SessionKeysScope.maybeOf(context);
+  final keychain = keychainStore ?? const KeychainStore();
+  if (kIsWeb) {
+    // github.com serves no CORS headers; the browser build cannot run the
+    // device flow — say so instead of failing mid-sheet.
+    if (context.mounted) {
+      showFahErrorSnack(
+        context,
+        'GitHub Copilot sign-in is not available on web — use the '
+        'desktop or mobile app.',
+      );
+    }
+    return false;
+  }
+
+  final resolved = callbacks ?? defaultCopilotCallbacks();
+
+  CopilotConnectResult? result;
+  await showCopilotConnectSheet(
+    context: context,
+    callbacks: resolved,
+    onResult: (r) => result = r,
+  );
+  final connect = result;
+  if (connect == null) return false;
+
+  // The landing (re-auth match, `kind: copilot` add, rememberKey, the
+  // Keychain-first/saved-keys-fallback entry-scoped persist) is fa_ui's
+  // shared `FaUiSso.landCopilotConnect` — one implementation for every
+  // host, no app-side fork of the security-adjacent store writes
+  // (issue #1326 review, the #1194 drift class).
+  final provider = await FaUiSso.landCopilotConnect(
+    registry,
+    connect,
+    keychain: keychain,
+    sessionKeys: sessionKeys,
+  );
+  if (provider == null) return false;
+
+  final baseUrl = copilotBaseUrl(
+    accountType: connect.accountType,
+    baseUrlOverride: connect.baseUrlOverride,
+  );
+  final config = AgentConfig(
+    providerKind: 'copilot',
+    modelId: provider.modelId,
+    baseUrl: baseUrl,
+    apiKey: connect.githubToken,
+  );
+  if (service != null) await service.reconfigure(config);
+  await lastConnectionStore.saveFromConfig(config);
+
+  return true;
+}

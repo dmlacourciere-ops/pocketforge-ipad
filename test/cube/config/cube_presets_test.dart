@@ -1,0 +1,258 @@
+/// Tests for the built-in cube security presets: the catalog shape, id
+/// lookup, and the manifest generator — every generated yaml must parse
+/// through the strict [CubeSpec.fromYaml] parser (a preset can never drift
+/// from the schema) and carry the level/app-axis semantics.
+library;
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+import 'package:yaml/yaml.dart';
+
+/// A shell that records started commands and answers everything.
+class _MatrixShell implements Shell {
+  final commands = <String>[];
+
+  @override
+  Future<Result<ShellExecResult, ExecutionError>> exec(
+    String command, {
+    ShellExecOptions? options,
+  }) async {
+    commands.add(command);
+    return const Ok(ShellExecResult(stdout: '', stderr: '', exitCode: 0));
+  }
+}
+
+void main() {
+  group('CubePresets.all', () {
+    test('exposes the 3 levels x 2 app axes with unique lowercase ids', () {
+      final ids = CubePresets.all.map((p) => p.id).toList();
+      expect(ids, hasLength(6));
+      expect(
+        ids,
+        containsAll([
+          'l1-core',
+          'l1-full',
+          'l2-core',
+          'l2-full',
+          'l3-core',
+          'l3-full',
+        ]),
+      );
+      expect(ids.toSet(), hasLength(ids.length), reason: 'ids must be unique');
+    });
+
+    test('every preset carries level, apps and a non-empty description', () {
+      for (final preset in CubePresets.all) {
+        expect(preset.level, isIn(CubePresets.levels));
+        expect(preset.apps, isIn(CubePresets.appAxes));
+        expect(preset.id, '${preset.level.toLowerCase()}-${preset.apps}');
+        expect(preset.title, isNotEmpty);
+        expect(preset.description, isNotEmpty);
+      }
+    });
+  });
+
+  group('CubePresets.byId', () {
+    test('accepts exact ids case-insensitively', () {
+      expect(CubePresets.byId('l2-full')?.id, 'l2-full');
+      expect(CubePresets.byId('L2-FULL')?.id, 'l2-full');
+      expect(CubePresets.byId(' l1-core ')?.id, 'l1-core');
+    });
+
+    test('a bare level selects the conservative core axis', () {
+      expect(CubePresets.byId('L2')?.id, 'l2-core');
+      expect(CubePresets.byId('l3')?.id, 'l3-core');
+    });
+
+    test('non-preset ids return null', () {
+      expect(CubePresets.byId('l4-core'), isNull);
+      expect(CubePresets.byId('l2-fast'), isNull);
+      expect(CubePresets.byId(''), isNull);
+      expect(CubePresets.byId('my-cube.yaml'), isNull);
+    });
+  });
+
+  group('CubePresets.manifestYaml', () {
+    const cwd = '/tmp/project';
+
+    /// Parses the generated yaml through the STRICT parser — the invariant
+    /// that presets can never drift from the schema.
+    CubeSpec parse(String id, {String root = cwd}) {
+      final preset = CubePresets.byId(id)!;
+      return CubeSpec.fromYaml(
+        loadYaml(CubePresets.manifestYaml(preset, root)),
+        sourcePath: 'builtin:$id',
+      );
+    }
+
+    test('all 6 presets parse through the strict CubeSpec parser', () {
+      for (final preset in CubePresets.all) {
+        final spec = parse(preset.id);
+        expect(spec.name, preset.id);
+        expect(spec.backend, CubeBackendMode.kernel);
+        expect(spec.filesystem.workspace, cwd);
+      }
+    });
+
+    test('presets are refusal-by-default (no implicit allowDegrade)', () {
+      // SEC-05: a preset on a host without an enforcing backend refuses
+      // all commands unless the user explicitly opts in via
+      // `/cube use <preset> --allow-degrade` or an edited manifest.
+      for (final preset in CubePresets.all) {
+        expect(
+          CubePresets.maybeSpec(name: preset.id, cwd: cwd)!.allowDegrade,
+          isFalse,
+          reason: '${preset.id} must not degrade implicitly',
+        );
+      }
+    });
+
+    test('L1: no mounts, no network', () {
+      final spec = parse('l1-core');
+      expect(spec.filesystem.mounts, isEmpty);
+      expect(spec.network.allow, isEmpty);
+      expect(spec.network.permits('pub.dev', 443), isFalse);
+    });
+
+    test('L2: cwd rw + root ro, dev hosts on 443 only', () {
+      final spec = parse('l2-full');
+      final mounts = {for (final m in spec.filesystem.mounts) m.path: m.access};
+      expect(mounts[cwd], CubePathAccess.readWrite);
+      expect(mounts['/'], CubePathAccess.readOnly);
+
+      expect(spec.network.permits('pub.dev', 443), isTrue);
+      expect(spec.network.permits('api.github.com', 443), isTrue);
+      expect(spec.network.permits('evil.example.com', 443), isFalse);
+      expect(spec.network.permits('pub.dev', 80), isFalse);
+    });
+
+    test('L3: root rw, full network', () {
+      final spec = parse('l3-core');
+      expect(spec.filesystem.mounts.single.path, '/');
+      expect(spec.filesystem.mounts.single.access, CubePathAccess.readWrite);
+      expect(spec.network.permits('anything.example.com', 8080), isTrue);
+    });
+
+    test('core axis: read commands + read-only git only', () {
+      final spec = parse('l2-core');
+      expect(spec.tools.allow, containsAll(CubePresets.coreToolAllow));
+      expect(spec.tools.allow, isNot(contains('*')));
+      expect(spec.tools.permits('cat file.txt'), isTrue);
+      expect(spec.tools.permits('git status'), isTrue);
+      expect(spec.tools.permits('git log -5'), isTrue);
+      // Write paths stay out.
+      expect(spec.tools.permits('git push'), isFalse);
+      expect(spec.tools.permits('rm -rf /'), isFalse);
+      expect(spec.tools.permits('curl http://x'), isFalse);
+    });
+
+    test('full axis: any command', () {
+      final spec = parse('l3-full');
+      expect(spec.tools.allow, contains('*'));
+      expect(spec.tools.permits('rm -rf /'), isTrue);
+      expect(spec.tools.permits('git push'), isTrue);
+    });
+
+    test('a cwd with quotes survives the yaml escaping', () {
+      final spec = parse("l1-core", root: "/tmp/it's a test");
+      expect(spec.filesystem.workspace, "/tmp/it's a test");
+    });
+  });
+
+  group('CubePresets.maybeSpec', () {
+    test('resolves a preset id to a parsed spec with a builtin source', () {
+      final spec = CubePresets.maybeSpec(name: 'L1-FULL', cwd: '/tmp/x');
+      expect(spec, isNotNull);
+      expect(spec!.name, 'l1-full');
+      expect(spec.filesystem.workspace, '/tmp/x');
+    });
+
+    test('returns null for names that are not preset ids', () {
+      expect(CubePresets.maybeSpec(name: 'my-cube.yaml', cwd: '/tmp'), isNull);
+      expect(CubePresets.maybeSpec(name: 'l9', cwd: '/tmp'), isNull);
+    });
+  });
+  group('preset confinement matrix', () {
+    test(
+      'every preset confines out-of-scope writes through guard and shell',
+      () async {
+        const cwd = '/work';
+        for (final preset in CubePresets.all) {
+          final escapesDenied = preset.level != 'L3';
+          final spec = CubePresets.maybeSpec(name: preset.id, cwd: cwd)!;
+          final inner = _MatrixShell();
+          final env = SandboxedExecutionEnv(
+            MemoryExecutionEnv(cwd: cwd, shell: inner),
+            spec,
+            // Presets demand kernel mode; on this enforcing platform the
+            // shell delivers it (profile staged in the in-memory home),
+            // so the matrix exercises the presets as they really run.
+            os: 'macos',
+            homeDir: '/home',
+          );
+
+          // bash: a redirect write one level above the workspace.
+          final escaped = await env.exec('echo x > ../escape');
+          // bash: a redirect inside the workspace stays runnable.
+          await env.exec('echo x > out.txt');
+          // fs tool: a write outside the workspace.
+          final write = await env.writeFile('../escape.txt', 'x');
+          // fs tool: an L1 read of a system path vanishes.
+          final read = await env.readTextFile('/etc/hosts');
+
+          if (escapesDenied) {
+            final exec = escaped.getOrThrow();
+            expect(exec.exitCode, 127, reason: preset.id);
+            expect(
+              exec.stderr,
+              startsWith('fa_cube[${preset.id}]:'),
+              reason: preset.id,
+            );
+            // The one in-workspace command ran, kernel-wrapped.
+            expect(inner.commands, hasLength(1), reason: preset.id);
+            expect(
+              inner.commands.single,
+              startsWith('sandbox-exec'),
+              reason: preset.id,
+            );
+            expect(
+              inner.commands.single,
+              contains('echo x > out.txt'),
+              reason: preset.id,
+            );
+            expect(
+              write.errorOrNull!.code,
+              FileErrorCode.permissionDenied,
+              reason: preset.id,
+            );
+          } else {
+            // L3 mounts `/` read-write, which makes the user-level
+            // staging directory guest-writable: SEC-02 fail-closes
+            // kernel mode — every command is refused, nothing runs or
+            // stages (the clean error names the staging directory).
+            expect(
+              escaped.errorOrNull!.message,
+              contains('guest-writable under the spec mounts'),
+              reason: preset.id,
+            );
+            // The refusal discloses the escape hatch (round-3 review).
+            expect(
+              escaped.errorOrNull!.message,
+              contains('allowDegrade'),
+              reason: preset.id,
+            );
+            expect(inner.commands, isEmpty, reason: preset.id);
+            expect(write.isOk, isTrue, reason: preset.id);
+          }
+          if (preset.level == 'L1') {
+            expect(
+              read.errorOrNull!.code,
+              FileErrorCode.notFound,
+              reason: preset.id,
+            );
+          }
+        }
+      },
+    );
+  });
+}

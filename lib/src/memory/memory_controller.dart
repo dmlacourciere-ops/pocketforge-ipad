@@ -1,0 +1,619 @@
+/// Session-scoped facade over the `flutter_agent_memory` package.
+///
+/// Owns two [KbStorage]+[KBSearchEngine] pairs (project + user scope),
+/// created lazily from an [ExecutionEnv]. Exposes `add`/`search`/`list` for
+/// the memory tools and `formatPromptSection` for the system prompt.
+library;
+
+import 'dart:async';
+
+import 'package:flutter_agent_memory/flutter_agent_memory.dart';
+
+import '../env/execution_env.dart';
+import '../memory_config.dart';
+import 'execution_env_kb_storage.dart';
+import 'memory_repo_git_support.dart';
+
+/// Formats the `/memory` stats block (pure, testable): counts per type,
+/// last maintenance, and the due hint.
+List<String> formatMemoryStatsLines(
+  List<MemoryEntry> entries,
+  DateTime? lastMaintenance,
+  bool maintenanceDue,
+) {
+  final byType = <String, int>{};
+  for (final entry in entries) {
+    byType[entry.type] = (byType[entry.type] ?? 0) + 1;
+  }
+  final lines = <String>['[Memory]', '  entries: ${entries.length}'];
+  for (final type in byType.keys.toList()..sort()) {
+    lines.add('  $type: ${byType[type]}');
+  }
+  lines.add(
+    lastMaintenance == null
+        ? '  last maintenance: never (/memory maintain to run)'
+        : '  last maintenance: $lastMaintenance',
+  );
+  if (maintenanceDue) {
+    lines.add('  maintenance due — /memory maintain');
+  }
+  return lines;
+}
+
+/// A single memory entry returned by [MemoryController.search] / [list].
+final class MemoryEntry {
+  const MemoryEntry({
+    required this.id,
+    required this.type,
+    required this.text,
+    this.tags = const [],
+    this.importance = 0.5,
+    this.scope = 'project',
+  });
+
+  final String id;
+  final String type;
+  final String text;
+  final List<String> tags;
+  final double importance;
+  final String scope;
+
+  String get displayLine {
+    final tagStr = tags.isNotEmpty ? ' [${tags.join(',')}]' : '';
+    return '($type) $text$tagStr';
+  }
+}
+
+/// Controls the agent's durable memory across sessions and projects.
+final class MemoryController {
+  MemoryController({
+    required ExecutionEnv env,
+    String? projectRoot,
+    this._userRoot,
+    this._llmProvider,
+    this._projectStoragePath,
+    this._userStoragePath,
+    this.configSource,
+    this.onConfigChanged,
+    this.onDegrade,
+    this.printSink,
+  }) : _env = env,
+       _projectRoot = projectRoot ?? env.cwd;
+
+  /// Runtime config freshness: invoked before every memory operation; a
+  /// non-null result REPLACES the active `memory:` section — stores whose
+  /// resolved path changed are dropped and re-created lazily at the new
+  /// location (editing .fah/config.yaml takes effect without a restart).
+  /// A thrown error keeps the current config (a mid-session yaml typo
+  /// must not kill memory ops; the next successful read recovers).
+  final Future<MemoryConfig?> Function()? configSource;
+
+  /// Invoked after a config swap actually changed the resolved store
+  /// paths (the host re-composes its `<memory>` prompt section here).
+  final void Function()? onConfigChanged;
+
+  /// Observability breadcrumb for the gh-1393 degrade paths (LLM-backed
+  /// search falling back to keyword, an unusable scope skipped, an add
+  /// retrying through the provider-less plain store). The swallows are
+  /// the ticket's intent — memory tools NEVER throw — but they must not
+  /// be silent: the host (app `AppLog`, CLI diagnostics) wires its log
+  /// here; null keeps the historical quiet behavior.
+  final void Function(String message)? onDegrade;
+
+  /// Print interceptor for the `flutter_agent_memory` package's bare
+  /// `print()` debug logs (gh-1510). The package logs with
+  /// `// ignore: avoid_print` on the calling isolate; in TUI mode stdout
+  /// IS the terminal, so those raw bytes interleave with the frame
+  /// protocol, physically clobber cells, and the cell-diff renderer then
+  /// skips repainting "unchanged" cells against the desynced grid — the
+  /// screen buffer loses characters (`memory round-tripcomplete`).
+  /// Every package-facing op runs inside a zone whose `print` delegates
+  /// here; the CLI wires its diagnostic log. Null keeps the package's
+  /// default print behavior (headless/embedders).
+  final void Function(String line)? printSink;
+
+  /// Runs [body] with `print()` redirected to [printSink]. No-op when no
+  /// sink is wired. The redirect matters in TUI mode only, but the zone
+  /// is cheap enough to keep unconditional there; with a null sink the
+  /// body runs unwrapped so embedders observe no zone side effects.
+  Future<T> _redirectPackagePrints<T>(Future<T> Function() body) {
+    final sink = printSink;
+    if (sink == null) return body();
+    return runZoned<Future<T>>(
+      body,
+      zoneSpecification: ZoneSpecification(
+        print: (self, parent, zone, line) => sink(line),
+      ),
+    );
+  }
+
+  /// The config the current cached stores were built from (null =
+  /// defaults). Only a RESOLVED-path difference triggers a swap.
+  MemoryConfig? _activeConfig;
+
+  final ExecutionEnv _env;
+  final String _projectRoot;
+  final String? _userRoot;
+  final LlmProvider? _llmProvider;
+
+  /// Optional storage path overrides (the `memory:` config section —
+  /// git-backed memory points projectPath inside the repo). Null = the
+  /// historical `<root>/.fah/memory`. Relative project paths resolve
+  /// against the project root; a user path's leading `~/` expands
+  /// against the user root.
+  String? _projectStoragePath;
+  String? _userStoragePath;
+
+  ExecutionEnvKbStorage? _projectStorage;
+  ExecutionEnvKbStorage? _userStorage;
+  KBMemoryStore? _projectStore;
+  KBMemoryStore? _userStore;
+  KBMemoryStore? _projectPlainStore;
+  KBMemoryStore? _userPlainStore;
+  KBSearchEngine? _projectSearch;
+  KBSearchEngine? _userSearch;
+
+  /// Lazily initializes the project-scope store + search engine.
+  Future<KBMemoryStore> get projectStore async {
+    if (_projectStore != null) return _projectStore!;
+    _projectStorage = ExecutionEnvKbStorage(_env, _resolvedProjectPath());
+    await _projectStorage!.initialize();
+    // Git-backed memory: the store dir carries .gitignore (derived
+    // artifacts never committed) + .gitattributes (union merge drivers).
+    // Idempotent — appends only missing lines, never touches user content.
+    // Project scope only: the user store is machine-local by design.
+    // ensureGitSupport() covers the library's own file layout; the harness
+    // adapter's singular entity dirs need their own union driver lines
+    // (memory_repo_git_support.dart).
+    await MemoryRepoInit(_projectStorage!).ensureGitSupport();
+    await ensureHarnessMergeDrivers(_projectStorage!);
+    _projectStore = KBMemoryStore(_projectStorage!, provider: _llmProvider);
+    _projectSearch = KBSearchEngine(_projectStorage!, provider: _llmProvider);
+    return _projectStore!;
+  }
+
+  /// Lazily initializes the user-scope store + search engine.
+  Future<KBMemoryStore?> get userStore async {
+    if (_userRoot == null) return null;
+    if (_userStore != null) return _userStore;
+    _userStorage = ExecutionEnvKbStorage(_env, _resolvedUserPath());
+    await _userStorage!.initialize();
+    _userStore = KBMemoryStore(_userStorage!, provider: _llmProvider);
+    _userSearch = KBSearchEngine(_userStorage!, provider: _llmProvider);
+    return _userStore!;
+  }
+
+  /// Re-reads the injected config source and swaps the stores when the
+  /// resolved paths changed. Called at the entry of every public
+  /// operation; a null source is the plain boot-fixed behavior.
+  Future<void> _refreshConfig() async {
+    final source = configSource;
+    if (source == null) return;
+    final MemoryConfig? next;
+    try {
+      next = await source();
+    } on Object {
+      return; // keep the current config; the next read may recover
+    }
+    if (next == null) return;
+    if (_sameResolution(next)) {
+      _activeConfig ??= next;
+      return;
+    }
+    await _applyConfig(next);
+  }
+
+  /// Whether [next] resolves to the SAME store paths as the active
+  /// config (the active null = the constructor-injected paths).
+  bool _sameResolution(MemoryConfig next) {
+    final active =
+        _activeConfig ??
+        MemoryConfig(
+          projectPath: _projectStoragePath,
+          userPath: _userStoragePath,
+        );
+    if (active.resolveProjectPath(_projectRoot) !=
+        next.resolveProjectPath(_projectRoot)) {
+      return false;
+    }
+    final userRoot = _userRoot;
+    if (userRoot == null) return true;
+    return active.resolveUserPath(userRoot) == next.resolveUserPath(userRoot);
+  }
+
+  /// Swaps to [next]: updates the raw paths, drops every cached store —
+  /// the next access re-initializes at the new location — and notifies
+  /// the host. The plain (provider-less fallback) stores ride the same
+  /// reset: a stale `KBMemoryStore` over the previous storage root would
+  /// land the next fallback write in the abandoned location (gh-1393
+  /// rework).
+  Future<void> _applyConfig(MemoryConfig next) async {
+    _activeConfig = next;
+    _projectStoragePath = next.projectPath;
+    _userStoragePath = next.userPath;
+    _projectStorage = null;
+    _projectStore = null;
+    _projectSearch = null;
+    _projectPlainStore = null;
+    _userStorage = null;
+    _userStore = null;
+    _userSearch = null;
+    _userPlainStore = null;
+    onConfigChanged?.call();
+  }
+
+  // The resolution rules live in MemoryConfig (the `memory:` yaml
+  // section) — one source of truth, shared with the config consumers.
+  String _resolvedProjectPath() => MemoryConfig(
+    projectPath: _projectStoragePath,
+  ).resolveProjectPath(_projectRoot);
+
+  String _resolvedUserPath() =>
+      MemoryConfig(userPath: _userStoragePath).resolveUserPath(_userRoot!);
+
+  /// Adds a memory entry (project scope by default).
+  Future<MemoryEntry> add({
+    required String text,
+    String type = 'note',
+    List<String> tags = const [],
+    double importance = 0.5,
+    String scope = 'project',
+  }) => _redirectPackagePrints(
+    () => _addImpl(
+      text: text,
+      type: type,
+      tags: tags,
+      importance: importance,
+      scope: scope,
+    ),
+  );
+
+  Future<MemoryEntry> _addImpl({
+    required String text,
+    String type = 'note',
+    List<String> tags = const [],
+    double importance = 0.5,
+    String scope = 'project',
+  }) async {
+    await _refreshConfig();
+    final store = scope == 'user' ? await userStore : await projectStore;
+    if (store == null) {
+      return MemoryEntry(
+        id: 'no-store',
+        type: type,
+        text: text,
+        tags: tags,
+        importance: importance,
+        scope: scope,
+      );
+    }
+    final record = await _addNoteAnyhow(
+      store,
+      scope: scope,
+      text: text,
+      tags: tags,
+      importance: importance,
+    );
+    return MemoryEntry(
+      id: record.id,
+      type: type,
+      text: text,
+      tags: tags,
+      importance: importance,
+      scope: scope,
+    );
+  }
+
+  /// gh-1393: an LLM-backed enrichment failure (the iOS "Invalid core"
+  /// crash family) must not lose a memory — the raw text is the payload,
+  /// enrichment only adds area/topic/tag metadata. Retry through a
+  /// provider-less view of the same storage (enrichment no-ops), so the
+  /// save lands with keyword-only metadata. The storage fields are
+  /// REBUILT from the resolved paths when a config swap nulled them
+  /// mid-flight (never a force-unwrap crash on the never-throw path);
+  /// the plain stores are cached per config generation and reset by
+  /// [_applyConfig].
+  Future<MemoryRecord> _addNoteAnyhow(
+    KBMemoryStore store, {
+    required String scope,
+    required String text,
+    required List<String> tags,
+    required double importance,
+  }) async {
+    try {
+      return await store.addNote(
+        text: text,
+        tags: tags,
+        area: scope,
+        importance: importance,
+        author: 'agent',
+      );
+    } on Object catch (error) {
+      onDegrade?.call(
+        'memory_add: LLM enrichment failed, saving without it '
+        '($scope): $error',
+      );
+      final plain = scope == 'user'
+          ? (_userPlainStore ??= KBMemoryStore(
+              _userStorage ??= ExecutionEnvKbStorage(
+                _env,
+                _resolvedUserPath(),
+              ),
+            ))
+          : (_projectPlainStore ??= KBMemoryStore(
+              _projectStorage ??= ExecutionEnvKbStorage(
+                _env,
+                _resolvedProjectPath(),
+              ),
+            ));
+      try {
+        return await plain.addNote(
+          text: text,
+          tags: tags,
+          area: scope,
+          importance: importance,
+          author: 'agent',
+        );
+      } on Object catch (fallbackError) {
+        onDegrade?.call(
+          'memory_add: plain-store fallback failed too ($scope): '
+          '$fallbackError',
+        );
+        rethrow;
+      }
+    }
+  }
+
+  /// Deletes a memory entry by id. With no explicit [scope], scans project
+  /// then user storage. Returns the scope it was deleted from, or null when
+  /// the id exists in neither.
+  Future<String?> delete(String id, {String? scope}) =>
+      _redirectPackagePrints(() => _deleteImpl(id, scope: scope));
+
+  Future<String?> _deleteImpl(String id, {String? scope}) async {
+    await _refreshConfig();
+    final candidateScopes = <String>[
+      if (scope != null)
+        scope
+      else ...[
+        'project',
+        if (_userRoot != null) 'user',
+      ],
+    ];
+    for (final s in candidateScopes) {
+      if (s == 'user') {
+        await userStore; // no-op when there is no user root
+        if (_userStorage == null) continue;
+        if (await _kbStoreFor('user', _userStorage!).deleteRecord(id)) {
+          return s;
+        }
+      } else {
+        await projectStore;
+        if (await _kbStoreFor('project', _projectStorage!).deleteRecord(id)) {
+          return s;
+        }
+      }
+    }
+    return null;
+  }
+
+  final Map<String, KBMemoryStore> _kbStores = {};
+
+  /// The [KBMemoryStore] for [scope] — delete MUST go through it (not the
+  /// raw storage): its MemoryDeletionService writes tombstones + bumps the
+  /// revision so consolidation cannot resurrect deleted entries.
+  KBMemoryStore _kbStoreFor(String scope, KbStorage storage) =>
+      _kbStores[scope] ??= KBMemoryStore(storage, source: 'fa-$scope');
+
+  /// Searches both scopes (project first, then user).
+  Future<List<MemoryEntry>> search(String query, {int limit = 10}) =>
+      _redirectPackagePrints(() => _searchImpl(query, limit: limit));
+
+  Future<List<MemoryEntry>> _searchImpl(String query, {int limit = 10}) async {
+    await _refreshConfig();
+    final results = <MemoryEntry>[];
+    await projectStore; // ensure initialized
+    await _searchScope(_projectSearch, query, limit, 'project', results);
+    await userStore;
+    if (results.length < limit) {
+      await _searchScope(
+        _userSearch,
+        query,
+        limit - results.length,
+        'user',
+        results,
+      );
+    }
+    return results;
+  }
+
+  /// Searches one scope and appends matching results to [results].
+  Future<void> _searchScope(
+    KBSearchEngine? engine,
+    String query,
+    int limit,
+    String scope,
+    List<MemoryEntry> results,
+  ) async {
+    if (engine == null) return;
+    // gh-1393: a memory tool NEVER throws. The LLM-backed path can fail
+    // with more than a StateError (the iOS "Invalid core: OLDER session
+    // state read on a NEW session" crash family) — every failure degrades
+    // to keyword-only search for this scope; a broken keyword path skips
+    // the scope instead of crashing the session.
+    try {
+      final found = await engine.searchByText(query);
+      results.addAll(
+        found.results.take(limit).map((r) => _fromSearchResult(r, scope)),
+      );
+      return;
+    } on Object catch (error) {
+      // LLM-backed search unusable — fall through to keyword-only search.
+      onDegrade?.call('memory_search: $scope scope degraded to keywords: $error');
+    }
+    try {
+      final found = await engine.searchByKeywords(query);
+      results.addAll(found.take(limit).map((r) => _fromSearchResult(r, scope)));
+    } on Object catch (error) {
+      // scope unusable — skip it, the other scope may still answer
+      onDegrade?.call('memory_search: $scope scope skipped: $error');
+    }
+  }
+
+  /// Lists recent entries from both scopes (project first, then user).
+  Future<List<MemoryEntry>> list({int limit = 20}) =>
+      _redirectPackagePrints(() => _listImpl(limit: limit));
+
+  Future<List<MemoryEntry>> _listImpl({int limit = 20}) async {
+    await _refreshConfig();
+    final results = <MemoryEntry>[];
+    await projectStore;
+    await _listScope(_projectStorage, 'project', limit, results);
+    if (results.length < limit) {
+      await userStore;
+      await _listScope(_userStorage, 'user', limit - results.length, results);
+    }
+    return results;
+  }
+
+  /// Appends up to [limit] note entries of one scope's storage.
+  Future<void> _listScope(
+    KbStorage? storage,
+    String scope,
+    int limit,
+    List<MemoryEntry> results,
+  ) async {
+    if (storage == null) return;
+    final noteIds = await storage.listEntityIds('note');
+    for (final id in noteIds.take(limit)) {
+      if (results.length >= limit) break;
+      final entry = await _readNoteEntry(storage, id, scope);
+      if (entry != null) results.add(entry);
+    }
+  }
+
+  /// Reads one entity as a [MemoryEntry], or null if the entity is absent.
+  /// The raw file is frontmatter + body markdown — parse it properly
+  /// (the naive first line is the `---` delimiter, not the fact).
+  Future<MemoryEntry?> _readNoteEntry(
+    KbStorage? storage,
+    String id,
+    String scope,
+  ) async {
+    final raw = await storage?.readEntity('note', id);
+    if (raw == null) return null;
+    String text;
+    try {
+      text = KBFileParser().parseNote(raw).text;
+    } on Object {
+      text = _firstLine(raw);
+    }
+    return MemoryEntry(id: id, type: 'note', text: text, scope: scope);
+  }
+
+  /// Formats a ≤2 KiB `<memory>` block for the system prompt.
+  Future<String> formatPromptSection() async {
+    await _refreshConfig();
+    final entries = await list(limit: 15);
+    if (entries.isEmpty) return '';
+    final lines = <String>[
+      '<memory>',
+      'Durable facts from past sessions (memory_search finds more):',
+    ];
+    for (final entry in entries) {
+      final line = '  ${entry.displayLine}';
+      if (lines.join('\n').length + line.length + 10 > 2000) break;
+      lines.add(line);
+    }
+    lines.add('</memory>');
+    return lines.join('\n');
+  }
+
+  /// Phase 2: runs `maintainMemoryLevels()` + `consolidate()` on both
+  /// scopes sequentially (smol-role cost class). Guarded: a second call
+  /// while one runs is a no-op returning `false`. Consolidation needs an
+  /// LLM provider — without one only level maintenance runs.
+  Future<bool> maintain() => _redirectPackagePrints(_maintainImpl);
+
+  Future<bool> _maintainImpl() async {
+    await _refreshConfig();
+    if (_maintaining) return false;
+    _maintaining = true;
+    try {
+      for (final store in [await projectStore, await userStore]) {
+        if (store == null) continue;
+        await store.maintainMemoryLevels();
+        if (_llmProvider != null) {
+          try {
+            await store.consolidate();
+          } on Object {
+            // Consolidation is best-effort: stale summary, LLM hiccup, or
+            // a concurrent write all skip this cycle (phase 2 spec).
+          }
+        }
+      }
+      await _writeMaintenanceStamp();
+      return true;
+    } finally {
+      _maintaining = false;
+    }
+  }
+
+  bool _maintaining = false;
+
+  /// True while a [maintain] run is in flight (the phase 2 running guard).
+  bool get isMaintaining => _maintaining;
+
+  /// Reads the last-maintenance timestamp (null when never maintained).
+  Future<DateTime?> lastMaintenanceAt() async {
+    final info = await _env.fileInfo(_maintenanceStampPath);
+    final mtimeMs = info.valueOrNull?.mtimeMs;
+    if (mtimeMs == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(mtimeMs);
+  }
+
+  /// True when maintenance is due: never run, or > [maxMaintenanceAge] old.
+  Future<bool> maintenanceDue() async {
+    final last = await lastMaintenanceAt();
+    if (last == null) return true;
+    return DateTime.now().difference(last) > maxMaintenanceAge;
+  }
+
+  String get _maintenanceStampPath =>
+      '$_projectRoot/.fah/memory/.last_maintenance';
+
+  /// Maintenance cadence: due when the last run is older than 24 h.
+  static const maxMaintenanceAge = Duration(hours: 24);
+
+  Future<void> _writeMaintenanceStamp() async {
+    await _env.writeFile(_maintenanceStampPath, '');
+  }
+
+  /// Counters backing the add-trigger (phase 2): after
+  /// [addsBeforeMaintenance] `memory_add` calls the next idle moment runs
+  /// [maintain] (debounced by the host).
+  int _addsSinceMaintenance = 0;
+  static const addsBeforeMaintenance = 20;
+
+  /// Records an `add` toward the maintenance counter. Returns true when the
+  /// threshold was just crossed (host should schedule maintenance).
+  bool noteAddForMaintenance() =>
+      ++_addsSinceMaintenance >= addsBeforeMaintenance;
+
+  MemoryEntry _fromSearchResult(KBSearchResult r, String scope) {
+    final note = r.note;
+    return MemoryEntry(
+      id: note?.id ?? r.path,
+      type: note != null ? 'note' : 'entity',
+      text: note?.text ?? r.path,
+      tags: note?.tags ?? const [],
+      importance: note?.importance ?? 0.5,
+      scope: scope,
+    );
+  }
+
+  String _firstLine(String text) {
+    final idx = text.indexOf('\n');
+    return idx < 0 ? text : text.substring(0, idx);
+  }
+}

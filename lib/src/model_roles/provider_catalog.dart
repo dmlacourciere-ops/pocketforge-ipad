@@ -1,0 +1,990 @@
+/// The provider catalog: the small static table mapping provider names to
+/// their adapter kind, default base URL, API-key env names, and model
+/// defaults.
+///
+/// Shared by the model-roles resolver (which builds chain entries from
+/// config) and the `fah` executable (which builds its legacy single model
+/// from CLI flags), so provider defaults live in exactly one place.
+library;
+
+import 'package:http/http.dart' as http;
+
+import '../agent/agent_loop.dart';
+import '../cancel_token.dart';
+import '../context.dart';
+import '../event_stream.dart';
+import '../exceptions.dart';
+import '../model.dart';
+import '../providers/anthropic.dart';
+import '../providers/aiin_auth.dart';
+import '../providers/chatgpt_codex.dart';
+import '../providers/chatgpt_oauth.dart';
+import '../providers/codemie_sso.dart';
+import '../providers/copilot.dart';
+import '../providers/copilot_oauth.dart';
+import '../providers/transient_retry_stream.dart';
+import '../providers/dial.dart';
+import '../providers/google.dart';
+import '../providers/openai_completions.dart';
+import 'capability_resolver.dart';
+
+/// Static description of a supported provider.
+final class ProviderSpec {
+  /// Creates a provider spec.
+  const ProviderSpec({
+    required this.name,
+    required this.kind,
+    required this.api,
+    required this.defaultBaseUrl,
+    required this.apiKeyEnvNames,
+    required this.contextWindow,
+    required this.maxTokens,
+    this.reasoning = true,
+    this.input = const ['text', 'image'],
+    this.visible = true,
+    this.endpointLocked = false,
+  });
+
+  /// Canonical provider name (e.g. `openrouter`, `anthropic`).
+  final String name;
+
+  /// Adapter kind consumed by [providerStreamFunction]:
+  /// `openai-completions`, `anthropic`, `google`, `dial`, or
+  /// `chatgpt-codex`.
+  final String kind;
+
+  /// The API dialect recorded on built models (e.g. `anthropic-messages`).
+  final String api;
+
+  /// Default API base URL.
+  final String defaultBaseUrl;
+
+  /// API-key base names, in preference order. The first present in the
+  /// secrets store wins; rotation stacks `_2`, `_3`, ... suffixes on the
+  /// chosen base name.
+  final List<String> apiKeyEnvNames;
+
+  /// Default total context window in tokens.
+  final int contextWindow;
+
+  /// Default maximum output tokens.
+  final int maxTokens;
+
+  /// Whether models on this provider default to reasoning output.
+  final bool reasoning;
+
+  /// Default input modalities.
+  final List<String> input;
+
+  /// Whether this provider shows in the CLI/app provider pickers.
+  final bool visible;
+
+  /// The wire serves ONLY this spec's own [defaultBaseUrl]: the credentials
+  /// are account-scoped (OAuth) and the endpoint dialect is not spoken by
+  /// other hosts (`chatgpt-codex` — the Codex Responses wire on
+  /// chatgpt.com). A persisted provider/baseUrl PAIR pointing an
+  /// endpoint-locked kind elsewhere is not servable; the boot restore
+  /// degrades the pair (loud warning + fallback) instead of refusing to
+  /// boot or mis-resolving keys (gh-760 review).
+  final bool endpointLocked;
+}
+
+/// The built-in provider table.
+///
+/// **Build-time provider filtering:** the `FA_PROVIDERS` dart-define
+/// restricts the binary to a subset of providers —
+/// `dart compile exe -DFA_PROVIDERS=dial,codemie` builds a CLI that offers
+/// ONLY those (plus saved custom openai-like endpoints; `custom` is always
+/// available). Unset or `all` keeps every provider. The [ProviderSpec] map
+/// itself stays complete (adapters, tests, config parsing unchanged); the
+/// filter applies at every user-facing surface: the catalog lookups
+/// ([catalogProvider]), the CLI pickers, `/provider` status, the model
+/// pickers, and key-name collection.
+const providerCatalog = <String, ProviderSpec>{
+  'aiin': ProviderSpec(
+    name: 'aiin',
+    // Own kind (the minimax/zai pattern) so `--provider aiin` and the parity
+    // guards treat AIIN as a first-class provider; chat is OpenAI-compatible,
+    // so providerStreamFunction routes it to the OpenAI completions adapter.
+    kind: 'aiin',
+    api: 'openai-completions',
+    defaultBaseUrl: '$aiinApiBaseUrl/v1',
+    apiKeyEnvNames: ['AIIN_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'openrouter': ProviderSpec(
+    name: 'openrouter',
+    kind: 'openai-completions',
+    api: 'openai-completions',
+    defaultBaseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyEnvNames: ['OPENROUTER_API_KEY', 'OPENAI_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'kimi': ProviderSpec(
+    name: 'kimi',
+    kind: 'openai-completions',
+    api: 'openai-completions',
+    defaultBaseUrl: 'https://api.kimi.com/coding/v1',
+    apiKeyEnvNames: ['KIMI_API_KEY', 'OPENAI_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'openai': ProviderSpec(
+    name: 'openai',
+    kind: 'openai-completions',
+    api: 'openai-completions',
+    defaultBaseUrl: 'https://api.openai.com/v1',
+    apiKeyEnvNames: ['OPENAI_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'chatgpt': ProviderSpec(
+    name: 'chatgpt',
+    kind: 'chatgpt-codex',
+    api: 'responses',
+    defaultBaseUrl: chatGptCodexBaseUrl,
+    apiKeyEnvNames: ['CHATGPT_OAUTH_CREDENTIALS'],
+    contextWindow: 128000,
+    maxTokens: 16384,
+    // OAuth account creds + the Codex Responses wire exist only on
+    // chatgpt.com; a persisted pair pointing the kind at another host is
+    // not servable (the boot restore degrades it).
+    endpointLocked: true,
+  ),
+
+  'copilot': ProviderSpec(
+    name: 'copilot',
+    kind: 'copilot',
+    api: 'openai-completions',
+    defaultBaseUrl: copilotIndividualBaseUrl,
+    apiKeyEnvNames: ['COPILOT_GITHUB_TOKEN'],
+    contextWindow: 1000000,
+    maxTokens: 32768,
+  ),
+  'codemie': ProviderSpec(
+    name: 'codemie',
+    kind: 'openai-completions',
+    api: 'openai-completions',
+    defaultBaseUrl: '$defaultCodeMieBaseUrl/code-assistant-api/v1',
+    apiKeyEnvNames: ['CODEMIE_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'dial': ProviderSpec(
+    name: 'dial',
+    kind: 'dial',
+    api: 'openai-completions',
+    defaultBaseUrl: 'https://ai-proxy.lab.epam.com',
+    apiKeyEnvNames: ['DIAL_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'minimax': ProviderSpec(
+    name: 'minimax',
+    // Chat is OpenAI-compatible (MiniMax-M3 works via the OpenAI completions
+    // adapter, including vision); image generation uses a separate dialect
+    // handled in generate_image.dart (detected by the baseUrl marker). The
+    // kind is its own so `--provider minimax` and the parity guards treat it
+    // as a first-class provider; providerStreamFunction routes it to the
+    // OpenAI completions adapter.
+    kind: 'minimax',
+    api: 'openai-completions',
+    defaultBaseUrl: 'https://api.minimax.io/v1',
+    apiKeyEnvNames: ['MINIMAX_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'anthropic': ProviderSpec(
+    name: 'anthropic',
+    kind: 'anthropic',
+    api: anthropicMessagesApi,
+    defaultBaseUrl: 'https://api.anthropic.com',
+    apiKeyEnvNames: ['ANTHROPIC_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+  ),
+  'google': ProviderSpec(
+    name: 'google',
+    kind: 'google',
+    api: 'google-generative-ai',
+    defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    apiKeyEnvNames: ['GOOGLE_API_KEY'],
+    contextWindow: 1000000,
+    maxTokens: 16384,
+  ),
+  'zai': ProviderSpec(
+    name: 'zai',
+    // Own kind (the minimax pattern) so `--provider zai` and the parity
+    // guards treat Z.AI as a first-class provider; chat is OpenAI-
+    // compatible, so providerStreamFunction routes it to the OpenAI
+    // completions adapter.
+    kind: 'zai',
+    api: 'openai-completions',
+    // The CODING plan endpoint — the plain /api/paas/v4 root serves a
+    // different, non-agentic model set.
+    defaultBaseUrl: 'https://api.z.ai/api/coding/paas/v4',
+    apiKeyEnvNames: ['ZAI_API_KEY', 'Z_AI_API_KEY'],
+    contextWindow: 200000,
+    maxTokens: 16384,
+    // glm-5.3 (the coding endpoint's flagship) is text-only; the per-id
+    // vision heuristic covers the `...v` variants when one is selected.
+    input: ['text'],
+  ),
+};
+
+/// The `FA_PROVIDERS` dart-define value: a comma-separated allowlist of
+/// provider names, `all`/empty for everything. Compile-time constant so
+/// filtered-out adapters still tree-shake out of a `dart compile` build.
+/// Set via the CI/build system: the native-binaries workflow passes it as
+/// `-DFA_PROVIDERS=...` on the compile step.
+const _faProvidersDefine = String.fromEnvironment('FA_PROVIDERS');
+
+/// The runtime `FA_PROVIDERS` environment variable, resolved by the host
+/// (bin/fah.dart or the app wiring) and injected once at startup. The
+/// compile-time define WINS over this runtime value when both are set.
+/// Unset (`null`) on hosts without a concept of process env (web).
+String? providerFilterEnvOverride;
+
+/// Whether [name] survives the provider filter (see [providerCatalog]).
+/// `true` for every name without a filter.
+///
+/// Filter precedence: the `FA_PROVIDERS` dart-define first (immutable,
+/// tree-shakable), then the runtime env override ([providerFilterEnvOverride],
+/// set from the process environment by the host at startup). Values: an
+/// empty/`all`/`*` value keeps every provider; anything else is a
+/// comma-separated name allowlist.
+bool providerEnabledInBuild(String name) {
+  final define = _faProvidersDefine.isNotEmpty
+      ? _faProvidersDefine
+      : (providerFilterEnvOverride ?? '');
+  if (define.isEmpty || define == 'all' || define == '*') return true;
+  final allowed = define
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .where((s) => s.isNotEmpty);
+  return allowed.contains(name.trim().toLowerCase());
+}
+
+/// The build-enabled subset of the catalog (insertion order preserved).
+/// Without `FA_PROVIDERS` this is the whole table; `visible: false`
+/// entries are excluded regardless of the filter.
+List<ProviderSpec> enabledProviders() => [
+  for (final spec in providerCatalog.values)
+    if (spec.visible && providerEnabledInBuild(spec.name)) spec,
+];
+
+/// The build-enabled provider names (`enabledProviders` in name form).
+List<String> enabledProviderNames() => [
+  for (final spec in enabledProviders()) spec.name,
+];
+
+/// Provider base URLs the CLI can show WITHOUT any user config — the
+/// catalog's default endpoints above. The cli_visual leak guard subtracts
+/// these from the real-config markers so a hermetic screen rendering the
+/// provider picker is never flagged for bundled-catalog content
+/// (issue #508).
+Set<String> get bundledCatalogEndpoints => {
+  for (final spec in enabledProviders())
+    if (spec.defaultBaseUrl.isNotEmpty) spec.defaultBaseUrl,
+};
+
+/// Resolves [name] against the [providerCatalog], honoring the build-time
+/// provider filter (`FA_PROVIDERS` — filtered names resolve to null and the
+/// error paths list only the enabled providers).
+///
+/// The legacy CLI kind `openai-completions` is accepted as an alias for
+/// `openrouter` (its historical default endpoint).
+ProviderSpec? catalogProvider(String name) {
+  final normalized = name.trim().toLowerCase();
+  if (normalized == 'openai-completions' &&
+      providerEnabledInBuild('openrouter')) {
+    return providerCatalog['openrouter'];
+  }
+  final spec = providerCatalog[normalized];
+  if (spec == null || !providerEnabledInBuild(spec.name)) return null;
+  return spec;
+}
+
+/// The Anthropic API dialect family the Claude ceiling table was derived
+/// from: the table is only consulted for models riding this api — a claude
+/// id served over any other dialect (openrouter routing, a claude-named
+/// model on an OpenAI-compatible proxy) keeps its provider's own default.
+const anthropicMessagesApi = 'anthropic-messages';
+
+/// Per-family maximum OUTPUT token ceilings for Claude models, ported from
+/// kimi-code's `_modelOutputCeilings` (issue #273): `family ->
+/// 'major.minor' -> maxOutputTokens`. Anthropic raised output caps from
+/// 4096 (3.x) through 32768/64000 (4.x) to 128000 (4.6+), but the provider
+/// specs' blanket `maxTokens: 16384` clamps every model to the old floor;
+/// this table is the per-model correction.
+const _modelOutputCeilings = <String, Map<String, int>>{
+  'opus': {
+    '3.0': 4096,
+    '4.0': 32768,
+    '4.1': 32768,
+    '4.5': 64000,
+    '4.6': 128000,
+    '4.7': 128000,
+    '4.8': 128000,
+  },
+  'sonnet': {
+    '3.0': 4096,
+    '3.5': 8192,
+    '3.7': 8192,
+    '4.0': 64000,
+    '4.1': 64000,
+    '4.2': 64000,
+    '4.3': 64000,
+    '4.4': 64000,
+    '4.5': 64000,
+    '4.6': 128000,
+    '5.0': 128000,
+  },
+  'haiku': {'3.0': 4096, '3.5': 8192, '4.5': 64000},
+};
+
+/// Conservative fallback for a Claude model the table cannot pin (kimi-code's
+/// unknown-fallback): allow the largest documented cap and let the API
+/// reject, rather than silently truncating a modern response at 16384.
+const int _unknownClaudeOutputCeiling = 128000;
+
+/// The ceiling-table step of max-output-token resolution for [modelId]:
+/// per-model config override (caller-side) > this table > provider default
+/// (caller-side). Null is the table MISS — non-`claude` ids (glm, kimi,
+/// ...) ride the caller's provider default unchanged, and so does any
+/// `claude` id whose [api] is outside the table's family
+/// ([anthropicMessagesApi], issue #302: Claude-specific ceilings never
+/// leak onto other provider families).
+///
+/// Ported from kimi-code (issue #273). Resolution over the normalized id
+/// (lowercased, `_` → `-`):
+/// - no `claude` substring → null;
+/// - family (`opus`|`sonnet`|`haiku`) + version, from two regexes:
+///   (a) version AFTER the family:
+///   `(?:^|-)(opus|sonnet|haiku)(?:-?(\d{1,2})(?:[.-](\d{1,2}))?(?=[-.]|$))?`
+///   — `claude-opus-4-5-20251101` → (4,5), `claude-opus-4.5` → (4,5),
+///   `claude-opus-4` → (4,0); the `\d{1,2}` + `[-.]|$` lookahead rejects
+///   date suffixes (`claude-3-opus-20240229` never parses `20240229`);
+///   (b) no version from (a): one BEFORE the family, matched over the text
+///   preceding it with `(\d{1,2})(?:[.-](\d{1,2}))?(?=-|$)` —
+///   `claude-3-opus` → (3,0), `claude-3-5-sonnet` → (3,5);
+/// - the largest catalogued (major,minor) ≤ the parsed version wins (an
+///   exact hit is that maximum, so one scan serves both: opus-4.9 rides
+///   4.8's 128000, sonnet-4.7 falls to 4.6's); nothing catalogued ≤ it, an
+///   unparseable version, or no known family → [_unknownClaudeOutputCeiling]
+///   (AC2: totally unknown Claude → conservative fallback).
+int? resolveModelMaxOutputTokens(String modelId, {required String api}) {
+  if (api != anthropicMessagesApi) return null;
+  final id = modelId.toLowerCase().replaceAll('_', '-');
+  if (!id.contains('claude')) return null;
+
+  final match = RegExp(
+    r'(?:^|-)(opus|sonnet|haiku)(?:-?(\d{1,2})(?:[.-](\d{1,2}))?(?=[-.]|$))?',
+  ).firstMatch(id);
+  if (match == null) return _unknownClaudeOutputCeiling;
+  final table = _modelOutputCeilings[match.group(1)!]!;
+
+  int major;
+  int minor;
+  final after = match.group(2);
+  if (after != null) {
+    major = int.parse(after);
+    minor = match.group(3) == null ? 0 : int.parse(match.group(3)!);
+  } else {
+    final before = RegExp(
+      r'(\d{1,2})(?:[.-](\d{1,2}))?(?=-|$)',
+    ).firstMatch(id.substring(0, match.start));
+    if (before == null) return _unknownClaudeOutputCeiling;
+    major = int.parse(before.group(1)!);
+    minor = before.group(2) == null ? 0 : int.parse(before.group(2)!);
+  }
+
+  // Largest catalogued version ≤ the parsed one; monotonic
+  // `major*100+minor` keys keep the comparison integer-simple.
+  final given = major * 100 + minor;
+  int? bestCeiling;
+  var bestVersion = -1;
+  for (final entry in table.entries) {
+    final dot = entry.key.indexOf('.');
+    final version =
+        int.parse(entry.key.substring(0, dot)) * 100 +
+        int.parse(entry.key.substring(dot + 1));
+    if (version > given) continue;
+    if (version > bestVersion) {
+      bestVersion = version;
+      bestCeiling = entry.value;
+    }
+  }
+  return bestCeiling ?? _unknownClaudeOutputCeiling;
+}
+
+/// RFC 7230 token bytes — everything an HTTP header NAME may carry. A name
+/// outside this set either carries whitespace (`x api key`) or injects a
+/// CRLF into the request head (`x-api-key\r\nX-Evil: 1`), so both are
+/// rejected at config parse, not on the wire (issue #964 AC5).
+final _authHeaderNamePattern = RegExp(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$");
+
+/// Parses the optional `authHeader:` yaml value into a header name. Null
+/// stays null (the `Authorization: Bearer` default); anything that is not a
+/// non-empty RFC 7230 token throws [ConfigException] naming [where] — the
+/// config entry that owns the value.
+String? parseAuthHeaderName(Object? value, String where) {
+  if (value == null) return null;
+  final name = value is String ? value.trim() : '';
+  if (!_authHeaderNamePattern.hasMatch(name)) {
+    throw ConfigException(
+      '$where: invalid authHeader "$value" — expected an HTTP header name '
+      "(letters, digits, !#\$%&*+-.^_`|~), e.g. x-api-key",
+    );
+  }
+  return name;
+}
+
+/// Measured per-model unique-image caps (issue #1750): only values
+/// actually observed from the provider — invented limits rot. Absent id
+/// = no per-model knowledge, the global `images.maxPerRequest` default
+/// applies. `images.perModel.<modelId>` config beats this (user truth
+/// beats built-ins).
+const catalogMaxImages = <String, int>{'gemini-4-argon': 10};
+
+/// The adapter kinds whose stream function routes through
+/// [streamOpenAICompletions] — the only wire that reads
+/// [Model.authHeader]. `dial` carries its own transport with a hardcoded
+/// `Api-Key` header, and `copilot`/`chatgpt-codex` authenticate via OAuth
+/// — all three speak openai-completions-shaped APIs (`spec.api`) but
+/// ignore the field, so a config-declared authHeader on them is rejected
+/// loudly instead of silently dropped (issue #964 round-2 review).
+const _authHeaderAdapterKinds = {
+  'openai-completions',
+  'minimax',
+  'zai',
+  'aiin',
+};
+
+/// Rejects a config-declared `authHeader` on a provider whose adapter does
+/// not read the field (issue #964 review): only the OpenAI-completions
+/// adapter family honors it — everywhere else the header would be silently
+/// ignored. A null [spec] (provider unknown at parse time — roles chain
+/// entries skip unknown providers at resolve) passes; nothing reaches a
+/// builder for it.
+void validateAuthHeaderDialect(
+  String? authHeader,
+  ProviderSpec? spec,
+  String where,
+) {
+  if (authHeader == null ||
+      spec == null ||
+      _authHeaderAdapterKinds.contains(spec.kind)) {
+    return;
+  }
+  throw ConfigException(
+    '$where: authHeader only applies to the OpenAI-completions adapter '
+    '(openai-completions, minimax, zai, aiin) — provider "${spec.name}" '
+    'routes to the ${spec.kind} adapter, which ignores it',
+  );
+}
+
+/// Builds a [Model] for [provider]/[modelId] with catalog defaults, overrid-
+/// able per reference (see `ModelRef`).
+///
+/// `maxTokens` resolution order: the capability override layer
+/// ([modelCapabilityOverrides], gh-1426), the explicit override, then the
+/// Claude ceiling table ([resolveModelMaxOutputTokens]), then the provider
+/// spec default — per-model reality beats the blanket 16384. The same
+/// layered precedence governs `contextWindow` and `thinkingLevel`, and an
+/// override's `omitMaxOutputTokens` lands on the model compat (AC7).
+///
+/// Throws [ConfigException] for unknown providers.
+Model buildCatalogModel(
+  String provider,
+  String modelId, {
+  String? baseUrl,
+  int? contextWindow,
+  int? maxTokens,
+  List<String>? input,
+  String? thinkingLevel,
+  String? authHeader,
+  String? projectHeader,
+  Duration? connectTimeout,
+  Duration? streamIdleTimeout,
+  String? timeoutScopeLabel,
+}) {
+  final spec = catalogProvider(provider);
+  if (spec == null) {
+    throw ConfigException(
+      'unknown provider "$provider" — supported providers: '
+      '${providerCatalog.keys.join(', ')}',
+    );
+  }
+  validateAuthHeaderDialect(authHeader, spec, 'provider "$provider"');
+  final caps = resolveModelCapabilities(
+    provider: spec.name,
+    modelId: modelId,
+    override: modelCapabilityOverrides?.lookup(spec.name, modelId),
+    roleContextWindow: contextWindow,
+    roleMaxTokens: maxTokens,
+    roleThinkingLevel: thinkingLevel,
+    spec: spec,
+    api: spec.api,
+    reasoning: spec.reasoning,
+  );
+  return Model(
+    id: modelId,
+    name: modelId,
+    api: spec.api,
+    provider: spec.name,
+    baseUrl: baseUrl ?? spec.defaultBaseUrl,
+    reasoning: spec.reasoning,
+    input: input ?? spec.input,
+    thinkingLevel: caps.thinkingLevel,
+    contextWindow: caps.contextWindow,
+    maxTokens: caps.maxTokens,
+    authHeader: authHeader,
+    // The CodeMie project the model bills (issue #1941): the selected
+    // project rides EVERY request — a header-less model falls back to the
+    // user's DEFAULT project on the backend.
+    headers: projectHeader == null
+        ? null
+        : {codeMieProjectHeader: projectHeader},
+    // The omit-compat flag rides the model compat (AC7); every other
+    // compat field stays null so the adapter's auto-detection applies.
+    compat: caps.omitMaxOutputTokens
+        ? const OpenAICompletionsCompat(omitMaxOutputTokens: true)
+        : null,
+    // The resolver's loud notes (E1 divergence, E3 gate, E4 catalog miss)
+    // ride the model so the status surfaces can render them — never
+    // dropped at the build boundary (gh-1426 rework).
+    capabilityNotes: caps.notes,
+    // Request-scoped watchdog windows from a roles chain entry (issue
+    // #1554): the top precedence layer, riding the model like every other
+    // per-entry config field (thinkingLevel/authHeader precedent).
+    connectTimeout: connectTimeout,
+    streamIdleTimeout: streamIdleTimeout,
+    timeoutScopeLabel: timeoutScopeLabel,
+    maxImages: catalogMaxImages[modelId],
+  );
+}
+
+/// Providers carry NO default model: a model is always an explicit choice
+/// (`--model`, a saved switch, a roles chain, or a picker's live `/models`
+/// list). Silent defaults chose paid flagships over free tiers behind the
+/// user's back (zai's `glm-5.3` vs `glm-5.3-flash` — real spend nobody
+/// ordered), so the mechanism was removed, not re-seeded.
+///
+/// Resolves a CLI provider [kind] or catalog name to its [ProviderSpec]
+/// for the legacy single-model boot path. The lookup is catalog-driven:
+/// every [providerCatalog] entry is reachable by its name AND its adapter
+/// kind, so a catalog addition can never again leave the boot switch
+/// behind and brick the CLI with `ConfigException: unknown provider`
+/// (issue #760 — the app wrote `provider: chatgpt-codex`, the hand-maint-
+/// ained switch did not know the kind). Returns `null` for ids no version
+/// knows; the config boundary degrades those (warn + fallback) instead of
+/// throwing.
+///
+/// Historical behavior preserved: `openai-completions`/`openrouter` with
+/// a custom [baseUrl] resolve to the `openai` spec (the model reports
+/// provider `openai` instead of `openrouter`); without one, `openrouter`.
+///
+/// Intentionally filter-less by default: the boot restore path must judge
+/// every persisted id against the full catalog — a disabled-in-this-build
+/// saved provider restores and boots (the wire adapters stay in the
+/// binary) instead of degrading to the fallback warning. User-facing
+/// surfaces (pickers, roles, `/provider`, key collection, `models:`
+/// validation) pass `honorBuildFilter: true` — the filter the
+/// [catalogProvider] lookups used to apply — instead of re-wiring
+/// [providerEnabledInBuild] by hand.
+
+/// The legacy `openai-completions`/`openrouter` default-endpoint rule
+/// (gh-760 historical behavior): the model reports provider `openai`
+/// instead of `openrouter` on a custom base URL.
+ProviderSpec? _legacyOpenAiSpec(String? baseUrl) =>
+    baseUrl == null ? providerCatalog['openrouter'] : providerCatalog['openai'];
+
+/// The kind scan: the entry whose ADAPTER KIND is [key] — a kind that is
+/// not itself a catalog name (e.g. `chatgpt-codex`).
+ProviderSpec? _kindScan(String key) {
+  for (final spec in providerCatalog.values) {
+    if (spec.kind == key) return spec;
+  }
+  return null;
+}
+
+/// The FA_PROVIDERS gate for resolved specs: a [honorBuildFilter] lookup
+/// yields null when the resolved entry is disabled in this build.
+ProviderSpec? _applyBuildFilter(ProviderSpec? spec, bool honorBuildFilter) {
+  if (spec == null) return null;
+  if (honorBuildFilter && !providerEnabledInBuild(spec.name)) return null;
+  return spec;
+}
+
+ProviderSpec? resolveCliProviderSpec(
+  String kind, {
+  String? baseUrl,
+  bool honorBuildFilter = false,
+}) {
+  // Uniform normalization: names AND kinds are lowercase in the catalog,
+  // so the literal special-case, the name leg, and the kind leg all
+  // accept case variants identically.
+  final key = kind.trim().toLowerCase();
+  if (key == 'openai-completions' || key == 'openrouter') {
+    return _applyBuildFilter(_legacyOpenAiSpec(baseUrl), honorBuildFilter);
+  }
+  return _applyBuildFilter(
+    providerCatalog[key] ?? _kindScan(key),
+    honorBuildFilter,
+  );
+}
+
+/// The canonical PERSISTED identity for a provider id (issue #772): the
+/// catalog entry's adapter [ProviderSpec.kind]. Config files
+/// (`provider:`, folder model state, handoffs) carry the kind — the name
+/// (`chatgpt`) is display/command sugar that resolves here, in ONE place.
+///
+/// Only UNIQUE-kind entries canonicalize: when several catalog entries
+/// share one kind (`openai-completions` is openrouter/openai/kimi/codemie),
+/// the kind is coarser than the saved name and the name stays (the endpoint
+/// base URL carries the identity there). A kind owned by exactly one entry
+/// (`chatgpt-codex` → `chatgpt`) folds its name-shaped spellings onto the
+/// kind. Alias spellings (`chatgpt.com`) fold first via
+/// [canonicalProviderName] at the config boundary. Unknown ids return
+/// unchanged — the boot boundary warns and degrades (issue #760), it never
+/// rewrites a value it cannot resolve.
+String canonicalProviderKind(String id) {
+  final spec = resolveCliProviderSpec(id);
+  if (spec == null) return id;
+  for (final other in providerCatalog.values) {
+    if (other.kind == spec.kind && other.name != spec.name) return id;
+  }
+  return spec.kind;
+}
+
+/// Builds the legacy single [Model] the `fah` executable runs when no roles
+/// are configured (`--provider`/`--model`/`--base-url` flags).
+///
+/// Resolves through [resolveCliProviderSpec] — every catalog name and kind
+/// builds; an id no version knows throws [ConfigException] (direct API
+/// callers get the loud error, the boot config boundary degrades it).
+/// `maxTokens` resolves like [buildCatalogModel]: the capability override
+/// layer first ([modelCapabilityOverrides], gh-1426), then the ceiling
+/// table ([resolveModelMaxOutputTokens]), then the provider spec default.
+/// [contextWindow]/[maxTokens] (gh-1471 D4: an `FA_PROVIDER_CONFIG`
+/// capability declaration from the env preconfig) win per-field over the
+/// yaml override; null keeps the yaml layer byte-identical.
+Model buildCliDefaultModel(
+  String providerKind, {
+  String? modelId,
+  String? baseUrl,
+  List<String>? input,
+  String? thinkingLevel,
+  String? authHeader,
+  String? projectHeader,
+  int? contextWindow,
+  int? maxTokens,
+}) {
+  final spec = resolveCliProviderSpec(providerKind, baseUrl: baseUrl);
+  if (spec == null) {
+    throw ConfigException('unknown provider: $providerKind');
+  }
+  validateAuthHeaderDialect(authHeader, spec, 'provider "$providerKind"');
+
+  final id = modelId;
+  if (id == null) {
+    // No provider has a default model — the choice is always explicit.
+    throw ConfigException('provider "$providerKind" requires --model <id>');
+  }
+  // gh-1471 D4: an FA_PROVIDER_CONFIG capability declaration rides the
+  // resolver's override layer, winning per-field over the yaml
+  // `models.overrides` entry (the container's explicit declaration is
+  // the strongest user intent; absent declarations keep the yaml
+  // override untouched — byte-identical legacy boot).
+  final yamlOverride = modelCapabilityOverrides?.lookup(spec.name, id);
+  final override = contextWindow == null && maxTokens == null
+      ? yamlOverride
+      : ModelCapabilityOverride(
+          contextWindow: contextWindow ?? yamlOverride?.contextWindow,
+          maxTokens: maxTokens ?? yamlOverride?.maxTokens,
+          thinkingLevel: yamlOverride?.thinkingLevel,
+          omitMaxOutputTokens: yamlOverride?.omitMaxOutputTokens,
+        );
+  final caps = resolveModelCapabilities(
+    provider: spec.name,
+    modelId: id,
+    override: override,
+    roleThinkingLevel: thinkingLevel,
+    spec: spec,
+    api: spec.api,
+    reasoning: spec.reasoning,
+  );
+  return Model(
+    id: id,
+    name: id,
+    api: spec.api,
+    provider: spec.name,
+    baseUrl: baseUrl ?? spec.defaultBaseUrl,
+    reasoning: spec.reasoning,
+    input: input ?? spec.input,
+    // The FA_PROVIDER_* preconfig level rides the fallback/default model
+    // when no roles chain pins it (issue #734 rework: the boot notice must
+    // never name a level the booted model does not carry).
+    thinkingLevel: caps.thinkingLevel,
+    contextWindow: caps.contextWindow,
+    maxTokens: caps.maxTokens,
+    // Folder-state restores adopt the matching saved entry's authHeader
+    // (issue #964) — a restored gateway endpoint without its header 401s.
+    authHeader: authHeader,
+    // Restores adopt the matching saved entry's CodeMie project (issue
+    // #1941) — a restored CodeMie endpoint without its project header
+    // bills the user's DEFAULT project, not the selected one.
+    headers: projectHeader == null
+        ? null
+        : {codeMieProjectHeader: projectHeader},
+    // The omit-compat flag rides the model compat (AC7, gh-1426).
+    compat: caps.omitMaxOutputTokens
+        ? const OpenAICompletionsCompat(omitMaxOutputTokens: true)
+        : null,
+    // The resolver's loud notes ride the model (gh-1426 rework) — the
+    // boot notice renders them; never dropped at the build boundary.
+    capabilityNotes: caps.notes,
+    maxImages: catalogMaxImages[id],
+  );
+}
+
+/// Builds the [StreamFunction] for a provider adapter [kind]
+/// (`openai-completions`, `minimax`, `zai`, `anthropic`, `google`, `dial`,
+/// `chatgpt-codex`, `copilot`)
+/// with a static [apiKey]. Throws [ConfigException] for unknown kinds.
+///
+/// [sessionId] (resolved lazily per call) is the prompt-cache affinity key
+/// threaded to adapters that support one (OpenAI `prompt_cache_key`,
+/// OpenRouter `x-session-id`); [cacheRetention] sets the adapters' cache
+/// retention (`short`/`long`/`none`, adapter default when null). Both are
+/// defaults: an active [StreamCacheRouting] override (the compaction
+/// bypass) wins per call. [dialApiVersion] is the DIAL `api-version` query
+/// parameter (the `dial` kind only; omitted when null).
+StreamFunction providerStreamFunction(
+  String kind,
+  String apiKey, {
+  String? Function()? sessionId,
+  String? cacheRetention,
+  String? dialApiVersion,
+  bool? dialCacheMarkersSupported,
+  ChatGptCredentialsPersist? onChatGptCredentialsRefreshed,
+  http.Client? httpClient,
+}) {
+  if (kind != 'openai-completions' &&
+      kind != 'anthropic' &&
+      kind != 'google' &&
+      kind != 'dial' &&
+      kind != 'minimax' &&
+      kind != 'zai' &&
+      kind != 'aiin' &&
+      kind != 'chatgpt-codex' &&
+      kind != 'copilot') {
+    throw ConfigException('Unknown provider kind: $kind');
+  }
+  // ignore: implicit_call_tearoffs
+  final inner = _CatalogStreamFunction(
+    kind,
+    apiKey,
+    sessionId,
+    cacheRetention,
+    dialApiVersion,
+    dialCacheMarkersSupported,
+    onChatGptCredentialsRefreshed,
+    httpClient,
+  );
+  // Every provider call (chat turns, compaction summaries, memory
+  // extraction, media) rides the transient-network retry: a Wi-Fi switch
+  // mid-turn dies with "Connection reset by peer" — sleep, replay.
+  return transientRetryStreamFunction(inner.call);
+}
+
+/// The normalized adapter builder of `_CatalogStreamFunction._builders`:
+/// `(self, model, context, cancelToken, sessionId, cacheRetention)` —
+/// routing-resolved values already applied (gh-1713).
+typedef _CatalogStreamBuilder =
+    AssistantMessageEventStream Function(
+      _CatalogStreamFunction self,
+      Model model,
+      Context context,
+      CancelToken? cancelToken,
+      String? sessionId,
+      String? cacheRetention,
+    );
+
+/// The [providerStreamFunction] product: resolves the cache routing at call
+/// time — an active [StreamCacheRouting] override first, then the factory
+/// defaults — and builds the adapter options for one call.
+final class _CatalogStreamFunction {
+  const _CatalogStreamFunction(
+    this._kind,
+    this._apiKey,
+    this._sessionId,
+    this._cacheRetention,
+    this._dialApiVersion,
+    this._dialCacheMarkersSupported,
+    this._onChatGptCredentialsRefreshed,
+    this._httpClient,
+  );
+
+  final String _kind;
+  final String _apiKey;
+  final String? Function()? _sessionId;
+  final String? _cacheRetention;
+  final String? _dialApiVersion;
+  final bool? _dialCacheMarkersSupported;
+  final ChatGptCredentialsPersist? _onChatGptCredentialsRefreshed;
+
+  /// The pre-built HTTP client a bound provider runs on (issue #1921 —
+  /// the per-provider proxy). Null keeps the adapters on the shared
+  /// direct client, byte-identical to the unbound behavior.
+  final http.Client? _httpClient;
+
+  /// Route table: provider kind → adapter builder (gh-1713). The four
+  /// OpenAI-compatible kinds share one builder; each builder keeps CC 1 —
+  /// only its family's options construction.
+  static final Map<String, _CatalogStreamBuilder> _builders = {
+    'openai-completions': _CatalogStreamFunction._streamOpenAi,
+    'minimax': _CatalogStreamFunction._streamOpenAi,
+    'zai': _CatalogStreamFunction._streamOpenAi,
+    'aiin': _CatalogStreamFunction._streamOpenAi,
+    'anthropic': _CatalogStreamFunction._streamAnthropic,
+    'google': _CatalogStreamFunction._streamGoogle,
+    'dial': _CatalogStreamFunction._streamDial,
+    'copilot': _CatalogStreamFunction._streamCopilot,
+    'chatgpt-codex': _CatalogStreamFunction._streamChatGptCodex,
+  };
+
+  /// The [StreamFunction] entry point.
+  AssistantMessageEventStream call(
+    Model model,
+    Context context, {
+    CancelToken? cancelToken,
+  }) {
+    final routing = StreamCacheRouting.current;
+    final effectiveSessionId = routing?.sessionId ?? _sessionId?.call();
+    final effectiveRetention = routing?.cacheRetention ?? _cacheRetention;
+    final builder = _builders[_kind];
+    if (builder == null) {
+      // Validated by providerStreamFunction; unreachable.
+      throw ConfigException('Unknown provider kind: $_kind');
+    }
+    return builder(
+      this,
+      model,
+      context,
+      cancelToken,
+      effectiveSessionId,
+      effectiveRetention,
+    );
+  }
+
+  static AssistantMessageEventStream _streamOpenAi(
+    _CatalogStreamFunction self,
+    Model model,
+    Context context,
+    CancelToken? cancelToken,
+    String? sessionId,
+    String? cacheRetention,
+  ) => streamOpenAICompletions(
+    model,
+    context,
+    OpenAICompletionsOptions(
+      apiKey: self._apiKey,
+      cancelToken: cancelToken,
+      sessionId: sessionId,
+      cacheRetention: cacheRetention,
+    ),
+    self._httpClient,
+  );
+
+  static AssistantMessageEventStream _streamAnthropic(
+    _CatalogStreamFunction self,
+    Model model,
+    Context context,
+    CancelToken? cancelToken,
+    String? sessionId,
+    String? cacheRetention,
+  ) => streamAnthropic(
+    model,
+    context,
+    AnthropicOptions(
+      apiKey: self._apiKey,
+      cancelToken: cancelToken,
+      cacheRetention: cacheRetention,
+    ),
+    self._httpClient,
+  );
+
+  static AssistantMessageEventStream _streamGoogle(
+    _CatalogStreamFunction self,
+    Model model,
+    Context context,
+    CancelToken? cancelToken,
+    String? sessionId,
+    String? cacheRetention,
+  ) => streamGoogle(
+    model,
+    context,
+    GoogleOptions(apiKey: self._apiKey, cancelToken: cancelToken),
+    self._httpClient,
+  );
+
+  static AssistantMessageEventStream _streamDial(
+    _CatalogStreamFunction self,
+    Model model,
+    Context context,
+    CancelToken? cancelToken,
+    String? sessionId,
+    String? cacheRetention,
+  ) => streamDial(
+    model,
+    context,
+    DialOptions(
+      apiKey: self._apiKey,
+      apiVersion: self._dialApiVersion,
+      cancelToken: cancelToken,
+      sessionId: sessionId,
+      cacheRetention: cacheRetention,
+      cacheMarkersSupported: self._dialCacheMarkersSupported,
+    ),
+    self._httpClient,
+  );
+
+  static AssistantMessageEventStream _streamCopilot(
+    _CatalogStreamFunction self,
+    Model model,
+    Context context,
+    CancelToken? cancelToken,
+    String? sessionId,
+    String? cacheRetention,
+  ) => streamCopilot(
+    model,
+    context,
+    CopilotOptions(
+      githubToken: self._apiKey,
+      cancelToken: cancelToken,
+      sessionId: sessionId,
+      cacheRetention: cacheRetention,
+    ),
+    self._httpClient,
+  );
+
+  static AssistantMessageEventStream _streamChatGptCodex(
+    _CatalogStreamFunction self,
+    Model model,
+    Context context,
+    CancelToken? cancelToken,
+    String? sessionId,
+    String? cacheRetention,
+  ) => streamChatGptCodex(
+    model,
+    context,
+    credentials: self._apiKey,
+    onCredentialsRefreshed: self._onChatGptCredentialsRefreshed,
+    cancelToken: cancelToken,
+    client: self._httpClient,
+  );
+}

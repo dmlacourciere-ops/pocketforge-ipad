@@ -1,0 +1,175 @@
+/// Plugin/extension API for `fah`.
+///
+/// Shaped after [pi packages](https://pi.dev/packages): third-party packages
+/// can extend the CLI with extra tools, hooks, slash commands, and
+/// configuration without forking the core agent code.
+library;
+
+import '../agent/agent_tool.dart';
+import '../env/execution_env.dart';
+import '../messaging/agent_message.dart';
+
+/// A slash-command handler registered by a plugin.
+typedef SlashCommand = Future<void> Function(List<String> args);
+
+/// One multiple-choice option for [PluginPickOption]: stable key + display
+/// label + dim description.
+typedef PluginMenuOption = (String key, String label, String description);
+
+/// A multiple-choice question rendered by the host (a TUI menu, or a
+/// numbered list in line mode). Resolves to the chosen option key, or null
+/// on cancel.
+typedef PluginPickOption =
+    Future<String?> Function(
+      String title,
+      List<PluginMenuOption> options, {
+      String? initialKey,
+    });
+
+/// A free-form question rendered by the host (masked input when
+/// [secret]). Resolves to the entered text, or null on cancel.
+typedef PluginAskLine =
+    Future<String?> Function(String question, {bool secret});
+
+/// Appends one application-defined custom record to the host session
+/// JSONL tree (issue #1825): the record stays out of model context and is
+/// replayed on resume, so a plugin can persist session-scoped state (e.g.
+/// a `dap_channel_membership`) without owning session storage.
+typedef PluginAppendSessionRecord =
+    Future<void> Function(String customType, Map<String, Object?> data);
+
+/// Reads the data payloads of the current branch's custom records of
+/// [customType], oldest first. Session-scoped plugin state follows the
+/// branch it was recorded on.
+typedef PluginReadSessionRecords =
+    Future<List<Map<String, Object?>>> Function(String customType);
+
+/// IO surface exposed to plugins for writing to the terminal.
+abstract interface class PluginIO {
+  /// Writes [text] without a trailing newline.
+  void write(String text);
+
+  /// Writes [text] followed by a newline.
+  void writeln(String text);
+}
+
+/// Context passed to [FahPlugin.register]. Plugins use it to contribute
+/// capabilities to the running agent session.
+final class PluginContext {
+  /// Creates a plugin context.
+  PluginContext({
+    required this.env,
+    required this.io,
+    this.config = const {},
+    this.pickOption,
+    this.askLine,
+    this.appendSessionRecord,
+    this.readSessionRecords,
+  });
+
+  /// The execution environment backing the current CLI session.
+  final ExecutionEnv env;
+
+  /// Output channel for the plugin.
+  final PluginIO io;
+
+  /// Plugin-specific configuration from `.fah/packages.yaml`.
+  final Map<String, dynamic> config;
+
+  /// Interactive multiple-choice questions, or null on hosts without an
+  /// interactive UI (headless runs, the app): guided flows must fall back
+  /// to plain text then.
+  final PluginPickOption? pickOption;
+
+  /// Interactive free-form questions (masked for secrets), or null on
+  /// non-interactive hosts.
+  final PluginAskLine? askLine;
+
+  /// Optional host session-record seam (issue #1825), null on hosts
+  /// without a writable session. Session-scoped plugin state rides the
+  /// session JSONL tree: replayed on resume, dropped with the branch.
+  final PluginAppendSessionRecord? appendSessionRecord;
+
+  /// The read side of [appendSessionRecord] (current branch, oldest
+  /// first), null on hosts without a session.
+  final PluginReadSessionRecords? readSessionRecords;
+
+  final List<AgentTool> _tools = [];
+  final Map<String, SlashCommand> _slashCommands = {};
+  final Map<String, String> _slashCommandDescriptions = {};
+  final List<ExternalInbox> _externalInboxes = [];
+  final List<void Function()> _sessionReadyListeners = [];
+
+  /// Registers a lightweight listener run after the host loads or replaces
+  /// its session. Session-derived plugin state should invalidate itself
+  /// here; remote joins and other async work belong in an inbox/probe path.
+  void registerSessionReadyListener(void Function() listener) =>
+      _sessionReadyListeners.add(listener);
+
+  /// Session-ready listeners collected from this plugin.
+  List<void Function()> get sessionReadyListeners =>
+      List.unmodifiable(_sessionReadyListeners);
+
+  /// Registers an [AgentTool] that will be available to the agent.
+  void registerTool(AgentTool tool) => _tools.add(tool);
+
+  /// Registers a `/name` slash command. [description] is the one-line
+  /// hint the slash menu shows next to the command.
+  void registerSlashCommand(
+    String name,
+    SlashCommand handler, {
+    String? description,
+  }) {
+    _slashCommands[name] = handler;
+    if (description != null) _slashCommandDescriptions[name] = description;
+  }
+
+  /// Registers an external inbox (e.g. a network hub mailbox) whose mail
+  /// is drained into the agent loop as steering messages at every turn
+  /// boundary.
+  void registerExternalInbox(ExternalInbox inbox) =>
+      _externalInboxes.add(inbox);
+
+  /// Tools collected from plugins.
+  List<AgentTool> get tools => List.unmodifiable(_tools);
+
+  /// Slash commands collected from plugins.
+  Map<String, SlashCommand> get slashCommands =>
+      Map.unmodifiable(_slashCommands);
+
+  /// Slash-menu hints collected from plugins (only commands registered
+  /// with a `description`).
+  Map<String, String> get slashCommandDescriptions =>
+      Map.unmodifiable(_slashCommandDescriptions);
+
+  /// External inboxes collected from plugins (unmodifiable).
+  List<ExternalInbox> get externalInboxes =>
+      List.unmodifiable(_externalInboxes);
+}
+
+/// A plugin-provided inbox drained into the agent loop as steering
+/// messages, oldest first. Sources may be remote (a hub connection), so
+/// both callbacks must be cheap and [drain] must never throw — a failing
+/// drain returns an empty list instead.
+final class ExternalInbox {
+  const ExternalInbox({required this.drain, this.hasPending});
+
+  /// Consumes the unread messages, oldest first. Never throws; an empty
+  /// list means "nothing arrived".
+  final Future<List<AgentMessage>> Function() drain;
+
+  /// Non-draining probe: true when at least one unread message waits.
+  /// Optional — inboxes without it cannot wake the idle loop or soften a
+  /// long tool call, only deliver at turn boundaries.
+  final Future<bool> Function()? hasPending;
+}
+
+/// Base interface for a `fah` plugin / package extension.
+abstract interface class FahPlugin {
+  /// Unique plugin name (matches the key in `.fah/packages.yaml`).
+  String get name;
+
+  /// Called once when the CLI starts. Use [context] to register tools,
+  /// hooks, slash commands, and read plugin-specific [context.config].
+  void register(PluginContext context);
+}

@@ -1,0 +1,1979 @@
+@Tags(['integration'])
+@Timeout(Duration(minutes: 10))
+/// Visual integration tests for the Fa CLI: the real `dart bin/fah.dart`
+/// runs in a PTY and every step is screenshotted through the real Flutter
+/// TerminalView (JetBrainsMono, Fa palette) — what the PNG shows is what a
+/// user sees in a real terminal. Each PNG gets a `.txt` twin with the exact
+/// xterm screen text for pixel-independent verification.
+///
+/// Excluded from the default `flutter test` gate (integration tag); run
+/// manually with:
+///   cd flutter_app && flutter test test/cli_visual --tags integration
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_agent_harness/io.dart';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:xterm/xterm.dart';
+
+import '../golden/golden_test_helper.dart';
+import 'cli_visual_harness.dart';
+
+import 'package:flutter_agent_harness/src/cli/omp_reg_scenarios.dart';
+
+void main() {
+  late String repoRoot;
+  late String shotsDir;
+
+  setUpAll(() async {
+    await ensureGoldenFonts();
+    repoRoot = findRepoRoot();
+    shotsDir = '$repoRoot/test/integration/screenshots';
+    final dir = Directory(shotsDir);
+    if (!dir.existsSync()) dir.createSync(recursive: true);
+    // Remove stale screenshots from previous runs so only the current
+    // run's output is left in the directory.
+    for (final file in dir.listSync()) {
+      if (file is File &&
+          (file.path.endsWith('.png') || file.path.endsWith('.txt'))) {
+        file.deleteSync();
+      }
+    }
+  });
+
+  /// Spawns the CLI, binds the tester, pumps the TerminalView (which sizes
+  /// the PTY to the real cell geometry) and waits for the boot banner.
+  /// [args] are forwarded to the CLI (e.g. `--session-root <dir>`).
+  Future<CliVisualHarness> boot(
+    WidgetTester tester, {
+    Map<String, String>? extraEnv,
+    List<String> args = const [],
+  }) async {
+    // runAsync returns T? — spawn never returns null.
+    final harness = (await tester.runAsync(
+      () => CliVisualHarness.spawn(
+        repoRoot: repoRoot,
+        extraEnv: extraEnv,
+        args: args,
+      ),
+    ))!;
+    harness.attach(tester);
+    await harness.pumpTerminalView();
+    await harness.waitForBoot();
+    return harness;
+  }
+
+  group('boot and model selection', () {
+    testWidgets('boot → model picker → filter → select', (tester) async {
+      // Fixture models: the picker must show seeded data, never the real
+      // user registry (issue #508).
+      final tempHome = _tempHomeWithModels();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '01_boot');
+      // Issue #506 AC1: the banner mark is the composed two-role label —
+      // `>_` in the accent role, `Fa` in accent2 — the same styling tokens
+      // the chat-time prefix carries, never a single plain role.
+      _expectComposedFaMark(harness, topRow: true, shot: '01_boot');
+      expect(harness.screenText, contains('test-mini'));
+
+      // /model opens the model picker over the seeded fixture models.
+      await harness.runSlashCommand('/model');
+      await harness.liveWaitForText(
+        'Select model',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '02_model_picker');
+      expect(harness.screenText, contains('test-mini'));
+      expect(harness.screenText, contains('test-max'));
+      expect(harness.screenText, contains('omega'));
+      // The active fixture model carries the current marker.
+      expect(harness.screenText, contains('●'));
+
+      // Type to filter: 'test' matches exactly the two test-* fixtures —
+      // the row set shrinks and omega is filtered OUT.
+      harness.sendText('test');
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '03_model_filter');
+      expect(harness.screenText, contains('[Select model: test]'));
+      expect(harness.screenText, contains('test-max'));
+      expect(harness.screenText, isNot(contains('omega')));
+
+      // Navigate: the highlight cursor lands on the second fixture row.
+      harness.sendArrowDown();
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '04_model_highlight');
+      final highlightedLine = harness.viewportLines.firstWhere(
+        (line) => line.contains('▸'),
+        orElse: () => '',
+      );
+      expect(
+        highlightedLine,
+        contains('test-max'),
+        reason: 'no highlighted picker row on screen',
+      );
+
+      // Enter switches to the highlighted fixture model.
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'switched model to test-max',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '05_model_selected');
+      expect(harness.screenText, contains('switched model to test-max'));
+      expect(harness.screenText, isNot(contains('Select model')));
+
+      // A query matching nothing is its own named state: the title keeps
+      // the query and the dim no-matches hint renders.
+      await harness.runSlashCommand('/model');
+      await harness.liveWaitForText(
+        'Select model',
+        timeout: const Duration(seconds: 15),
+      );
+      // Type the filter one character at a time, verifying the picker title
+      // absorbed each keystroke. On a loaded runner the picker can paint
+      // before its filter grabs keyboard focus, and the keystroke falls
+      // through into the composer (failure frame: '╰─ z' under an
+      // unfiltered '[Select model]' list) — erase the leak (DEL) and retry
+      // until the filter takes the key.
+      var typed = '';
+      for (final ch in 'zzz'.split('')) {
+        var absorbed = false;
+        for (var attempt = 0; attempt < 6 && !absorbed; attempt++) {
+          await harness.settle(settleMs: 250);
+          harness.sendText(ch);
+          try {
+            await harness.liveWaitForText(
+              '[Select model: $typed$ch',
+              timeout: const Duration(seconds: 3),
+            );
+            absorbed = true;
+          } on TimeoutException {
+            // Focus had not attached yet — the char leaked into the
+            // composer; erase it so retries never compound into garbage.
+            harness.sendText('\x7f');
+          }
+        }
+        expect(absorbed, isTrue, reason: 'filter keystroke "$ch" never landed');
+        typed += ch;
+      }
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '06_model_filter_no_match');
+      expect(harness.screenText, contains('[Select model: zzz]'));
+      expect(harness.screenText, contains('(no matches)'));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('boot → /models list', (tester) async {
+      // Fixture registry: /models must list seeded providers only — a real
+      // provider name on this screen is a config leak (issue #508).
+      final tempHome = _tempHomeWithModels();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '10_boot_models');
+      expect(harness.screenText, contains('test-mini'));
+
+      await harness.runSlashCommand('/models');
+      await harness.settle(settleMs: 500);
+      await harness.liveWaitForText(
+        'openai/test-mini',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '11_models_list');
+      // The line-mode list shows every seeded fixture model.
+      expect(harness.screenText, contains('test-mini'));
+      expect(harness.screenText, contains('test-max'));
+      expect(harness.screenText, contains('omega'));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('provider edit and delete', () {
+    testWidgets('/settings → provider → Edit picker → wizard steps', (
+      tester,
+    ) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '20_boot_provider');
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForText(
+        'Chat model',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '20_settings_hub');
+
+      // "Provider" is the first settings entry — open the provider picker.
+      harness.sendEnter();
+      // gh-1026 family: 'test-provider' paints on the idle [Providers]
+      // status panel and below the open hub too, so the positive wait below
+      // can resolve BEFORE the provider picker replaces the hub — and the
+      // Enter after it races the swap (a key mid-transition activates the
+      // hub row again; the Edit/Delete picker never opens; the run flakes
+      // under host load, a different test each time). The hub closing is
+      // the transition-complete signal: '[Settings]' is the hub picker's
+      // title row and paints only while the hub menu is active.
+      await _waitForScreenGone(tester, harness, '[Settings]');
+      await harness.liveWaitForText(
+        'test-provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '21_provider_picker');
+
+      // The saved provider is first — its selection opens Edit/Delete.
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Delete provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '21_edit_delete_picker');
+
+      // Pick Edit (first option — already highlighted)
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'api type',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '22_wizard_api_type');
+
+      // Pick openai-like (first option)
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'base URL',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '23_wizard_base_url');
+
+      // Accept default URL (empty = keep current)
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'provider name',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '24_wizard_name');
+
+      // Accept default name
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'API key',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '25_wizard_key');
+
+      // Accept empty key (keep existing)
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'model',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '26_wizard_model');
+
+      // Pick first model from list
+      harness.sendEnter();
+      await harness.settle(settleMs: 500);
+      await harness.screenshot(shotsDir, '27_edit_done');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('/settings → provider → Delete picker → confirm → deleted', (
+      tester,
+    ) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '30_boot_delete');
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForScreen(
+        'Chat model',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendEnter();
+      // Same hub→provider-picker race as the Edit test above: pin the wait
+      // to the hub closing before the next Enter (gh-1026 family).
+      await _waitForScreenGone(tester, harness, '[Settings]');
+      await harness.liveWaitForScreen(
+        'test-provider',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendEnter();
+      await harness.liveWaitForScreen(
+        'Delete provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '31_delete_picker');
+
+      // Navigate to Delete (second option) and confirm
+      harness.sendArrowDown();
+      harness.sendEnter();
+      await harness.liveWaitForScreen(
+        'Yes, delete',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '32_delete_confirm');
+
+      // Pick Yes (first option)
+      harness.sendEnter();
+      await harness.liveWaitForScreen(
+        'deleted provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '33_deleted');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('add provider presets', () {
+    testWidgets('/provider → + Add provider → GitHub Copilot opens sign-in', (
+      tester,
+    ) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      await harness.runSlashCommand('/provider');
+      await harness.liveWaitForText(
+        '+ Add provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '28_provider_picker_add');
+
+      // The saved provider is the first row; the add row is second.
+      harness.sendArrowDown();
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'GitHub Copilot',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '29_add_provider_copilot');
+
+      // Picker order (top → down): AIIN, OpenRouter, ChatGPT (Codex),
+      // GitHub Copilot — three downs, enter.
+      harness.sendArrowDown();
+      harness.sendArrowDown();
+      harness.sendArrowDown();
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Copilot sign-in',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '34_copilot_signin');
+
+      harness.sendEscape();
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('approval flow', () {
+    testWidgets('always-ask mode → approval mode set → /approval shows mode', (
+      tester,
+    ) async {
+      final tempHome = _tempHomeWithApproval();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '40_boot_approval');
+
+      // Set approval mode to always-ask
+      await harness.runSlashCommand('/approval always-ask');
+      await harness.liveWaitForText(
+        'approval mode set to always-ask',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '41_approval_mode_set');
+
+      // Verify the mode persisted — bare /approval opens the interactive
+      // picker with always-ask marked as current.
+      await harness.runSlashCommand('/approval');
+      // Screen anchor: a raw-only wait can return while the picker bytes
+      // streamed but the frame is still the boot one — the (current)
+      // assert then reads a stale screen (CI dispatch red under load).
+      // settle: true additionally holds until the frame is fully applied —
+      // the cell-diff renderer paints the title row before the item rows,
+      // and a load-descheduled CLI left a matching title with the
+      // '(current)' rows still streaming (gh-1204 CI red). The asserts pin
+      // the SETTLED frame the wait returns — fresh screenText reads would
+      // re-read the live buffer and could straddle a repaint.
+      final settled = await harness.liveWaitForScreen(
+        '[Approval mode]',
+        timeout: const Duration(seconds: 15),
+        settle: true,
+      );
+      expect(settled, contains('always-ask'));
+      expect(settled, contains('(current)'));
+      await harness.screenshot(shotsDir, '42_approval_mode_shown');
+
+      // Close the picker.
+      harness.sendEscape();
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('model edit', () {
+    testWidgets('/model-edit → Model capabilities flow (merged surface)', (
+      tester,
+    ) async {
+      // Fixture chat model: the flow pins the ACTIVE model's caps, which
+      // must never be the real user's (issue #508).
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '50_boot_model_edit');
+
+      // 50 is the EDIT-FLOW state: bare /model-edit is the ALIAS into the
+      // Model capabilities flow, pre-focused on the active model (issue
+      // #1515 — the standalone Model parameters surface is retired).
+      await harness.runSlashCommand('/model-edit');
+      await harness.liveWaitForText(
+        'Context window',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '50_boot_model_edit');
+      expect(harness.screenText, contains('capabilities —'));
+      expect(harness.screenText, contains('Context window'));
+      expect(harness.screenText, contains('Max output tokens'));
+
+      // Open the context-window row (first option) → the preset list with
+      // the Custom… free input (ported from the retired editor).
+      harness.sendEnter();
+      await harness.liveWaitForText('4K', timeout: const Duration(seconds: 15));
+      await harness.screenshot(shotsDir, '51_context_presets');
+      expect(harness.screenText, contains('4K'));
+      expect(harness.screenText, contains('Custom…'));
+
+      // Type-to-filter to the 128K preset and pin it: the pick writes
+      // models.overrides and applies live (issue #1515).
+      harness.sendText('128K');
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'models.overrides',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '53_context_set');
+      expect(harness.screenText, contains('models.overrides'));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('key set', () {
+    testWidgets('/key set → masked value entry', (tester) async {
+      // /key set PERSISTS a key — into a fixture HOME, never the real
+      // ~/.fah/config.yaml (issue #508).
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '60_boot_key');
+
+      await harness.runSlashCommand('/key set TEST_KEY');
+      // Two post-merge realities (main@17a58a48 moved the store probe ahead
+      // of the prompt): a host WITH a working store opens the masked prompt
+      // and the save writes through (CI macOS — the keychain is user-level,
+      // not HOME-bound); a host WITHOUT one reports unavailable and never
+      // prompts (Linux: no secret service). The test adapts; both paths
+      // keep the value out of any real config file.
+      await harness.liveWaitForText(
+        RegExp('Value for|secure storage unavailable on this host'),
+        timeout: const Duration(seconds: 15),
+      );
+      final storeUsable = harness.screenText.contains('Value for');
+      await harness.screenshot(
+        shotsDir,
+        '61_key_${storeUsable ? 'prompt' : 'unavailable'}',
+      );
+      if (!storeUsable) {
+        // No store on this host: the honest unavailable report IS the
+        // contract — masked entry cannot exist without a prompt. The
+        // save-success path stays covered on store-bearing runners.
+        await harness.close();
+        tempHome.deleteSync(recursive: true);
+        return;
+      }
+
+      // Type a value (should be masked)
+      harness.sendText('secret123');
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '62_key_masked');
+
+      harness.sendEnter();
+      // The masked entry is the behavior under test. The save report is
+      // environment-honest, not uniform: a store whose keychain accepts
+      // the write reports `saved`; a sandbox where the write degrades
+      // reports `could not save TEST_KEY` (the gh-781 root cause — the
+      // CI macOS runner proved both shapes occur across machines). Wait
+      // for either terminal report; never assert which one.
+      await harness.liveWaitForText(
+        RegExp('saved|could not save TEST_KEY'),
+        timeout: const Duration(seconds: 15),
+      );
+      final savedOk = !harness.screenText.contains('could not save');
+      await harness.screenshot(
+        shotsDir,
+        '63_key_${savedOk ? 'saved' : 'unsaved'}',
+      );
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('agents', () {
+    testWidgets('/agents shows the live agents tree', (tester) async {
+      // Sandboxed HOME: the session tree must come from the fixture, not
+      // the developer's real sessions (issue #508).
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.runSlashCommand('/agents');
+      await harness.liveWaitForText(
+        'main (orchestrator)',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '90_agents_tree');
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    // NOTE: the live badge (`bg:` in the status line during an active
+    // spawn) is unit-covered via formatActiveAgentsBadge. A real-model
+    // visual variant was dropped: the spawn requires a working provider
+    // key (the macOS `security` keychain read is HOME-dependent, so a temp
+    // HOME cannot resolve stored keys; scoped env keys work but the model
+    // may stream past the test's time budget, hanging the harness on
+    // close). The agents tree + open session flows are covered below.
+
+    testWidgets('/agents types lists the agent type catalog', (tester) async {
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.runSlashCommand('/agents types');
+      await harness.liveWaitForText(
+        'agent types:',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '91_agents_types');
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('/agents shows pending inbox markers from the messaging '
+        'fabric', (tester) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      // Deliver a message into the main agent's file inbox, exactly like
+      // another Fa instance (or a child agent) would through the messaging
+      // fabric: <sessions>/<cwd-slug>/messages/<sessionId>_main/inbox/.
+      // Sessions live under the platform default root (the macOS app-group
+      // container when writable, else ~/.fah/sessions).
+      final sessionsDir = [
+        Directory(
+          '${tempHome.path}/Library/Group Containers/'
+          'group.dev.fa1.shared/fa/sessions',
+        ),
+        Directory('${tempHome.path}/.fah/sessions'),
+      ].firstWhere((dir) => dir.existsSync(), orElse: () => Directory(''));
+      final sessionFile = sessionsDir
+          .listSync(recursive: true)
+          .whereType<File>()
+          .firstWhere((f) => f.path.endsWith('.jsonl'));
+      final sessionId = sessionFile.uri.pathSegments.last
+          .split('_')
+          .last
+          .replaceAll('.jsonl', '');
+      final inboxDir = Directory(
+        '${sessionFile.parent.path}/messages/${sessionId}_main/inbox',
+      )..createSync(recursive: true);
+      File('${inboxDir.path}/20260816000000_0001_x.json').writeAsStringSync(
+        jsonEncode({
+          'id': '20260816000000_0001_x',
+          'fromId': 'explore:a1',
+          'toId': '$sessionId/main',
+          'text': 'survey done: 42 files',
+          'sentAt': '2026-08-16T00:00:00Z',
+          'hops': 0,
+        }),
+      );
+
+      await harness.runSlashCommand('/agents');
+      // The hub overlay renders the `mail:N` marker once the fabric peek
+      // resolves (the async refresher re-pushes the tree — issue #277's
+      // picker carried the same cue).
+      await harness.liveWaitForText(
+        'mail:1',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '92_agents_inbox');
+
+      // Close the overlay. (The picker-era flow drilled into a "children:"
+      // info block here; the hub overlay's enter opens the transcript, and
+      // delivery is asserted at the source of truth below.) The wake turn
+      // may drain the inbox on a loaded machine — that race is fine, the
+      // session-file assert is the binding one.
+      harness.sendEscape();
+      await harness.settle(settleMs: 300);
+
+      await harness.close();
+      // The fabric delivery itself is asserted at the source of truth: the
+      // mail text landed in the session file as a user message.
+      final sessionText = sessionFile.readAsStringSync();
+      expect(sessionText, contains('survey done: 42 files'));
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('settings', () {
+    testWidgets('/settings hub → chat model: provider → model', (tester) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '80_boot_settings');
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForText(
+        'Chat model',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '81_settings_hub');
+
+      // Navigate to "Chat model" (second entry) and open it.
+      harness.sendArrowDown();
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '82_settings_model_highlight');
+
+      // Step 1: the provider picker (saved entries first).
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'test-provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '83_settings_chat_provider');
+
+      // Pick the saved test-provider. Its endpoint is dead
+      // (localhost:9999), so the model step falls back to manual entry.
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'model id',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '84_settings_chat_model_manual');
+
+      // Type a model id and submit — the connection switches.
+      harness.sendText('picked-model');
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'switched provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '85_settings_chat_switched');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('/settings hub → media models: slot → provider → model', (
+      tester,
+    ) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForText(
+        'Media models',
+        timeout: const Duration(seconds: 15),
+      );
+
+      // Navigate to "Media models" via type-to-filter — the hub row set
+      // is curated per issue (#1515 merged the Model parameters row into
+      // Model capabilities), so fixed arrow counts go stale; the filter
+      // matches the row's visible label (the compaction test's pattern)
+      // and the filtered picker title carries the query.
+      harness.sendText('media');
+      await harness.liveWaitForText(
+        'Settings: media',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendEnter();
+
+      // Step 1: the slot picker.
+      await harness.liveWaitForText(
+        'imageGeneration',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '86_settings_media_slot');
+
+      // Pick imageGeneration → the provider picker (openai-compatible).
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'test-provider',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '87_settings_media_provider');
+
+      // Pick the saved test-provider; dead endpoint → manual model entry.
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'model id',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendText('image-model-1');
+      // Confirm the prompt actually received the text before submitting.
+      await harness.liveWaitForText(
+        'image-model-1',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'slot imageGeneration → image-model-1',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '88_settings_media_done');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets(
+      '/settings hub → model capabilities: the caps flow opens in the app '
+      'context (gh-1426 AC4: the embedded CLI is the app edit surface)',
+      (tester) async {
+        final tempHome = _tempHomeWithProvider();
+        final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+        await harness.runSlashCommand('/settings');
+        await harness.liveWaitForText(
+          'Model capabilities',
+          timeout: const Duration(seconds: 15),
+        );
+
+        // The picker viewport is shorter than the hub list, so
+        // type-to-filter narrows it to the gh-1426 entry; the filtered
+        // picker title carries the QUERY (the compaction test's
+        // "Settings: compaction" precedent).
+        harness.sendText('model cap');
+        await harness.liveWaitForText(
+          'Settings: model cap',
+          timeout: const Duration(seconds: 15),
+        );
+        harness.sendEnter();
+
+        // The caps flow menu renders inside the app-hosted CLI — the same
+        // validated upsert + live-apply flow the CLI settings expose.
+        await harness.liveWaitForText(
+          'Pin or edit an override',
+          timeout: const Duration(seconds: 15),
+        );
+        await harness.screenshot(shotsDir, '90_settings_model_caps');
+
+        await harness.close();
+        tempHome.deleteSync(recursive: true);
+      },
+    );
+
+    testWidgets('/settings hub → compaction engine: pick → scope → set', (
+      tester,
+    ) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForText(
+        'Chat model',
+        timeout: const Duration(seconds: 15),
+      );
+
+      // The hub carries the Compaction entry (issue #288: every yaml key
+      // reachable from the settings TUI); the picker viewport is shorter
+      // than the list, so type-to-filter narrows it to the entry.
+      harness.sendText('compaction');
+      await harness.liveWaitForText(
+        'Settings: compaction',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_compaction_hub');
+
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Structured',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_compaction_picker');
+
+      harness.sendArrowDown(); // → Structured
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+
+      // The scope picker (session / project / global).
+      await harness.liveWaitForText(
+        'Session',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_compaction_scope');
+
+      // Global scope: writes the temp HOME config (2nd arrow-down).
+      for (var i = 0; i < 2; i++) {
+        harness.sendArrowDown();
+      }
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'compaction.engine = structured',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_compaction_set');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('/settings hub → memory stores: path → set', (tester) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForText(
+        'Chat model',
+        timeout: const Duration(seconds: 15),
+      );
+
+      // Memory entry via type-to-filter (below the fold otherwise).
+      harness.sendText('memory');
+      await harness.liveWaitForText(
+        'Settings: memory',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_memory_hub');
+
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'User memory',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_memory_stores');
+
+      harness.sendArrowDown(); // → User memory (writes the HOME config)
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'user memory path',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_memory_prompt');
+
+      harness.sendText('~/fa-visual-memory');
+      await harness.liveWaitForText(
+        'fa-visual-memory',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'memory.userPath = ~/fa-visual-memory',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '89_settings_memory_set');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('mcp', () {
+    testWidgets('/mcp shows guidance when no servers configured', (
+      tester,
+    ) async {
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+      await harness.screenshot(shotsDir, '70_boot_mcp');
+
+      await harness.runSlashCommand('/mcp');
+      await harness.liveWaitForText(
+        'No MCP servers',
+        timeout: const Duration(seconds: 30),
+      );
+      await harness.screenshot(shotsDir, '71_mcp_no_servers');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('input, queue and history UX', () {
+    testWidgets('a long single-line input soft-wraps into physical rows', (
+      tester,
+    ) async {
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      // Far longer than any terminal width — the whole text must stay
+      // visible as a wrapped paragraph (no horizontal clipping).
+      final text = 'wrap-check-${'a' * 120}-middle-${'b' * 120}-wrap-end';
+      harness.sendText(text);
+      await harness.settle(settleMs: 400);
+      await harness.screenshot(shotsDir, '94_input_wrap');
+      // The text wrapped across rows: the tail chunk is visible, and the
+      // full single-line string is NOT on screen unwrapped.
+      expect(harness.screenText, contains('wrap-check-'));
+      expect(harness.screenText, contains('ap-end'));
+      expect(harness.screenText, isNot(contains(text)));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('composer fuzzy overlay: slash menu ranks and highlights; '
+        'kill-ring yank restores text', (tester) async {
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      // Typing a slash prefix opens the fuzzy-ranked command menu: '/e'
+      // must surface /exit (tight match first) alongside /help and
+      // /sessions via the subsequence fallback (issue #275 AC1).
+      harness.sendText('/e');
+      await harness.settle(settleMs: 400);
+      await harness.screenshot(shotsDir, '97_fuzzy_overlay');
+      expect(harness.screenText, contains('/exit'));
+      expect(harness.screenText, contains('/help'));
+      expect(harness.screenText, contains('Commands'));
+
+      // Escape closes the overlay; the typed prefix stays for editing.
+      harness.sendEscape();
+      await harness.settle(settleMs: 300);
+      expect(harness.screenText, contains('/e'));
+
+      // Kill-ring: ctrl-w cuts the word, ctrl-y yanks it back (AC3).
+      harness.sendText('word-to-kill');
+      await harness.settle(settleMs: 200);
+      harness.sendText('\x17'); // ctrl-w
+      await harness.settle(settleMs: 300);
+      expect(harness.screenText, isNot(contains('word-to-kill')));
+      harness.sendText('\x19'); // ctrl-y
+      await harness.settle(settleMs: 300);
+      expect(harness.screenText, contains('word-to-kill'));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('busy queue: enter queues, ↑ pops the message back', (
+      tester,
+    ) async {
+      // A slow endpoint (a python process sleeping on POST) keeps the turn
+      // busy; hosting it OUTSIDE the test isolate keeps cleanup trivial.
+      const port = 18777;
+      final serverScript =
+          File('${Directory.systemTemp.path}/fa_slow_server.py')
+            ..writeAsStringSync('''
+import http.server, time
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        time.sleep(120)
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", $port), H).serve_forever()
+''');
+      // Process I/O must run in the REAL-async zone: fake-zone timers
+      // (Future.delayed) never fire without a pump, so zone-naive waits
+      // hang the test forever.
+      final server = (await tester.runAsync(
+        () => Process.start('python3', [serverScript.path]),
+      ))!;
+      final up = await tester.runAsync(() async {
+        for (var i = 0; i < 50; i++) {
+          try {
+            final socket = await Socket.connect('127.0.0.1', port);
+            await socket.close();
+            return true;
+          } on Object {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+        }
+        return false;
+      });
+      if (up != true) throw StateError('slow server did not start');
+      final tempHome = _tempHomeWithEndpoint('http://127.0.0.1:$port/v1');
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      // The first message starts the (hanging) turn — the busy row shows
+      // the elapsed seconds.
+      harness.sendText('first');
+      await harness.settle(settleMs: 300, timeout: const Duration(seconds: 2));
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Working',
+        timeout: const Duration(seconds: 30),
+      );
+
+      // The second message queues (❯ row above the input).
+      harness.sendText('second');
+      await harness.settle(settleMs: 300, timeout: const Duration(seconds: 2));
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        '❯ second',
+        timeout: const Duration(seconds: 30),
+      );
+      await harness.screenshot(shotsDir, '95_queue_row');
+
+      // ↑ pops it back into the input for editing (the ❯ row disappears).
+      harness.sendArrowUp();
+      await harness.settle(settleMs: 300, timeout: const Duration(seconds: 2));
+      await harness.screenshot(shotsDir, '96_queue_pop');
+      expect(harness.screenText, isNot(contains('❯ second')));
+
+      await harness.close();
+      await tester.runAsync(() async {
+        server.kill();
+        await server.exitCode.timeout(
+          const Duration(seconds: 5),
+          onTimeout: () => -1,
+        );
+      });
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('↑/↓ browses the submitted-message history', (tester) async {
+      // The dead endpoint errors every turn instantly, so both submits
+      // complete and land in the input history.
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      harness.sendText('first message');
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.settle(settleMs: 1500);
+      harness.sendText('second message');
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.settle(settleMs: 1500);
+
+      // ↑ recalls the newest, then the older one; ↓ walks back.
+      harness.sendArrowUp();
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '97_history_recall');
+      expect(harness.screenText, contains('second message'));
+      harness.sendArrowUp();
+      await harness.settle(settleMs: 300);
+      expect(harness.screenText, contains('first message'));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('generic picker type-to-filter narrows the settings hub', (
+      tester,
+    ) async {
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      await harness.runSlashCommand('/settings');
+      await harness.liveWaitForText(
+        'Media models',
+        timeout: const Duration(seconds: 30),
+      );
+      // Type-to-filter on a generic picker: the title echoes the query.
+      harness.sendText('med');
+      await harness.settle(settleMs: 400);
+      await harness.screenshot(shotsDir, '98_settings_filter');
+      expect(harness.screenText, contains('Settings: med'));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('bracketed paste of Cyrillic text stays UTF-8 (no mojibake)', (
+      tester,
+    ) async {
+      final tempHome = _tempHome();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      // dart_tui 2.0.0's paste decoder mapped bytes to Latin-1 char codes;
+      // fa repairs it — pasted Cyrillic must render as itself.
+      harness
+        ..sendText('\x1b[200~')
+        ..sendText('Привет, проверка вставки')
+        ..sendText('\x1b[201~');
+      await harness.settle(settleMs: 400);
+      await harness.screenshot(shotsDir, '99_paste_cyrillic');
+      expect(harness.screenText, contains('Привет, проверка вставки'));
+      expect(harness.screenText, isNot(contains('Ð')));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('a markdown bold span keeps its style across a soft wrap', (
+      tester,
+    ) async {
+      // The canned endpoint answers one long line whose bold span is longer
+      // than any terminal row: the wrap MUST cut inside it, and the
+      // continuation row must stay bold (SGR carry across the cut).
+      // Ephemeral port + addTearDown leak guard (gh-781): a mid-test
+      // failure must not leak the python answer server, and a leaked
+      // server from a crashed run must not hold a fixed port.
+      final port = await _freeLoopbackPort(tester);
+      final server = await _startAnsweringServer(
+        tester,
+        port,
+        'Verified: **the bold span deliberately runs past every possible '
+        'terminal width so the soft wrap cuts right through the middle of '
+        'it** — and this trailing plain suffix proves word wrap.',
+      );
+      addTearDown(() => _stopServer(tester, server));
+      final tempHome = _tempHomeWithEndpoint('http://127.0.0.1:$port/v1');
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      harness.sendText('go');
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Verified:',
+        timeout: const Duration(seconds: 30),
+      );
+      await harness.screenshot(shotsDir, '100_markdown_wrap');
+      // Issue #506: the chat-time prefix carries the same composed
+      // two-role label the boot banner shows.
+      _expectComposedFaMark(harness, shot: '100_markdown_wrap');
+      // The whole line is on screen (wrapped); row splits put newlines into
+      // the raw screen text, so assertions run on the flattened form. The
+      // markdown markers themselves are consumed by the formatter.
+      final flat = harness.screenText.replaceAll('\n', '');
+      expect(flat, contains('bold span deliberately'));
+      expect(flat, contains('trailing plain suffix'));
+      expect(flat, isNot(contains('**')));
+
+      await harness.close();
+      await _stopServer(tester, server);
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('ctrl+s during a long bash moves it to a background job '
+        'untouched and answers right away', (tester) async {
+      // The canned endpoint answers a `tail -f /dev/null` tool call to the
+      // first user message (a long blocker — issue #1349 denies a bare
+      // foreground `sleep` at validation, so the stand-in for a long-running
+      // call must be legitimate work) and a text answer once the user steers
+      // mid-tool.
+      // Ephemeral port + addTearDown leak guard (gh-781), same as the
+      // other answer-server tests in this file.
+      final port = await _freeLoopbackPort(tester);
+      final server = await _startAnsweringServer(
+        tester,
+        port,
+        null, // steer mode: tool call first, text after the steer
+      );
+      addTearDown(() => _stopServer(tester, server));
+      final tempHome = _tempHomeWithEndpoint('http://127.0.0.1:$port/v1');
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      harness.sendText('run the long task');
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'tail -f /dev/null',
+        timeout: const Duration(seconds: 30),
+      );
+
+      // Steer mid-tool: the bash call must yield to a background job (the
+      // process is NOT killed) and the message is answered immediately.
+      harness.sendText('status?');
+      await harness.settle(settleMs: 200);
+      harness.sendText('\x13'); // ctrl+s
+      await harness.liveWaitForText(
+        'Working on it',
+        timeout: const Duration(seconds: 30),
+      );
+      await harness.screenshot(shotsDir, '101_steer_yield');
+      // The follow-up answer mentions the background job (flattened: row
+      // splits insert newlines into the raw screen text).
+      expect(
+        harness.screenText.replaceAll('\n', ''),
+        contains('background job'),
+      );
+
+      // The job is alive and listed; cancel it by hand.
+      await harness.runSlashCommand('/tasks');
+      await harness.liveWaitForText(
+        'sh-1',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '102_tasks_shell_job');
+      expect(harness.screenText, contains('tail -f /dev/null'));
+
+      // Job ids carry a unique suffix (sh-1-<uniq>) — cancel the EXACT id
+      // the listing shows.
+      final shellJobId = RegExp('sh-[A-Za-z0-9-]+')
+          .firstMatch(harness.screenText)
+          ?.group(0);
+      expect(shellJobId, isNotNull);
+
+      await harness.runSlashCommand('/tasks cancel $shellJobId');
+      await harness.settle(settleMs: 500);
+      expect(harness.screenText, contains('stopped $shellJobId'));
+
+      await harness.close();
+      await _stopServer(tester, server);
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  group('editing keys — the Cmd+Left (aaaa) regression + secret sheet', () {
+    testWidgets('ctrl+a/ctrl+e move the composer cursor without leaking '
+        'letters; unhandled combos print nothing', (tester) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      harness.sendText('hello world');
+      await harness.settle(settleMs: 300);
+      // macOS Cmd+Left arrives as ^A (0x01): readline start-of-line.
+      harness.sendText('\x01');
+      await harness.settle(settleMs: 200);
+      harness.sendText('X'); // lands at the start iff the cursor moved
+      await harness.settle(settleMs: 200);
+      // Cmd+Right → ^E: end-of-line.
+      harness.sendText('\x05');
+      await harness.settle(settleMs: 200);
+      harness.sendText('Y');
+      await harness.settle(settleMs: 200);
+      // ctrl+x is the #275 queue-row delete (no queue -> no-op) and
+      // ctrl+g stays unhandled: neither may leak its base letter.
+      harness.sendText('\x18\x07'); // ctrl+x, ctrl+g
+      await harness.settle(settleMs: 200);
+      harness.sendText(' Z'); // a fresh word: one undo group of its own
+      await harness.settle(settleMs: 300);
+      // ctrl+z is grouped undo since #275: the Z inserts, then undo
+      // removes it again — visible undo in the real terminal.
+      harness.sendText('\x1a'); // ctrl+z
+      await harness.settle(settleMs: 200);
+
+      await harness.screenshot(shotsDir, '102_composer_ctrl_keys');
+      final flat = harness.screenText.replaceAll('\n', '');
+      expect(flat, contains('Xhello worldY'));
+      expect(flat, isNot(contains('Xhello worldYZ')));
+      expect(flat, isNot(contains('Xhello worldYxg')));
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('request_secret sheet: value-first focus, dots mask, Ctrl+R '
+        'reveals, Ctrl+U clears, the saved secret never echoes', (
+      tester,
+    ) async {
+      // The gh-781 leak class, closed at the source: this test used to
+      // bind the FIXED port 18780 with a happy-path-only stop — any
+      // mid-test failure (the nightly's liveWaitForText timeout on the
+      // rename hint) skipped the stop and leaked the server, which then
+      // poisoned the next test's bind. The addTearDown guard stops the
+      // server on every exit path; the ephemeral port means a stale
+      // leaked process from a crashed run can never wedge the rerun.
+      final port = await _freeLoopbackPort(tester);
+      final server = await _startAnsweringServer(
+        tester,
+        port,
+        null, // steer/secret mode: 'deploy the app' → request_secret
+      );
+      addTearDown(() => _stopServer(tester, server));
+      final tempHome = _tempHomeWithEndpoint('http://127.0.0.1:$port/v1');
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      harness.sendText('deploy the app');
+      await harness.settle(settleMs: 300);
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Name (UPPER_SNAKE)',
+        timeout: const Duration(seconds: 30),
+      );
+      await harness.screenshot(shotsDir, '103_secret_sheet_suggested_name');
+      // The suggested name renders as a dimmed ghost placeholder (issue #97
+      // F1) and focus starts on the value field so the first keystroke is
+      // the secret (issue #97 F2).
+      expect(harness.screenText, contains('SUDO_PASSWORD'));
+      expect(harness.screenText, contains('Ctrl+R reveals'));
+
+      // Enter with an empty value explains itself (issue #97 F3).
+      harness.sendEnter();
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '104_secret_empty_value_blocked');
+      expect(harness.screenText, contains('Type the value first'));
+
+      // The first keystroke lands in the masked value row.
+      harness.sendText('hunter2');
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '105_secret_dots');
+      final dotsScreen = harness.screenText.replaceAll('\n', '');
+      expect(dotsScreen, contains('•••••••'));
+      expect(dotsScreen, isNot(contains('hunter2')));
+
+      // Ctrl+R reveals the typed value for verification.
+      harness.sendText('\x12');
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '106_secret_revealed');
+      expect(harness.screenText, contains('hunter2'));
+      expect(harness.screenText, contains('Ctrl+R hides'));
+
+      // Ctrl+U on value focus kills the field back to the cursor.
+      harness.sendText('\x15');
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '107_secret_value_cleared');
+      final cleared = harness.screenText.replaceAll('\n', '');
+      expect(cleared, isNot(contains('hunter2')));
+      expect(cleared, isNot(contains('•••')));
+
+      // Tab renames: the committed name replaces the ghost suggestion.
+      harness.sendText('\t');
+      await harness.settle(settleMs: 200);
+      // The rename-mode hint names the field (#627 rewrote the cue copy;
+      // #834's keyHint grammar renders it lowercase).
+      expect(harness.screenText, contains('type to replace name'));
+      harness.sendText('SUDO_X');
+      await harness.settle(settleMs: 300);
+      expect(harness.screenText, contains('SUDO_X'));
+      harness.sendText('\t');
+      await harness.settle(settleMs: 200);
+
+      // Retype and save: the grant completes the turn; the transcript
+      // must NEVER echo the secret value.
+      harness.sendText('hunter2');
+      await harness.settle(settleMs: 200);
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'Secret received',
+        timeout: const Duration(seconds: 30),
+      );
+      await harness.screenshot(shotsDir, '108_secret_saved_no_echo');
+      expect(
+        harness.screenText.replaceAll('\n', ''),
+        isNot(contains('hunter2')),
+      );
+
+      await harness.close();
+      await _stopServer(tester, server);
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+
+  testWidgets('a [short, long] markdown table renders a real grid with '
+      'short columns intact (issue #686)', (tester) async {
+    // The canned endpoint answers with the report's repro shape: short
+    // labels + one long-text column. The fit-preserving sizing keeps the
+    // first column at its full natural width — every label cell renders
+    // on a single grid row while the text column wraps. (A Dart SSE
+    // server — no python3 dependency, unlike _startAnsweringServer.)
+    const tableReply =
+        'Готово:\n'
+        '| Гейт | Результат |\n'
+        '|---|---|\n'
+        '| Сьюты форка | +697 passed, вкл. новый fps-тест и дроп-кадровый '
+        'троттлинг рендера |\n'
+        '| fa-сьюты поверх форка | +139 passed |\n';
+    String sse(String content) =>
+        'data: ${jsonEncode({
+          'choices': [
+            {
+              'delta': {'content': content},
+            },
+          ],
+        })}\n\n';
+    final server = (await tester.runAsync(() async {
+      // Port 0 = ephemeral: a fixed port here turned any leftover listener
+      // (a leaked server from a failed sibling test) into a bind-time
+      // SocketException that killed this test with an unreadable signature.
+      final bound = await HttpServer.bind('127.0.0.1', 0);
+      bound.listen((request) async {
+        final payload = utf8
+            .encode(
+              '${sse(tableReply)}'
+              '${sse('')}'
+              'data: [DONE]\n\n',
+            )
+            .length;
+        request.response.headers.set('Content-Type', 'text/event-stream');
+        request.response.headers.set('Content-Length', '$payload');
+        request.response.add(
+          utf8.encode(
+            '${sse(tableReply)}'
+            '${sse('')}'
+            'data: [DONE]\n\n',
+          ),
+        );
+        await request.response.close();
+      });
+      return bound;
+    }))!;
+    final tempHome = _tempHomeWithEndpoint(
+      'http://127.0.0.1:${server.port}/v1',
+    );
+    final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+    harness.sendText('покажи отчёт');
+    await harness.settle(settleMs: 300);
+    harness.sendEnter();
+    await harness.liveWaitForText(
+      'Сьюты форка',
+      timeout: const Duration(seconds: 30),
+    );
+    await harness.screenshot(shotsDir, '109_markdown_table');
+
+    final flat = harness.screenText.replaceAll('\n', ' ');
+    // A real box grid (dim box-drawing separator), never raw pipes.
+    expect(flat, contains('┼'));
+    expect(flat, isNot(contains('|---')));
+    // Both short labels render complete on their own grid rows.
+    expect(flat, contains('Сьюты форка'));
+    expect(flat, contains('fa-сьюты поверх форка'));
+
+    await harness.close();
+    await tester.runAsync(() => server.close(force: true));
+    tempHome.deleteSync(recursive: true);
+  });
+
+  group('agents hub (issue 277)', () {
+    testWidgets('/agents opens the hub overlay; enter drills into the '
+        'transcript; esc unwinds', (tester) async {
+      final tempHome = _tempHomeWithProvider();
+      final harness = await boot(tester, extraEnv: {'HOME': tempHome.path});
+
+      await harness.runSlashCommand('/agents');
+      await harness.liveWaitForText(
+        'agents hub',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '277_agents_hub');
+      expect(harness.screenText, contains('main'));
+
+      // Enter on the orchestrator row opens its transcript viewer.
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'transcript',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '277_hub_transcript');
+
+      // Esc returns to the hub, a second esc closes it back to the REPL.
+      harness.sendEscape();
+      await harness.liveWaitForText(
+        'agents hub',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '277_hub_back');
+      harness.sendEscape();
+      await harness.settle(settleMs: 300);
+      await harness.screenshot(shotsDir, '277_hub_closed');
+
+      await harness.close();
+      tempHome.deleteSync(recursive: true);
+    });
+
+    testWidgets('seeded fleet renders children with metrics; child '
+        'transcript and /mail panels are real', (tester) async {
+      final tempHome = _tempHomeWithProvider();
+      final sessionsDir = Directory('${tempHome.path}/sessions')
+        ..createSync(recursive: true);
+      // The CLI runs with its own session root, so the seeded fleet is the
+      // only state in it and /resume deterministically lands on it.
+      final harness = await boot(
+        tester,
+        extraEnv: {'HOME': tempHome.path},
+        args: ['--session-root', sessionsDir.path],
+      );
+
+      // Seed AFTER boot: /resume picks the newest created session — the
+      // seeded parent must be newer than the boot's own fresh session.
+      await _seedHubFleet(tester, repoRoot, sessionsDir.path);
+      await harness.runSlashCommand('/resume');
+      await harness.liveWaitForText(
+        "switched to session 'hub-evidence'",
+        timeout: const Duration(seconds: 15),
+      );
+
+      // The hub tree: main + two children with live metrics.
+      await harness.runSlashCommand('/agents');
+      await harness.liveWaitForText(
+        'agents hub',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.liveWaitForText(
+        'explore#1',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '277_hub_tree_fleet');
+      expect(harness.screenText, contains('explore#2'));
+      expect(harness.screenText, contains('18.4k tok'));
+      expect(harness.screenText, contains('Σ'));
+
+      // Drill into the first child row — the tree orders idle above done
+      // (hubStatusRank), and explore#2 is seeded `idle`: a seeded `running`
+      // row would be zombie-settled to failed at boot (issue #332 — a
+      // resumed registry row has no live runner), which silently reorders
+      // the tree under this test's arrow navigation.
+      harness.sendArrowDown();
+      harness.sendEnter();
+      await harness.liveWaitForText(
+        'transcript — explore#2',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.liveWaitForText(
+        'end follow',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '277_hub_child_transcript');
+
+      // Esc unwinds to the tree, then closes back to the REPL; /mail
+      // renders the deferred panel seeded in this session's mailbox.
+      harness.sendEscape();
+      await harness.liveWaitForText(
+        'agents hub',
+        timeout: const Duration(seconds: 15),
+      );
+      harness.sendEscape();
+      await harness.settle(settleMs: 300);
+      await harness.runSlashCommand('/mail');
+      await harness.liveWaitForText(
+        'mail from explore#1',
+        timeout: const Duration(seconds: 15),
+      );
+      await harness.screenshot(shotsDir, '277_hub_mail');
+
+      tempHome.deleteSync(recursive: true);
+    });
+  });
+}
+
+/// Asserts the `>_Fa` mark on screen is the composed two-role label
+/// (issue #506): `>` + `_` in one bold role, `F` + `a` in another, the two
+/// roles distinct — the boot banner carries the same styling tokens as the
+/// chat-time prefix, never a single plain role. Reads the xterm buffer —
+/// the exact cells the PNG painter draws. With [topRow] the mark must sit
+/// on the screen's top row (the boot banner's position).
+void _expectComposedFaMark(
+  CliVisualHarness harness, {
+  bool topRow = false,
+  required String shot,
+}) {
+  final buf = harness.terminal.buffer;
+  final lastRow = topRow ? buf.scrollBack : buf.lines.length - 1;
+  for (var i = buf.scrollBack; i <= lastRow; i++) {
+    final cells = [for (var x = 0; x < 4; x++) CellData.empty()];
+    for (var x = 0; x < 4; x++) {
+      buf.lines[i].getCellData(x, cells[x]);
+    }
+    final text = cells
+        .map(
+          (c) => String.fromCharCodes([c.content & CellContent.codepointMask]),
+        )
+        .join();
+    if (text != '>_Fa') continue;
+    int fg(int index) => cells[index].foreground & CellColor.valueMask;
+    final accent = fg(0);
+    final brand = fg(2);
+    // A role carrying the terminal DEFAULT fg (type 0) means that half of
+    // the mark is unstyled — the single-role regression this asserts away.
+    int fgType(int index) =>
+        (cells[index].foreground & CellColor.typeMask) >> CellColor.typeShift;
+    expect(fgType(0), isNot(0), reason: '$shot: `>_` role is a real color');
+    expect(fgType(2), isNot(0), reason: '$shot: `Fa` role is a real color');
+    expect(accent, fg(1), reason: '$shot: `>` and `_` share the accent role');
+    expect(brand, fg(3), reason: '$shot: `F` and `a` share the accent2 role');
+    expect(
+      accent,
+      isNot(brand),
+      reason: '$shot: the mark composes two distinct roles',
+    );
+    for (var x = 0; x < 4; x++) {
+      expect(
+        cells[x].flags & CellFlags.bold,
+        CellFlags.bold,
+        reason: '$shot: mark cell $x renders bold',
+      );
+    }
+    return;
+  }
+  fail('$shot: no >_Fa mark row found on screen');
+}
+
+/// Seeds a hub fleet for the visual evidence test (issue #277): a parent
+/// session named `hub-evidence` carrying a `subagent_registry` record with
+/// two children (one completed with metrics, one running), each child a
+/// real JSONL session with a short transcript, plus one fabric mail in the
+/// parent's main mailbox. All writes go through the real session/fabric
+/// writers so the CLI rehydrates exactly what a real fleet would leave.
+Future<void> _seedHubFleet(
+  WidgetTester tester,
+  String repoRoot,
+  String sessionsDir,
+) async {
+  return tester.runAsync(() async {
+    final env = LocalExecutionEnv(cwd: repoRoot);
+    final repo = JsonlSessionRepo(fs: env, sessionsRoot: sessionsDir);
+    final now = DateTime.now().toUtc();
+
+    Future<Session> child(String name) async {
+      final session = await repo.create(
+        JsonlSessionCreateOptions(
+          cwd: repoRoot,
+          metadata: {'agent': 'cli', 'model': 'test-model'},
+        ),
+      );
+      await session.appendMessage(
+        UserMessage.text('$name: map the retry paths'),
+      );
+      await session.appendMessage(
+        AssistantMessage(
+          content: const [
+            TextContent(
+              text:
+                  'Found three retry paths: transport, auth, and rate '
+                  'limit — the transport one backoffs exponentially.',
+            ),
+          ],
+          api: 'openai-completions',
+          provider: 'test-provider',
+          model: 'test-model',
+          usage: const Usage(
+            input: 900,
+            output: 300,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 1200,
+            cost: UsageCost(total: 0.0042),
+          ),
+          stopReason: StopReason.stop,
+          timestamp: now.add(const Duration(seconds: 4)),
+        ),
+      );
+      return session;
+    }
+
+    final done = await child('explore#1');
+    final running = await child('explore#2');
+    final doneMeta = await done.getMetadata();
+    final runningMeta = await running.getMetadata();
+
+    final parent = await repo.create(
+      JsonlSessionCreateOptions(
+        cwd: repoRoot,
+        metadata: {'agent': 'cli', 'model': 'test-model'},
+      ),
+    );
+    await parent.appendSessionName('hub-evidence');
+    await parent.appendMessage(
+      UserMessage.text('Audit the retry paths across the fleet'),
+    );
+    await parent.appendCustomEntry(
+      customType: 'subagent_registry',
+      data: [
+        {
+          'id': 'explore#1',
+          'name': 'explore#1',
+          'agentType': 'explore',
+          'sessionId': doneMeta.path,
+          'createdAt': now.toIso8601String(),
+          'lastActivity': now
+              .subtract(const Duration(minutes: 5))
+              .toIso8601String(),
+          'task': 'Map the retry paths in the api client',
+          'status': 'completed',
+          'tokens': 18432,
+          'requests': 6,
+          'modelId': 'test-model',
+        },
+        {
+          'id': 'explore#2',
+          'name': 'explore#2',
+          'agentType': 'explore',
+          'sessionId': runningMeta.path,
+          'createdAt': now.toIso8601String(),
+          'lastActivity': now.toIso8601String(),
+          'task': 'Check the auth refresh loop',
+          'status': 'idle',
+          'tokens': 512,
+          'requests': 1,
+        },
+      ],
+    );
+    final parentMeta = await parent.getMetadata();
+
+    // One fabric mail in the parent's main mailbox: /mail lists it with
+    // the reply hint, proving the deferred-message plumbing end to end.
+    final mailbox = FileMessagingRepository.sanitizeAgentId(
+      '${parentMeta.id}/main',
+    );
+    final messagesRoot = '$sessionsDir/${encodeSessionCwd(repoRoot)}/messages';
+    final inbox = Directory('$messagesRoot/$mailbox/inbox')
+      ..createSync(recursive: true);
+    File('${inbox.path}/m1.json').writeAsStringSync(
+      jsonEncode({
+        'id': 'm1',
+        'fromId': 'explore#1',
+        'toId': '${parentMeta.id}/main',
+        'text': 'what about the retry path?',
+        'sentAt': now.toIso8601String(),
+        'hops': 0,
+      }),
+    );
+  });
+}
+
+/// Creates a temp HOME with a saved custom provider.
+/// gh-1026 family: bounded poll until [pattern] has LEFT the painted
+/// screen — the transition-complete signal for a picker swap whose
+/// successor shares all of its row text with the panels underneath (the
+/// provider picker re-renders the same 'test-provider' line the idle
+/// status panel paints). Same poll shape as
+/// [CliVisualHarness.liveWaitForScreen], inverted; runs in the real-async
+/// zone so frames keep painting while the poll samples.
+Future<void> _waitForScreenGone(
+  WidgetTester tester,
+  CliVisualHarness harness,
+  Pattern pattern, {
+  Duration timeout = const Duration(seconds: 15),
+}) async {
+  await tester.runAsync(() async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (!harness.screenText.contains(pattern)) return;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    throw TimeoutException(
+      'Timed out waiting for "$pattern" to leave the screen.\n'
+      '--- screen ---\n${harness.screenText}',
+      timeout,
+    );
+  });
+}
+
+Directory _tempHomeWithProvider() {
+  final tempHome = Directory.systemTemp.createTempSync('fa_test_');
+  File('${tempHome.path}/.fah/config.yaml')
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+provider: openai-completions
+model: test-model
+baseUrl: http://localhost:9999/v1
+mode: code
+approvalMode: yolo
+allowedTools: []
+customProviders:
+  - name: test-provider
+    apiType: openai
+    baseUrl: http://localhost:9999/v1
+    modelId: test-model
+''');
+  return tempHome;
+}
+
+/// Creates a temp HOME with always-ask approval mode.
+Directory _tempHomeWithApproval() {
+  final tempHome = Directory.systemTemp.createTempSync('fa_test_');
+  File('${tempHome.path}/.fah/config.yaml')
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+provider: openai-completions
+model: test-model
+baseUrl: http://localhost:9999/v1
+mode: code
+approvalMode: always-ask
+allowedTools: []
+''');
+  return tempHome;
+}
+
+/// Creates a temp HOME with default config (no custom providers, yolo mode).
+Directory _tempHome() {
+  final tempHome = Directory.systemTemp.createTempSync('fa_test_');
+  File('${tempHome.path}/.fah/config.yaml')
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+provider: openai-completions
+model: test-model
+baseUrl: http://localhost:9999/v1
+mode: code
+approvalMode: yolo
+allowedTools: []
+''');
+  return tempHome;
+}
+
+/// Creates a temp HOME whose boot model is the fixture `test-mini` and
+/// whose persisted cross-provider model cache seeds the fixture models
+/// the visual picker tests filter by (`test-mini`, `test-max`, `omega`).
+/// This is the real instant-boot path: the CLI trusts a
+/// `~/.fah/model_cache.json` entry younger than 24h, so the picker
+/// renders a deterministic set with no live endpoint.
+Directory _tempHomeWithModels() {
+  final tempHome = Directory.systemTemp.createTempSync('fa_test_');
+  File('${tempHome.path}/.fah/config.yaml')
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+provider: openai-completions
+model: test-mini
+baseUrl: http://localhost:9999/v1
+mode: code
+approvalMode: yolo
+allowedTools: []
+''');
+  File('${tempHome.path}/.fah/model_cache.json').writeAsStringSync(
+    jsonEncode({
+      'openai': {
+        'ids': ['test-mini', 'test-max', 'omega'],
+        'fetchedAtMs': DateTime.now().millisecondsSinceEpoch,
+      },
+    }),
+  );
+  return tempHome;
+}
+
+/// Creates a temp HOME whose endpoint URL is given (e.g. a test HTTP server
+/// on loopback).
+Directory _tempHomeWithEndpoint(String baseUrl) {
+  final tempHome = Directory.systemTemp.createTempSync('fa_test_');
+  File('${tempHome.path}/.fah/config.yaml')
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+provider: openai-completions
+model: test-model
+baseUrl: $baseUrl
+mode: code
+approvalMode: yolo
+allowedTools: []
+''');
+  return tempHome;
+}
+
+/// A canned OpenAI-SSE endpoint for visual tests: with [answer] it always
+/// replies with that text; without it (steer mode) the first user message
+/// gets a `tail -f /dev/null` bash tool call and every later request a text
+/// answer.
+const _answerServerPy = r'''
+import http.server, json, sys
+
+args = sys.argv[1:]
+ANSWER = args[0] if len(args) > 1 else ''
+PORT = int(args[-1])
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        raw = self.rfile.read(int(self.headers.get('Content-Length') or 0))
+        if ANSWER:
+            deltas = [
+                {'choices': [{'delta': {'content': ANSWER}}]},
+                {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
+            ]
+        else:
+            messages = json.loads(raw).get('messages', [])
+            last_user = ''
+            for m in reversed(messages):
+                if m.get('role') == 'user':
+                    c = m.get('content')
+                    last_user = c if isinstance(c, str) else json.dumps(c)
+                    break
+            if 'run the long task' in last_user:
+                deltas = [
+                    {'choices': [{'delta': {'tool_calls': [
+                        {'index': 0, 'id': 'call_1', 'function': {
+                            'name': 'bash',
+                            'arguments': '{"command":"tail -f /dev/null"}'}}]}}]},
+                    {'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]},
+                ]
+            elif ('deploy the app' in last_user
+                    and not any(m.get('role') == 'tool' for m in messages)):
+                # request_secret once: the follow-up request carries the
+                # tool result (role 'tool') and must get a text answer,
+                # not the same tool call again.
+                deltas = [
+                    {'choices': [{'delta': {'tool_calls': [
+                        {'index': 0, 'id': 'call_1', 'function': {
+                            'name': 'request_secret',
+                            'arguments': json.dumps({
+                                'name': 'SUDO_PASSWORD',
+                                'reason': 'deploy Fa.app to /Applications'})}}]}}]},
+                    {'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]},
+                ]
+            elif 'deploy the app' in last_user:
+                deltas = [
+                    {'choices': [{'delta': {'content':
+                        'Secret received — deploying now.'}}]},
+                    {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
+                ]
+            else:
+                deltas = [
+                    {'choices': [{'delta': {'content':
+                        'Working on it — the long task keeps running as a '
+                        'background job.'}}]},
+                    {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
+                ]
+        body = ''.join('data: %s\n\n' % json.dumps(c) for c in deltas)
+        body += 'data: [DONE]\n\n'
+        encoded = body.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Content-Length', str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *a):
+        pass
+
+http.server.HTTPServer(('127.0.0.1', PORT), H).serve_forever()
+''';
+
+/// Grabs a free loopback port for a canned answer server — fixed ports
+/// turned any leaked server (a crashed sibling run holding 18778-18780)
+/// into a bind-time wedge, and the gh-781 cascade: the secret-sheet leak
+/// poisoned the markdown-table test's bind. Same bind-:0-then-hand-the-
+/// port-to-the-script pattern the mouse visual test uses.
+Future<int> _freeLoopbackPort(WidgetTester tester) async {
+  return (await tester.runAsync(() async {
+    final socket = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    final port = socket.port;
+    await socket.close();
+    return port;
+  }))!;
+}
+
+/// Starts the canned-answer server on [port] and waits until it accepts
+/// connections. Process I/O runs in the real-async zone (see the harness
+/// docs on fake-zone timers).
+Future<Process> _startAnsweringServer(
+  WidgetTester tester,
+  int port,
+  String? answer,
+) async {
+  final script = File('${Directory.systemTemp.path}/fa_answer_server_$port.py')
+    ..writeAsStringSync(_answerServerPy);
+  final server = (await tester.runAsync(
+    () => Process.start('python3', [script.path, ?answer, '$port']),
+  ))!;
+  final up = await tester.runAsync(() async {
+    for (var i = 0; i < 50; i++) {
+      try {
+        final socket = await Socket.connect('127.0.0.1', port);
+        await socket.close();
+        return true;
+      } on Object {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+    }
+    return false;
+  });
+  if (up != true) throw StateError('answer server did not start on $port');
+  return server;
+}
+
+/// Stops the canned-answer server (best-effort).
+Future<void> _stopServer(WidgetTester tester, Process server) async {
+  await tester.runAsync(() async {
+    server.kill();
+    await server.exitCode.timeout(
+      const Duration(seconds: 5),
+      onTimeout: () => -1,
+    );
+  });
+}

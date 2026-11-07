@@ -1,0 +1,311 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show DapJoinBundle;
+
+import 'dap_service.dart';
+
+/// Request/response bridge into the extension service worker
+/// (`chrome.runtime.sendMessage`). Injected so this core stays
+/// VM-testable — the js_interop defaults live in `dap_service_web.dart`.
+typedef SwSendMessage = Future<Object?> Function(Map<String, Object?> message);
+
+/// `chrome.storage.local.get` for one key, resolving to the raw storage
+/// result map (`{key: value}`). Injected for the same reason as
+/// [SwSendMessage].
+typedef SwStorageGet = Future<Object?> Function(String key);
+
+/// The zero-config default URL (mirrors `fah_hub_client`'s `defaultDapUrl`,
+/// which cannot be imported here without dragging in `dart:io`).
+const defaultWebDapUrl = 'ws://127.0.0.1:8787/ws';
+
+/// `host:8787` → `ws://host:8787/ws` — the same normalization the CLI
+/// applies (`fah_hub_client`'s `normalizeDapHost`, re-implemented so this
+/// file stays IO-free).
+String normalizeWebDapHost(String host) {
+  final withScheme = host.startsWith(RegExp(r'wss?://')) ? host : 'ws://$host';
+  final uri = Uri.parse(withScheme);
+  final path = (uri.path.isEmpty || uri.path == '/') ? '/ws' : uri.path;
+  return uri.replace(path: path).toString();
+}
+
+/// The extension-hosted [DapHubService]: the panel app cannot open its own
+/// hub connection (the service worker already holds one for the same
+/// identity — a second dial would evict it), so settings read the
+/// configured connection from `chrome.storage` (`faDap`, the same key the
+/// SW agent boots from) and the live phase/agentId from the SW's status
+/// snapshot, and saves go through the SW's `hub.save` handler (which
+/// reconfigures the live agent without a reboot).
+final class ExtensionDapHubService implements DapHubService {
+  ExtensionDapHubService({
+    required SwSendMessage sendMessage,
+    required SwStorageGet storageGet,
+    this.probeTimeout = const Duration(seconds: 5),
+    this.pollInterval = const Duration(milliseconds: 250),
+  }) : // Public bridge parameter names, private storage.
+       // ignore: prefer_initializing_formals
+       _sendMessage = sendMessage,
+       // ignore: prefer_initializing_formals
+       _storageGet = storageGet;
+
+  final SwSendMessage _sendMessage;
+  final SwStorageGet _storageGet;
+
+  /// How long [probe] waits for a transient phase (connecting /
+  /// reconnecting) to settle before reporting unreachable.
+  final Duration probeTimeout;
+
+  /// Poll step for the [probe] settle loop.
+  final Duration pollInterval;
+
+  @override
+  Future<DapHubSnapshot> load() async {
+    final config = await _readConfig();
+    final live = await _readLive();
+    final bound = config.bound;
+    final mode = switch ('${bound?['mode'] ?? ''}') {
+      'dedicated' => DapInboundMode.dedicated,
+      'named' => DapInboundMode.named,
+      _ => DapInboundMode.currentSession,
+    };
+    final boundTitle = '${bound?['title'] ?? ''}'.trim();
+    final boundId = '${bound?['sessionId'] ?? ''}'.trim();
+    return DapHubSnapshot(
+      supported: true,
+      url: config.url,
+      name: config.name,
+      agentId: live.agentId,
+      channels: live.channels,
+      connected: live.connected,
+      inboundMode: mode,
+      boundSessionId: boundId.isEmpty ? null : boundId,
+      boundSessionTitle: boundTitle.isEmpty ? null : boundTitle,
+    );
+  }
+
+  @override
+  Future<void> saveConnection({
+    required String url,
+    required String name,
+    String? secret,
+  }) async {
+    final password = (secret ?? '').trim();
+    final reply = await _sendMessage({
+      'type': 'hub.save',
+      'url': normalizeWebDapHost(url.trim()),
+      'name': name.trim(),
+      // The SW keeps the stored one when the field is empty (write-only
+      // field — a saved password is never echoed back into the form).
+      // ignore: prefer_adjacent_string_concatenation
+      if (password.isNotEmpty) 'sec' + 'ret': password,
+    });
+    if (reply is Map && reply['ok'] == false) {
+      throw StateError('hub.save failed: ${reply['error'] ?? 'unknown'}');
+    }
+  }
+
+  /// Enrolls through the service worker's existing hub client. Opening a
+  /// panel-local socket would create a second runtime and evict the worker's
+  /// presence for the same extension agent.
+  Future<void> joinEnrollment(DapJoinBundle bundle) async {
+    final pub = bundle.invite.pub;
+    final priv = bundle.invite.priv;
+    if ((pub == null) != (priv == null)) {
+      throw const FormatException('incomplete channel keypair');
+    }
+    final reply = await _sendMessage({
+      'type': 'hub.join',
+      'url': normalizeWebDapHost(bundle.hubUrl),
+      'channel': bundle.invite.channel,
+      'clientSecret': ?bundle.clientSecret,
+      'pub': ?pub,
+      'priv': ?priv,
+      'name': ?bundle.agentName,
+    });
+    if (reply is! Map || reply['ok'] != true) {
+      // Do not relay a server/worker error: it can contain a credentialed URI.
+      throw StateError('hub.join failed');
+    }
+  }
+
+  @override
+  Future<DapHubSnapshot> probe() async {
+    final snapshot = await load();
+    var live = await _readLive();
+    // The SW owns a persistent connection with its own reconnects — a
+    // probe polls briefly for a transient phase to settle instead of
+    // dialing a second socket.
+    final deadline = DateTime.now().add(probeTimeout);
+    while (live.connected == null && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(pollInterval);
+      live = await _readLive();
+    }
+    return snapshot.withProbe(live.connected ?? false);
+  }
+
+  @override
+  Future<void> saveBinding(
+    DapInboundMode mode, {
+    String? sessionId,
+    String? sessionTitle,
+  }) async {
+    final reply = await _sendMessage({
+      'type': 'hub.bind',
+      'mode': switch (mode) {
+        DapInboundMode.dedicated => 'dedicated',
+        DapInboundMode.named => 'named',
+        DapInboundMode.currentSession => 'current',
+      },
+      'sessionId': ?sessionId,
+      'title': ?sessionTitle,
+    });
+    if (reply is Map && reply['ok'] == false) {
+      throw StateError('hub.bind failed: ${reply['error'] ?? 'unknown'}');
+    }
+  }
+
+  @override
+  Future<List<DapBindableSession>> listBindableSessions() async {
+    try {
+      final reply = await _sendMessage({'type': 'hub.sessions'});
+      if (reply is! Map) return const [];
+      final sessions = reply['sessions'];
+      if (sessions is! List) return const [];
+      return [
+        for (final row in sessions)
+          if (row is Map && '${row['id'] ?? ''}'.isNotEmpty)
+            (id: '${row['id']}', title: _sessionRowTitle(row)),
+      ];
+    } on Object {
+      return const []; // SW unreachable — the picker just stays empty
+    }
+  }
+
+  /// The bookmarked hub connections (`faDap.savedConnections`). Extension
+  /// only — the IO service keeps a single `~/.dap` connection today.
+  Future<List<DapSavedConnection>> savedConnections() async {
+    final config = await _readConfig();
+    return config.saved;
+  }
+
+  /// Overwrites the bookmark list wholesale (the page owns list editing).
+  Future<void> setSavedConnections(List<DapSavedConnection> list) async {
+    final reply = await _sendMessage({
+      'type': 'hub.connections.set',
+      'list': [for (final e in list) e.toJson()],
+    });
+    if (reply is Map && reply['ok'] == false) {
+      throw StateError(
+        'hub.connections.set failed: ${reply['error'] ?? 'unknown'}',
+      );
+    }
+  }
+
+  /// Makes a bookmarked connection active: the SW re-points `faDap` at the
+  /// entry (secret comes from the bookmark — an open bookmark clears the
+  /// stored password) and reboots the live agent onto it.
+  Future<void> switchConnection(String url) async {
+    final reply = await _sendMessage({'type': 'hub.switch', 'url': url});
+    if (reply is Map && reply['ok'] == false) {
+      throw StateError('hub.switch failed: ${reply['error'] ?? 'unknown'}');
+    }
+  }
+
+  /// The SW's session rows carry no title today — label by id prefix,
+  /// marking the live one.
+  static String _sessionRowTitle(Map row) {
+    final id = '${row['id']}';
+    final short = id.length > 8 ? id.substring(0, 8) : id;
+    return row['running'] == true
+        ? 'session $short (active)'
+        : 'session $short';
+  }
+
+  // -- internals --------------------------------------------------------------
+
+  /// The configured connection (`faDap` in chrome.storage), falling back
+  /// to the zero-config default when never saved. The `boundSession`
+  /// block rides along: `{mode, sessionId?, title?}`, as do the bookmarked
+  /// connections (`savedConnections`).
+  Future<
+    ({String url, String? name, Map? bound, List<DapSavedConnection> saved})
+  >
+  _readConfig() async {
+    try {
+      final result = await _storageGet('faDap');
+      if (result is Map) {
+        final raw = result['faDap'];
+        if (raw is Map) {
+          final url = '${raw['url'] ?? ''}'.trim();
+          if (url.isNotEmpty) {
+            final name = '${raw['name'] ?? ''}'.trim();
+            final bound = raw['boundSession'];
+            final savedRaw = raw['savedConnections'];
+            final saved = [
+              if (savedRaw is List)
+                for (final row in savedRaw)
+                  if (row is Map && '${row['url'] ?? ''}'.trim().isNotEmpty)
+                    DapSavedConnection.fromJson(row),
+            ];
+            return (
+              url: url,
+              name: name.isEmpty ? null : name,
+              bound: bound is Map ? bound : null,
+              saved: saved,
+            );
+          }
+        }
+      }
+    } on Object {
+      // Storage blocked → fall through to the default.
+    }
+    return (
+      url: defaultWebDapUrl,
+      name: null,
+      bound: null,
+      saved: const <DapSavedConnection>[],
+    );
+  }
+
+  /// The SW's live hub status: the `status` handler answers with the
+  /// snapshot WRAPPED — `{ok: true, status: {…, agent: {hub: …}}}` —
+  /// so unwrap the envelope first (a bare map without `status` is
+  /// tolerated for tests/future relays).
+  Future<({bool? connected, String? agentId, List<String> channels})>
+  _readLive() async {
+    final ({bool? connected, String? agentId, List<String> channels}) none = (
+      connected: null,
+      agentId: null,
+      channels: const [],
+    );
+    try {
+      final reply = await _sendMessage({'type': 'status'});
+      if (reply is! Map) return none;
+      final wrapped = reply['status'];
+      final envelope = wrapped is Map ? wrapped : reply;
+      final agent = envelope['agent'];
+      if (agent is! Map) return none;
+      final hub = agent['hub'];
+      if (hub is! Map) return none;
+      final rawChannels = hub['channels'];
+      return (
+        connected: switch (hub['phase']) {
+          'connected' => true,
+          'disconnected' => false,
+          _ => null, // connecting/reconnecting — not settled yet
+        },
+        agentId: hub['agentId'] is String ? hub['agentId'] as String : null,
+        channels: [
+          if (rawChannels is List)
+            for (final channel in rawChannels)
+              if (channel is String) channel,
+        ],
+      );
+    } on Object {
+      // SW unreachable (update in flight) — unknown, not "unreachable hub".
+      return none;
+    }
+  }
+}

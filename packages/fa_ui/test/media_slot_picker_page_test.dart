@@ -1,0 +1,567 @@
+import 'package:fa_ui/fa_ui.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+/// A `/models` fetch reporting image and vision models.
+Future<ModelsEndpointInfo> _someModels(
+  String baseUrl, {
+  required String apiKey,
+}) async => (
+  const ['gpt-image-1', 'dall-e-3', 'gpt-4o'],
+  const <String, int>{},
+  const <String, int>{},
+);
+
+/// Pumps a home button that pushes [page] and captures its pop result.
+Future<void> _pumpWithOpener(
+  WidgetTester tester,
+  Widget page,
+  void Function(MediaSlotEditorResult?) onResult,
+) {
+  return tester.pumpWidget(
+    MaterialApp(
+      home: Builder(
+        builder: (context) => Scaffold(
+          body: FilledButton(
+            onPressed: () async {
+              final result = await Navigator.of(context)
+                  .push<MediaSlotEditorResult>(
+                    MaterialPageRoute(builder: (_) => page),
+                  );
+              onResult(result);
+            },
+            child: const Text('open'),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+Future<void> _open(WidgetTester tester) async {
+  await tester.tap(find.text('open'));
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  group('MediaSlotProviderPickerPage', () {
+    testWidgets('renders the main connection, presets, custom providers and '
+        'the add row; the override provider is checked', (tester) async {
+      final registry = ProviderRegistry.inMemory();
+      await registry.add(
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-1',
+      );
+      await _pumpWithOpener(
+        tester,
+        MediaSlotProviderPickerPage(
+          slot: MediaSlot.imageGeneration,
+          title: 'Edit Image generation',
+          mainBaseUrl: 'https://openrouter.ai/api/v1',
+          initial: const MediaSlotOverride(
+            providerKind: 'openai-completions',
+            baseUrl: 'https://acme.example/v1',
+            modelId: 'acme-img',
+          ),
+          registry: registry,
+          modelsFetcher: _someModels,
+        ),
+        (_) {},
+      );
+      await _open(tester);
+
+      expect(find.text('Edit Image generation'), findsOneWidget);
+      expect(find.text('Main connection'), findsOneWidget);
+      expect(find.text('OpenRouter'), findsOneWidget);
+      expect(find.text('Ollama'), findsOneWidget);
+      expect(find.text('Acme'), findsOneWidget);
+      // The AIIN row added one more entry — the trailing add row can sit
+      // below the fold, so scroll it into view before asserting.
+      await tester.scrollUntilVisible(
+        find.text('Add provider'),
+        120,
+        scrollable: find.byType(Scrollable).last,
+      );
+      expect(find.text('Add provider'), findsOneWidget);
+      expect(find.text('acme.example'), findsOneWidget);
+      // Exactly one row is checked — the override's provider.
+      expect(find.byIcon(Icons.check), findsOneWidget);
+      final checkedTile = tester.widget<ListTile>(
+        find.ancestor(
+          of: find.byIcon(Icons.check),
+          matching: find.byType(ListTile),
+        ),
+      );
+      expect((checkedTile.title as Text).data, 'Acme');
+    });
+
+    testWidgets('the main connection row pops a clear result', (tester) async {
+      MediaSlotEditorResult? result;
+      var popped = false;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotProviderPickerPage(
+          slot: MediaSlot.imageGeneration,
+          title: 'Edit Image generation',
+        ),
+        (value) {
+          popped = true;
+          result = value;
+        },
+      );
+      await _open(tester);
+
+      await tester.tap(find.text('Main connection'));
+      await tester.pumpAndSettle();
+
+      expect(popped, isTrue);
+      expect(result, isNotNull);
+      // gh-1844: "Same as main connection" is the explicit opt-in, saved
+      // as an override — not a clear.
+      expect(result!.cleared, isFalse);
+      expect(result!.override!.useMainConnection, isTrue);
+    });
+
+    testWidgets('a saved model-page result unwinds the whole flow', (
+      tester,
+    ) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        MediaSlotProviderPickerPage(
+          slot: MediaSlot.imageGeneration,
+          title: 'Edit Image generation',
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      await tester.tap(find.text('OpenRouter'));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'gpt-image-1',
+      );
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      // Both pages popped; the section's push resolves with the save.
+      expect(find.byType(MediaSlotProviderPickerPage), findsNothing);
+      expect(result, isNotNull);
+      expect(result!.cleared, isFalse);
+      expect(result!.override!.modelId, 'gpt-image-1');
+    });
+  });
+
+  group('MediaSlotModelPage', () {
+    testWidgets('the fetched list renders immediately and narrows as you '
+        'type', (tester) async {
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: ProviderPreset.openrouter,
+          modelsFetcher: _someModels,
+        ),
+        (_) {},
+      );
+      await _open(tester);
+
+      // No field tap needed — the list is right there.
+      expect(find.text('gpt-image-1'), findsOneWidget);
+      expect(find.text('dall-e-3'), findsOneWidget);
+      expect(find.text('gpt-4o'), findsOneWidget);
+
+      // Quick search narrows it live.
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'dall',
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('dall-e-3'), findsOneWidget);
+      expect(find.text('gpt-image-1'), findsNothing);
+      expect(find.text('gpt-4o'), findsNothing);
+    });
+
+    testWidgets('an unlisted id gets the manual row and still saves', (
+      tester,
+    ) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: ProviderPreset.openrouter,
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'flux-pro',
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Use "flux-pro"'), findsOneWidget);
+      expect(find.text('dall-e-3'), findsNothing);
+
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+      expect(result!.override!.modelId, 'flux-pro');
+    });
+
+    testWidgets('an endpoint without models shows the manual-entry note', (
+      tester,
+    ) async {
+      await _pumpWithOpener(
+        tester,
+        MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: ProviderPreset.openrouter,
+          modelsFetcher: (baseUrl, {required apiKey}) async =>
+              (const <String>[], const <String, int>{}, const <String, int>{}),
+        ),
+        (_) {},
+      );
+      await _open(tester);
+
+      expect(
+        find.text('The endpoint listed no models — type the id manually'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('the /models fetch feeds the quick select', (tester) async {
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: ProviderPreset.openrouter,
+          modelsFetcher: _someModels,
+        ),
+        (_) {},
+      );
+      await _open(tester);
+      // The post-frame fetch completes during settle.
+      expect(find.byType(MediaSlotModelPage), findsOneWidget);
+
+      await tester.tap(find.widgetWithText(TextField, 'Model id'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('dall-e-3'));
+      await tester.pumpAndSettle();
+
+      expect(
+        tester
+            .widget<TextField>(find.widgetWithText(TextField, 'Model id'))
+            .controller!
+            .text,
+        'dall-e-3',
+      );
+    });
+
+    testWidgets('a hosted preset save maps to its well-known key name', (
+      tester,
+    ) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.ollamaCloud,
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'tts-1',
+      );
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      final override = result!.override!;
+      expect(override.providerKind, 'openai-completions');
+      expect(override.baseUrl, 'https://ollama.com/v1');
+      expect(override.modelId, 'tts-1');
+      expect(override.apiKeyName, 'OLLAMA_API_KEY');
+    });
+
+    testWidgets('a custom provider save maps to the host-scoped key name', (
+      tester,
+    ) async {
+      const provider = CustomProvider(
+        id: 'p1',
+        name: 'Acme',
+        baseUrl: 'https://acme.example/v1',
+        modelId: 'acme-img',
+      );
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: provider,
+          initialModel: 'acme-img',
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      // The provider header + prefilled model; save directly.
+      expect(find.text('Acme'), findsWidgets);
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      final override = result!.override!;
+      expect(override.baseUrl, 'https://acme.example/v1');
+      expect(override.modelId, 'acme-img');
+      expect(override.apiKeyName, 'FA_KEY_ACME_EXAMPLE');
+    });
+
+    testWidgets('an empty model id fails validation', (tester) async {
+      var popped = false;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: ProviderPreset.openrouter,
+          initialModel: '',
+          modelsFetcher: _someModels,
+        ),
+        (_) => popped = true,
+      );
+      await _open(tester);
+
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Model id is required'), findsOneWidget);
+      expect(popped, isFalse);
+    });
+
+    testWidgets('the voice field renders only for the TTS slot, prefilled, '
+        'and rides into the saved override', (tester) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.openrouter,
+          // No presets match this model — the free-text field stays.
+          initialModel: 'acme-voice-1',
+          initialVoice: 'af_heart',
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      final voiceField = find.widgetWithText(TextField, 'Voice (optional)');
+      expect(voiceField, findsOneWidget);
+      expect(tester.widget<TextField>(voiceField).controller!.text, 'af_heart');
+
+      await tester.enterText(voiceField, 'nova');
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      expect(result!.override!.modelId, 'acme-voice-1');
+      expect(result!.override!.voice, 'nova');
+    });
+
+    testWidgets('a Gemini TTS model swaps the voice field for the preset '
+        'picker and saves the picked voice', (tester) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.openrouter,
+          initialModel: 'gemini-2.5-flash-preview-tts',
+          initialVoice: 'Kore',
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      // The picker shows the saved voice (with its trait and a preview
+      // button); the free-text field is gone.
+      expect(find.byType(FaVoicePresetPicker), findsOneWidget);
+      expect(find.widgetWithText(TextField, 'Voice (optional)'), findsNothing);
+      expect(find.text('Kore — Firm'), findsOneWidget);
+      expect(find.byIcon(Icons.play_arrow), findsOneWidget);
+
+      await tester.tap(find.byType(DropdownButtonFormField<String>));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Puck — Upbeat').last);
+      await tester.pumpAndSettle();
+
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      expect(result!.override!.modelId, 'gemini-2.5-flash-preview-tts');
+      expect(result!.override!.voice, 'Puck');
+    });
+
+    testWidgets('a saved voice unknown to the presets is kept as-is', (
+      tester,
+    ) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.openrouter,
+          initialModel: 'tts-1',
+          initialVoice: 'my-custom-voice',
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      // tts-1 matches the OpenAI presets; the saved voice is none of them
+      // but still renders (and saves) unchanged.
+      expect(find.byType(FaVoicePresetPicker), findsOneWidget);
+      expect(find.text('my-custom-voice'), findsOneWidget);
+
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      expect(result!.override!.voice, 'my-custom-voice');
+    });
+
+    testWidgets('the picker tracks the typed model id live', (tester) async {
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.openrouter,
+          initialModel: 'acme-voice-1',
+          modelsFetcher: _someModels,
+        ),
+        (_) {},
+      );
+      await _open(tester);
+
+      expect(find.byType(FaVoicePresetPicker), findsNothing);
+      expect(
+        find.widgetWithText(TextField, 'Voice (optional)'),
+        findsOneWidget,
+      );
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'Model id'),
+        'kokoro-82m',
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(FaVoicePresetPicker), findsOneWidget);
+      expect(find.widgetWithText(TextField, 'Voice (optional)'), findsNothing);
+      // Kokoro presets publish no samples — no preview button.
+      expect(find.byIcon(Icons.play_arrow), findsNothing);
+    });
+
+    testWidgets('no voice field outside the TTS slot', (tester) async {
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: ProviderPreset.openrouter,
+          modelsFetcher: _someModels,
+        ),
+        (_) {},
+      );
+      await _open(tester);
+
+      expect(find.widgetWithText(TextField, 'Voice (optional)'), findsNothing);
+    });
+
+    testWidgets('an empty voice field saves no voice', (tester) async {
+      MediaSlotEditorResult? result;
+      await _pumpWithOpener(
+        tester,
+        const MediaSlotModelPage(
+          slot: MediaSlot.audioTts,
+          provider: ProviderPreset.openrouter,
+          initialModel: 'tts-1',
+          modelsFetcher: _someModels,
+        ),
+        (value) => result = value,
+      );
+      await _open(tester);
+
+      await tester.ensureVisible(find.text('Save'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Save'));
+      await tester.pumpAndSettle();
+
+      expect(result!.override!.voice, isNull);
+    });
+
+    testWidgets('a CodeMie custom provider fetches with its remembered key', (
+      tester,
+    ) async {
+      // The SSO flow stores the org JWT via ProviderRegistry.rememberKey —
+      // the model page must resolve it so the /llm_models list loads.
+      final registry = ProviderRegistry.inMemory();
+      final codemie = await registry.add(
+        name: 'CodeMie',
+        baseUrl: 'https://codemie.example.com/code-assistant-api/v1',
+        modelId: 'gpt-4o',
+      );
+      registry.rememberKey(codemie.id, 'codemie-jwt');
+
+      String? fetchedUrl;
+      String? fetchedKey;
+      await _pumpWithOpener(
+        tester,
+        MediaSlotModelPage(
+          slot: MediaSlot.imageGeneration,
+          provider: codemie,
+          registry: registry,
+          modelsFetcher: (baseUrl, {required apiKey}) async {
+            fetchedUrl = baseUrl;
+            fetchedKey = apiKey;
+            return (
+              const ['gpt-4o', 'claude-sonnet'],
+              const <String, int>{},
+              const <String, int>{},
+            );
+          },
+        ),
+        (_) {},
+      );
+      await _open(tester);
+      await tester.pump(const Duration(milliseconds: 100));
+      await tester.pumpAndSettle();
+
+      expect(fetchedUrl, 'https://codemie.example.com/code-assistant-api/v1');
+      expect(fetchedKey, 'codemie-jwt');
+      expect(find.text('claude-sonnet'), findsOneWidget);
+    });
+  });
+}

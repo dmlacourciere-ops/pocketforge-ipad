@@ -1,0 +1,726 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:convert';
+
+import 'package:http/http.dart' as http;
+
+/// The connected GitHub user profile (subset the app needs).
+final class GithubUser {
+  const GithubUser({required this.login, this.avatarUrl});
+
+  factory GithubUser.fromJson(Map<String, dynamic> json) => GithubUser(
+    login: (json['login'] ?? '').toString(),
+    avatarUrl: json['avatar_url']?.toString(),
+  );
+
+  final String login;
+  final String? avatarUrl;
+}
+
+/// A GitHub repository (subset).
+final class GithubRepo {
+  const GithubRepo({
+    required this.fullName,
+    required this.isPrivate,
+    required this.defaultBranch,
+    this.description,
+  });
+
+  factory GithubRepo.fromJson(Map<String, dynamic> json) => GithubRepo(
+    fullName: (json['full_name'] ?? '').toString(),
+    isPrivate: json['private'] == true,
+    defaultBranch: (json['default_branch'] ?? 'main').toString(),
+    description: json['description']?.toString(),
+  );
+
+  final String fullName;
+  final bool isPrivate;
+  final String defaultBranch;
+  final String? description;
+}
+
+/// A pull request (subset).
+final class GithubPull {
+  const GithubPull({
+    required this.number,
+    required this.url,
+    required this.htmlUrl,
+    required this.state,
+    required this.merged,
+    required this.title,
+    this.headSha,
+  });
+
+  factory GithubPull.fromJson(Map<String, dynamic> json) => GithubPull(
+    number: (json['number'] as num).toInt(),
+    url: (json['url'] ?? '').toString(),
+    htmlUrl: (json['html_url'] ?? '').toString(),
+    state: (json['state'] ?? 'open').toString(),
+    merged: json['merged_at'] != null || json['merged'] == true,
+    title: (json['title'] ?? '').toString(),
+    headSha: (json['head'] is Map ? (json['head'] as Map)['sha'] : null)
+        ?.toString(),
+  );
+
+  final int number;
+  final String url;
+  final String htmlUrl;
+
+  /// `open` | `closed`; [merged] distinguishes a published merge from a
+  /// rejected close.
+  final String state;
+  final bool merged;
+  final String title;
+
+  /// Head commit sha of the PR branch — the ref CI check-runs attach to
+  /// (issue #1045 status mapping). Null on synthesized/partial responses.
+  final String? headSha;
+}
+
+/// One CI check run on a ref (subset the publish-status flow needs).
+final class GithubCheckRun {
+  const GithubCheckRun({
+    required this.name,
+    required this.status,
+    this.conclusion,
+    this.htmlUrl,
+    this.outputTitle,
+    this.outputSummary,
+    this.outputText,
+  });
+
+  factory GithubCheckRun.fromJson(Map<String, dynamic> json) {
+    final output = json['output'];
+    String? outputField(String key) =>
+        output is Map &&
+            output[key] != null &&
+            output[key].toString().isNotEmpty
+        ? output[key].toString()
+        : null;
+    return GithubCheckRun(
+      name: (json['name'] ?? '').toString(),
+      status: (json['status'] ?? '').toString(),
+      conclusion: json['conclusion']?.toString(),
+      htmlUrl: json['html_url']?.toString(),
+      outputTitle: outputField('title'),
+      outputSummary: outputField('summary'),
+      outputText: outputField('text'),
+    );
+  }
+
+  /// Check name (the catalog's validator check is `validate`).
+  final String name;
+
+  /// `queued` | `in_progress` | `completed`.
+  final String status;
+
+  /// When completed: `success` | `failure` | `neutral` | `skipped` | ….
+  final String? conclusion;
+
+  /// Browser URL — for the catalog's job checks this is the Actions job
+  /// URL (`…/actions/runs/<run>/job/<job>`).
+  final String? htmlUrl;
+
+  /// The check's rendered output, when the workflow writes one (plain
+  /// `dart run` steps carry none — the verbatim errors then come from the
+  /// job log; see [GithubApiClient.jobLog]).
+  final String? outputTitle;
+  final String? outputSummary;
+  final String? outputText;
+
+  bool get isCompleted => status == 'completed';
+
+  /// Conclusions the catalog treats as a validator verdict AGAINST the
+  /// widget (issue #1045 review): plain failure, a run that outlived its
+  /// budget, and an infrastructure startup failure. `cancelled` and
+  /// `action_required` have no verdict — they keep the PR 'open'.
+  bool get isFailed =>
+      conclusion == 'failure' ||
+      conclusion == 'timed_out' ||
+      conclusion == 'startup_failure';
+}
+
+/// One PR conversation entry (issue comment or review comment, unified).
+final class GithubComment {
+  const GithubComment({
+    required this.author,
+    required this.body,
+    required this.createdAt,
+    required this.isReview,
+  });
+
+  final String author;
+  final String body;
+  final DateTime createdAt;
+
+  /// True for line-level review comments, false for conversation comments.
+  final bool isReview;
+}
+
+/// One entry of a git tree: a file blob. Mode-`160000` entries were
+/// retired with #232 — external widget provenance is the overlay
+/// `source: {repo, commit}` pin, never a tree entry.
+final class GithubTreeEntry {
+  const GithubTreeEntry({required this.path, required this.mode, this.sha});
+
+  /// File blob entry.
+  factory GithubTreeEntry.file(String path, String blobSha) =>
+      GithubTreeEntry(path: path, mode: '100644', sha: blobSha);
+
+  final String path;
+  final String mode;
+  final String? sha;
+
+  Map<String, Object?> toJson() => {
+    'path': path,
+    'mode': mode,
+    'type': 'blob',
+    if (sha != null) 'sha': sha,
+  };
+}
+
+/// A non-2xx GitHub API response, with the status and the server's message.
+final class GithubApiException implements Exception {
+  const GithubApiException(this.statusCode, this.message, {this.errors});
+
+  final int statusCode;
+  final String message;
+  final List<String>? errors;
+
+  bool get isUnauthorized => statusCode == 401;
+  bool get isNotFound => statusCode == 404;
+
+  /// 403 with a rate-limit body — status polling backs off to the reset.
+  bool get isRateLimited =>
+      statusCode == 403 && message.toLowerCase().contains('rate limit');
+
+  /// 403 "Resource not accessible by integration" — the token cannot act
+  /// on this resource at all. Typical for fine-grained PATs (especially
+  /// scoped to "Only select repositories": a repo that does not exist yet
+  /// can never be in the selection) or tokens without the Administration
+  /// repo permission — repository creation needs it.
+  bool get isForbiddenIntegration =>
+      statusCode == 403 &&
+      message.toLowerCase().contains('resource not accessible by integration');
+
+  /// The actionable fix for [isForbiddenIntegration], appended to the
+  /// server message by the write paths ([createRepo], [ensureFork],
+  /// [createPull]).
+  static const tokenPermissionHint =
+      'The connected GitHub token lacks permission for this. Use a classic '
+      'PAT with the public_repo scope, or a fine-grained PAT with "All '
+      'repositories" + Administration (read/write) + Contents (read/write).';
+
+  /// Rethrows [error] with [tokenPermissionHint] appended when it is a
+  /// forbidden-integration failure; otherwise rethrows unchanged.
+  static Never rethrowWithPermissionHint(GithubApiException error) {
+    if (error.isForbiddenIntegration) {
+      throw GithubApiException(
+        error.statusCode,
+        '${error.message}. $tokenPermissionHint',
+        errors: error.errors,
+      );
+    }
+    throw error;
+  }
+
+  /// Validation failed (422) — e.g. fork already exists, ref exists.
+  bool get isValidation => statusCode == 422;
+
+  @override
+  String toString() {
+    final suffix = (errors == null || errors!.isEmpty)
+        ? ''
+        : ' (${errors!.join('; ')})';
+    return 'GitHub API $statusCode: $message$suffix';
+  }
+}
+
+/// Pure-Dart GitHub REST v3 client for the widget-publishing flow
+/// (issue #35). No `gh` CLI — works in the App-Store sandbox; every method
+/// takes an injectable [http.Client] at construction so tests script the
+/// API with `MockClient`.
+///
+/// The token goes ONLY to `https://api.github.com` (literal host check is
+/// unnecessary — the base URI is a constant), via `Authorization: Bearer`.
+/// All mutating calls target the caller's OWN repositories or their fork —
+/// the catalog repo is written exclusively through pull requests.
+class GithubApiClient {
+  GithubApiClient({required this._token, http.Client? httpClient})
+    : _http = httpClient ?? http.Client();
+
+  static const baseUrl = 'https://api.github.com';
+
+  /// The catalog repository every widget PR targets.
+  static const catalogOwner = 'IstiN';
+  static const catalogRepo = 'fa_widgets';
+
+  final String _token;
+  final http.Client _http;
+
+  Map<String, String> get _headers => {
+    'Authorization': 'Bearer $_token',
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+
+  // --- account -------------------------------------------------------------
+
+  /// `GET /user` — the connected account (login + avatar).
+  Future<GithubUser> getUser() async {
+    final json = await _request('GET', '/user');
+    return GithubUser.fromJson(json as Map<String, dynamic>);
+  }
+
+  /// `GET /user` returning the account AND the token's OAuth scopes from
+  /// the `X-OAuth-Scopes` response header. Fine-grained PATs report an
+  /// empty scope list — their permissions are implicit.
+  Future<(GithubUser, List<String>)> getUserAndScopes() async {
+    final uri = Uri.parse('$baseUrl/user');
+    final request = http.Request('GET', uri)..headers.addAll(_headers);
+    final streamed = await _http.send(request);
+    final response = await http.Response.fromStream(streamed);
+    if (response.statusCode >= 400) {
+      // Same message extraction as [_request] so tests and UI show the
+      // server's human message ("Bad credentials"), not the raw JSON.
+      String message = response.body;
+      try {
+        final decoded = jsonDecode(response.body);
+        if (decoded is Map && decoded['message'] != null) {
+          message = decoded['message'].toString();
+        }
+      } on FormatException {
+        // Non-JSON error body — keep the raw text.
+      }
+      throw GithubApiException(response.statusCode, message);
+    }
+    final user = GithubUser.fromJson(
+      jsonDecode(response.body) as Map<String, dynamic>,
+    );
+    final raw = response.headers['x-oauth-scopes'] ?? '';
+    final scopes = [for (final part in raw.split(',')) part.trim()]
+      ..removeWhere((scope) => scope.isEmpty);
+    return (user, scopes);
+  }
+
+  /// Whether a token with these scopes can create repositories and open
+  /// pull requests — what publishing needs. Classic/OAuth-app tokens must
+  /// carry `public_repo` (or the full `repo`); an empty list (fine-grained
+  /// PATs report no scopes) is treated as "unknown — assume yes" and let
+  /// the publish flow surface a precise failure when the rights are
+  /// actually missing.
+  static bool tokenCanCreateRepos(List<String> scopes) =>
+      scopes.isEmpty ||
+      scopes.contains('public_repo') ||
+      scopes.contains('repo');
+
+  // --- repositories --------------------------------------------------------
+
+  /// `GET /repos/<owner>/<name>`; null when the repo does not exist.
+  Future<GithubRepo?> getRepo(String owner, String name) async {
+    try {
+      final json = await _request('GET', '/repos/$owner/$name');
+      return GithubRepo.fromJson(json as Map<String, dynamic>);
+    } on GithubApiException catch (error) {
+      if (error.isNotFound) return null;
+      rethrow;
+    }
+  }
+
+  /// `POST /user/repos` — creates a repo under the connected account.
+  /// Widget repos are PUBLIC ([private] defaults false): the catalog CI
+  /// fetches the pinned commit over anonymous codeload (#232).
+  Future<GithubRepo> createRepo({
+    required String name,
+    String? description,
+    bool private = false,
+  }) async {
+    final Map<String, dynamic> json;
+    try {
+      json =
+          await _request(
+                'POST',
+                '/user/repos',
+                body: {
+                  'name': name,
+                  'private': private,
+                  'description': ?description,
+                  'auto_init': false,
+                },
+              )
+              as Map<String, dynamic>;
+    } on GithubApiException catch (error) {
+      // Creating a repo is exactly what fine-grained PATs without the
+      // Administration permission (or scoped to select repositories)
+      // cannot do — surface the token fix immediately.
+      throw GithubApiException.rethrowWithPermissionHint(error);
+    }
+    return GithubRepo.fromJson(json);
+  }
+
+  /// Forks `<owner>/<repo>` into the connected account (`POST /forks`) and
+  /// waits for the fork to become usable (GitHub forks asynchronously).
+  /// An existing fork is returned as-is. [asUser] is the connected login.
+  Future<GithubRepo> ensureFork({
+    required String owner,
+    required String repo,
+    required String asUser,
+    Future<void> Function(Duration)? sleep,
+  }) async {
+    final existing = await getRepo(asUser, repo);
+    if (existing != null) return existing;
+    await _request('POST', '/repos/$owner/$repo/forks'); // 202 Accepted
+    final nap = sleep ?? Future<void>.delayed;
+    for (var i = 0; i < 20; i++) {
+      await nap(const Duration(milliseconds: 1500));
+      final ready = await getRepo(asUser, repo);
+      if (ready != null) return ready;
+    }
+    throw const GithubApiException(
+      408,
+      'the fork is still being created — try again in a few seconds',
+    );
+  }
+
+  // --- git data ------------------------------------------------------------
+
+  /// The head commit sha of [branch] in `<owner>/<repo>`; null when the
+  /// repo is empty (no commits yet).
+  Future<String?> getHeadSha(String owner, String repo, String branch) async {
+    try {
+      final json =
+          await _request('GET', '/repos/$owner/$repo/git/ref/heads/$branch')
+              as Map<String, dynamic>;
+      final object = json['object'];
+      return object is Map ? object['sha']?.toString() : null;
+    } on GithubApiException catch (error) {
+      // A repo without commits (freshly created) answers 409 "Git
+      // Repository is empty." on the ref read — that is "no branch yet",
+      // not a failure.
+      if (error.isNotFound || error.statusCode == 409) return null;
+      rethrow;
+    }
+  }
+
+  /// `POST /git/blobs` — one file's content; returns the blob sha.
+  Future<String> createBlob(String owner, String repo, String content) async {
+    final json =
+        await _request(
+              'POST',
+              '/repos/$owner/$repo/git/blobs',
+              body: {
+                'content': base64Encode(utf8.encode(content)),
+                'encoding': 'base64',
+              },
+            )
+            as Map<String, dynamic>;
+    return (json['sha'] as String);
+  }
+
+  /// `PUT /repos/<owner>/<repo>/contents/<path>` — creates [path] in a
+  /// single commit and returns the new commit sha. The ONLY write endpoint
+  /// that works on a repo with zero commits (the git data API 409s on
+  /// those) — used to bootstrap a freshly created repo.
+  Future<String> putFile(
+    String owner,
+    String repo,
+    String path, {
+    required String message,
+    required String content,
+    String branch = 'main',
+  }) async {
+    final json =
+        await _request(
+              'PUT',
+              '/repos/$owner/$repo/contents/$path',
+              body: {
+                'message': message,
+                'content': base64Encode(utf8.encode(content)),
+                'branch': branch,
+              },
+            )
+            as Map<String, dynamic>;
+    return ((json['commit'] as Map)['sha'] as String);
+  }
+
+  /// `POST /git/trees` — entries relative to [baseTreeSha] (null = a fresh
+  /// root tree, used for the first commit of an empty repo).
+  Future<String> createTree(
+    String owner,
+    String repo,
+    List<GithubTreeEntry> entries, {
+    String? baseTreeSha,
+  }) async {
+    final json =
+        await _request(
+              'POST',
+              '/repos/$owner/$repo/git/trees',
+              body: {
+                'base_tree': ?baseTreeSha,
+                'tree': [for (final entry in entries) entry.toJson()],
+              },
+            )
+            as Map<String, dynamic>;
+    return json['sha'] as String;
+  }
+
+  /// `POST /git/commits`.
+  Future<String> createCommit(
+    String owner,
+    String repo, {
+    required String treeSha,
+    required String message,
+    String? parentSha,
+  }) async {
+    final json =
+        await _request(
+              'POST',
+              '/repos/$owner/$repo/git/commits',
+              body: {
+                'tree': treeSha,
+                'message': message,
+                'parents': ?(parentSha == null ? null : [parentSha]),
+              },
+            )
+            as Map<String, dynamic>;
+    return json['sha'] as String;
+  }
+
+  /// Creates `refs/heads/<branch>`; 422 (already exists) is fine — the
+  /// follow-up [updateRef] moves it.
+  Future<void> createBranch(
+    String owner,
+    String repo,
+    String branch,
+    String sha,
+  ) async {
+    try {
+      await _request(
+        'POST',
+        '/repos/$owner/$repo/git/refs',
+        body: {'ref': 'refs/heads/$branch', 'sha': sha},
+      );
+    } on GithubApiException catch (error) {
+      if (!error.isValidation) rethrow;
+    }
+  }
+
+  /// `PATCH /git/refs/heads/<branch>` — fast-forward (or force) the branch
+  /// to [sha].
+  Future<void> updateRef(
+    String owner,
+    String repo,
+    String branch,
+    String sha,
+  ) async {
+    await _request(
+      'PATCH',
+      '/repos/$owner/$repo/git/refs/heads/$branch',
+      body: {'sha': sha, 'force': true},
+    );
+  }
+
+  // --- pull requests -------------------------------------------------------
+
+  /// `POST /repos/<owner>/<repo>/pulls` — [head] is `<login>:<branch>` for
+  /// the cross-fork PR; 422 when an identical open PR exists.
+  Future<GithubPull> createPull({
+    required String owner,
+    required String repo,
+    required String head,
+    required String base,
+    required String title,
+    required String body,
+  }) async {
+    final Map<String, dynamic> json;
+    try {
+      json =
+          await _request(
+                'POST',
+                '/repos/$owner/$repo/pulls',
+                body: {
+                  'head': head,
+                  'base': base,
+                  'title': title,
+                  'body': body,
+                },
+              )
+              as Map<String, dynamic>;
+    } on GithubApiException catch (error) {
+      throw GithubApiException.rethrowWithPermissionHint(error);
+    }
+    return GithubPull.fromJson(json);
+  }
+
+  /// `GET /repos/<owner>/<repo>/pulls/<number>`; null when gone.
+  Future<GithubPull?> getPull(String owner, String repo, int number) async {
+    try {
+      final json =
+          await _request('GET', '/repos/$owner/$repo/pulls/$number')
+              as Map<String, dynamic>;
+      return GithubPull.fromJson(json);
+    } on GithubApiException catch (error) {
+      if (error.isNotFound) return null;
+      rethrow;
+    }
+  }
+
+  /// The open PR for a head branch, if any — re-publish dedupes on this.
+  Future<GithubPull?> findOpenPull(
+    String owner,
+    String repo, {
+    required String head,
+  }) async {
+    final json =
+        await _request(
+              'GET',
+              '/repos/$owner/$repo/pulls?state=open&head=${Uri.encodeComponent(head)}',
+            )
+            as List<dynamic>;
+    if (json.isEmpty) return null;
+    return GithubPull.fromJson(json.first as Map<String, dynamic>);
+  }
+
+  /// Conversation + review comments of a PR, merged and date-sorted.
+  Future<List<GithubComment>> listPullComments(
+    String owner,
+    String repo,
+    int number,
+  ) async {
+    final issueComments =
+        await _request('GET', '/repos/$owner/$repo/issues/$number/comments')
+            as List<dynamic>;
+    final reviewComments =
+        await _request('GET', '/repos/$owner/$repo/pulls/$number/comments')
+            as List<dynamic>;
+    final all = <GithubComment>[
+      for (final raw in issueComments)
+        _comment(raw as Map<String, dynamic>, isReview: false),
+      for (final raw in reviewComments)
+        _comment(raw as Map<String, dynamic>, isReview: true),
+    ]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return all;
+  }
+
+  // --- check runs (issue #1045 publish status) ------------------------------
+
+  /// Check runs attached to [ref] (a commit sha) in `<owner>/<repo>` —
+  /// for a catalog PR the head-sha runs carry the `validate` verdict.
+  Future<List<GithubCheckRun>> listCheckRuns(
+    String owner,
+    String repo,
+    String ref,
+  ) async {
+    // Paginate — a bare first page would treat a failing check beyond 100
+    // entries as "all green" (issue #1045 review). Bounded at 5 pages.
+    final raw = <Object?>[];
+    var page = 1;
+    var totalCount = 0;
+    while (true) {
+      final json =
+          await _request(
+                'GET',
+                '/repos/$owner/$repo/commits/$ref/check-runs'
+                    '?per_page=100&page=$page',
+              )
+              as Map<String, dynamic>;
+      totalCount = (json['total_count'] as num?)?.toInt() ?? 0;
+      final batch = json['check_runs'];
+      if (batch is! List || batch.isEmpty) break;
+      raw.addAll(batch);
+      if (raw.length >= totalCount || page >= 5) break;
+      page++;
+    }
+    return [
+      for (final run in raw)
+        GithubCheckRun.fromJson(Map<String, dynamic>.from(run as Map)),
+    ];
+  }
+
+  /// The plain-text log of an Actions job — where the catalog validator's
+  /// `ERROR <id>: …` lines live verbatim (the check-run output itself is
+  /// empty for plain `dart run` steps). Null when the log is unreachable
+  /// (expired, rate-limited) — the caller keeps the last-known errors and
+  /// the run link instead.
+  Future<String?> jobLog(String owner, String repo, int jobId) async {
+    final uri = Uri.parse(
+      '$baseUrl/repos/$owner/$repo/actions/jobs/$jobId/logs',
+    );
+    final request = http.Request('GET', uri)..headers.addAll(_headers);
+    // refreshStatus polls this once per failing check every tick — bound
+    // the fetch so a wedged log endpoint degrades to "keep last-known"
+    // instead of hanging the poller. Plain `.timeout(d)` (no onTimeout
+    // closure): the timeout THROWS, so there is no value substitution to
+    // mis-reify against a real IOClient (the gh-1125 failure shape).
+    const logTimeout = Duration(seconds: 30);
+    final streamed = await _http.send(request).timeout(logTimeout);
+    final response = await http.Response.fromStream(
+      streamed,
+    ).timeout(logTimeout);
+    if (response.statusCode >= 400) return null;
+    return response.body;
+  }
+
+  /// The Actions job id encoded in a check-run's job URL
+  /// (`…/actions/runs/<run>/job/<job>`), or null when [htmlUrl] is not a
+  /// job URL.
+  static int? jobIdFromUrl(String? htmlUrl) {
+    if (htmlUrl == null) return null;
+    final match = RegExp(r'/job/(\d+)').firstMatch(htmlUrl);
+    return match == null ? null : int.parse(match.group(1)!);
+  }
+
+  GithubComment _comment(Map<String, dynamic> json, {required bool isReview}) {
+    final user = json['user'];
+    return GithubComment(
+      author: user is Map ? (user['login'] ?? '?').toString() : '?',
+      body: (json['body'] ?? '').toString(),
+      createdAt:
+          DateTime.tryParse((json['created_at'] ?? '').toString()) ??
+          DateTime.fromMillisecondsSinceEpoch(0),
+      isReview: isReview,
+    );
+  }
+
+  // --- transport -----------------------------------------------------------
+
+  Future<Object?> _request(
+    String method,
+    String path, {
+    Map<String, Object?>? body,
+  }) async {
+    final uri = Uri.parse('$baseUrl$path');
+    final request = http.Request(method, uri)..headers.addAll(_headers);
+    if (body != null) {
+      request.headers['content-type'] = 'application/json';
+      request.body = jsonEncode(body);
+    }
+    final streamed = await _http.send(request);
+    final response = await http.Response.fromStream(streamed);
+    final text = response.body;
+    if (response.statusCode >= 400) {
+      String message = text;
+      List<String>? errors;
+      try {
+        final decoded = jsonDecode(text);
+        if (decoded is Map<String, dynamic>) {
+          message = (decoded['message'] ?? message).toString();
+          final raw = decoded['errors'];
+          if (raw is List) {
+            errors = [
+              for (final e in raw)
+                e is Map ? (e['message'] ?? e['code'] ?? e).toString() : '$e',
+            ];
+          }
+        }
+      } on FormatException {
+        // Non-JSON error body (proxy pages etc.) — keep the raw text.
+      }
+      throw GithubApiException(response.statusCode, message, errors: errors);
+    }
+    if (text.isEmpty) return null;
+    return jsonDecode(text);
+  }
+}

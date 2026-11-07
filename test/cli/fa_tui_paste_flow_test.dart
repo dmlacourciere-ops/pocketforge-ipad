@@ -1,0 +1,609 @@
+/// The Ctrl+V paste flow at the model level (issue #276): a wired reader
+/// turns the keystroke into a chip, failures print their named reason,
+/// slash/bang submits keep the chips while plain submits consume them and
+/// hand the images to the host callback.
+library;
+
+import 'package:dart_tui/dart_tui.dart';
+
+import 'package:flutter_agent_harness/src/cli/fa_tui.dart';
+import 'package:flutter_agent_harness/src/cli/paste_image.dart';
+import 'package:flutter_agent_harness/src/cli/tui_prompt.dart';
+import 'package:test/test.dart';
+
+/// A PNG signature plus a payload — sniffable, under every cap.
+final _png = <int>[
+  0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, //
+  0x00, 0x00, 0x01, 0x02,
+];
+
+/// Not an image under any magic the sniffer knows.
+final _garbage = <int>[1, 2, 3, 4, 5, 6, 7, 8];
+
+FaTuiModel build({
+  Future<PasteboardRead> Function()? reader,
+  Future<PasteboardRead> Function()? textReader,
+  void Function(String line, List<TuiImageAttachment> images)? onSubmit,
+  List<TuiImageAttachment> attachments = const [],
+  String inputText = 'hello',
+  DateTime Function()? now,
+}) {
+  return FaTuiModel(
+    callbacks: FaTuiCallbacks(
+      onSubmit: (line, {images = const []}) async =>
+          onSubmit?.call(line, images),
+      onSteer: (messages, {images}) async {},
+      onModelSelected: (_) async {},
+      buildSlashMenu: (_) => const [],
+      buildModelMenu: (_, _) => const [],
+      statusLine: () => 'test',
+      prompt: 'fa> ',
+      readClipboardImage: reader,
+      readClipboardText: textReader,
+    ),
+    isExited: () => false,
+    termHeight: 12,
+    now: now,
+  ).copyWith(attachments: attachments, inputText: inputText);
+}
+
+void main() {
+  group('prompt sheet: one paste gesture inserts exactly once (review of #1974)',
+      () {
+    FaTuiModel sheet({
+      required Future<PasteboardRead> Function() textReader,
+    }) => build(textReader: textReader).copyWith(
+      prompt: TuiPromptState(SecretPromptSpec(name: 'KEY', reason: 'r')),
+    );
+
+    KeyPressMsg ctrlV() => KeyPressMsg(
+      const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+    );
+
+    test('the ctrl+v twin of a bracketed paste does not double the token',
+        () async {
+      // A terminal may deliver ONE paste gesture as both the ctrl+v key event
+      // and a bracketed PasteMsg. Before the gesture window covered this path
+      // the sheet received "sk-tokensk-token" (masked, so invisible).
+      var model = sheet(textReader: () async => const PasteboardText('sk-token'));
+
+      final (afterKey, cmd) = model.update(ctrlV());
+      model = afterKey as FaTuiModel;
+      final (afterPaste, _) = model.update(PasteMsg('sk-token'));
+      model = afterPaste as FaTuiModel;
+
+      final followUp = await cmd?.call();
+      if (followUp != null) {
+        model = model.update(followUp).$1 as FaTuiModel;
+      }
+
+      expect(model.prompt?.secretValue, 'sk-token');
+    });
+
+    test('a bracketed paste first absorbs the twin ctrl+v key', () {
+      var model = sheet(textReader: () async => const PasteboardText('sk-token'));
+
+      final (afterPaste, _) = model.update(PasteMsg('sk-token'));
+      model = afterPaste as FaTuiModel;
+      final (afterKey, cmd) = model.update(ctrlV());
+      model = afterKey as FaTuiModel;
+
+      expect(cmd, isNull, reason: 'the paste already owns this gesture');
+      expect(model.prompt?.secretValue, 'sk-token');
+    });
+
+    test('a clipboard result for a sheet that closed meanwhile is dropped',
+        () async {
+      var model = sheet(textReader: () async => const PasteboardText('sk-token'));
+
+      final (afterKey, cmd) = model.update(ctrlV());
+      model = (afterKey as FaTuiModel).copyWith(clearPrompt: true);
+
+      final followUp = await cmd?.call();
+      if (followUp != null) {
+        model = model.update(followUp).$1 as FaTuiModel;
+      }
+
+      expect(model.prompt, isNull, reason: 'a late result must not reopen it');
+      expect(
+        model.inputText,
+        isNot(contains('sk-token')),
+        reason: 'a rescued secret must never leak into the composer',
+      );
+    });
+  });
+
+  test('ctrl+v pastes the clipboard text into an open prompt sheet', () async {
+    // gh-1575 wired the text fallback for the composer; a prompt sheet (the
+    // provider/secret wizard) owns typed input, so Ctrl+V used to be a silent
+    // no-op exactly where a token has to be pasted.
+    var model = build(
+      textReader: () async => const PasteboardText('sk-token-123'),
+    );
+    model = model.copyWith(
+      prompt: TuiPromptState(SecretPromptSpec(name: 'KEY', reason: 'r')),
+    );
+
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    // The read is async: the sheet is untouched until the message lands.
+    expect(model.prompt?.secretValue, isEmpty);
+
+    final followUp = await cmd?.call();
+    if (followUp != null) {
+      model = model.update(followUp).$1 as FaTuiModel;
+    }
+
+    expect(model.prompt?.secretValue, 'sk-token-123');
+    // A paste must not answer the sheet: it stays open for Enter.
+    expect(model.prompt, isNotNull);
+  });
+
+  test('ctrl+v in a prompt ignores an empty clipboard silently', () async {
+    var model = build(textReader: () async => const PasteboardText(''));
+    model = model.copyWith(
+      prompt: TuiPromptState(SecretPromptSpec(name: 'KEY', reason: 'r')),
+    );
+
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    if (followUp != null) {
+      model = model.update(followUp).$1 as FaTuiModel;
+    }
+
+    expect(model.prompt?.secretValue, isEmpty);
+    expect(model.view().content, isNot(contains('clipboard')));
+  });
+
+  test('ctrl+v in a prompt is a no-op without a text reader', () {
+    // Web/headless hosts wire no reader: the pre-existing silence is kept.
+    var model = build(reader: () async => PasteboardImage(_png));
+    model = model.copyWith(
+      prompt: TuiPromptState(SecretPromptSpec(name: 'KEY', reason: 'r')),
+    );
+
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+
+    expect(cmd, isNull);
+    final after = next as FaTuiModel;
+    expect(after.prompt?.secretValue, isEmpty);
+    // The composer's image path is never reached from prompt mode.
+    expect(after.attachments, isEmpty);
+  });
+
+  test('ctrl+v in a prompt stays silent when the pasteboard is unavailable', () async {
+    var model = build(
+      textReader: () async => const PasteboardUnavailable('no pasteboard'),
+    );
+    model = model.copyWith(
+      prompt: TuiPromptState(SecretPromptSpec(name: 'KEY', reason: 'r')),
+    );
+
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    if (followUp != null) {
+      model = model.update(followUp).$1 as FaTuiModel;
+    }
+
+    expect(model.prompt?.secretValue, isEmpty);
+    expect(model.view().content, isNot(contains('no pasteboard')));
+  });
+
+  test('ctrl+v with a wired reader attaches a chip', () async {
+    var model = build(reader: () async => PasteboardImage(_png));
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    // The keystroke produced the async read; its result message carries
+    // the image into a chip.
+    final followUp = await cmd?.call();
+    if (followUp != null) {
+      model = model.update(followUp).$1 as FaTuiModel;
+    }
+
+    expect(model.attachments, hasLength(1));
+    expect(model.attachments.first.chip, '[image: clipboard-1.png 12B]');
+    expect(model.view().content, contains('[image: clipboard-1.png 12B]'));
+  });
+
+  test('an unavailable pasteboard prints its named reason', () async {
+    var model = build(
+      reader: () async =>
+          const PasteboardUnavailable('no pasteboard on this host'),
+    );
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    if (followUp != null) {
+      model = model.update(followUp).$1 as FaTuiModel;
+    }
+
+    expect(model.attachments, isEmpty);
+    expect(
+      model.outputLines.join('\n'),
+      contains('no pasteboard on this host'),
+    );
+  });
+
+  test('non-image clipboard bytes print the named error', () async {
+    var model = build(reader: () async => PasteboardImage(_garbage));
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    if (followUp != null) {
+      model = model.update(followUp).$1 as FaTuiModel;
+    }
+
+    expect(model.outputLines.join('\n'), contains('magic bytes'));
+  });
+
+  test('ctrl+v without a reader prints the unavailable hint', () async {
+    var model = build();
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    expect(cmd, isNull, reason: 'no reader: a synchronous note, no work');
+    expect(model.attachments, isEmpty);
+    expect(model.outputLines.join('\n'), contains('clipboard'));
+  });
+
+  // --- gh-1575: Ctrl+V with a TEXT clipboard pastes the text ---
+
+  test('ctrl+v with a TEXT clipboard and no image inserts the text', () async {
+    var model = build(
+      reader: () async =>
+          const PasteboardUnavailable('clipboard holds no image'),
+      textReader: () async => const PasteboardText('pasted words'),
+      inputText: '',
+    );
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.inputText, 'pasted words', reason: 'text lands in composer');
+    expect(model.attachments, isEmpty);
+    expect(model.outputLines.join('\n'), isNot(contains('no image')),
+        reason: 'no dead-end error when text was pasted instead');
+  });
+
+  test('ctrl+v with neither image nor text keeps the named reason', () async {
+    var model = build(
+      reader: () async =>
+          const PasteboardUnavailable('clipboard holds no image'),
+      textReader: () async =>
+          const PasteboardUnavailable('clipboard holds no text'),
+    );
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.attachments, isEmpty);
+    expect(model.inputText, 'hello', reason: 'nothing to paste');
+    expect(
+      model.outputLines.join('\n'),
+      contains('clipboard holds no image'),
+    );
+  });
+
+  test('ctrl+v prefers the image and never consults the text reader',
+      () async {
+    var textProbes = 0;
+    var model = build(
+      reader: () async => PasteboardImage(_png),
+      textReader: () async {
+        textProbes++;
+        return const PasteboardText('should not be used');
+      },
+    );
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.attachments, hasLength(1));
+    expect(model.inputText, 'hello', reason: 'text fallback never fired');
+    expect(textProbes, 0);
+  });
+
+  test('ctrl+v text fallback without a wired text reader keeps the reason',
+      () async {
+    var model = build(
+      reader: () async =>
+          const PasteboardUnavailable('no pasteboard on this host'),
+      inputText: '',
+    );
+    final (next, cmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.inputText, '');
+    expect(
+      model.outputLines.join('\n'),
+      contains('no pasteboard on this host'),
+    );
+  });
+
+  test('a plain submit consumes the chips and passes them to the host',
+      () async {
+    final submitted = <(String, List<TuiImageAttachment>)>[];
+    var model = build(
+      attachments: [
+        TuiImageAttachment(
+          name: 'clipboard-1.png',
+          mimeType: 'image/png',
+          bytes: _png,
+        ),
+      ],
+      onSubmit: (line, images) => submitted.add((line, images)),
+    );
+    final (next, cmd) = model.update(KeyPressMsg(const TeaKey(code: KeyCode.enter)));
+    model = next as FaTuiModel;
+
+    expect(model.attachments, isEmpty, reason: 'chips are consumed');
+    await cmd?.call();
+    expect(submitted, hasLength(1));
+    expect(submitted.single.$1, 'hello');
+    expect(submitted.single.$2, hasLength(1));
+  });
+
+  test('a slash submit keeps the chips for the next message', () {
+    var model = build(
+      attachments: [
+        TuiImageAttachment(
+          name: 'clipboard-1.png',
+          mimeType: 'image/png',
+          bytes: _png,
+        ),
+      ],
+      inputText: '/help',
+    );
+    final (next, cmd) = model.update(KeyPressMsg(const TeaKey(code: KeyCode.enter)));
+    model = next as FaTuiModel;
+
+    expect(model.attachments, hasLength(1), reason: 'slash keeps chips (E2)');
+  });
+
+  test('a theme swap repaints without losing composer state', () {
+    var model = build();
+    model = model.update(const ThemeSwappedMsg()).$1 as FaTuiModel;
+    expect(model.inputText, 'hello');
+    expect(model.view().content, contains('hello'));
+  });
+
+  // --- Issue #1067: any paste action probes the clipboard for images ---
+
+  test('an empty bracketed paste with a clipboard image attaches a chip',
+      () async {
+    var model = build(reader: () async => PasteboardImage(_png), inputText: '');
+    final (next, cmd) = model.update(PasteMsg(''));
+    model = next as FaTuiModel;
+    expect(cmd, isNotNull, reason: 'the paste fires the clipboard probe');
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.attachments, hasLength(1));
+    expect(model.attachments.first.chip, '[image: clipboard-1.png 12B]');
+  });
+
+  test('a text bracketed paste inserts the text AND attaches the image',
+      () async {
+    var model = build(reader: () async => PasteboardImage(_png), inputText: '');
+    final (next, cmd) = model.update(PasteMsg('pasted text'));
+    model = next as FaTuiModel;
+    expect(model.inputText, 'pasted text',
+        reason: 'text insertion is unchanged');
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.inputText, 'pasted text', reason: 'attach is additive');
+    expect(model.attachments, hasLength(1));
+  });
+
+  test('a bracketed paste without an image stays silent — no chip, no note',
+      () async {
+    var model = build(
+      reader: () async =>
+          const PasteboardUnavailable('no pasteboard on this host'),
+      inputText: '',
+    );
+    final linesBefore = model.outputLines.length;
+    final (next, cmd) = model.update(PasteMsg('plain words'));
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.inputText, 'plain words');
+    expect(model.attachments, isEmpty);
+    expect(model.outputLines.length, linesBefore,
+        reason: 'failed probes never print on a normal text paste');
+  });
+
+  test('a bracketed paste without a wired reader inserts text, no probe', () {
+    var model = build(inputText: '');
+    final (next, cmd) = model.update(PasteMsg('plain words'));
+    model = next as FaTuiModel;
+
+    expect(cmd, isNull);
+    expect(model.inputText, 'plain words');
+  });
+
+  test('prompt mode never probes — pastes stay plain text (AC4)', () {
+    var model = build(reader: () async => PasteboardImage(_png)).copyWith(
+      prompt: TuiPromptState(TextPromptSpec(question: 'Pick')),
+    );
+    final (next, cmd) = model.update(PasteMsg('secret-key'));
+    model = next as FaTuiModel;
+
+    expect(cmd, isNull, reason: 'no clipboard probe in prompt mode');
+    expect(model.prompt, isNotNull, reason: 'paste went to the prompt buffer');
+    expect(model.attachments, isEmpty);
+  });
+
+  test('ctrl+v and the bracketed paste of one action attach ONE chip',
+      () async {
+    var t = 1000;
+    var model = build(
+      reader: () async => PasteboardImage(_png),
+      now: () => DateTime.fromMillisecondsSinceEpoch(t),
+      inputText: '',
+    );
+    // One user paste in a bracketed-paste terminal: the key event AND the
+    // paste message both arrive. Only the first path fires a probe.
+    final (m1, keyCmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    final (m2, pasteCmd) = (m1 as FaTuiModel).update(PasteMsg(''));
+    expect(pasteCmd, isNull,
+        reason: 'the twin path never spawns a second subprocess read');
+    final keyResult = await keyCmd?.call();
+    final (m3, _) = (m2 as FaTuiModel).update(keyResult!);
+
+    expect((m3 as FaTuiModel).attachments, hasLength(1));
+  });
+
+  test('a bracketed-paste twin after a slow read still spawns no probe',
+      () async {
+    var t = 1000;
+    var model = build(
+      reader: () async => PasteboardImage(_png),
+      now: () => DateTime.fromMillisecondsSinceEpoch(t),
+      inputText: '',
+    );
+    // The key-event probe fires at t=1000 but its result lands late; the
+    // twin PasteMsg arrives at t=1400 — inside the gesture window — and
+    // must not probe again regardless of result timing.
+    final (m1, keyCmd) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    t = 1400;
+    final (m2, pasteCmd) = (m1 as FaTuiModel).update(PasteMsg(''));
+    expect(pasteCmd, isNull);
+    final keyResult = await keyCmd?.call();
+    final (m3, _) = (m2 as FaTuiModel).update(keyResult!);
+
+    expect((m3 as FaTuiModel).attachments, hasLength(1));
+  });
+
+  test('a second paste after the gesture window probes and attaches again',
+      () async {
+    var t = 1000;
+    var model = build(
+      reader: () async => PasteboardImage(_png),
+      now: () => DateTime.fromMillisecondsSinceEpoch(t),
+      inputText: '',
+    );
+    final (m1, cmd1) = model.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    t = 1100;
+    final firstResult = await cmd1?.call();
+    final (m2, _) = (m1 as FaTuiModel).update(firstResult!);
+    expect((m2 as FaTuiModel).attachments, hasLength(1));
+
+    // A deliberate second paste much later attaches its own chip.
+    t = 1700; // beyond the 500ms gesture window
+    final (m3, cmd2) = m2.update(
+      KeyPressMsg(
+        const TeaKey(code: KeyCode.rune, text: 'v', modifiers: {KeyMod.ctrl}),
+      ),
+    );
+    final secondResult = await cmd2?.call();
+    final (m4, _) = (m3 as FaTuiModel).update(secondResult!);
+
+    expect((m4 as FaTuiModel).attachments, hasLength(2));
+  });
+
+  test('an oversized image on an EMPTY paste names the failure (image intent)',
+      () async {
+    var model = build(
+      reader: () async =>
+          PasteboardImage(List.filled(maxPasteImageBytes + 1, 0)),
+      inputText: '',
+    );
+    final (next, cmd) = model.update(PasteMsg(''));
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.attachments, isEmpty);
+    expect(
+      model.outputLines.join('\n'),
+      contains('clipboard image too large'),
+    );
+  });
+
+  test('an oversized image on a text paste stays silent', () async {
+    var model = build(
+      reader: () async =>
+          PasteboardImage(List.filled(maxPasteImageBytes + 1, 0)),
+      inputText: '',
+    );
+    final linesBefore = model.outputLines.length;
+    final (next, cmd) = model.update(PasteMsg('plain words'));
+    model = next as FaTuiModel;
+    final followUp = await cmd?.call();
+    model = model.update(followUp!).$1 as FaTuiModel;
+
+    expect(model.inputText, 'plain words');
+    expect(model.attachments, isEmpty);
+    expect(model.outputLines.length, linesBefore,
+        reason: 'a normal text paste never prints clipboard errors');
+  });
+}

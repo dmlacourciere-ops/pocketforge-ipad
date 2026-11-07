@@ -1,0 +1,882 @@
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+void main() {
+  group('parseCliArgs', () {
+    test('no args is interactive REPL mode', () {
+      final result = parseCliArgs(const []);
+      expect(result, isA<CliArgs>());
+      final args = result as CliArgs;
+      expect(args.isHeadless, isFalse);
+      expect(args.prompt, isNull);
+      expect(args.positionals, isEmpty);
+      expect(args.provider, 'openai-completions');
+      expect(args.providerExplicit, isFalse);
+    });
+
+    test('--provider marks the provider explicit', () {
+      final args = parseCliArgs(const ['--provider', 'dial']) as CliArgs;
+      expect(args.provider, 'dial');
+      expect(args.providerExplicit, isTrue);
+    });
+
+    test('a single positional is the headless prompt source', () {
+      final args = parseCliArgs(const ['summarize the changelog']) as CliArgs;
+      expect(args.isHeadless, isTrue);
+      expect(args.positionals, ['summarize the changelog']);
+      expect(args.prompt, isNull);
+    });
+
+    test('multiple positionals are preserved in order (joined later)', () {
+      final args = parseCliArgs(const ['fix', 'the', 'typos']) as CliArgs;
+      expect(args.positionals, ['fix', 'the', 'typos']);
+    });
+
+    test('-p sets the prompt verbatim', () {
+      final args = parseCliArgs(const ['-p', 'do the thing']) as CliArgs;
+      expect(args.prompt, 'do the thing');
+      expect(args.positionals, isEmpty);
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('--prompt sets the prompt verbatim', () {
+      final args = parseCliArgs(const ['--prompt', 'do the thing']) as CliArgs;
+      expect(args.prompt, 'do the thing');
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('-p combined with a positional is an error', () {
+      expect(
+        () => parseCliArgs(const ['-p', 'text', 'extra']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('cannot combine'),
+          ),
+        ),
+      );
+    });
+
+    test('--prompt-file sets the file path', () {
+      final args =
+          parseCliArgs(const ['--prompt-file', '/tmp/prompt.md']) as CliArgs;
+      expect(args.promptFile, '/tmp/prompt.md');
+      expect(args.prompt, isNull);
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('-f is an alias for --prompt-file', () {
+      final args = parseCliArgs(const ['-f', 'notes.txt']) as CliArgs;
+      expect(args.promptFile, 'notes.txt');
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('--prompt-file without a value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--prompt-file']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--prompt-file requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('--prompt-file combined with -p is an error', () {
+      expect(
+        () => parseCliArgs(const ['--prompt-file', 'a.md', '-p', 'text']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('cannot combine'),
+          ),
+        ),
+      );
+    });
+
+    test('--prompt-file combined with a positional is an error', () {
+      expect(
+        () => parseCliArgs(const ['-f', 'a.md', 'extra']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('cannot combine'),
+          ),
+        ),
+      );
+    });
+
+    test('--system-prompt sets the verbatim override', () {
+      final args =
+          parseCliArgs(const ['--system-prompt', 'You are terse.']) as CliArgs;
+      expect(args.systemPrompt, 'You are terse.');
+      expect(args.systemPromptFile, isNull);
+    });
+
+    test('--system-prompt-file sets the file path', () {
+      final args =
+          parseCliArgs(const ['--system-prompt-file', '~/prompts/sys.md'])
+              as CliArgs;
+      expect(args.systemPromptFile, '~/prompts/sys.md');
+      expect(args.systemPrompt, isNull);
+    });
+
+    test('--system-prompt combined with --system-prompt-file is an error', () {
+      expect(
+        () => parseCliArgs(const [
+          '--system-prompt',
+          'x',
+          '--system-prompt-file',
+          'sys.md',
+        ]),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('cannot combine --system-prompt and --system-prompt-file'),
+          ),
+        ),
+      );
+    });
+
+    test('unknown flag still fails', () {
+      expect(
+        () => parseCliArgs(const ['--bogus']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown argument: --bogus'),
+          ),
+        ),
+      );
+    });
+
+    test('a dash-prefixed unknown argument fails even next to positionals', () {
+      expect(
+        () => parseCliArgs(const ['hello', '-x']),
+        throwsA(isA<CliArgsException>()),
+      );
+    });
+
+    test('flags and positionals mix freely', () {
+      final args =
+          parseCliArgs(const [
+                '--model',
+                'openai/gpt-4o-mini',
+                '--cwd',
+                '/tmp/work',
+                'summarize this',
+              ])
+              as CliArgs;
+      expect(args.model, 'openai/gpt-4o-mini');
+      expect(args.cwd, '/tmp/work');
+      expect(args.positionals, ['summarize this']);
+    });
+
+    test('all long flags parse (moved from bin/fah.dart)', () {
+      final args =
+          parseCliArgs(const [
+                '--model',
+                'm',
+                '--provider',
+                'anthropic',
+                '--base-url',
+                'https://api.example',
+                '--vision-model',
+                'gpt-4o',
+                '--vision-base-url',
+                'https://vision.example',
+                '--transcribe-model',
+                'whisper-1',
+                '--transcribe-base-url',
+                'https://transcribe.example',
+                '--plugin',
+                'inspect_image',
+                '--plugin',
+                'transcribe_audio',
+                '--prompt-template-dir',
+                '/a',
+                '--prompt-template-dir',
+                '/b',
+                '--mode',
+                'review',
+                '--session-root',
+                '/sessions',
+                '--session',
+                'feature-x',
+                '--cube',
+                'dev',
+                '--cube-config',
+                '/c/dev.yaml',
+              ])
+              as CliArgs;
+      expect(args.model, 'm');
+      expect(args.provider, 'anthropic');
+      expect(args.baseUrl, 'https://api.example');
+      expect(args.visionModel, 'gpt-4o');
+      expect(args.visionBaseUrl, 'https://vision.example');
+      expect(args.transcribeModel, 'whisper-1');
+      expect(args.transcribeBaseUrl, 'https://transcribe.example');
+      expect(args.plugins, ['inspect_image', 'transcribe_audio']);
+      expect(args.promptTemplateDirs, ['/a', '/b']);
+      expect(args.mode, 'review');
+      expect(args.sessionRoot, '/sessions');
+      expect(args.session, 'feature-x');
+      expect(args.cubeName, 'dev');
+      expect(args.cubeConfigPath, '/c/dev.yaml');
+      expect(args.isHeadless, isFalse);
+    });
+
+    test('a missing flag value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--model']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--model requires a value'),
+          ),
+        ),
+      );
+      expect(
+        () => parseCliArgs(const ['-p']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--prompt requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('unknown provider is an error', () {
+      expect(
+        () => parseCliArgs(const ['--provider', 'bogus']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown provider: bogus'),
+          ),
+        ),
+      );
+    });
+
+    test('--cube sets the cube name', () {
+      final args = parseCliArgs(const ['--cube', 'web-scraper']) as CliArgs;
+      expect(args.cubeName, 'web-scraper');
+      expect(args.cubeConfigPath, isNull);
+      expect(args.isHeadless, isFalse);
+    });
+
+    test('--cube-config sets the manifest path', () {
+      final args =
+          parseCliArgs(const ['--cube-config', '~/cubes/dev.yaml']) as CliArgs;
+      expect(args.cubeConfigPath, '~/cubes/dev.yaml');
+      expect(args.cubeName, isNull);
+    });
+
+    test('--log-file sets the tee path', () {
+      final args =
+          parseCliArgs(const ['--log-file', 'trace.log', '-p', 'hi'])
+              as CliArgs;
+      expect(args.logFile, 'trace.log');
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('--log-file with a missing value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--log-file']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--log-file requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('--cube with a missing value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--cube']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--cube requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('--help and -h request usage', () {
+      expect(parseCliArgs(const ['--help']), isA<CliArgsHelp>());
+      expect(parseCliArgs(const ['-h']), isA<CliArgsHelp>());
+    });
+
+    test('--version requests the version', () {
+      expect(parseCliArgs(const ['--version']), isA<CliArgsVersion>());
+    });
+  });
+
+  group('parseCliArgs config', () {
+    test('no verb is a usage error', () {
+      expect(
+        () => parseCliArgs(const ['config']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('usage: fa config'),
+          ),
+        ),
+      );
+    });
+
+    test('--help and -h request usage', () {
+      expect(parseCliArgs(const ['config', '--help']), isA<CliArgsHelp>());
+      expect(parseCliArgs(const ['config', '-h']), isA<CliArgsHelp>());
+      expect(
+        parseCliArgs(const ['config', 'export-providers', '--help']),
+        isA<CliArgsHelp>(),
+      );
+    });
+
+    test('export-providers parses with defaults', () {
+      final args =
+          parseCliArgs(const ['config', 'export-providers']) as CliArgs;
+      expect(args.config!.verb, 'export-providers');
+      expect(args.config!.out, isNull);
+      expect(args.config!.passphraseStdin, isFalse);
+    });
+
+    test('--out and --passphrase-stdin parse together', () {
+      final args =
+          parseCliArgs(const [
+                'config',
+                'export-providers',
+                '--out',
+                'backup.fahx',
+              ])
+              as CliArgs;
+      expect(args.config!.out, 'backup.fahx');
+      expect(args.config!.passphraseStdin, isFalse);
+
+      final headless =
+          parseCliArgs(const [
+                'config',
+                'export-providers',
+                '--passphrase-stdin',
+              ])
+              as CliArgs;
+      expect(headless.config!.passphraseStdin, isTrue);
+      expect(headless.config!.out, isNull);
+
+      final both =
+          parseCliArgs(const [
+                'config',
+                'export-providers',
+                '--out',
+                'b.fahx',
+                '--passphrase-stdin',
+              ])
+              as CliArgs;
+      expect(both.config!.out, 'b.fahx');
+      expect(both.config!.passphraseStdin, isTrue);
+    });
+
+    test('an unknown verb is an error', () {
+      expect(
+        () => parseCliArgs(const ['config', 'export-keys']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown config verb: export-keys'),
+          ),
+        ),
+      );
+    });
+
+    test('--out without a value is an error', () {
+      expect(
+        () => parseCliArgs(const ['config', 'export-providers', '--out']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--out requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('an unknown flag is an error', () {
+      expect(
+        () => parseCliArgs(const ['config', 'export-providers', '--bogus']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown argument: --bogus'),
+          ),
+        ),
+      );
+    });
+
+    test('a stray positional is an error', () {
+      expect(
+        () => parseCliArgs(const ['config', 'export-providers', 'extra']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('takes no operands'),
+          ),
+        ),
+      );
+    });
+    test('get requires exactly one key', () {
+      for (final args in const [
+        ['config', 'get'],
+        ['config', 'get', 'a', 'b'],
+      ]) {
+        expect(
+          () => parseCliArgs(args),
+          throwsA(
+            isA<CliArgsException>().having(
+              (e) => e.message,
+              'message',
+              contains('fa config get requires exactly one key'),
+            ),
+          ),
+        );
+      }
+    });
+
+    test('set requires a key and a value', () {
+      for (final args in const [
+        ['config', 'set'],
+        ['config', 'set', 'only-key'],
+        ['config', 'set', 'k', 'v', 'extra'],
+      ]) {
+        expect(
+          () => parseCliArgs(args),
+          throwsA(
+            isA<CliArgsException>().having(
+              (e) => e.message,
+              'message',
+              contains('fa config set requires a key and a value'),
+            ),
+          ),
+        );
+      }
+    });
+
+    test('--project/--global only apply to set', () {
+      expect(
+        () => parseCliArgs(const [
+          'config',
+          'get',
+          'memory.projectPath',
+          '--project',
+        ]),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--project/--global only apply to set'),
+          ),
+        ),
+      );
+    });
+
+    test('--out/--passphrase-stdin only apply to export-providers', () {
+      expect(
+        () => parseCliArgs(const ['config', 'check', '--out', 'x.fahx']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--out/--passphrase-stdin only apply to export-providers'),
+          ),
+        ),
+      );
+    });
+  });
+  group('parseCliArgs provider', () {
+    test('no verb is a usage error', () {
+      expect(
+        () => parseCliArgs(const ['provider']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('usage: fa provider export'),
+          ),
+        ),
+      );
+    });
+
+    test('--help and -h request usage', () {
+      expect(parseCliArgs(const ['provider', '--help']), isA<CliArgsHelp>());
+      expect(parseCliArgs(const ['provider', '-h']), isA<CliArgsHelp>());
+      expect(
+        parseCliArgs(const ['provider', 'export', '--help']),
+        isA<CliArgsHelp>(),
+      );
+    });
+
+    test('export parses the provider name with check off by default', () {
+      final args =
+          parseCliArgs(const ['provider', 'export', 'my-chatgpt']) as CliArgs;
+      expect(args.providerCmd!.verb, 'export');
+      expect(args.providerCmd!.name, 'my-chatgpt');
+      expect(args.providerCmd!.check, isFalse);
+      // The subcommand never becomes a prompt run.
+      expect(args.positionals, isEmpty);
+      expect(args.prompt, isNull);
+    });
+
+    test('--check parses before or after the name', () {
+      expect(
+        (parseCliArgs(const ['provider', 'export', '--check', 'acct'])
+                as CliArgs)
+            .providerCmd!
+            .check,
+        isTrue,
+      );
+      expect(
+        (parseCliArgs(const ['provider', 'export', 'acct', '--check'])
+                as CliArgs)
+            .providerCmd!
+            .check,
+        isTrue,
+      );
+    });
+
+    test('an unknown verb is an error', () {
+      expect(
+        () => parseCliArgs(const ['provider', 'import', 'x']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('unknown provider verb: import'),
+              contains('export'),
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('an unknown flag is an error', () {
+      expect(
+        () => parseCliArgs(const ['provider', 'export', 'acct', '--out', 'f']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown argument: --out'),
+          ),
+        ),
+      );
+    });
+
+    test('a missing provider name is an arity error', () {
+      expect(
+        () => parseCliArgs(const ['provider', 'export']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('requires exactly one provider name'),
+          ),
+        ),
+      );
+    });
+
+    test('two provider names are an arity error', () {
+      expect(
+        () => parseCliArgs(const ['provider', 'export', 'a', 'b']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('requires exactly one provider name'),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('parseCliArgs --output (backend agent mode, issue #155)', () {
+    test('--output events parses', () {
+      final args =
+          parseCliArgs(const ['--output', 'events', '-p', 'hi']) as CliArgs;
+      expect(args.output, 'events');
+    });
+
+    test('--output events=full parses', () {
+      final args =
+          parseCliArgs(const ['--output', 'events=full', '-p', 'hi'])
+              as CliArgs;
+      expect(args.output, 'events=full');
+    });
+
+    test('--output without a value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--output']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--output requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('unknown --output value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--output', 'yaml', '-p', 'hi']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown --output mode: yaml'),
+          ),
+        ),
+      );
+    });
+
+    test('--output json is only valid with --version', () {
+      expect(
+        () => parseCliArgs(const ['--output', 'json', '-p', 'hi']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--output json applies to --version only'),
+          ),
+        ),
+      );
+    });
+
+    test('--version --output json carries the output mode', () {
+      final result =
+          parseCliArgs(const ['--version', '--output', 'json'])
+              as CliArgsVersion;
+      expect(result.output, 'json');
+    });
+
+    test('--output json --version carries the output mode (flag order)', () {
+      final result =
+          parseCliArgs(const ['--output', 'json', '--version'])
+              as CliArgsVersion;
+      expect(result.output, 'json');
+    });
+
+    test('--version without --output has no output mode', () {
+      final result = parseCliArgs(const ['--version']) as CliArgsVersion;
+      expect(result.output, isNull);
+    });
+  });
+
+  group('parseCliArgs --attach (backend agent mode, issue #155)', () {
+    test('--attach parses and repeats', () {
+      final args =
+          parseCliArgs(const [
+                '--attach',
+                '/tmp/a.jpg',
+                '--attach',
+                '/tmp/b.png',
+                '-p',
+                'compare',
+              ])
+              as CliArgs;
+      expect(args.attachments, ['/tmp/a.jpg', '/tmp/b.png']);
+    });
+
+    test('--attach without a value is an error', () {
+      expect(
+        () => parseCliArgs(const ['--attach']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--attach requires a value'),
+          ),
+        ),
+      );
+    });
+
+    test('--attach applies to headless runs only', () {
+      expect(
+        () => parseCliArgs(const ['--attach', '/tmp/a.jpg']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('--attach applies to headless runs'),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('parseCliArgs --no-format (issue #774)', () {
+    test('parses as the raw-markdown switch', () {
+      final args = parseCliArgs(const ['--no-format', '-p', 'hi']) as CliArgs;
+      expect(args.noFormat, isTrue);
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('defaults to false', () {
+      final args = parseCliArgs(const ['-p', 'hi']) as CliArgs;
+      expect(args.noFormat, isFalse);
+    });
+  });
+
+  group('parseCliArgs --stream-thinking (gh-1198)', () {
+    test('parses the flag in a headless run', () {
+      final args =
+          parseCliArgs(const ['--stream-thinking', '-p', 'hi']) as CliArgs;
+      expect(args.streamThinking, isTrue);
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('parses the flag in an interactive run', () {
+      final args = parseCliArgs(const ['--stream-thinking']) as CliArgs;
+      expect(args.streamThinking, isTrue);
+      expect(args.isHeadless, isFalse);
+    });
+
+    test('defaults to false', () {
+      final args = parseCliArgs(const ['-p', 'hi']) as CliArgs;
+      expect(args.streamThinking, isFalse);
+    });
+  });
+
+  group('resolveStreamThinking (gh-1198 AC6)', () {
+    test('the flag wins for the run', () {
+      expect(resolveStreamThinking(flag: true, configValue: false), isTrue);
+    });
+
+    test('the config default enables it without the flag', () {
+      expect(resolveStreamThinking(flag: false, configValue: true), isTrue);
+    });
+
+    test('both off stays off (the byte-identical legacy default)', () {
+      expect(resolveStreamThinking(flag: false, configValue: false), isFalse);
+    });
+  });
+
+  group('parseCliArgs --no-stream-thinking (gh-1433)', () {
+    test('parses the hatch in a headless run', () {
+      final args =
+          parseCliArgs(const ['--no-stream-thinking', '-p', 'hi']) as CliArgs;
+      expect(args.noStreamThinking, isTrue);
+      expect(args.streamThinking, isFalse);
+      expect(args.isHeadless, isTrue);
+    });
+
+    test('defaults to false', () {
+      final args = parseCliArgs(const ['-p', 'hi']) as CliArgs;
+      expect(args.noStreamThinking, isFalse);
+    });
+
+    test('rejects the combination with --stream-thinking', () {
+      expect(
+        () => parseCliArgs(const [
+          '--stream-thinking',
+          '--no-stream-thinking',
+          '-p',
+          'hi',
+        ]),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('cannot combine --stream-thinking'),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('parseCliArgs --timer/--deadline (gh-1556)', () {
+    CliArgs parse(List<String> args) => parseCliArgs(args) as CliArgs;
+
+    test('--timer carries the raw spec through', () {
+      final args = parse(const ['--timer', '25m', '-p', 'hi']);
+      expect(args.timer, '25m');
+      expect(args.deadline, isNull);
+    });
+
+    test('--deadline carries duration and epoch forms through', () {
+      expect(parse(const ['--deadline', '1h30m']).deadline, '1h30m');
+      expect(
+        parse(const ['--deadline', '1893456000000', '-p', 'hi']).deadline,
+        '1893456000000',
+      );
+    });
+
+    test('valid unit shapes parse', () {
+      for (final spec in ['25m', '90s', '1h', '1h30m', '2h15m30s']) {
+        expect(() => parse(['--timer', spec]), returnsNormally, reason: spec);
+      }
+    });
+
+    test('invalid shapes are usage errors naming the flag', () {
+      for (final spec in ['abc', '25', '25x', '1h30', '-5m', '0s', '']) {
+        expect(
+          () => parse(['--timer', spec]),
+          throwsA(
+            isA<CliArgsException>().having(
+              (e) => e.message,
+              'message',
+              contains('invalid --timer value'),
+            ),
+          ),
+          reason: spec,
+        );
+      }
+    });
+
+    test('invalid --deadline value names --deadline', () {
+      expect(
+        () => parse(const ['--deadline', 'nope']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('invalid --deadline value'),
+          ),
+        ),
+      );
+    });
+
+    test('combining --timer with --deadline is a usage error', () {
+      expect(
+        () => parse(const ['--timer', '25m', '--deadline', '90s']),
+        throwsA(
+          isA<CliArgsException>().having(
+            (e) => e.message,
+            'message',
+            contains('cannot combine --timer and --deadline'),
+          ),
+        ),
+      );
+    });
+  });
+}

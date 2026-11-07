@@ -1,0 +1,496 @@
+@TestOn('vm')
+@Tags(['integration'])
+@Timeout(Duration(minutes: 5))
+/// Issue #97 residual — the original three defects were fixed in PR #98, but
+/// the owner reopened the ticket after #109 surfaced prompt-frame rendering
+/// defects. These tests pin the SECRET-sheet-specific residue on current main:
+///
+/// RT1 two consecutive `request_secret` sheets in one session — the second
+///     (shorter) frame must fully replace the first: no leaked value dots, no
+///     ghost rows of the first sheet's content, aligned borders.
+/// RT2 the Enter-reason row grows then shrinks the frame — after it clears,
+///     the vacated row must be gone (no ghost error text, aligned borders).
+/// RT3 a name exactly as wide as the sheet interior — the frame must stay
+///     intact (no torn or short-closed rows).
+/// RT4 a multiline paste (PEM-style) — frame intact, value granted verbatim.
+/// RT5 an over-wide paste — every frame row stays inside the terminal.
+library;
+
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:test/test.dart';
+
+import 'pty_harness.dart';
+
+void main() {
+  late _ResidualMock mock;
+  late Directory tempHome;
+  late FaCliHarness harness;
+
+  setUp(() async {
+    mock = _ResidualMock();
+    await mock.start();
+    tempHome = _tempHomeForMock(mock.port);
+    harness = await FaCliHarness.spawn(
+      extraEnv: {'HOME': tempHome.path, 'OPENAI_API_KEY': 'test-key'},
+    );
+  });
+
+  tearDown(() async {
+    await harness.close();
+    tempHome.deleteSync(recursive: true);
+    await mock.close();
+  });
+
+  /// Boots the REPL and sends a message whose scripted answer is the first
+  /// `request_secret` tool call.
+  Future<void> bootAndRequest() async {
+    await harness.waitForBoot();
+    harness.sendText('need the key');
+    harness.sendEnter();
+    await harness.waitForText(
+      'Credential request',
+      timeout: const Duration(seconds: 60),
+    );
+    await harness.waitForOutput(settleMs: 300);
+  }
+
+  /// Types [secret] into the sheet's value field and synchronizes on
+  /// STABLE markers only (gh-1244, same [typeSecret] property anchor as
+  /// secret_sheet_test.dart): the full masked value row on the painted
+  /// SCREEN, then the masking property. Never waits on an exact transient
+  /// bullet count — under CI timing the PTY paints past the checkpoint
+  /// before the wait evaluates, and on the raw wire the focused row's
+  /// cursor cell is wrapped in inverse-video escapes, so N consecutive
+  /// `•` need never exist in the STREAM at all. The full N-bullet row is
+  /// monotone while typing, so `waitForScreen` holds until it is painted
+  /// (or fails loudly with the screen dump), and the returned anchored
+  /// screen is what the assertions read — never a fresh re-sample
+  /// (gh-1049 family).
+  Future<void> typeSecret(String secret) async {
+    harness.sendText(secret);
+    var screen = await harness.waitForScreen(
+      '•' * secret.length,
+      timeout: const Duration(seconds: 30),
+    );
+    // The anchored frame can still predate the value row's closing
+    // border by one repaint; re-anchor once on the current screen
+    // before failing (gh-1244 review thread: tolerate a short-lived
+    // intermediate frame by re-settling once on mismatch).
+    if (maskedValueRow(screen) == null) {
+      screen = await harness.waitForScreen(
+        '•' * secret.length,
+        timeout: const Duration(seconds: 30),
+      );
+    }
+    // The security pin, asserted BEFORE the row-dependent masking count —
+    // it is race-free: rawOutput is append-only, and by now every frame
+    // the typing could ever paint has been captured. The plaintext bytes
+    // must never appear in ANY captured frame.
+    expect(
+      harness.rawOutput.contains(secret),
+      isFalse,
+      reason: 'the secret bytes appeared in the raw PTY output',
+    );
+    expect(screen.contains(secret), isFalse);
+    // The frame-closed value row carries exactly one bullet per typed
+    // char — masking held from the first keystroke through the last. The
+    // history's tool row (`• request_secret · …`) is not frame-closed, so
+    // the `│` guard (maskedValueRow) pins this to the sheet's own row.
+    final row = maskedValueRow(screen);
+    if (row == null) {
+      throw StateError(
+        'the value row must render the masked secret; screen:\n$screen',
+      );
+    }
+    expect(
+      row.split('•').length - 1,
+      secret.length,
+      reason: 'every typed char must be masked (one bullet per char)',
+    );
+  }
+
+  /// Every rendered line must fit the terminal width, and every frame row
+  /// (between ┌ and └ inclusive) must close with its border glyph at the
+  /// ┌ row's right edge — no wrapped, torn, or short-closed rows.
+  void expectFrameIntact() {
+    final lines = harness.viewportLines
+        .map((l) => l.replaceAll(RegExp(r'\x1b\[[0-9;?]*[a-zA-Z]'), ''))
+        .toList();
+    final top = lines.indexWhere((l) => l.startsWith('┌'));
+    final bottom = lines.lastIndexWhere((l) => l.startsWith('└'));
+    expect(top, isNonNegative, reason: 'no secret-sheet frame on screen');
+    expect(bottom, greaterThan(top), reason: 'frame never closed');
+    final expectedWidth = lines[top].trimRight().length;
+    for (final row in lines.sublist(top, bottom + 1)) {
+      final t = row.trimRight();
+      expect(
+        t.length,
+        expectedWidth,
+        reason: 'frame row "$t" is ${t.length} cols, expected $expectedWidth',
+      );
+      expect(
+        t.endsWith('┐') ||
+            t.endsWith('┤') ||
+            t.endsWith('│') ||
+            t.endsWith('┘'),
+        isTrue,
+        reason: 'frame row "$t" does not close with a border glyph',
+      );
+    }
+  }
+
+  test('RT1: a second, shorter sheet fully replaces the first', () async {
+    await bootAndRequest();
+    // gh-1244: assert the masking property instead of pinning a transient
+    // bullet count the PTY can paint past.
+    await typeSecret('s3cr3t-TOKEN-42');
+    harness.sendEnter(); // grant #1 -> mock turn 2 requests another secret
+    await harness.waitForText(
+      'OTHER_API_KEY',
+      timeout: const Duration(seconds: 20),
+    );
+    await harness.waitForOutput(settleMs: 500);
+
+    // The second sheet starts with an EMPTY value buffer: no dots from the
+    // first sheet's secret may linger in the frame. A single '•' also
+    // appears in tool-row glyphs (`• request_secret · …`), so the residual
+    // check targets RUNS of dots (the masked value), not the glyph.
+    expect(
+      harness.screenText.contains('•••'),
+      isFalse,
+      reason: 'the second sheet shows value dots from the first secret',
+    );
+    // The first sheet's reason text must be fully gone: the second frame is
+    // shorter, so a stale row would survive BELOW or INSIDE it.
+    expect(
+      harness.screenText.contains('the upstream API'),
+      isFalse,
+      reason: 'ghost of the first sheet is still on screen',
+    );
+    expectFrameIntact();
+
+    // And the second sheet is a live, submittable sheet (gh-1244 anchor).
+    await typeSecret('second-secret');
+    harness.sendEnter();
+    await harness.waitForText(
+      'turn-complete',
+      timeout: const Duration(seconds: 30),
+    );
+  });
+
+  test(
+    'RT2: the blocked-Enter reason row leaves no ghost when it clears',
+    () async {
+      await bootAndRequest();
+      harness.sendEnter(); // blocked: the reason row appears (+1 frame row)
+      await harness.waitForText(
+        'Type the value first',
+        timeout: const Duration(seconds: 10),
+      );
+      harness.sendText(
+        'x',
+      ); // value typed: the reason row clears (-1 frame row)
+      await harness.waitForText('•', timeout: const Duration(seconds: 10));
+      await harness.waitForOutput(settleMs: 500);
+
+      expect(
+        harness.screenText.contains('Type the value first'),
+        isFalse,
+        reason: 'the Enter reason row is still on screen after clearing',
+      );
+      expectFrameIntact();
+    },
+  );
+
+  test(
+    'RT3: a name exactly as wide as the sheet interior keeps borders aligned',
+    () async {
+      mock.nextName = 'A' * 76; // '> ' + name == inner width at an 80-col PTY
+      await bootAndRequest();
+      await harness.waitForOutput(settleMs: 500);
+      expectFrameIntact();
+      harness.sendEscape();
+      // The mock scripts a second request (turn 2); decline it to finish.
+      await harness.waitForText(
+        'OTHER_API_KEY',
+        timeout: const Duration(seconds: 20),
+      );
+      harness.sendEscape();
+      await harness.waitForText(
+        'turn-complete',
+        timeout: const Duration(seconds: 30),
+      );
+    },
+  );
+
+  test(
+    'RT4: a multiline paste keeps the frame intact and the value intact',
+    () async {
+      await bootAndRequest();
+      // Bracketed paste: the PTY input path a password manager actually uses.
+      const pasted = '-----BEGIN KEY-----\nabc123\n-----END KEY-----';
+      harness.sendText('\x1b[200~$pasted\x1b[201~');
+      // gh-1244: synchronize on the painted SCREEN, not a transient raw
+      // bullet count. The paste lands as one buffer update and the masked
+      // value renders ONE FRAME ROW PER LINE (tui_prompt masks per
+      // segment), so no row ever carries all 44 bullets — anchor on the
+      // full first-segment run instead (19 == '-----BEGIN KEY-----'),
+      // which exists only once the pasted frame has painted.
+      final screen = await harness.waitForScreen(
+        '•' * 19,
+        timeout: const Duration(seconds: 30),
+      );
+      // Multiline masking property: one bullet per pasted char, one frame
+      // row per line (same `│` guard as maskedValueRow — the history's
+      // tool-row glyph is not frame-closed — over all masked rows).
+      final maskedRows = screen
+          .split('\n')
+          .where((l) => l.contains('•') && l.trimRight().endsWith('│'))
+          .map((l) => l.split('•').length - 1)
+          .toList();
+      expect(
+        maskedRows,
+        [19, 6, 17],
+        reason: 'every pasted char must be masked (one row per line)',
+      );
+      await harness.waitForOutput(settleMs: 500);
+      expectFrameIntact();
+      // Masked mode: no byte of the secret may reach the screen or the raw
+      // output (the input stream itself is not echoed).
+      expect(screen.contains('BEGIN KEY'), isFalse);
+      expect(
+        harness.rawOutput.contains(pasted),
+        isFalse,
+        reason: 'the secret bytes appeared in the raw PTY output',
+      );
+      harness.sendEnter();
+      // The mock scripts a second request (turn 2); decline it to finish.
+      await harness.waitForText(
+        'OTHER_API_KEY',
+        timeout: const Duration(seconds: 20),
+      );
+      // End-to-end grant integrity: the turn-2 request carries the grant
+      // CONFIRMATION - the transcript never carries the value itself
+      // (redaction by design). CR must not survive anywhere near it.
+      final turn2 = jsonDecode(mock.bodies[1]) as Map<String, dynamic>;
+      final transcript = (turn2['messages'] as List)
+          .map((m) => ((m as Map<String, dynamic>)['content'] ?? '').toString())
+          .join(' ');
+      expect(transcript, contains('Secret MY_SERVICE_TOKEN is available'));
+      expect(
+        transcript.contains('\r'),
+        isFalse,
+        reason: 'CR is a paste artifact',
+      );
+      harness.sendEscape();
+      await harness.waitForText(
+        'turn-complete',
+        timeout: const Duration(seconds: 30),
+      );
+    },
+  );
+
+  test(
+    'RT5: an over-wide paste keeps every frame row inside the terminal',
+    () async {
+      await bootAndRequest();
+      // 'k' * 200 is not const-evaluable in Dart (const_eval_type_num) —
+      // the literal multiplication stays a runtime value, so `final`.
+      final pasted = 'k' * 200;
+      harness.sendText('\x1b[200~$pasted\x1b[201~');
+      // gh-1244: synchronize on the painted SCREEN, not a transient raw
+      // bullet count. The sheet TRIMS an over-wide value row to the frame
+      // budget (_wrapBodyLine), so only the leading run of the 200-bullet
+      // mask can ever paint — anchor on a 40-bullet leading run instead
+      // (only masked value cells carry bullet runs; the history's
+      // tool-row glyph is a single '•'). 40 < the trimmed run at the
+      // 80-col PTY (75 cells), and the run is monotone once painted.
+      final screen = await harness.waitForScreen(
+        '•' * 40,
+        timeout: const Duration(seconds: 30),
+      );
+      // The frame-closed value row is ALL bullets — no pasted byte may
+      // leak into the frame or the raw transcript (gh-1244 property
+      // anchor, trim-aware: assert the masked prefix, not the full count).
+      final row = maskedValueRow(screen);
+      if (row == null) {
+        throw StateError(
+          'the value row must render the masked paste; screen:\n$screen',
+        );
+      }
+      expect(
+        row.split('•').length - 1,
+        greaterThanOrEqualTo(40),
+        reason: 'the masked run must cover the anchored prefix',
+      );
+      expect(
+        screen.contains('kk'),
+        isFalse,
+        reason: 'the pasted value must be fully masked on screen',
+      );
+      await harness.waitForOutput(settleMs: 500);
+      expectFrameIntact();
+      expect(
+        harness.rawOutput.contains(pasted),
+        isFalse,
+        reason: 'the secret bytes appeared in the raw PTY output',
+      );
+      harness.sendEscape();
+      // The mock scripts a second request (turn 2); decline it to finish.
+      await harness.waitForText(
+        'OTHER_API_KEY',
+        timeout: const Duration(seconds: 20),
+      );
+      harness.sendEscape();
+      await harness.waitForText(
+        'turn-complete',
+        timeout: const Duration(seconds: 30),
+      );
+    },
+  );
+}
+
+Directory _tempHomeForMock(int port) {
+  final tempHome = Directory.systemTemp.createTempSync('fa_secret_res_');
+  File('${tempHome.path}/.fah/config.yaml')
+    ..createSync(recursive: true)
+    ..writeAsStringSync('''
+provider: openai-completions
+model: test-model
+baseUrl: http://127.0.0.1:$port/v1
+mode: code
+approvalMode: yolo
+allowedTools: []
+''');
+  return tempHome;
+}
+
+/// OpenAI-compatible SSE mock. Turn 0: `request_secret` for MY_SERVICE_TOKEN
+/// (long reason -> tall frame). Turn 1: `request_secret` for OTHER_API_KEY
+/// (short reason -> shorter frame). Later turns: plain text.
+final class _ResidualMock {
+  HttpServer? _server;
+  final List<String> bodies = [];
+
+  /// Overrides the suggested secret name of the FIRST tool call.
+  String? nextName;
+
+  int get port => _server!.port;
+
+  Future<void> start() async {
+    _server = await HttpServer.bind('127.0.0.1', 0);
+    _server!.listen((request) async {
+      if (request.method == 'GET' && request.uri.path.endsWith('/models')) {
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode({'object': 'list', 'data': []}));
+        await request.response.close();
+        return;
+      }
+      if (request.method != 'POST' ||
+          !request.uri.path.endsWith('/chat/completions')) {
+        request.response.statusCode = HttpStatus.notFound;
+        await request.response.close();
+        return;
+      }
+      final body = await utf8.decoder.bind(request).join();
+      bodies.add(body);
+      final n = bodies.length - 1;
+      request.response.headers.contentType = ContentType(
+        'text',
+        'event-stream',
+      );
+      final chunks = switch (n) {
+        0 => _secretChunks(
+          'call_1',
+          nextName ?? 'MY_SERVICE_TOKEN',
+          // Reason stays short of the frame interior width; the
+          // exactly-full-width case is RT3's job.
+          'to call the upstream API and the nightly deploy job',
+        ),
+        1 => _secretChunks('call_2', 'OTHER_API_KEY', 'for the other service'),
+        _ => _textChunks(),
+      };
+      for (final chunk in chunks) {
+        request.response.write('data: $chunk\n\n');
+      }
+      request.response.write('data: [DONE]\n\n');
+      await request.response.close();
+    });
+  }
+
+  Future<void> close() async {
+    await _server?.close(force: true);
+  }
+
+  static List<String> _secretChunks(
+    String callId,
+    String name,
+    String reason,
+  ) => [
+    jsonEncode({
+      'id': 'chatcmpl-1',
+      'object': 'chat.completion.chunk',
+      'choices': [
+        {
+          'index': 0,
+          'delta': {
+            'role': 'assistant',
+            'tool_calls': [
+              {
+                'index': 0,
+                'id': callId,
+                'type': 'function',
+                'function': {'name': 'request_secret', 'arguments': ''},
+              },
+            ],
+          },
+          'finish_reason': null,
+        },
+      ],
+    }),
+    jsonEncode({
+      'choices': [
+        {
+          'index': 0,
+          'delta': {
+            'tool_calls': [
+              {
+                'index': 0,
+                'function': {
+                  'arguments': jsonEncode({'name': name, 'reason': reason}),
+                },
+              },
+            ],
+          },
+          'finish_reason': null,
+        },
+      ],
+    }),
+    jsonEncode({
+      'choices': [
+        {'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'},
+      ],
+    }),
+  ];
+
+  static List<String> _textChunks() => [
+    jsonEncode({
+      'id': 'chatcmpl-2',
+      'object': 'chat.completion.chunk',
+      'choices': [
+        {
+          'index': 0,
+          'delta': {'role': 'assistant', 'content': 'turn-complete'},
+          'finish_reason': null,
+        },
+      ],
+    }),
+    jsonEncode({
+      'choices': [
+        {'index': 0, 'delta': {}, 'finish_reason': 'stop'},
+      ],
+    }),
+  ];
+}

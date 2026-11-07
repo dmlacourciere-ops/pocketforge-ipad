@@ -1,0 +1,1145 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:cross_file/cross_file.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../theme/app_theme.dart';
+import 'chat_strings.dart';
+import 'fa_chat_features.dart';
+import 'fa_chat_host.dart';
+import 'fa_chat_service.dart';
+import 'fa_glyphs.dart';
+import 'upload_utils.dart';
+import '../widgets/snackbars.dart';
+
+/// The chat composer: attachment chips + staging into the sandbox `uploads/`
+/// folder, the queued-steer chips, the text field, the voice-input mic
+/// button, and the gradient send/stop button. The streaming indicator is
+/// NOT here — it is the single transient status row ([FaRunStatusRow],
+/// issues #459, #1042), mounted by hosts as the transcript's last entry.
+///
+/// Synchronous submit interception for host-owned commands/enrollments.
+/// Return true to consume the draft without calling [FaChatService.sendText]
+/// or analytics. The composer clears the consumed text and attachments.
+typedef FaChatSubmitInterceptor =
+    bool Function(BuildContext context, String text);
+
+/// The pill-shaped multiline input decoration shared by every chat
+/// composer (the channel composer included): 16×8 inner air, borderless
+/// 24-radius capsule, filled.
+InputDecoration faComposerFieldDecoration(String hintText) {
+  return InputDecoration(
+    hintText: hintText,
+    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+    border: const OutlineInputBorder(
+      borderRadius: BorderRadius.all(Radius.circular(24)),
+      borderSide: BorderSide.none,
+    ),
+    enabledBorder: const OutlineInputBorder(
+      borderRadius: BorderRadius.all(Radius.circular(24)),
+      borderSide: BorderSide.none,
+    ),
+    focusedBorder: const OutlineInputBorder(
+      borderRadius: BorderRadius.all(Radius.circular(24)),
+      borderSide: BorderSide.none,
+    ),
+    filled: true,
+  );
+}
+
+/// The circular send/stop shell: light theme a solid indigo circle, dark
+/// theme the brand gradient. [child] is the button itself.
+Widget faSendBubbleShell(
+  BuildContext context,
+  FahColors palette,
+  Widget child,
+) {
+  return Container(
+    decoration: BoxDecoration(
+      color: Theme.of(context).brightness == Brightness.light
+          ? palette.indigo
+          : null,
+      gradient: Theme.of(context).brightness == Brightness.dark
+          ? palette.brandGradient
+          : null,
+      shape: BoxShape.circle,
+    ),
+    child: child,
+  );
+}
+
+/// Backend-agnostic: sends through [FaChatService], picks files/images
+/// through [FaChatHost] hooks (or the constructor overrides, which tests
+/// inject), and reports analytics through [FaChatHost.track]. All strings
+/// come from [FaChatStrings], all colors from the ambient theme.
+class ChatComposer extends StatefulWidget {
+  const ChatComposer({
+    super.key,
+    required this.service,
+    this.features = const FaChatFeatures(),
+    this.uploadPicker,
+    this.galleryPicker,
+    this.cameraPicker,
+    this.voiceInput,
+    this.clipboardReader,
+    this.dropBridge,
+    this.leadingBuilder,
+    this.hideMicWhenNotEmpty = false,
+    this.onSent,
+    this.onSubmit,
+    this.onFocusChanged,
+    this.autofocus = true,
+  });
+
+  /// The session this composer sends to.
+  final FaChatService service;
+
+  /// Capability flags; the defaults turn everything on and let the host
+  /// hooks decide what is actually reachable.
+  final FaChatFeatures features;
+
+  /// Arbitrary-file picker behind the attach sheet's "Attach file" entry;
+  /// overrides [FaChatHost.uploadPicker]. Null (with no host hook) hides
+  /// the entry.
+  final FaChatUploadPicker? uploadPicker;
+
+  /// Gallery picker behind the attach sheet's "Gallery" entry; overrides
+  /// [FaChatHost.galleryPicker]. Null (with no host hook) hides the entry.
+  final FaChatUploadPicker? galleryPicker;
+
+  /// Camera picker behind the attach sheet's "Camera" entry; overrides
+  /// [FaChatHost.cameraPicker]. Null (with no host hook) hides the entry.
+  final FaChatUploadPicker? cameraPicker;
+
+  /// Voice-input backend for the mic button; overrides
+  /// [FaChatHost.voiceInput]. Null (with no host hook) hides the mic.
+  final FaChatVoiceInput? voiceInput;
+
+  /// Clipboard file reader for smart paste (files / audio / video /
+  /// images); overrides [FaChatHost.clipboardReader]. Null (with no host
+  /// hook) pastes text only.
+  final FaClipboardReader? clipboardReader;
+
+  /// OS drag-and-drop consumer (issue #465): the chat surface owns the
+  /// [DropTarget] over the transcript + composer and forwards drops here;
+  /// the composer state registers its handler so dropped files stage as
+  /// the same pending chips the pickers produce. Null ignores drops.
+  final FaChatDropBridge? dropBridge;
+
+  /// Replaces the built-in attach button in the leading slot (e.g. the
+  /// launcher's sessions-drawer toggle). Null keeps the default attach
+  /// button (shown when a picker is wired).
+  final Widget Function(BuildContext context)? leadingBuilder;
+
+  /// iMessage-style trailing slot with exactly ONE action: the mic while
+  /// the field is empty and idle, stop while streaming with an empty field,
+  /// send as soon as the field has text (the swap runs through an
+  /// [AnimatedSwitcher] — a quick scale+fade). Default false keeps the mic
+  /// and the send/stop button both always visible (full chat screen
+  /// behavior).
+  final bool hideMicWhenNotEmpty;
+
+  /// Fired after a message was sent successfully (the launcher's bar uses
+  /// it to open the session panel).
+  final VoidCallback? onSent;
+
+  /// Host-owned submit path (for example a credential-bearing enrollment
+  /// block). Runs before clearing/analytics/sendText; true consumes it.
+  final FaChatSubmitInterceptor? onSubmit;
+
+  /// Fired when the input field's focus changes (the launcher's bar opens
+  /// the session panel the moment the user starts typing).
+  final ValueChanged<bool>? onFocusChanged;
+
+  /// Whether the field grabs focus on mount and on session switch (the
+  /// full chat screen wants that; the launcher's always-visible bar must
+  /// NOT pop the keyboard at app start). Default true.
+  final bool autofocus;
+
+  @override
+  ChatComposerState createState() => ChatComposerState();
+}
+
+/// Type-aware chip icon for non-raster attachments (issue #1979 AC8):
+/// audio and video get their own marks; everything else stays the generic
+/// file icon (raster images render thumbnails instead).
+IconData chipIconForMimeType(String mimeType) {
+  if (mimeType.startsWith('audio/')) return Icons.audiotrack;
+  if (mimeType.startsWith('video/')) return Icons.movie_outlined;
+  return Icons.insert_drive_file_outlined;
+}
+
+/// Public so the chat surface can hand OS drops to a default composer
+/// through a [GlobalKey] and tests can stage files directly.
+class ChatComposerState extends State<ChatComposer>
+    with SingleTickerProviderStateMixin {
+  final _textController = TextEditingController();
+  final _focusNode = FocusNode();
+
+  /// Files attached in the composer but not sent yet. They are staged into
+  /// the sandbox `uploads/` folder at PICK time (see
+  /// [FaChatService.stageAttachment]) — attaching never sends anything by
+  /// itself; on send the message references the staged [path]s plus the
+  /// typed text.
+  final List<({String name, String path, Uint8List bytes, String mimeType})>
+  _pendingAttachments = [];
+
+  bool _isStreaming = false;
+
+  /// Pickers resolved once (constructor override, else the host hook), in
+  /// the order the attach sheet lists them.
+  late final FaChatUploadPicker? _galleryPicker =
+      widget.galleryPicker ?? FaChatHost.galleryPicker;
+  late final FaChatUploadPicker? _cameraPicker =
+      widget.cameraPicker ?? FaChatHost.cameraPicker;
+  late final FaChatUploadPicker? _uploadPicker =
+      widget.uploadPicker ?? FaChatHost.uploadPicker;
+
+  /// Voice-input backend for the composer's mic button.
+  late final FaChatVoiceInput? _voiceInput =
+      widget.voiceInput ?? FaChatHost.voiceInput;
+
+  /// Clipboard file reader for smart paste (Cmd/Ctrl+V).
+  late final FaClipboardReader? _clipboardReader =
+      widget.clipboardReader ?? FaChatHost.clipboardReader;
+
+  /// Voice-input state: idle → recording → transcribing → idle.
+  bool _micRecording = false;
+  bool _micTranscribing = false;
+
+  /// Drives the red pulse of the recording-state mic button; runs only
+  /// while recording (a repeating animation would keep `pumpAndSettle`
+  /// from ever settling if left running). Created in [initState] — a
+  /// `late` field touched first in [dispose] would create a ticker while
+  /// the element is deactivating.
+  late final AnimationController _micPulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _micPulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+    _isStreaming = widget.service.isStreaming;
+    widget.service.addListener(_onServiceChanged);
+    // The send/stop button's look depends on the field being non-empty.
+    _textController.addListener(_onTextChanged);
+    _focusNode.addListener(_onFocusChange);
+    // OS drops over the chat surface land here (issue #465).
+    widget.dropBridge?.handler = _handleSurfaceDrop;
+    // Auto-focus the input when a session opens (first mount or switch).
+    if (widget.autofocus) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _focusNode.requestFocus();
+      });
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant ChatComposer oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.dropBridge != widget.dropBridge) {
+      oldWidget.dropBridge?.handler = null;
+      widget.dropBridge?.handler = _handleSurfaceDrop;
+    }
+    if (oldWidget.service != widget.service) {
+      oldWidget.service.removeListener(_onServiceChanged);
+      _isStreaming = widget.service.isStreaming;
+      widget.service.addListener(_onServiceChanged);
+      // Session switched — focus the input so the user can type immediately.
+      if (widget.autofocus) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _focusNode.requestFocus();
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.dropBridge?.handler = null;
+    _focusNode.removeListener(_onFocusChange);
+    _focusNode.dispose();
+    widget.service.removeListener(_onServiceChanged);
+    _textController.removeListener(_onTextChanged);
+    _micPulse.dispose();
+    if (_micRecording) {
+      // Best effort: never leave the native recorder running.
+      _voiceInput?.cancel().ignore();
+    }
+    _textController.dispose();
+    super.dispose();
+  }
+
+  /// Streaming flag + queued-steer rows live on the service; rebuild on any
+  /// change (the composer subtree is small).
+  void _onServiceChanged() {
+    if (!mounted) return;
+    setState(() => _isStreaming = widget.service.isStreaming);
+  }
+
+  void _onTextChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _onFocusChange() {
+    widget.onFocusChanged?.call(_focusNode.hasFocus);
+  }
+
+  /// Mic button tap: idle starts a recording (after the OS permission
+  /// prompt), recording stops it and transcribes the take into the input
+  /// field.
+  Future<void> _toggleMic() async {
+    final voiceInput = _voiceInput;
+    if (voiceInput == null || _micTranscribing) return;
+    if (_micRecording) {
+      await _stopMic(voiceInput);
+      return;
+    }
+    final strings = FaChatStrings.of(context);
+    final bool started;
+    try {
+      started = await voiceInput.start();
+    } on Object catch (e) {
+      if (mounted) _showSnack(strings.chatMicError(e.toString()));
+      return;
+    }
+    if (!started) {
+      if (mounted) {
+        _showSnack(voiceInput.unavailableReason ?? strings.chatMicDenied);
+      }
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _micRecording = true);
+    _micPulse.repeat(reverse: true);
+  }
+
+  Future<void> _stopMic(FaChatVoiceInput voiceInput) async {
+    _micPulse.stop();
+    if (!mounted) return;
+    setState(() {
+      _micRecording = false;
+      _micTranscribing = true;
+    });
+    try {
+      final transcript = await voiceInput.stopAndTranscribe();
+      if (!mounted || transcript == null || transcript.isEmpty) return;
+      final current = _textController.text;
+      final spacer = current.isNotEmpty && !current.endsWith(' ') ? ' ' : '';
+      _textController.text = '$current$spacer$transcript';
+      _textController.selection = TextSelection.collapsed(
+        offset: _textController.text.length,
+      );
+      FaChatHost.track('voice_input_used');
+    } on Object catch (e) {
+      if (mounted) {
+        _showSnack(
+          FaChatStrings.of(
+            context,
+          ).chatMicError(e is StateError ? e.message : e.toString()),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _micTranscribing = false);
+    }
+  }
+
+  /// Stages a batch of files as pending chips — the shared tail of the
+  /// picker, paste, and drop paths (issue #465). The batch size cap is
+  /// checked before anything stages (an oversized batch never lands
+  /// partially); beyond [kMaxPendingAttachments] the extra files are
+  /// skipped with a notice (E2).
+  Future<void> stageDroppedFiles(List<FaChatUploadFile> files) async {
+    final strings = FaChatStrings.of(context);
+    final sizeError = uploadBatchSizeError([
+      for (final file in files) (name: file.name, bytes: file.bytes),
+    ], message: (total, max) => strings.uploadTooLarge(max, total));
+    if (sizeError != null) {
+      _showSnack(sizeError);
+      return;
+    }
+    final room = kMaxPendingAttachments - _pendingAttachments.length;
+    if (files.length > room) {
+      _showSnack(strings.chatAttachmentCap(files.length - room));
+    }
+    for (final file in files.take(room.clamp(0, files.length))) {
+      await _stagePending(file.name, file.bytes);
+    }
+  }
+
+  /// OS drop delivered by the chat surface ([FaChatDropBridge]): files
+  /// stage as chips, a text-only drop inserts at the cursor. Directories
+  /// (iOS Files / Finder folder drags) are rejected with a hint instead
+  /// of ghosting (E4); unreadable files surface the attach-error notice.
+  Future<void> _handleSurfaceDrop(List<XFile> files, String? rawText) async {
+    final staged = <FaChatUploadFile>[];
+    for (final file in files) {
+      if (file.path.isNotEmpty && Directory(file.path).existsSync()) {
+        if (!mounted) return;
+        _showSnack(FaChatStrings.of(context).chatDropFolderRejected(file.name));
+        continue;
+      }
+      final Uint8List bytes;
+      try {
+        bytes = await file.readAsBytes();
+      } on Object catch (e) {
+        if (!mounted) return;
+        _showSnack(
+          FaChatStrings.of(context).chatAttachError(e.toString(), file.name),
+        );
+        continue;
+      }
+      staged.add((
+        name: file.name,
+        bytes: bytes,
+        mimeType: mimeTypeForUploadName(file.name),
+      ));
+    }
+    if (staged.isNotEmpty) {
+      await stageDroppedFiles(staged);
+      return;
+    }
+    // Text drags (desktop_drop exposes the payload as raw text on Linux).
+    final text = rawText?.trim();
+    if (text != null && text.isNotEmpty) insertDroppedText(text);
+  }
+
+  /// Inserts dropped/pasted text at the cursor (text drags fall back to
+  /// insertion per the issue contract).
+  void insertDroppedText(String text) => _insertTextAtSelection(text);
+
+  /// Stages one picked file into `uploads/` right away and adds a pending
+  /// chip for it. Failures surface as a snackbar — nothing is staged and
+  /// nothing is sent.
+  Future<void> _stagePending(String name, Uint8List bytes) async {
+    final strings = FaChatStrings.of(context);
+    final clean = sanitizeUploadName(name).split('/').last;
+    if (clean.isEmpty) {
+      _showSnack(strings.chatAttachNoName(name));
+      return;
+    }
+    try {
+      final path = await widget.service.stageAttachment(
+        name: clean,
+        bytes: bytes,
+      );
+      if (!mounted) return;
+      setState(() {
+        _pendingAttachments.add((
+          name: clean,
+          path: path,
+          bytes: bytes,
+          mimeType: mimeTypeForUploadName(clean),
+        ));
+      });
+      FaChatHost.track('upload_added', {'count': 1});
+    } on Object catch (e) {
+      if (mounted) {
+        _showSnack(strings.chatAttachError(e.toString(), clean));
+      }
+    }
+  }
+
+  void _removePendingAttachment(int index) {
+    final removed = _pendingAttachments[index];
+    setState(() => _pendingAttachments.removeAt(index));
+    // The file was staged at pick time; removing the chip drops it again
+    // (best effort — a leftover in uploads/ is harmless).
+    unawaited(widget.service.discardStagedAttachment(removed.path));
+  }
+
+  /// Enter sends; Shift+Enter inserts a newline (issue #973). The key
+  /// event is handled here (a Focus ancestor) so plain Enter never reaches
+  /// the IME — with the field's `TextInputAction.newline` the IME would
+  /// turn it into a line break. Shift+Enter falls through untouched: the
+  /// IME inserts the break itself, which keeps an in-flight composing run
+  /// (e.g. Cyrillic autocorrect) intact — Shift alone means newline;
+  /// Cmd/Ctrl+Enter sends with or without Shift (the pre-fix precedence).
+  /// Touch keyboards deliver the return key through the IME as a text
+  /// delta under that same `newline` action — no hardware key event
+  /// reaches this handler, so the mobile newline behavior is unchanged.
+  ///
+  /// Cmd/Ctrl+V is smart paste (the YoLoIT pattern): a clipboard image is
+  /// staged as an upload chip, long or multi-line text becomes a staged
+  /// `.txt` chip, and only short single-line text is pasted inline.
+  KeyEventResult _handleComposerKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    final keyboard = HardwareKeyboard.instance;
+    final isEnter =
+        event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter;
+    if (isEnter &&
+        (!keyboard.isShiftPressed ||
+            keyboard.isMetaPressed ||
+            keyboard.isControlPressed)) {
+      unawaited(_send(_textController.text));
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.keyV &&
+        (keyboard.isMetaPressed || keyboard.isControlPressed)) {
+      unawaited(_handleSmartPaste());
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  /// Smart paste: clipboard files (file refs, audio, video, images) →
+  /// staged upload chips through the same [stageDroppedFiles] tail the
+  /// pickers and drops use; long/multi-line text → staged `.txt` chip;
+  /// short single-line text → inserted inline at the cursor. A MIXED
+  /// clipboard (files + text) lands both — the chips AND the inline text;
+  /// the user keeps what they want (issue #465 AC2). An unsupported rich
+  /// flavor surfaces the hint toast, never silence (issue #1979 AC3).
+  Future<void> _handleSmartPaste() async {
+    final reader = _clipboardReader;
+    if (reader != null) {
+      try {
+        final files = await reader();
+        if (files.isNotEmpty) {
+          if (mounted) await stageDroppedFiles(files);
+          if (mounted) await _pasteClipboardText();
+          return;
+        }
+      } on FaClipboardUnsupportedException {
+        if (mounted) {
+          _showSnack(FaChatStrings.of(context).chatClipboardUnsupported);
+        }
+        // Still fall through: text may be stageable/insertable alongside.
+      } on Object {
+        // Clipboard probing is best effort — fall through to text.
+      }
+    }
+    if (!mounted) return;
+    await _pasteClipboardText();
+  }
+
+  /// Reads text/plain off the clipboard (silently nothing when the
+  /// platform denies or holds no text — the platform-honesty fallback,
+  /// AC4) and applies the smart-paste rules.
+  Future<void> _pasteClipboardText() async {
+    String? text;
+    try {
+      text = (await Clipboard.getData('text/plain'))?.text;
+    } on Object {
+      // No clipboard access (web denial) — nothing to paste.
+    }
+    if (text == null || text.isEmpty || !mounted) return;
+    if (_isSafeInlinePaste(text) || _looksLikeUrl(text)) {
+      _insertTextAtSelection(text);
+    } else {
+      await _stagePending(
+        'pasted-${DateTime.now().millisecondsSinceEpoch}.txt',
+        Uint8List.fromList(utf8.encode(text)),
+      );
+    }
+  }
+
+  /// Short, single-line, control-character-free text pastes inline;
+  /// anything longer or multi-line becomes a staged file chip.
+  static bool _isSafeInlinePaste(String text) {
+    if (text.length > 1000) return false;
+    if (text.contains('\n') || text.contains('\r')) return false;
+    for (final codeUnit in text.codeUnits) {
+      if (codeUnit < 32 && codeUnit != 9) return false;
+    }
+    return true;
+  }
+
+  /// Single-line URLs paste inline, never as a file chip.
+  static bool _looksLikeUrl(String text) {
+    final trimmed = text.trim();
+    if (trimmed.contains('\n') || trimmed.contains('\r')) return false;
+    final lower = trimmed.toLowerCase();
+    return lower.startsWith('http://') ||
+        lower.startsWith('https://') ||
+        lower.startsWith('file://');
+  }
+
+  void _insertTextAtSelection(String insert) {
+    final value = _textController.value;
+    final selection = value.selection;
+    final start = selection.isValid ? selection.start : value.text.length;
+    final end = selection.isValid ? selection.end : value.text.length;
+    _textController.value = TextEditingValue(
+      text: value.text.replaceRange(start, end, insert),
+      selection: TextSelection.collapsed(offset: start + insert.length),
+    );
+  }
+
+  Future<void> _send(String text) async {
+    final trimmed = text.trim();
+    if (trimmed.isEmpty && _pendingAttachments.isEmpty) return;
+    final interceptor = widget.onSubmit;
+    if (interceptor != null) {
+      var candidate = trimmed;
+      // Smart paste stages a multi-line block as one .txt chip. Inspect
+      // that exact payload too, so an enrollment secret cannot reach the
+      // model through sendAttachments instead of sendText.
+      if (candidate.isEmpty && _pendingAttachments.length == 1) {
+        try {
+          candidate = utf8.decode(_pendingAttachments.single.bytes);
+        } on Object {
+          // Binary attachments are never enrollment text.
+        }
+      }
+      if (candidate.isNotEmpty && interceptor(context, candidate)) {
+        final consumed = List.of(_pendingAttachments);
+        setState(() => _pendingAttachments.clear());
+        _textController.clear();
+        for (final attachment in consumed) {
+          unawaited(widget.service.discardStagedAttachment(attachment.path));
+        }
+        return;
+      }
+    }
+    // The IME's send action UNFOCUSES the field (EditableText finalizes
+    // editing with shouldUnfocus for send/done/go/search). A chat composer
+    // keeps the keyboard up instead — the follow-up message must not need a
+    // re-tap. Defer past performAction's own unfocus (end of this frame).
+    _scheduleFocusRestore();
+    final pending = _consumeComposedForSend(trimmed);
+    await _dispatchSend(trimmed, pending);
+  }
+
+  /// Defers a focus restore to the end of the frame when the field holds
+  /// focus right now (the IME's send action is about to steal it).
+  void _scheduleFocusRestore() {
+    if (!_focusNode.hasFocus) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _focusNode.requestFocus();
+    });
+  }
+
+  /// Clears the composer for the send: the pending chips leave the list
+  /// (their metadata rides the outgoing message), the field resets, and the
+  /// send telemetry fires — metadata only (never the text, never the files).
+  List<({String name, String path, Uint8List bytes, String mimeType})>
+  _consumeComposedForSend(String trimmed) {
+    final pending = List.of(_pendingAttachments);
+    setState(() => _pendingAttachments.clear());
+    _textController.clear();
+    FaChatHost.track('message_sent', {
+      'has_attachments': pending.isNotEmpty,
+      'text_length': trimmed.length,
+    });
+    return pending;
+  }
+
+  Future<void> _dispatchSend(
+    String trimmed,
+    List<({String name, String path, Uint8List bytes, String mimeType})>
+    pending,
+  ) async {
+    // Capture the pre-send streaming state: sendText STARTS a run when
+    // idle, which flips the flag synchronously — aborting on the flipped
+    // flag would kill the run we just started (that's the "empty session
+    // after every send" bug). The interrupt is only for a run that was
+    // ALREADY in flight when the user hit send.
+    final wasStreaming = _isStreaming;
+    try {
+      await _submitComposed(trimmed, pending);
+      // Steer-interrupt (pi semantics): a message sent mid-run interrupts
+      // the current turn — the queued message gets its own run right after
+      // the lifecycle ends (AgentEndEvent → continueRun), instead of
+      // waiting out a long turn.
+      if (wasStreaming) widget.service.abort();
+      widget.onSent?.call();
+    } on Object catch (e) {
+      // The send itself failed before the run started: hand the chips and
+      // the typed text back so nothing the user composed is lost.
+      _restoreFailedSend(trimmed, pending, e);
+    }
+  }
+
+  /// The two send arms: plain text when nothing is attached, otherwise the
+  /// staged-chip send. Attachments were staged into `<cwd>/uploads/` at pick
+  /// time; the outgoing message references the sandbox paths so the agent
+  /// reads the files with its tools (see FaChatService.sendAttachments).
+  Future<void> _submitComposed(
+    String trimmed,
+    List<({String name, String path, Uint8List bytes, String mimeType})>
+    pending,
+  ) {
+    if (pending.isEmpty) return widget.service.sendText(trimmed);
+    return widget.service.sendAttachments(
+      attachments: [
+        for (final attachment in pending)
+          (
+            path: attachment.path,
+            bytes: attachment.bytes,
+            mimeType: attachment.mimeType,
+          ),
+      ],
+      text: trimmed,
+    );
+  }
+
+  /// Hands the chips and the typed text back after a failed send so nothing
+  /// the user composed is lost, plus the failure notice.
+  void _restoreFailedSend(
+    String trimmed,
+    List<({String name, String path, Uint8List bytes, String mimeType})>
+    pending,
+    Object error,
+  ) {
+    if (!mounted) return;
+    setState(() => _pendingAttachments.addAll(pending));
+    _textController.text = trimmed;
+    _showSnack(FaChatStrings.of(context).chatSendError(error.toString()));
+  }
+
+  /// Picks arbitrary files and stages them as pending attachments. Staging
+  /// happens immediately — the chips wait in the composer until the user
+  /// sends (see [_send]). The batch flows through [stageDroppedFiles], the
+  /// same size-cap/attachment-cap tail the paste and drop paths use.
+  Future<void> _attachFiles(FaChatUploadPicker picker) async {
+    final List<FaChatUploadFile> picked;
+    try {
+      picked = await picker();
+    } on Object catch (e) {
+      if (mounted) {
+        _showSnack(FaChatStrings.of(context).chatUploadFailed(e.toString()));
+      }
+      return;
+    }
+    if (picked.isEmpty || !mounted) return;
+    await stageDroppedFiles(picked);
+  }
+
+  void _showSnack(String message) {
+    // Every composer snack is a failure/limit notice — all carry the copy
+    // affordance (issue #869).
+    showFahErrorSnack(
+      context,
+      message,
+      duration: const Duration(seconds: 3),
+      hideCurrent: true,
+    );
+  }
+
+  void _showAttachmentSheet() {
+    final strings = FaChatStrings.of(context);
+    final galleryPicker = _galleryPicker;
+    final cameraPicker = _cameraPicker;
+    final uploadPicker = _uploadPicker;
+
+    // Skip the sheet when there's only one option — go straight to the
+    // picker (e.g. on macOS the camera is hidden, leaving gallery +
+    // file; if only one is wired up there's no choice to make).
+    final available = <(IconData, String, FaChatUploadPicker)>[
+      if (galleryPicker != null)
+        (Icons.photo_library, strings.chatGallery, galleryPicker),
+      if (cameraPicker != null)
+        (Icons.camera_alt, strings.chatCamera, cameraPicker),
+      if (uploadPicker != null)
+        (Icons.upload_file, strings.chatAttachFile, uploadPicker),
+    ];
+    if (available.length == 1) {
+      _attachFiles(available.single.$3);
+      return;
+    }
+
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final (icon, label, picker) in available)
+              ListTile(
+                leading: Icon(icon),
+                title: Text(label),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  _attachFiles(picker);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// One pending attachment in the composer: a thumbnail for decodable
+  /// raster images, an icon + name + size chip otherwise (SVG previews stay
+  /// generic — see [isInlineImageMimeType]), each with a remove affordance.
+  Widget _buildPendingAttachmentChip(int index) {
+    final attachment = _pendingAttachments[index];
+    final isImage = isInlineImageMimeType(attachment.mimeType);
+    final palette = fahChatColorsOf(context);
+    return Container(
+      padding: const EdgeInsets.all(4),
+      decoration: BoxDecoration(
+        color: palette.panel,
+        border: Border.all(color: palette.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isImage)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: Image.memory(
+                attachment.bytes,
+                height: 48,
+                width: 48,
+                fit: BoxFit.cover,
+                errorBuilder: (context, error, stackTrace) =>
+                    const Icon(Icons.broken_image_outlined, size: 24),
+              ),
+            )
+          else ...[
+            Icon(chipIconForMimeType(attachment.mimeType), size: 18),
+            const SizedBox(width: 6),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 200),
+              child: Text(
+                '${attachment.name.split('/').last} · '
+                '${formatFileSize(attachment.bytes.length)}',
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ],
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            tooltip: FaChatStrings.of(context).chatRemoveAttachment,
+            onPressed: () => _removePendingAttachment(index),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Whether any picker backend is wired (constructor override or host
+  /// hook) — the order the attach sheet lists them in.
+  bool get _hasAnyPicker =>
+      _galleryPicker != null || _cameraPicker != null || _uploadPicker != null;
+
+  /// The attach button renders only when attachments are on AND at least
+  /// one picker is reachable.
+  bool get _showAttach => widget.features.attachments && _hasAnyPicker;
+
+  /// The mic renders only when the feature is on and the backend reports
+  /// itself available.
+  bool get _showMic =>
+      widget.features.voiceInput &&
+      _voiceInput != null &&
+      _voiceInput.isAvailable;
+
+  bool get _hasComposedText => _textController.text.trim().isNotEmpty;
+
+  /// A recording/transcribing take never disappears mid-flight.
+  bool get _micBusy => _micRecording || _micTranscribing;
+
+  /// The one-action slot swaps to send/stop while idle with no mic wired,
+  /// or while a run streams with an empty field (the stop arm).
+  bool get _slotForcesSendStop => !_micBusy && (_isStreaming || !_showMic);
+
+  /// iMessage-style trailing slot: exactly one action — the mic while the
+  /// field is empty and idle, stop while streaming with an empty field,
+  /// send as soon as the field has text. Default mode (no slot) keeps the
+  /// send/stop button always visible.
+  bool get _slotShowsSendStop =>
+      !widget.hideMicWhenNotEmpty || _hasComposedText || _slotForcesSendStop;
+
+  /// A running take (recording pulse / transcribing spinner) or an idle
+  /// empty field keeps the mic in the slot.
+  bool get _slotKeepsMic => _micBusy || (!_hasComposedText && !_isStreaming);
+
+  bool get _slotShowsMic =>
+      _showMic && (!widget.hideMicWhenNotEmpty || _slotKeepsMic);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        // Keep the composer transparent so it inherits the scaffold/sheet
+        // surface underneath. This avoids a color mismatch in the iOS/macOS
+        // overlay/bottom-sheet where the panel background is panelAlt, not
+        // palette.bg.
+        // The top hairline still visually separates it from the transcript.
+        border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
+      ),
+      child: SafeArea(
+        top: false,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_pendingAttachments.isNotEmpty) _buildAttachmentChipsRow(),
+            if (widget.service.pendingSteerTexts.isNotEmpty) _buildSteerRows(),
+            _buildFieldRow(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The pending-attachment chip strip above the field.
+  Widget _buildAttachmentChipsRow() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (var i = 0; i < _pendingAttachments.length; i++)
+              _buildPendingAttachmentChip(i),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// The queued-steer rows: messages typed while a run was streaming,
+  /// waiting to steer it (the schedule icon marks the wait).
+  Widget _buildSteerRows() {
+    final theme = Theme.of(context);
+    final palette = fahChatColorsOf(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (final pending in widget.service.pendingSteerTexts)
+            Container(
+              margin: const EdgeInsets.only(bottom: 6),
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: palette.userBubble.withValues(alpha: 0.6),
+                border: Border.all(color: palette.userBubbleBorder),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      pending,
+                      style: theme.textTheme.bodyMedium,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Icon(Icons.schedule, size: 16, color: palette.dim),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// The field row: leading slot (launcher toggle / attach button), the
+  /// multiline text field, and the trailing action slot.
+  Widget _buildFieldRow() {
+    final palette = fahChatColorsOf(context);
+    final strings = FaChatStrings.of(context);
+    return Padding(
+      // Compact single-layer vertical padding (issue #459): the field's
+      // contentPadding carries the pill's inner air; the row itself adds
+      // only a hairline 4dp above/below.
+      padding: widget.hideMicWhenNotEmpty
+          ? const EdgeInsets.fromLTRB(12, 4, 12, 4)
+          : const EdgeInsets.fromLTRB(8, 4, 8, 4),
+      child: Row(
+        children: [
+          if (widget.leadingBuilder != null)
+            widget.leadingBuilder!(context)
+          else if (_showAttach)
+            _buildAttachButton(palette, strings),
+          Expanded(child: _buildTextField()),
+          ..._buildTrailingSlot(palette, strings),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAttachButton(FahColors palette, FaChatStrings strings) {
+    return IconButton(
+      // The modern "add content" mark: a plus in a rounded square
+      // (owner-approved B3, see [FaAttachGlyph]) — its 2px stroke rhymes
+      // with the mic circle in the one-action slot.
+      icon: FaAttachGlyph(color: palette.dim),
+      tooltip: strings.chatAttachTooltip,
+      onPressed: _showAttachmentSheet,
+    );
+  }
+
+  Widget _buildTextField() {
+    return Padding(
+      padding: EdgeInsets.symmetric(
+        horizontal: widget.hideMicWhenNotEmpty ? 6 : 0,
+      ),
+      child: Focus(
+        onKeyEvent: _handleComposerKey,
+        child: TextField(
+          controller: _textController,
+          focusNode: _focusNode,
+          decoration:
+              // The host-localized hint (the session surface scopes
+              // FaChatStrings; channel chats override it with "Message
+              // <channel>").
+              faComposerFieldDecoration(
+                FaChatStrings.of(context).chatInputHint,
+              ),
+          // Multiline: Shift+Enter (hardware) or the touch return key
+          // inserts a line break; plain Enter sends (_handleComposerKey).
+          // The field grows 1→6 lines and then scrolls internally.
+          keyboardType: TextInputType.multiline,
+          textInputAction: TextInputAction.newline,
+          maxLines: 6,
+          minLines: 1,
+        ),
+      ),
+    );
+  }
+
+  /// The trailing actions: the iMessage-style one-action slot swaps mic ↔
+  /// send/stop through an AnimatedSwitcher; the default (full chat screen)
+  /// mode keeps both always visible, each under its own visibility rule.
+  List<Widget> _buildTrailingSlot(FahColors palette, FaChatStrings strings) {
+    if (widget.hideMicWhenNotEmpty) {
+      return [_buildOneActionSlot(palette, strings)];
+    }
+    return _buildAlwaysVisibleActions(palette, strings);
+  }
+
+  List<Widget> _buildAlwaysVisibleActions(
+    FahColors palette,
+    FaChatStrings strings,
+  ) {
+    return [
+      if (_slotShowsMic) _buildMicButton(context),
+      if (_slotShowsMic && _slotShowsSendStop) const SizedBox(width: 4),
+      if (_slotShowsSendStop) _buildSendStopButton(palette, strings),
+    ];
+  }
+
+  Widget _buildOneActionSlot(FahColors palette, FaChatStrings strings) {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 180),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: ScaleTransition(scale: animation, child: child),
+      ),
+      child: _slotShowsMic
+          ? KeyedSubtree(
+              key: const ValueKey('composerTrailingMic'),
+              child: _buildMicButton(context),
+            )
+          : _slotShowsSendStop
+          ? KeyedSubtree(
+              key: const ValueKey('composerTrailingSend'),
+              child: _buildSendStopButton(palette, strings),
+            )
+          : const SizedBox(key: ValueKey('composerTrailingNone')),
+    );
+  }
+
+  /// The circular send/stop button: stop while streaming with an empty
+  /// field, send (or steer-send mid-stream) otherwise. Light theme paints
+  /// a solid indigo circle; dark theme the brand gradient.
+  Widget _buildSendStopButton(FahColors palette, FaChatStrings strings) {
+    return faSendBubbleShell(
+      context,
+      palette,
+      Builder(
+        builder: (context) {
+          // Stop only while streaming AND nothing typed; with text in the
+          // field the button is a steer-send (interrupt the turn and run
+          // the message).
+          final showStop = _isStreaming && _textController.text.trim().isEmpty;
+          return IconButton(
+            icon: Icon(
+              // Prototype uses an up-arrow (send-up) icon.
+              showStop ? Icons.stop : Icons.arrow_upward,
+              size: 20,
+            ),
+            color: palette.onAccent,
+            tooltip: showStop
+                ? strings.chatAbortTooltip
+                : (_isStreaming
+                      ? strings.chatSteerTooltip
+                      : strings.chatSendTooltip),
+            onPressed: showStop
+                ? widget.service.abort
+                : () => _send(_textController.text),
+          );
+        },
+      ),
+    );
+  }
+
+  /// The composer's voice-input button: idle shows a mic (tap to record),
+  /// recording pulses red (tap again to stop + transcribe), transcribing
+  /// shows a spinner. Rendered only when the host's voice-input hook
+  /// reports itself available.
+  Widget _buildMicButton(BuildContext context) {
+    final strings = FaChatStrings.of(context);
+    if (_micTranscribing) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 12),
+        child: SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      );
+    }
+    if (_micRecording) {
+      final error = Theme.of(context).colorScheme.error;
+      return AnimatedBuilder(
+        animation: _micPulse,
+        builder: (context, child) => IconButton(
+          icon: Icon(
+            Icons.mic,
+            color: Color.lerp(
+              error,
+              error.withValues(alpha: 0.35),
+              _micPulse.value,
+            ),
+          ),
+          tooltip: strings.chatMicStopTooltip,
+          onPressed: _toggleMic,
+        ),
+      );
+    }
+    final idle = IconButton(
+      icon: Icon(
+        Icons.mic_none,
+        // Match the send/stop circle's icon size in the one-action slot.
+        size: widget.hideMicWhenNotEmpty ? 20 : null,
+      ),
+      tooltip: strings.chatMicTooltip,
+      onPressed: _toggleMic,
+    );
+    if (!widget.hideMicWhenNotEmpty) return idle;
+    // iMessage-style slot: the idle mic sits in the same 48px circle the
+    // send button occupies, filled with the text field's pill color plus a
+    // hairline border so the two states of the slot read as one control.
+    final palette = fahChatColorsOf(context);
+    return Container(
+      decoration: BoxDecoration(
+        color: palette.panelAlt,
+        border: Border.all(color: palette.border),
+        shape: BoxShape.circle,
+      ),
+      child: idle,
+    );
+  }
+}

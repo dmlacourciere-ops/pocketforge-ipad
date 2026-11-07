@@ -1,0 +1,152 @@
+name: PocketForge unsigned iOS verification
+run-name: PocketForge iOS source build · ${{ github.run_number }}
+
+# Manual only: a push never consumes Mac build minutes or publishes anything.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pocketforge-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.47.9'
+  POCKETFORGE_RUST_TOOLCHAIN: '1.91.1'
+  IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.build/pocketforge-rust-ios
+
+jobs:
+  ios-unsigned:
+    # GitHub's current standard macos-15 label is ARM64 and supports private
+    # repositories. No larger/self-hosted runner or Apple account is required.
+    runs-on: macos-15
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record build host and source
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/logs
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+          } | tee artifacts/logs/build-host.txt
+
+      - name: Install pinned Flutter SDK
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Restore source-build Rust cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .build/pocketforge-rust-ios
+          key: pocketforge-wasmi-${{ runner.os }}-${{ runner.arch }}-1.91.1-${{ hashFiles('vendor/wasm_run/native/Cargo.lock', 'vendor/wasm_run/native/Cargo.toml', 'vendor/wasm_run/native/src/**') }}
+
+      - name: Prepare independent unsigned iOS product
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/pocketforge -p 'test_prepare_ios.py' -v 2>&1 | tee artifacts/logs/prepare-tests.txt
+          python3 tools/pocketforge/prepare_ios.py 2>&1 | tee artifacts/logs/prepare-ios.txt
+          python3 tools/pocketforge/prepare_ios.py --check
+          # No API keys or upstream .env values enter the build bundle.
+          : > flutter_app/.env
+
+      - name: Resolve Flutter packages
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics
+          flutter config --no-enable-swift-package-manager
+          flutter --version | tee artifacts/logs/flutter-version.txt
+          (cd flutter_app && flutter pub get) 2>&1 | tee artifacts/logs/flutter-pub-get.txt
+
+      - name: Build wasmi interpreter for iOS from vendored Rust source
+        run: |
+          set -euo pipefail
+          bash tools/pocketforge/build_wasm_ios.sh 2>&1 | tee artifacts/logs/wasm-ios-build.txt
+
+      - name: Analyze and test PocketForge without live models
+        run: |
+          set -euo pipefail
+          (cd flutter_app && flutter analyze --no-pub lib/main_pocketforge.dart lib/pocketforge test/pocketforge) 2>&1 | tee artifacts/logs/pocketforge-analyze.txt
+          (cd flutter_app && flutter test --no-pub test/pocketforge) 2>&1 | tee artifacts/logs/pocketforge-tests.txt
+
+      - name: Verify full-frame PocketForge visual snapshots
+        # Baselines were captured on Windows. Preserve comparison diagnostics
+        # without hiding a native compilation result behind host font drift.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          (cd flutter_app && flutter test --no-pub test/golden/pocketforge_golden_test.dart) 2>&1 | tee artifacts/logs/pocketforge-goldens.txt
+
+      - name: Compile actual unsigned iOS release
+        run: |
+          set -euo pipefail
+          (cd flutter_app && flutter build ios --release --no-codesign --no-pub \
+            --target lib/main_pocketforge.dart --build-name 0.1.0 --build-number "$GITHUB_RUN_NUMBER") \
+            2>&1 | tee artifacts/logs/ios-release-build.txt
+
+      - name: Verify retained native FFI exports
+        run: |
+          set -euo pipefail
+          app="$GITHUB_WORKSPACE/flutter_app/build/ios/iphoneos/Runner.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+          xcrun dyld_info -exports "$app/$executable" > artifacts/logs/runner-exports.txt
+          for symbol in _wire_compile_wasm _store_dart_post_cobject _init_frb_dart_api_dl; do
+            if ! grep -Eq "[[:space:]]${symbol}$" artifacts/logs/runner-exports.txt; then
+              echo "Required wasm_run dlsym export missing: $symbol" >&2
+              exit 1
+            fi
+          done
+          if ! grep -q '_NativeCupertinoHttp_' artifacts/logs/runner-exports.txt; then
+            echo 'Native HTTP FFI trampolines were stripped.' >&2
+            exit 1
+          fi
+          test ! -e "$app/embedded.mobileprovision"
+          test ! -d "$app/PlugIns/FaLiveActivity.appex"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist" | grep -Fx 'com.pocketforge.ipad'
+
+      - name: Package unsigned artifact for a separate signing step
+        run: |
+          set -euo pipefail
+          unsigned_root="$RUNNER_TEMP/pocketforge-unsigned"
+          mkdir -p "$unsigned_root/Payload"
+          ditto flutter_app/build/ios/iphoneos/Runner.app "$unsigned_root/Payload/Runner.app"
+          ditto -c -k --keepParent "$unsigned_root/Payload" "$GITHUB_WORKSPACE/artifacts/PocketForge-unsigned.ipa"
+          shasum -a 256 artifacts/PocketForge-unsigned.ipa > artifacts/PocketForge-unsigned.ipa.sha256
+          cat > artifacts/UNSIGNED-READ-ME.txt <<'TEXT'
+          PocketForge unsigned source build.
+          This artifact has no Apple provisioning profile and is NOT directly installable by tapping it.
+          It still requires a separate authorized Apple signing/sideloading workflow.
+          This job does not sign, deploy, publish, submit to App Review, or upload to TestFlight.
+          Successful compilation and FFI export checks do not establish on-device runtime behavior.
+          TEXT
+
+      - name: Upload build diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PocketForge-iOS-build-${{ github.run_number }}
+          path: |
+            artifacts/
+            flutter_app/test/golden/failures/
+          if-no-files-found: warn
+          retention-days: 7

@@ -1,0 +1,1711 @@
+/// OpenAI chat-completions provider adapter (OpenRouter-ready).
+///
+/// Ported from pi-mono `packages/ai/src/api/openai-completions.ts`. Kept
+/// mechanically close to the TypeScript original so future pi fixes port
+/// trivially. Deliberate divergences:
+///
+/// - pi uses the `openai` SDK; this port talks to `POST {baseUrl}/chat/
+///   completions` directly with `package:http` and decodes SSE via
+///   [SseDecoder].
+/// - pi accumulates into one mutable `AssistantMessage`; Dart types are
+///   immutable, so every pushed event carries a freshly built snapshot of the
+///   live partial message instead (same partial-first contract).
+/// - pi's `parseStreamingJson` falls back to the `partial-json` package;
+///   [parseStreamingJson] falls back to an empty map (after a repair pass),
+///   which only matters for truncated final arguments.
+/// - pi's `normalizeProviderError` probes SDK-specific error shapes; there is
+///   no SDK here, so [formatProviderError] handles the Dart error types this
+///   adapter can actually produce.
+/// - Not yet ported (later phases): the full compat matrix (zai/qwen/
+///   together/...), `transformMessages` reordering, surrogate sanitization,
+///   developer-role system prompts, and thinking formats beyond
+///   OpenAI/OpenRouter.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+
+import 'package:http/http.dart' as http;
+
+import '../cancel_token.dart';
+import '../context.dart';
+import '../event_stream.dart';
+import '../model.dart';
+import '../types.dart';
+import 'provider_common.dart';
+
+/// Options for [streamOpenAICompletions].
+///
+/// Ported subset of pi's `OpenAICompletionsOptions` (which extends
+/// `SimpleStreamOptions`): temperature, maxTokens, apiKey, headers, signal,
+/// reasoningEffort, toolChoice, sessionId, cacheRetention, onPayload,
+/// onResponse. pi's `signal: AbortSignal` is [cancelToken] here.
+final class OpenAICompletionsOptions {
+  const OpenAICompletionsOptions({
+    this.temperature,
+    this.maxTokens,
+    this.apiKey,
+    this.headers,
+    this.cancelToken,
+    this.reasoningEffort,
+    this.toolChoice,
+    this.sessionId,
+    this.cacheRetention,
+    this.urlBuilder,
+    this.idleTimeout,
+    this.onPayload,
+    this.onResponse,
+  });
+
+  /// Sampling temperature.
+  final double? temperature;
+
+  /// Output-token cap. Sent as `max_completion_tokens` (or `max_tokens`,
+  /// depending on [OpenAICompletionsCompat.maxTokensField]).
+  final int? maxTokens;
+
+  /// API key sent as `Authorization: Bearer ...` — or, when [Model.authHeader]
+  /// declares a header name (issue #964), as a raw `<authHeader>: <key>`
+  /// header with no Bearer prefix. Empty or absent sends no auth header at
+  /// all (keyless local endpoints such as llama.cpp, Ollama, or LM Studio;
+  /// an explicit `authorization` entry in [headers] still applies) — an
+  /// endpoint that requires auth then answers 401, surfaced as an error
+  /// event.
+  final String? apiKey;
+
+  /// Extra request headers, merged over [Model.headers]; a `null` value
+  /// suppresses the header with the same name (pi's `ProviderHeaders`).
+  final Map<String, String?>? headers;
+
+  /// Cancels the in-flight request when triggered. The stream then ends with
+  /// an [ErrorEvent] whose reason is [StopReason.aborted].
+  final CancelToken? cancelToken;
+
+  /// Reasoning effort level (`minimal`, `low`, `medium`, `high`, `xhigh`,
+  /// `max`), sent per [OpenAICompletionsCompat.thinkingFormat]. pi's
+  /// thinking-level clamping/mapping is not ported yet.
+  final String? reasoningEffort;
+
+  /// Tool choice: `'auto'`, `'none'`, `'required'`, or a
+  /// `{type: 'function', function: {name: ...}}` map.
+  final Object? toolChoice;
+
+  /// Session id used as the prompt-cache affinity key: sent as
+  /// `prompt_cache_key` (OpenAI endpoints, or any endpoint under `long`
+  /// retention) and as the `x-session-id` routing header on OpenRouter
+  /// (pi's session-affinity headers). Ignored when [cacheRetention] is
+  /// `none`.
+  final String? sessionId;
+
+  /// Prompt-cache retention: `short` (default), `long` (sends
+  /// `prompt_cache_retention: "24h"` and a 1h TTL on Anthropic-style cache
+  /// markers), or `none` (no cache key, no cache markers, no affinity
+  /// header). pi's `PI_CACHE_RETENTION` env lookup is not ported.
+  final String? cacheRetention;
+
+  /// Builds the request URL; defaults to `{model.baseUrl}/chat/completions`.
+  /// Dialects with a different path layout plug in here (DIAL's
+  /// `/openai/deployments/{model}/chat/completions`, see `dial.dart`).
+  final Uri Function(Model model)? urlBuilder;
+
+  /// Idle-stream watchdog override (tests); defaults to
+  /// [providerStreamIdleTimeout].
+  final Duration? idleTimeout;
+
+  /// Inspect or replace the request payload before it is sent. Return `null`
+  /// to keep the payload unchanged.
+  final FutureOr<Map<String, dynamic>?> Function(
+    Map<String, dynamic> payload,
+    Model model,
+  )?
+  onPayload;
+
+  /// Called after the HTTP response headers arrive and before the body
+  /// stream is consumed.
+  final FutureOr<void> Function(
+    int statusCode,
+    Map<String, String> headers,
+    Model model,
+  )?
+  onResponse;
+}
+
+/// Streams an assistant message from an OpenAI-compatible chat-completions
+/// endpoint.
+///
+/// Ported from pi's `stream` in `openai-completions.ts`. The endpoint is
+/// `{model.baseUrl}/chat/completions`, so OpenRouter is reached by setting
+/// `baseUrl: 'https://openrouter.ai/api/v1'`.
+///
+/// **Errors-as-events invariant (non-negotiable):** this function never
+/// throws. Network failures, non-200 responses, malformed SSE, and aborts
+/// all terminate the returned stream with an [ErrorEvent] carrying
+/// [StopReason.error] or [StopReason.aborted].
+///
+/// [client] overrides the HTTP client (used by tests with
+/// `http.testing.MockClient`); when omitted, an owned client is created and
+/// closed when the stream finishes.
+AssistantMessageEventStream streamOpenAICompletions(
+  Model model,
+  Context context, [
+  OpenAICompletionsOptions? options,
+  http.Client? client,
+]) {
+  final eventStream = AssistantMessageEventStream();
+  final cancelToken = options?.cancelToken;
+  // No injected client: the shared keep-alive client (never closed per
+  // call — a fresh client per turn churns TCP connections into TIME_WAIT
+  // pileups that stall connect() into the watchdog).
+  final httpClient = client ?? sharedProviderHttpClient();
+
+  // Mutable accumulation state. pi mutates a single `output` object; we keep
+  // the pieces in a shared state holder and build an immutable snapshot per
+  // event instead.
+  final state = ProviderStreamState(model);
+  final session = _OpenAICompletionsSession(
+    model,
+    context,
+    options,
+    eventStream,
+    state,
+    cancelToken,
+    httpClient,
+  );
+
+  unawaited(
+    runProviderStream(
+      eventStream,
+      state,
+      cancelToken,
+      httpClient,
+      ownsClient: false, // shared or injected — never closed per call
+      body: session.run,
+    ),
+  );
+
+  return eventStream;
+}
+
+/// Per-stream session for [streamOpenAICompletions]: owns the mutable
+/// accumulation state pi keeps in closures around one `output` object plus
+/// the per-block streaming helpers, so [run] reads as the same phase
+/// sequence as pi's `stream` body.
+/// Inline-`<think>` extraction state (see `_OpenAICompletionsSession`):
+/// deciding whether the content starts with the tag, inside it, or past it.
+enum _ThinkTagState { deciding, inThink, plain }
+
+final class _OpenAICompletionsSession {
+  _OpenAICompletionsSession(
+    this.model,
+    this.context,
+    this.options,
+    this.eventStream,
+    this.state,
+    this.cancelToken,
+    this.httpClient,
+  );
+
+  final Model model;
+  final Context context;
+  final OpenAICompletionsOptions? options;
+  final AssistantMessageEventStream eventStream;
+  final ProviderStreamState state;
+  final CancelToken? cancelToken;
+  final http.Client httpClient;
+
+  final toolCallBlocksByIndex = <int, ToolCallStreamingBlock>{};
+  final toolCallBlocksById = <String, ToolCallStreamingBlock>{};
+  final pendingReasoningDetailsByToolCallId = <String, String>{};
+  var hasFinishReason = false;
+
+  TextStreamingBlock? textBlock;
+  ThinkingStreamingBlock? thinkingBlock;
+
+  // Inline `<think>` extraction: endpoints without a reasoning field send
+  // thinking as `<think>…</think>` tags inside the content stream (kimi k3
+  // via openai-completions). Routing it into a thinking block keeps the
+  // transcript clean instead of showing raw tags.
+  _ThinkTagState _thinkTagState = _ThinkTagState.deciding;
+  final _thinkTagBuf = StringBuffer();
+
+  List<StreamingBlock> get blocks => state.blocks;
+
+  int _contentIndex(StreamingBlock block) => blocks.indexOf(block);
+
+  /// Request setup → SSE consumption → finish/usage handling.
+  ///
+  /// A 400 that rejects the request's image parts from a text-only endpoint
+  /// (issue #42: z.ai glm-5.3 `messages.content.type is invalid, allowed
+  /// values: ['text']`) is retried ONCE with every image downgraded to its
+  /// placeholder — the turn survives and the model can explain the swap
+  /// instead of dying with a raw API error.
+  Future<void> run() async {
+    http.StreamedResponse response;
+    try {
+      response = await _startRequest();
+    } on ProviderHttpError catch (error) {
+      if (!_isImageContentRejection(error) ||
+          !messagesContainImages(context.messages)) {
+        rethrow;
+      }
+      response = await _startRequest(
+        messages: downgradeAllImages(context.messages),
+      );
+    }
+    await _consumeSse(response);
+    _finish();
+  }
+
+  Future<http.StreamedResponse> _startRequest({List<Message>? messages}) async {
+    final compat = _getCompat(model);
+    final retryContext = messages == null
+        ? context
+        : Context(
+            systemPrompt: context.systemPrompt,
+            messages: messages,
+            tools: context.tools,
+          );
+    final params = await applyPayloadHook(
+      _buildParams(model, retryContext, options, compat),
+      model,
+      options?.onPayload,
+    );
+
+    cancelToken?.throwIfCancelled();
+
+    final url =
+        options?.urlBuilder?.call(model) ??
+        Uri.parse('${model.baseUrl}/chat/completions');
+    final request = http.Request('POST', url)
+      ..headers.addAll(_buildHeaders(model, options))
+      ..body = jsonEncode(params);
+
+    return startProviderResponse(
+      eventStream,
+      state,
+      httpClient,
+      request,
+      cancelToken,
+      options?.onResponse,
+    );
+  }
+
+  Future<void> _consumeSse(http.StreamedResponse response) async {
+    // Issue #1554: the model's request-scoped idle window sits BELOW the
+    // explicit options override and ABOVE the per-provider table.
+    final scopedIdle = options?.idleTimeout ?? model.streamIdleTimeout;
+    final iterator = createSseIterator(
+      response,
+      cancelToken,
+      // Null falls through to the effective (config-overridable) default.
+      idleTimeout: scopedIdle,
+      // The scope label cites THE LEG THAT RAN (issue #1554 review round 1):
+      // an explicit options override or an unscoped model keeps bare text.
+      timeoutSource: options?.idleTimeout == null && scopedIdle != null
+          ? model.timeoutScopeLabel
+          : null,
+    );
+
+    var dataChunks = 0;
+    while (await iterator.moveNext()) {
+      final data = iterator.current.data.trim();
+      if (data.isEmpty || data == '[DONE]') {
+        continue;
+      }
+      final chunk = jsonDecode(data);
+      if (chunk is! Map<String, dynamic>) {
+        continue;
+      }
+      dataChunks++;
+      _handleChunk(chunk);
+    }
+    if (dataChunks == 0) {
+      // The endpoint accepted the request (200, an event-stream
+      // content-type) but sent NOTHING — no completion chunk, not even
+      // an error object. Downstream this renders as "(empty response —
+      // try again)" with zero diagnosable cause; a gateway doing this
+      // (dead session, unknown deployment) must surface as an error.
+      throw StateError(
+        'The endpoint answered with an EMPTY event stream (no SSE data) '
+        '— the gateway accepted the request but sent nothing. Check the '
+        'deployment/model id (${model.id}) and sign-in state at '
+        '${model.baseUrl}.',
+      );
+    }
+  }
+
+  /// Translates one SSE chunk into stream events: chunk-level metadata and
+  /// usage first, then the (single) choice's finish reason and delta.
+  void _handleChunk(Map<String, dynamic> chunk) {
+    _applyChunkMetadata(chunk);
+
+    final choice = _firstChoice(chunk);
+    if (choice == null) {
+      return;
+    }
+
+    _applyChoiceUsageFallback(chunk, choice);
+
+    _applyFinishReason(choice);
+
+    final delta = choice['delta'];
+    if (delta is! Map<String, dynamic>) {
+      return;
+    }
+
+    _handleContentDelta(delta);
+    _handleReasoningDelta(delta);
+    _handleToolCallsDelta(delta);
+    _handleReasoningDetailsDelta(delta);
+  }
+
+  Map<String, dynamic>? _firstChoice(Map<String, dynamic> chunk) {
+    final choices = chunk['choices'];
+    final choice = choices is List && choices.isNotEmpty ? choices.first : null;
+    return choice is Map<String, dynamic> ? choice : null;
+  }
+
+  /// Chunk-level metadata: response id, response model, and chunk.usage.
+  void _applyChunkMetadata(Map<String, dynamic> chunk) {
+    // Each chunk in a streamed completion carries the same id.
+    state.responseId ??= chunk['id'] as String?;
+    final chunkModel = chunk['model'];
+    if (chunkModel is String &&
+        chunkModel.isNotEmpty &&
+        chunkModel != model.id) {
+      state.responseModel ??= chunkModel;
+    }
+    final rawUsage = chunk['usage'];
+    if (rawUsage is Map<String, dynamic>) {
+      state.usage = _parseChunkUsage(rawUsage, model);
+    }
+  }
+
+  /// Fallback: some providers (e.g., Moonshot) return usage in
+  /// choice.usage instead of the standard chunk.usage.
+  void _applyChoiceUsageFallback(
+    Map<String, dynamic> chunk,
+    Map<String, dynamic> choice,
+  ) {
+    if (chunk['usage'] != null) {
+      return;
+    }
+    final choiceUsage = choice['usage'];
+    if (choiceUsage is Map<String, dynamic>) {
+      state.usage = _parseChunkUsage(choiceUsage, model);
+    }
+  }
+
+  void _applyFinishReason(Map<String, dynamic> choice) {
+    final finishReason = choice['finish_reason'];
+    if (finishReason != null) {
+      final result = _mapStopReason(finishReason as String);
+      state.stopReason = result.reason;
+      state.rawStopReason = finishReason;
+      state.errorMessage = result.errorMessage;
+      hasFinishReason = true;
+    }
+  }
+
+  void _handleContentDelta(Map<String, dynamic> delta) {
+    final content = delta['content'];
+    if (content is! String || content.isEmpty) return;
+    _routeContent(content);
+  }
+
+  /// Routes content text into the text block or — when the stream starts
+  /// with a `<think>` tag — into the thinking block until `</think>`.
+  void _routeContent(String chunk) {
+    if (_thinkTagState == _ThinkTagState.plain) {
+      _emitText(chunk);
+      return;
+    }
+    _thinkTagBuf.write(chunk);
+    _drainThinkTagBuffer();
+  }
+
+  /// Drains the think-tag buffer as far as decidable: tags may split across
+  /// deltas, so an ambiguous prefix stays buffered until [flush] (stream end).
+  void _drainThinkTagBuffer({bool flush = false}) {
+    final text = _thinkTagBuf.toString();
+    if (text.isEmpty) return;
+
+    switch (_thinkTagState) {
+      case _ThinkTagState.deciding:
+        _drainDecidingThinkTag(text, flush: flush);
+      case _ThinkTagState.inThink:
+        _drainInThinkTag(text, flush: flush);
+      case _ThinkTagState.plain:
+        _thinkTagBuf.clear();
+    }
+  }
+
+  /// Decides whether the buffered text starts with `<think>`; if so, enters
+  /// the in-think state and continues draining, otherwise falls back to plain.
+  void _drainDecidingThinkTag(String text, {required bool flush}) {
+    final probe = text.trimLeft();
+    // Undecided while the probe could still grow into the open tag.
+    if (!flush && probe.length < 7 && '<think>'.startsWith(probe)) return;
+    if (probe.startsWith('<think>')) {
+      _thinkTagState = _ThinkTagState.inThink;
+      final inner = probe.substring(7);
+      _thinkTagBuf
+        ..clear()
+        ..write(inner);
+      _drainInThinkTag(inner, flush: false);
+    } else {
+      _thinkTagState = _ThinkTagState.plain;
+      _thinkTagBuf.clear();
+      _emitText(text);
+    }
+  }
+
+  /// Emits completed thinking text and transitions back to plain when the
+  /// closing `</think>` tag is found; otherwise buffers a partial close-tag
+  /// tail.
+  void _drainInThinkTag(String text, {required bool flush}) {
+    final end = text.indexOf('</think>');
+    if (end >= 0) {
+      if (end > 0) _emitThinking(text.substring(0, end));
+      _thinkTagState = _ThinkTagState.plain;
+      _thinkTagBuf.clear();
+      final rest = text.substring(end + 8);
+      if (rest.isNotEmpty) _emitText(rest);
+      return;
+    }
+    // Hold back a potential partial `</think>` tail.
+    final hold = flush ? 0 : _partialTagTail(text);
+    final emit = hold == 0 ? text : text.substring(0, text.length - hold);
+    if (emit.isNotEmpty) _emitThinking(emit);
+    _thinkTagBuf
+      ..clear()
+      ..write(hold == 0 ? '' : text.substring(text.length - hold));
+  }
+
+  /// The length of the longest suffix of [text] that could grow into the
+  /// `</think>` close tag (0-8).
+  static int _partialTagTail(String text) {
+    const tag = '</think>';
+    final max = text.length < tag.length - 1 ? text.length : tag.length - 1;
+    for (var len = max; len > 0; len--) {
+      if (tag.startsWith(text.substring(text.length - len))) return len;
+    }
+    return 0;
+  }
+
+  void _emitText(String text) {
+    final block = _ensureTextBlock();
+    block.text.write(text);
+    eventStream.push(
+      TextDeltaEvent(
+        contentIndex: _contentIndex(block),
+        delta: text,
+        partial: state.snapshot(),
+      ),
+    );
+  }
+
+  void _emitThinking(String text) {
+    final block = _ensureThinkingBlock('think_tag');
+    block.thinking.write(text);
+    eventStream.push(
+      ThinkingDeltaEvent(
+        contentIndex: _contentIndex(block),
+        delta: text,
+        partial: state.snapshot(),
+      ),
+    );
+  }
+
+  void _handleReasoningDelta(Map<String, dynamic> delta) {
+    // Some endpoints return reasoning in reasoning_content (llama.cpp),
+    // or reasoning (other openai compatible endpoints). Use the first
+    // non-empty reasoning field to avoid duplication (e.g., chutes.ai
+    // returns both reasoning_content and reasoning with same content).
+    const reasoningFields = [
+      'reasoning_content',
+      'reasoning',
+      'reasoning_text',
+    ];
+    String? foundReasoningField;
+    for (final field in reasoningFields) {
+      final value = delta[field];
+      if (value is String && value.isNotEmpty) {
+        foundReasoningField = field;
+        break;
+      }
+    }
+    if (foundReasoningField == null) {
+      return;
+    }
+    var reasoningDelta = delta[foundReasoningField] as String;
+    final block = _ensureThinkingBlock(foundReasoningField);
+    // Some OpenAI-compatible relays send the reasoning as overlapping
+    // fragments (sliding window) or full snapshots so far instead of
+    // clean deltas — appending those verbatim stutters
+    // ("Продродололжжж…"). Trim the overlap: the longest prefix of
+    // the chunk that already sits at the tail of what we have.
+    reasoningDelta = _dedupeOverlap(block.thinking, reasoningDelta);
+    if (reasoningDelta.isNotEmpty) {
+      block.thinking.write(reasoningDelta);
+      eventStream.push(
+        ThinkingDeltaEvent(
+          contentIndex: _contentIndex(block),
+          delta: reasoningDelta,
+          partial: state.snapshot(),
+        ),
+      );
+    }
+  }
+
+  void _handleToolCallsDelta(Map<String, dynamic> delta) {
+    final toolCalls = delta['tool_calls'];
+    if (toolCalls is! List) {
+      return;
+    }
+    for (final rawToolCall in toolCalls) {
+      if (rawToolCall is! Map<String, dynamic>) {
+        continue;
+      }
+      _handleSingleToolCallDelta(rawToolCall);
+    }
+  }
+
+  /// Applies one streamed `tool_calls` entry: late id/name assignment,
+  /// arguments append, and the per-entry [ToolCallDeltaEvent].
+  void _handleSingleToolCallDelta(Map<String, dynamic> rawToolCall) {
+    final resend = _matchResentToolCallBlock(rawToolCall);
+    final block = _ensureToolCallBlock(rawToolCall, resend);
+    _applyToolCallIdentity(block, rawToolCall);
+    final function = rawToolCall['function'];
+    var toolDelta = '';
+    if (function is Map && function['arguments'] is String) {
+      toolDelta = function['arguments'] as String;
+      if (resend != null) {
+        // The re-sent frame repeats what the block already accumulated —
+        // append only the non-overlapping suffix so the merged args stay
+        // exact instead of doubling.
+        final existing = block.partialArgs.toString();
+        if (toolDelta.startsWith(existing)) {
+          toolDelta = toolDelta.substring(existing.length);
+        }
+        if (toolDelta.isEmpty) return;
+      }
+      block.partialArgs.write(toolDelta);
+    }
+    eventStream.push(
+      ToolCallDeltaEvent(
+        contentIndex: _contentIndex(block),
+        delta: toolDelta,
+        partial: state.snapshot(),
+      ),
+    );
+  }
+
+  /// Late id/name assignment for a streaming tool-call block (they arrive
+  /// spread across chunks: the first chunk carries them, later ones only
+  /// argument fragments).
+  void _applyToolCallIdentity(
+    ToolCallStreamingBlock block,
+    Map<String, dynamic> rawToolCall,
+  ) {
+    final id = rawToolCall['id'] as String?;
+    if (block.id.isEmpty && id != null) {
+      block.id = id;
+      toolCallBlocksById[id] = block;
+    }
+    final function = rawToolCall['function'];
+    if (function is Map) {
+      final name = function['name'] as String?;
+      if (block.name.isEmpty && name != null) {
+        block.name = name;
+      }
+    }
+  }
+
+  void _handleReasoningDetailsDelta(Map<String, dynamic> delta) {
+    final reasoningDetails = delta['reasoning_details'];
+    if (reasoningDetails is! List) {
+      return;
+    }
+    for (final detail in reasoningDetails) {
+      if (_isEncryptedReasoningDetail(detail)) {
+        final map = detail as Map<String, dynamic>;
+        final serialized = jsonEncode(map);
+        final matching = toolCallBlocksById[map['id']];
+        if (matching != null) {
+          matching.thoughtSignature = serialized;
+        } else {
+          pendingReasoningDetailsByToolCallId[map['id'] as String] = serialized;
+        }
+      } else if (detail is Map<String, dynamic>) {
+        _handleReasoningDetailText(detail);
+      }
+    }
+  }
+
+  /// OpenRouter routes some models' reasoning (e.g. NVIDIA nemotron) as
+  /// reasoning_details text entries instead of a plain `reasoning` delta
+  /// field — surface those as thinking too, otherwise the turn looks silent.
+  ///
+  /// Gemini models send BOTH: a `reasoning` delta field AND
+  /// reasoning_details text carrying the SAME content (as cumulative
+  /// snapshots) — writing both stutters ("The The user user…"). Run the
+  /// text through the same overlap dedupe as the reasoning field: identical
+  /// or snapshot content collapses to the new suffix only.
+  void _handleReasoningDetailText(Map<String, dynamic> detail) {
+    final detailText = detail['text'];
+    if (detailText is String && detailText.isNotEmpty) {
+      final block = _ensureThinkingBlock('reasoning_details');
+      final detailDelta = _dedupeOverlap(block.thinking, detailText);
+      if (detailDelta.isNotEmpty) {
+        block.thinking.write(detailDelta);
+        eventStream.push(
+          ThinkingDeltaEvent(
+            contentIndex: _contentIndex(block),
+            delta: detailDelta,
+            partial: state.snapshot(),
+          ),
+        );
+      }
+    }
+  }
+
+  TextStreamingBlock _ensureTextBlock() {
+    var block = textBlock;
+    if (block == null) {
+      block = TextStreamingBlock();
+      textBlock = block;
+      blocks.add(block);
+      eventStream.push(
+        TextStartEvent(
+          contentIndex: _contentIndex(block),
+          partial: state.snapshot(),
+        ),
+      );
+    }
+    return block;
+  }
+
+  ThinkingStreamingBlock _ensureThinkingBlock(String thinkingSignature) {
+    var block = thinkingBlock;
+    if (block == null) {
+      block = ThinkingStreamingBlock(signature: thinkingSignature);
+      thinkingBlock = block;
+      blocks.add(block);
+      eventStream.push(
+        ThinkingStartEvent(
+          contentIndex: _contentIndex(block),
+          partial: state.snapshot(),
+        ),
+      );
+    }
+    return block;
+  }
+
+  void _applyPendingReasoningDetail(ToolCallStreamingBlock block) {
+    if (block.id.isEmpty) {
+      return;
+    }
+    final pending = pendingReasoningDetailsByToolCallId.remove(block.id);
+    if (pending != null) {
+      block.thoughtSignature = pending;
+    }
+  }
+
+  ToolCallStreamingBlock _ensureToolCallBlock(
+    Map<String, dynamic> toolCall, [
+    ToolCallStreamingBlock? resent,
+  ]) {
+    final streamIndex = toolCall['index'] is int
+        ? toolCall['index'] as int
+        : null;
+    final id = toolCall['id'] as String?;
+    var block = resent ?? _lookupToolCallBlock(streamIndex, id);
+    block ??= _createToolCallBlock(toolCall, streamIndex, id);
+    if (streamIndex != null && block.streamIndex == null) {
+      block.streamIndex = streamIndex;
+      toolCallBlocksByIndex[streamIndex] = block;
+    }
+    if (id != null) {
+      toolCallBlocksById[id] = block;
+    }
+    _applyPendingReasoningDetail(block);
+    return block;
+  }
+
+  /// Detects a relay re-send of an already-seen tool-call frame: the frame
+  /// carries a freshly generated id (gh-1655), so the id/index lookup
+  /// misses, but the LAST registered block of the current message holds the
+  /// same non-empty name and its partial arguments are empty or a prefix of
+  /// the incoming arguments. Merging into it keeps the stuttered frame from
+  /// spawning a second block that would execute the same call twice.
+  ToolCallStreamingBlock? _matchResentToolCallBlock(
+    Map<String, dynamic> toolCall,
+  ) {
+    final function = toolCall['function'];
+    final name = function is Map ? function['name'] as String? : null;
+    if (name == null || name.isEmpty) {
+      return null;
+    }
+    final args = function['arguments'] is String
+        ? function['arguments'] as String
+        : '';
+    final last = _lastToolCallBlock(blocks);
+    if (last == null || last.name.isEmpty || last.name != name) {
+      return null;
+    }
+    final existing = last.partialArgs.toString();
+    if (existing.isNotEmpty && !args.startsWith(existing)) {
+      return null;
+    }
+    return last;
+  }
+
+  /// Finds an existing tool-call block by stream index first, then by id.
+  ToolCallStreamingBlock? _lookupToolCallBlock(int? streamIndex, String? id) {
+    var block = streamIndex != null ? toolCallBlocksByIndex[streamIndex] : null;
+    block ??= id != null ? toolCallBlocksById[id] : null;
+    return block;
+  }
+
+  /// Registers a new tool-call block under both indexes and pushes its
+  /// [ToolCallStartEvent].
+  ToolCallStreamingBlock _createToolCallBlock(
+    Map<String, dynamic> toolCall,
+    int? streamIndex,
+    String? id,
+  ) {
+    final function = toolCall['function'];
+    final block = ToolCallStreamingBlock(
+      id: id ?? '',
+      name: function is Map ? function['name'] as String? ?? '' : '',
+      streamIndex: streamIndex,
+    );
+    if (streamIndex != null) {
+      toolCallBlocksByIndex[streamIndex] = block;
+    }
+    if (id != null) {
+      toolCallBlocksById[id] = block;
+    }
+    blocks.add(block);
+    eventStream.push(
+      ToolCallStartEvent(
+        contentIndex: _contentIndex(block),
+        partial: state.snapshot(),
+      ),
+    );
+    return block;
+  }
+
+  /// Block-end events, abort/error propagation, the no-finish-reason
+  /// fallback, and the final [DoneEvent].
+  void _finish() {
+    // A truncated/ended stream may leave an undecided or mid-tag think
+    // buffer: flush it so its content lands in the right block.
+    _drainThinkTagBuffer(flush: true);
+    for (final block in List.of(blocks)) {
+      pushBlockEndEvent(eventStream, blocks, block, state.snapshot);
+    }
+
+    if (cancelToken?.isCancelled ?? false) {
+      throw const AbortedError();
+    }
+    if (state.stopReason == StopReason.error) {
+      throw StateError(
+        state.errorMessage ?? 'Provider returned an error stop reason',
+      );
+    }
+    if (!hasFinishReason) {
+      const truncated =
+          'stream ended without finish_reason — the reply may be truncated';
+      // Issue #312: with nothing observable streamed, a stream that closes
+      // without a finish_reason is a cut transport, not a natural stop —
+      // surface it as a (transient-classified) error the retry umbrella
+      // can replay, instead of answering an empty turn.
+      if (state.blocks.isEmpty) {
+        throw StateError(truncated);
+      }
+      // Some providers (seen on OpenRouter free-tier models) close the SSE
+      // stream without a final finish_reason chunk. The accumulated content
+      // is complete as far as we know, so keep the default natural stop
+      // instead of failing the whole turn — but flag the silent truncation
+      // so the UI can note the reply may be cut off. A genuinely truncated
+      // tool call surfaces as an args-parse error downstream, which the
+      // agent loop already feeds back to the model as a tool error.
+      state.stopReason = StopReason.stop;
+      state.errorMessage ??= truncated;
+    }
+
+    eventStream.push(
+      DoneEvent(reason: state.stopReason, message: state.snapshot()),
+    );
+  }
+}
+
+String _truncate40(String value) {
+  return value.length > 40 ? value.substring(0, 40) : value;
+}
+
+/// The last registered [ToolCallStreamingBlock] of [blocks], or null when
+/// the message has none yet.
+ToolCallStreamingBlock? _lastToolCallBlock(List<StreamingBlock> blocks) {
+  for (final block in blocks.reversed) {
+    if (block is ToolCallStreamingBlock) {
+      return block;
+    }
+  }
+  return null;
+}
+
+bool _hasToolHistory(List<Message> messages) {
+  for (final message in messages) {
+    if (message is ToolResultMessage) {
+      return true;
+    }
+    if (message is AssistantMessage &&
+        message.content.any((block) => block is ToolCall)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+Map<String, String> _buildHeaders(
+  Model model,
+  OpenAICompletionsOptions? options,
+) {
+  final apiKey = options?.apiKey;
+  // Issue #964: a config-declared auth header name replaces the Bearer
+  // scheme — `authHeader: x-api-key` sends `x-api-key: <key>` with NO
+  // `authorization` header (enterprise gateways, e.g. AWS API Gateway
+  // fronting Bedrock, reject Bearer). Unset keeps the Bearer default
+  // byte-identical; keyless requests still send neither (below).
+  final authHeaderName = model.authHeader;
+  final customAuth =
+      authHeaderName != null &&
+      authHeaderName.isNotEmpty &&
+      apiKey != null &&
+      apiKey.isNotEmpty;
+  // pi's session-affinity headers: OpenRouter pins a session to one upstream
+  // provider via `x-session-id`, so cache locality survives across turns.
+  // Suppressed under `none` retention (pi's `cacheSessionId`).
+  final sessionId = _resolveCacheRetention(options) == 'none'
+      ? null
+      : options?.sessionId;
+  final headers = mergeProviderHeaders(
+    {
+      'content-type': 'application/json',
+      // An empty/absent key sends NO Authorization header: keyless local
+      // servers (llama.cpp, Ollama, LM Studio) exist, and some reject a
+      // bogus `Bearer ` value. An endpoint that does require auth answers
+      // 401, which surfaces as a normal error event. Hosts can still pass an
+      // explicit `authorization` entry through [Model.headers] or
+      // [OpenAICompletionsOptions.headers]; a config-declared
+      // `authHeader` (issue #964) swaps the Bearer entry for a raw
+      // `<name>: <key>` header instead.
+      if (!customAuth && apiKey != null && apiKey.isNotEmpty)
+        'authorization': 'Bearer $apiKey',
+      if (customAuth) authHeaderName: apiKey,
+      if (sessionId != null &&
+          sessionId.isNotEmpty &&
+          _isOpenRouterModel(model))
+        'x-session-id': sessionId,
+    },
+    model.headers,
+    options?.headers,
+  );
+  return headers;
+}
+
+/// Auto-detected plus overridden compatibility settings for [model].
+///
+/// Ported subset of pi's `detectCompat`/`getCompat`: only the OpenRouter
+/// detection matters in Phase 0; the rest of the provider matrix arrives
+/// with later cards.
+final class _ResolvedCompat {
+  const _ResolvedCompat({
+    required this.maxTokensField,
+    required this.supportsUsageInStreaming,
+    required this.thinkingFormat,
+    required this.requiresToolResultName,
+    required this.cacheControlFormat,
+    required this.supportsLongCacheRetention,
+    required this.sendsToolStrict,
+    required this.omitMaxOutputTokens,
+  });
+
+  final String maxTokensField;
+  final bool supportsUsageInStreaming;
+  final ThinkingFormat thinkingFormat;
+  final bool requiresToolResultName;
+
+  /// `anthropic` when the endpoint wants Anthropic-style `cache_control`
+  /// markers (OpenRouter hosting `anthropic/*` models), otherwise null
+  /// (pi's `OpenAICompletionsCompat.cacheControlFormat` detection).
+  final String? cacheControlFormat;
+
+  /// Whether `prompt_cache_retention: "24h"` / 1h marker TTLs are honored
+  /// (pi's `supportsLongCacheRetention`; the non-supporting providers of
+  /// pi's matrix are not detected here, so the default is true).
+  final bool supportsLongCacheRetention;
+
+  /// Whether the top-level tool entry carries a `strict` field. DIAL Core's
+  /// strict request schema rejects it (`400 … strict … Extra inputs are not
+  /// permitted`).
+  final bool sendsToolStrict;
+
+  /// The endpoint rejects the max-output field: nothing rides (gh-1426).
+  final bool omitMaxOutputTokens;
+}
+
+bool _isOpenRouterModel(Model model) {
+  return model.provider == 'openrouter' ||
+      model.baseUrl.contains('openrouter.ai');
+}
+
+bool _isDialModel(Model model) {
+  return model.provider == 'dial';
+}
+
+/// Gemini's generateContent endpoint (`generativelanguage.googleapis.com`)
+/// rejects the OpenAI-only `strict: false` field in `tools[i]` with
+/// 400 "Cannot find field". Detect it by host or provider name.
+bool _isGoogleModel(Model model) {
+  return model.provider == 'google' ||
+      model.baseUrl.contains('generativelanguage.googleapis.com');
+}
+
+/// Matches a 400 whose body rejects the request's content-block types —
+/// the text-only-endpoint shape (issue #42, z.ai glm-5.3:
+/// `messages.content.type is invalid, allowed values: ['text']`; other
+/// gateways phrase it `invalid content type` or `image_url is not
+/// supported`). Only ever consulted alongside `messagesContainImages`, so
+/// image-free requests can never trip the retry.
+final _imageContentRejection = RegExp(
+  'content[._ -]?type[^\\n]{0,80}(invalid|allowed|not supported)'
+  '|(invalid|not supported|unsupported)[^\\n]{0,40}content[._ -]?type'
+  '|image_url[^\\n]{0,40}(not supported|invalid|unsupported)',
+  caseSensitive: false,
+);
+
+bool _isImageContentRejection(ProviderHttpError error) {
+  return error.statusCode == 400 && _imageContentRejection.hasMatch(error.body);
+}
+
+_ResolvedCompat _getCompat(Model model) {
+  final isOpenRouter = _isOpenRouterModel(model);
+  final isDial = _isDialModel(model);
+  final isGoogle = _isGoogleModel(model);
+  final compat = model.compat;
+  return _ResolvedCompat(
+    maxTokensField: compat?.maxTokensField ?? 'max_completion_tokens',
+    supportsUsageInStreaming: compat?.supportsUsageInStreaming ?? true,
+    thinkingFormat:
+        compat?.thinkingFormat ??
+        (isOpenRouter ? ThinkingFormat.openrouter : ThinkingFormat.openai),
+    requiresToolResultName: compat?.requiresToolResultName ?? false,
+    cacheControlFormat: isOpenRouter && model.id.startsWith('anthropic/')
+        ? 'anthropic'
+        : null,
+    supportsLongCacheRetention: true,
+    // DIAL Core's strict schema rejects `strict`; Google's Gemini
+    // generateContent endpoint also rejects it (400 "Cannot find
+    // field 'strict'"). Neither adapter carries it.
+    sendsToolStrict: compat?.sendsToolStrict ?? (!isDial && !isGoogle),
+    // gh-1426: the resolver's omit-compat escape — an endpoint that 400s
+    // on the max-output fields gets none.
+    omitMaxOutputTokens: compat?.omitMaxOutputTokens ?? false,
+  );
+}
+
+Map<String, dynamic> _buildParams(
+  Model model,
+  Context context,
+  OpenAICompletionsOptions? options,
+  _ResolvedCompat compat,
+) {
+  final retention = _resolveCacheRetention(options);
+  final messages = _convertMessages(model, context, compat);
+
+  final params = <String, dynamic>{
+    'model': model.id,
+    'messages': messages,
+    'stream': true,
+  };
+
+  _applyPromptCacheParams(params, model, options, compat, retention);
+
+  if (compat.supportsUsageInStreaming) {
+    params['stream_options'] = {'include_usage': true};
+  }
+
+  if (options?.maxTokens != null && !compat.omitMaxOutputTokens) {
+    params[compat.maxTokensField] = options!.maxTokens;
+  } else if (model.maxTokens > 0 && !compat.omitMaxOutputTokens) {
+    // The model's carried cap (catalog default or endpoint-detected via
+    // /models limits) — same fallback semantics as the Anthropic adapter.
+    params[compat.maxTokensField] = model.maxTokens;
+  }
+
+  if (options?.temperature != null) {
+    params['temperature'] = options!.temperature;
+  }
+
+  _applyToolsParam(params, context, compat);
+
+  if (options?.toolChoice != null) {
+    params['tool_choice'] = options!.toolChoice;
+  }
+
+  _applyReasoningParam(params, model, options, compat);
+  _applyAnthropicCacheControl(params, compat, retention);
+
+  return params;
+}
+
+/// pi's `resolveCacheRetention` (minus the `PI_CACHE_RETENTION` env lookup):
+/// `short` is the default.
+String _resolveCacheRetention(OpenAICompletionsOptions? options) {
+  return options?.cacheRetention ?? 'short';
+}
+
+/// pi's `prompt_cache_key`/`prompt_cache_retention` params: the key pins the
+/// session to one prompt-cache bucket on OpenAI endpoints (any non-`none`
+/// retention) and everywhere under `long` retention; `long` additionally
+/// asks for a 24h retention window where supported.
+void _applyPromptCacheParams(
+  Map<String, dynamic> params,
+  Model model,
+  OpenAICompletionsOptions? options,
+  _ResolvedCompat compat,
+  String retention,
+) {
+  final sendCacheKey =
+      (model.baseUrl.contains('api.openai.com') && retention != 'none') ||
+      (retention == 'long' && compat.supportsLongCacheRetention);
+  if (sendCacheKey) {
+    final key = _clampPromptCacheKey(options?.sessionId);
+    if (key != null) {
+      params['prompt_cache_key'] = key;
+    }
+  }
+  if (retention == 'long' && compat.supportsLongCacheRetention) {
+    params['prompt_cache_retention'] = '24h';
+  }
+}
+
+/// Ported from pi's `clampOpenAIPromptCacheKey` (`openai-prompt-cache.ts`):
+/// OpenAI caps `prompt_cache_key` at 64 characters.
+String? _clampPromptCacheKey(String? key) {
+  if (key == null) {
+    return null;
+  }
+  const maxLength = 64;
+  final chars = key.runes.toList();
+  return chars.length <= maxLength
+      ? key
+      : String.fromCharCodes(chars.take(maxLength));
+}
+
+/// Anthropic-style `cache_control` markers for OpenAI-compatible endpoints
+/// hosting `anthropic/*` models (OpenRouter; pi's `cacheControlFormat:
+/// "anthropic"`): the system prompt, the last tool definition, and the last
+/// conversation text part get an ephemeral breakpoint.
+void _applyAnthropicCacheControl(
+  Map<String, dynamic> params,
+  _ResolvedCompat compat,
+  String retention,
+) {
+  if (compat.cacheControlFormat != 'anthropic' || retention == 'none') {
+    return;
+  }
+  final cacheControl = <String, dynamic>{
+    'type': 'ephemeral',
+    if (retention == 'long' && compat.supportsLongCacheRetention) 'ttl': '1h',
+  };
+  final messages = params['messages'];
+  if (messages is! List) {
+    return;
+  }
+  _addCacheControlToSystemPrompt(messages, cacheControl);
+  _addCacheControlToLastTool(params['tools'], cacheControl);
+  _addCacheControlToLastConversationMessage(messages, cacheControl);
+}
+
+/// Marks the first system/developer message (pi's
+/// `addCacheControlToSystemPrompt`).
+void _addCacheControlToSystemPrompt(
+  List<dynamic> messages,
+  Map<String, dynamic> cacheControl,
+) {
+  for (final message in messages) {
+    if (message is Map &&
+        (message['role'] == 'system' || message['role'] == 'developer')) {
+      _addCacheControlToTextContent(message, cacheControl);
+      return;
+    }
+  }
+}
+
+/// Marks the last tool definition (pi's `addCacheControlToLastTool`).
+void _addCacheControlToLastTool(
+  Object? tools,
+  Map<String, dynamic> cacheControl,
+) {
+  if (tools is List && tools.isNotEmpty && tools.last is Map) {
+    (tools.last as Map)['cache_control'] = cacheControl;
+  }
+}
+
+/// Marks the last user/assistant/tool message that has a text part (pi's
+/// `addCacheControlToLastConversationMessage`).
+void _addCacheControlToLastConversationMessage(
+  List<dynamic> messages,
+  Map<String, dynamic> cacheControl,
+) {
+  for (var i = messages.length - 1; i >= 0; i--) {
+    final message = messages[i];
+    if (message is Map &&
+        (message['role'] == 'user' ||
+            message['role'] == 'assistant' ||
+            message['role'] == 'tool') &&
+        _addCacheControlToTextContent(message, cacheControl)) {
+      return;
+    }
+  }
+}
+
+/// Sets [cacheControl] on [message]'s text content, wrapping a plain-string
+/// content into a text-part list first (pi's
+/// `addCacheControlToTextContent`). Returns whether a marker was placed.
+bool _addCacheControlToTextContent(
+  Map<dynamic, dynamic> message,
+  Map<String, dynamic> cacheControl,
+) {
+  final content = message['content'];
+  if (content is String) {
+    if (content.isEmpty) {
+      return false;
+    }
+    message['content'] = [
+      {'type': 'text', 'text': content, 'cache_control': cacheControl},
+    ];
+    return true;
+  }
+  if (content is! List) {
+    return false;
+  }
+  for (var i = content.length - 1; i >= 0; i--) {
+    final part = content[i];
+    if (part is Map && part['type'] == 'text') {
+      part['cache_control'] = cacheControl;
+      return true;
+    }
+  }
+  return false;
+}
+
+void _applyToolsParam(
+  Map<String, dynamic> params,
+  Context context,
+  _ResolvedCompat compat,
+) {
+  if (context.tools != null && context.tools!.isNotEmpty) {
+    params['tools'] = _convertTools(context.tools!, compat);
+  } else if (_hasToolHistory(context.messages)) {
+    // Anthropic (via LiteLLM/proxy) requires tools param when conversation
+    // has tool_calls/tool_results.
+    params['tools'] = const <Object>[];
+  }
+}
+
+void _applyReasoningParam(
+  Map<String, dynamic> params,
+  Model model,
+  OpenAICompletionsOptions? options,
+  _ResolvedCompat compat,
+) {
+  // gh-1426 (AC6): a model-pinned level (roles chain entry, capability
+  // override, env preconfig) reaches the wire too — options silent and a
+  // carried level ride as the effort; an explicit options effort wins.
+  // Non-reasoning models never carry the field (E3: the gate drops the
+  // pin — the resolver notes it, the adapter enforces it).
+  final effort =
+      options?.reasoningEffort ??
+      (model.reasoning ? model.thinkingLevel : null);
+  if (model.reasoning && effort != null) {
+    if (compat.thinkingFormat == ThinkingFormat.openrouter) {
+      // OpenRouter normalizes reasoning across providers via a nested
+      // reasoning object.
+      params['reasoning'] = {'effort': effort};
+    } else {
+      params['reasoning_effort'] = effort;
+    }
+  }
+}
+
+List<Map<String, dynamic>> _convertMessages(
+  Model model,
+  Context context,
+  _ResolvedCompat compat,
+) {
+  final params = <Map<String, dynamic>>[];
+
+  if (context.systemPrompt != null) {
+    params.add({'role': 'system', 'content': context.systemPrompt});
+  }
+
+  final messages = downgradeUnsupportedImages(context.messages, model);
+  for (var i = 0; i < messages.length; i++) {
+    final message = messages[i];
+    if (message is UserMessage) {
+      final converted = _convertUserMessage(message);
+      if (converted != null) {
+        params.add(converted);
+      }
+    } else if (message is AssistantMessage) {
+      final converted = _convertAssistantMessage(message, model);
+      if (converted != null) {
+        params.add(converted);
+      }
+    } else if (message is ToolResultMessage) {
+      // Tool results arrive in consecutive runs; convert the whole run (and
+      // its image fan-out) in one go, then skip the consumed tail.
+      i = _convertToolResultRun(messages, i, model, compat, params) - 1;
+    }
+  }
+
+  return params;
+}
+
+String _normalizeToolCallId(String id, Model model) {
+  // Handle pipe-separated IDs from OpenAI Responses API
+  // (format: {call_id}|{id}): extract the call_id part, sanitize to
+  // allowed chars, and truncate to 40 chars (OpenAI limit).
+  if (id.contains('|')) {
+    final callId = id.split('|').first;
+    return _truncate40(callId.replaceAll(RegExp('[^a-zA-Z0-9_-]'), '_'));
+  }
+  if (model.provider == 'openai') {
+    // LiteLLM front-ends (e.g. CodeMie) embed Gemini thought signatures in
+    // the tool call id as `call_<n>__thought__<base64>` and recover them
+    // from the echoed id; truncating destroys the signature and Vertex then
+    // rejects the replay with a thought_signature base64 400.
+    if (id.contains('__thought__')) {
+      return id;
+    }
+    return _truncate40(id);
+  }
+  return id;
+}
+
+/// Audio MIME type → OpenAI `input_audio.format` tag. mp3/wav are the
+/// OpenAI-documented ones; OpenRouter's Gemini route additionally accepts
+/// m4a/aac/flac/ogg (verified against AIIN). Unknown mime types fall back
+/// to `mp3` — a table keeps the lookup O(1) and the complexity gate green
+/// (a 13-case switch measured CRAP 21.91 against the 12.0 ratchet).
+const _openAiAudioFormats = <String, String>{
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'audio/m4a': 'm4a',
+  'audio/aac': 'aac',
+  'audio/x-aac': 'aac',
+  'audio/flac': 'flac',
+  'audio/ogg': 'ogg',
+};
+
+String _openAiAudioFormat(String mimeType) =>
+    _openAiAudioFormats[mimeType.toLowerCase()] ?? 'mp3';
+
+Map<String, dynamic>? _convertUserMessage(UserMessage message) {
+  final content = message.content;
+  if (content is String) {
+    return {'role': 'user', 'content': content};
+  }
+  final parts = <Map<String, dynamic>>[];
+  for (final item in content as List<ContentBlock>) {
+    switch (item) {
+      case TextContent():
+        parts.add({'type': 'text', 'text': item.text});
+      case ImageContent():
+        parts.add({
+          'type': 'image_url',
+          'image_url': {'url': 'data:${item.mimeType};base64,${item.data}'},
+        });
+      case AudioContent():
+        // OpenAI/OpenRouter audio input (AIIN routes Gemini through this
+        // dialect too). Senders attach audio only for audio-capable
+        // models; mime type reduces to the wire `format` tag.
+        parts.add({
+          'type': 'input_audio',
+          'input_audio': {
+            'data': item.data,
+            'format': _openAiAudioFormat(item.mimeType),
+          },
+        });
+      case VideoContent():
+        // gh-1985 C1: video input rides the OpenRouter `video_url` content
+        // part with a base64 data URL (the only video wire in this
+        // dialect — OpenRouter routes it to the video-capable providers).
+        // Senders attach video only for video-capable models; the
+        // downgrade pre-pass strips it for the rest.
+        parts.add({
+          'type': 'video_url',
+          'video_url': {'url': 'data:${item.mimeType};base64,${item.data}'},
+        });
+      case ThinkingContent() || ToolCall():
+        // Not valid in user messages; skip defensively.
+        break;
+    }
+  }
+  if (parts.isEmpty) {
+    return null;
+  }
+  return {'role': 'user', 'content': parts};
+}
+
+Map<String, dynamic>? _convertAssistantMessage(
+  AssistantMessage message,
+  Model model,
+) {
+  final assistantMsg = <String, dynamic>{'role': 'assistant'};
+
+  _applyAssistantContent(assistantMsg, message.content);
+  _applyAssistantToolCalls(assistantMsg, message.content, model);
+
+  // Skip assistant messages that have no content and no tool calls.
+  final hasContent =
+      assistantMsg['content'] is String &&
+      (assistantMsg['content'] as String).isNotEmpty;
+  if (!hasContent && !assistantMsg.containsKey('tool_calls')) {
+    return null;
+  }
+  return assistantMsg;
+}
+
+void _applyAssistantContent(
+  Map<String, dynamic> assistantMsg,
+  List<ContentBlock> content,
+) {
+  final assistantText = _assistantText(content);
+  final thinkingBlocks = _thinkingBlocks(content);
+  if (thinkingBlocks.isNotEmpty) {
+    // Always send assistant content as a plain string (OpenAI Chat
+    // Completions API standard format); see pi for why arrays of text
+    // parts break some models.
+    if (assistantText.isNotEmpty) {
+      assistantMsg['content'] = assistantText;
+    }
+    // Use the signature from the first thinking block if available (for
+    // llama.cpp server + gpt-oss).
+    final signature = thinkingBlocks.first.thinkingSignature;
+    if (signature != null && signature.isNotEmpty) {
+      assistantMsg[signature] = thinkingBlocks
+          .map((block) => block.thinking)
+          .join('\n');
+    }
+  } else if (assistantText.isNotEmpty) {
+    assistantMsg['content'] = assistantText;
+  }
+}
+
+String _assistantText(List<ContentBlock> content) {
+  return [
+    for (final block in content)
+      if (block is TextContent && block.text.trim().isNotEmpty) block.text,
+  ].join();
+}
+
+List<ThinkingContent> _thinkingBlocks(List<ContentBlock> content) {
+  return [
+    for (final block in content)
+      if (block is ThinkingContent && block.thinking.trim().isNotEmpty) block,
+  ];
+}
+
+void _applyAssistantToolCalls(
+  Map<String, dynamic> assistantMsg,
+  List<ContentBlock> content,
+  Model model,
+) {
+  final toolCalls = [
+    for (final block in content)
+      if (block is ToolCall) block,
+  ];
+  if (toolCalls.isEmpty) {
+    return;
+  }
+  assistantMsg['tool_calls'] = [
+    for (final toolCall in toolCalls)
+      {
+        'id': _normalizeToolCallId(toolCall.id, model),
+        'type': 'function',
+        'function': {
+          'name': toolCall.name,
+          'arguments': jsonEncode(toolCall.arguments),
+        },
+      },
+  ];
+  final reasoningDetails = [
+    for (final toolCall in toolCalls)
+      if (toolCall.thoughtSignature != null)
+        _tryJsonDecode(toolCall.thoughtSignature!),
+  ].nonNulls.toList();
+  if (reasoningDetails.isNotEmpty) {
+    assistantMsg['reasoning_details'] = reasoningDetails;
+  }
+}
+
+/// Converts the consecutive run of [ToolResultMessage]s starting at [start]
+/// (plus the vision-model image fan-out user message) into [params]; returns
+/// the index just past the consumed run.
+int _convertToolResultRun(
+  List<Message> messages,
+  int start,
+  Model model,
+  _ResolvedCompat compat,
+  List<Map<String, dynamic>> params,
+) {
+  final imageBlocks = <Map<String, dynamic>>[];
+  final videoBlocks = <Map<String, dynamic>>[];
+  var j = start;
+
+  for (; j < messages.length && messages[j] is ToolResultMessage; j++) {
+    final toolMessage = messages[j] as ToolResultMessage;
+    params.add(_convertToolResult(toolMessage, model, compat));
+    if (model.input.contains('image')) {
+      imageBlocks.addAll(_toolResultImageParts(toolMessage));
+    }
+    if (model.input.contains('video')) {
+      videoBlocks.addAll(_toolResultVideoParts(toolMessage));
+    }
+  }
+
+  if (imageBlocks.isNotEmpty) {
+    params.add({
+      'role': 'user',
+      'content': [
+        {'type': 'text', 'text': 'Attached image(s) from tool result:'},
+        ...imageBlocks,
+      ],
+    });
+  }
+  if (videoBlocks.isNotEmpty) {
+    params.add({
+      'role': 'user',
+      'content': [
+        {'type': 'text', 'text': 'Attached video(s) from tool result:'},
+        ...videoBlocks,
+      ],
+    });
+  }
+
+  return j;
+}
+
+Map<String, dynamic> _convertToolResult(
+  ToolResultMessage toolMessage,
+  Model model,
+  _ResolvedCompat compat,
+) {
+  // Extract text and image content.
+  final textResult = [
+    for (final block in toolMessage.content)
+      if (block is TextContent) block.text,
+  ].join('\n');
+  final hasImages = toolMessage.content.any((block) => block is ImageContent);
+
+  // Always send tool result with text (or placeholder if only images).
+  final hasText = textResult.isNotEmpty;
+  final toolResultText = hasText
+      ? textResult
+      : hasImages
+      ? '(see attached image)'
+      : '(no tool output)';
+  final toolResultMsg = <String, dynamic>{
+    'role': 'tool',
+    'content': toolResultText,
+    'tool_call_id': _normalizeToolCallId(toolMessage.toolCallId, model),
+  };
+  if (compat.requiresToolResultName && toolMessage.toolName.isNotEmpty) {
+    toolResultMsg['name'] = toolMessage.toolName;
+  }
+  return toolResultMsg;
+}
+
+List<Map<String, dynamic>> _toolResultImageParts(
+  ToolResultMessage toolMessage,
+) {
+  return [
+    for (final block in toolMessage.content)
+      if (block is ImageContent)
+        {
+          'type': 'image_url',
+          'image_url': {'url': 'data:${block.mimeType};base64,${block.data}'},
+        },
+  ];
+}
+
+/// gh-1985 C1: tool-result videos ride the OpenRouter `video_url` shape in
+/// a dedicated "Attached video(s)" user turn, mirroring the image path.
+List<Map<String, dynamic>> _toolResultVideoParts(
+  ToolResultMessage toolMessage,
+) {
+  return [
+    for (final block in toolMessage.content)
+      if (block is VideoContent)
+        {
+          'type': 'video_url',
+          'video_url': {'url': 'data:${block.mimeType};base64,${block.data}'},
+        },
+  ];
+}
+
+List<Map<String, dynamic>> _convertTools(
+  List<Tool> tools,
+  _ResolvedCompat compat,
+) {
+  return [
+    for (final tool in tools)
+      {
+        'type': 'function',
+        'function': {
+          'name': tool.name,
+          'description': tool.description,
+          'parameters': tool.parameters,
+        },
+        // pi only includes `strict` when the provider supports it; strict
+        // request schemas (DIAL Core) reject unknown fields outright.
+        if (compat.sendsToolStrict) 'strict': false,
+      },
+  ];
+}
+
+Usage _parseChunkUsage(Map<String, dynamic> rawUsage, Model model) {
+  final promptTokens = rawUsage['prompt_tokens'] as int? ?? 0;
+  final promptDetails = rawUsage['prompt_tokens_details'];
+  final cachedTokens = promptDetails is Map
+      ? promptDetails['cached_tokens'] as int?
+      : null;
+  // Follow documented OpenAI/OpenRouter semantics: cached_tokens is
+  // cache-read tokens (hits). Do not subtract writes from cached_tokens.
+  final cacheReadTokens =
+      cachedTokens ?? rawUsage['prompt_cache_hit_tokens'] as int? ?? 0;
+  final cacheWriteTokens = promptDetails is Map
+      ? promptDetails['cache_write_tokens'] as int? ?? 0
+      : 0;
+
+  final input = max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+  // OpenAI completion_tokens already includes reasoning_tokens.
+  final outputTokens = rawUsage['completion_tokens'] as int? ?? 0;
+  final completionDetails = rawUsage['completion_tokens_details'];
+  final reasoningTokens = completionDetails is Map
+      ? completionDetails['reasoning_tokens'] as int?
+      : null;
+
+  var usage = Usage(
+    input: input,
+    output: outputTokens,
+    cacheRead: cacheReadTokens,
+    cacheWrite: cacheWriteTokens,
+    reasoning: reasoningTokens,
+    totalTokens: input + outputTokens + cacheReadTokens + cacheWriteTokens,
+    cost: const UsageCost(),
+  );
+  usage = calculateCost(usage, model);
+
+  // OpenRouter reports the actual billed cost in `usage.cost`; prefer it
+  // over the rate-based estimate when present.
+  final reportedCost = rawUsage['cost'];
+  if (reportedCost is num) {
+    usage = usage.copyWith(
+      cost: usage.cost.copyWith(total: reportedCost.toDouble()),
+    );
+  }
+  return usage;
+}
+
+({StopReason reason, String? errorMessage}) _mapStopReason(String reason) {
+  final mapped = switch (reason) {
+    'stop' || 'end' => (reason: StopReason.stop, errorMessage: null),
+    'length' => (reason: StopReason.length, errorMessage: null),
+    'function_call' ||
+    'tool_calls' => (reason: StopReason.toolUse, errorMessage: null),
+    'content_filter' => (
+      reason: StopReason.error,
+      errorMessage: 'Provider finish_reason: content_filter',
+    ),
+    'network_error' => (
+      reason: StopReason.error,
+      errorMessage: 'Provider finish_reason: network_error',
+    ),
+    _ => (
+      reason: StopReason.error,
+      errorMessage: 'Provider finish_reason: $reason',
+    ),
+  };
+  // Catalogue hook (issue #312): an unclassified FAILURE word is allowed —
+  // it defaults to transient downstream — but never silent. Successfully
+  // mapped reasons never trip it.
+  if (mapped.reason == StopReason.error &&
+      classifyFinishReason(reason) == FinishReasonClass.unknown) {
+    onUnknownFinishReason?.call(reason);
+  }
+  return mapped;
+}
+
+bool _isEncryptedReasoningDetail(Object? detail) {
+  if (detail is! Map) {
+    return false;
+  }
+  final id = detail['id'];
+  final data = detail['data'];
+  return detail['type'] == 'reasoning.encrypted' &&
+      id is String &&
+      id.isNotEmpty &&
+      data is String &&
+      data.isNotEmpty;
+}
+
+Object? _tryJsonDecode(String text) {
+  try {
+    return jsonDecode(text);
+  } on FormatException {
+    return null;
+  }
+}
+
+/// Trims the longest prefix of [delta] that is already present at the tail
+/// of [current] (overlapping/sliding-window reasoning chunks and full
+/// snapshots-so-far both collapse to the new suffix only). Returns the part
+/// of [delta] that still needs appending. Overlap search is capped at 64
+/// chars. A 1-char overlap counts too — stuttering relays re-send a
+/// standalone punctuation token (gh-1655) — except when the same char
+/// repeats right after the leading one ("." following "." inside the delta
+/// builds a legit "..." continuation, not a seam).
+String _dedupeOverlap(StringBuffer current, String delta) {
+  if (current.isEmpty || delta.isEmpty) return delta;
+  final text = current.toString();
+  // Full snapshot first: the chunk starts with everything we already have.
+  if (delta.startsWith(text)) return delta.substring(text.length);
+  var maxK = text.length < delta.length ? text.length : delta.length;
+  if (maxK > 64) maxK = 64;
+  for (var k = maxK; k >= 1; k--) {
+    if (!text.endsWith(delta.substring(0, k))) continue;
+    // Ellipsis guard: a leading char that the delta repeats immediately is
+    // real text ("..." split across deltas), never an overlap.
+    if (k == 1 &&
+        delta.length > 1 &&
+        delta.codeUnitAt(1) == delta.codeUnitAt(0)) {
+      return delta;
+    }
+    return delta.substring(k);
+  }
+  return delta;
+}

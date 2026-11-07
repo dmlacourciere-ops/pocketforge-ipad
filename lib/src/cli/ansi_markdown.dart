@@ -1,0 +1,1776 @@
+/// Incremental markdown-to-ANSI formatter for the TUI output history.
+///
+/// The TUI stores raw assistant text and formats it at view time: a fresh
+/// [AnsiMarkdown] walks the (bounded) output lines top-to-bottom on every
+/// frame via [formatAll], so multi-line state (code fences, tables) is
+/// tracked while partial markdown from an in-flight stream simply renders
+/// unstyled until its closing marker arrives. Only SGR sequences
+/// (`\x1b[...m`) are emitted — the same set the viewport already strips
+/// when measuring visible width for soft-wrapping, so scroll math stays
+/// correct. Output preserves the input line count for every construct
+/// EXCEPT a table that overflows the terminal width: its long cells wrap
+/// onto continuation grid rows (each still carrying the aligned borders),
+/// so a wide table renders as a real box grid instead of collapsing to raw
+/// markdown. Scroll math is unaffected either way — consumers work in
+/// wrapped-ROW space and treat a formatted line list generically.
+///
+///
+/// The visual mapping follows pi's `packages/tui/src/components/markdown.ts`
+/// dark theme, retinted to the site palette (teal/indigo): headings without
+/// the `#` prefix (H1 also underlined), fenced code indented 2 spaces with
+/// dim border lines and no background, `│ ` quote bars, accent list
+/// bullets, box-grid tables with a dim separator row, and full-width
+/// horizontal rules capped at 80 columns.
+library;
+
+import 'package:meta/meta.dart';
+
+import 'tui_text_width.dart' show tuiRuneCellWidth, tuiTextWidth;
+import 'tui_theme.dart';
+import 'pi_mode.dart' show isTruthyEnvValue;
+
+/// Lightweight inline renderer for streaming reasoning: bold (`**x**`),
+/// italic (`*x*`), inline code (`` `x` ``). Skips block constructs
+/// (fences, headings, lists) — those belong to [AnsiMarkdown] for full
+/// answers, and the dim wrapping in the TUI already downplays long
+/// thinking. Use [AnsiMarkdown.formatAll] when the caller needs the
+/// full block-level grammar.
+String renderInlineMarkdown(String text) {
+  final out = StringBuffer();
+  var i = 0;
+  while (i < text.length) {
+    final span = _matchInlineSpan(text, i);
+    if (span == null) {
+      out.write(text[i]);
+      i++;
+      continue;
+    }
+    final (opening, bodyStart, bodyEnd, closing, nextStart) = span;
+    out
+      ..write(opening)
+      ..write(text.substring(bodyStart, bodyEnd))
+      ..write(closing);
+    i = nextStart;
+  }
+  return out.toString();
+}
+
+/// One matched inline span starting at [start], or null when [start] is
+/// not a marker or the marker has no closing partner ahead. The record
+/// carries `(opening, bodyStart, bodyEnd, closing, nextStart)` so the
+/// caller emits the body and resumes past the closing marker without
+/// per-marker branches.
+(String, int, int, String, int)? _matchInlineSpan(String text, int start) {
+  final ch = text[start];
+  if (ch == '`') return _matchInlineCode(text, start);
+  if (ch != '*') return null;
+  if (start + 1 < text.length && text[start + 1] == '*') {
+    return _matchDoubleStar(text, start);
+  }
+  return _matchSingleStar(text, start);
+}
+
+/// Inline code: `` `x` ``. Returns null when the closing backtick is
+/// missing or the span is empty (a lone `` ` `` leaks as plain text).
+(String, int, int, String, int)? _matchInlineCode(String text, int start) {
+  final end = text.indexOf('`', start + 1);
+  if (end <= start + 1) return null;
+  return ('\x1b[2m\x1b[37m', start + 1, end, AnsiMarkdown._reset, end + 1);
+}
+
+/// Bold: `**x**`. Requires a `**` ahead of any closing pair. Empty
+/// matches (start == end) leak as plain `**` so reasoning still parses
+/// the stray markers.
+(String, int, int, String, int)? _matchDoubleStar(String text, int start) {
+  final end = text.indexOf('**', start + 2);
+  if (end <= start + 2) return null;
+  return ('\x1b[1m', start + 2, end, '\x1b[22m', end + 2);
+}
+
+/// Italic: `*x*`. Single-star span; the bold pair is tried first when
+/// the input starts with `**`, so this only runs on genuine single
+/// markers.
+(String, int, int, String, int)? _matchSingleStar(String text, int start) {
+  final end = text.indexOf('*', start + 1);
+  if (end <= start + 1) return null;
+  return ('\x1b[3m', start + 1, end, '\x1b[23m', end + 1);
+}
+
+/// One formatter per render pass; feed the whole output buffer via
+/// [formatAll] (or single lines in order via [formatLine]).
+final class AnsiMarkdown {
+  AnsiMarkdown({this.width = 80});
+
+  /// Terminal width, used for horizontal rules (capped at 80 like pi) and
+  /// as the table-fit budget (overflowing cells wrap; only a degenerate
+  /// budget still falls back to raw markdown).
+  final int width;
+
+  var _inFence = false;
+  final _tableBuffer = <String>[];
+
+  // Palette escapes ride the session theme (issue #279) — the default
+  // theme reproduces these three byte-identically. Cached per formatter
+  // instance: a theme switch repaints through a fresh pass, never
+  // mid-pass.
+  String get _teal => _tealSgr ??= tuiAccentSoftSgr();
+  String get _indigo => _indigoSgr ??= tuiAccent2SoftSgr();
+  String get _dim => _dimSgr ??= tuiDimSgr();
+  String? _tealSgr;
+  String? _indigoSgr;
+  String? _dimSgr;
+  static const _bold = '\x1b[1m';
+  static const _italic = '\x1b[3m';
+  static const _underline = '\x1b[4m';
+  static const _strike = '\x1b[9m';
+  static const _reset = '\x1b[0m';
+
+  static final _fenceRe = RegExp(r'^\s*```');
+  static final _headerRe = RegExp(r'^(#{1,6})\s+(.*)$');
+  static final _hrRe = RegExp(r'^\s{0,3}((-\s*){3,}|(_\s*){3,}|(\*\s*){3,})$');
+  static final _quoteRe = RegExp(r'^(\s*)>( |$)(.*)$');
+  static final _bulletRe = RegExp(r'^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$');
+  static final _taskRe = RegExp(r'^\[( |x|X)\]\s+(.*)$');
+  static final _linkRe = RegExp(r'\[([^\]]+)\]\(([^)]+)\)');
+  static final _codeSpanRe = RegExp(r'`([^`]+)`');
+  static final _boldRe = RegExp(r'\*\*([^*]+)\*\*');
+  static final _strikeRe = RegExp(r'~~([^~]+)~~');
+  static final _italicRe = RegExp(r'(?<!\w)[*_]([^*_]+)[*_](?!\w)');
+  static final _tableRowRe = RegExp(r'^\s*\|.*\|\s*$');
+  static final _tableSeparatorCellRe = RegExp(r'^:?-+:?$');
+  static final _ansiRe = RegExp(r'\x1b\[[0-9;]*m');
+  // Hoisted out of the per-line hot path: constructing a RegExp per
+  // formatted line showed up in scroll/stream rendering profiles.
+  static final _ruleRe = RegExp(r'^─+$');
+
+  /// The SGR matcher shared with [wrapAnsiLine] and tests.
+  static RegExp get ansiSgrPattern => _ansiRe;
+
+  /// Whether code-fence mode is active (cross-line state).
+  bool get inFence => _inFence;
+
+  /// Emits any buffered table rows (the end-of-buffer step of
+  /// [formatAll]); a no-op with nothing pending.
+  List<String> flushTrailing() => _flushTable();
+
+  /// Streams one source line through the incremental pipeline: table rows
+  /// are buffered (0 output lines) like in [formatAll]; anything else
+  /// emits `[…pending table…, formattedLine]`. Used by
+  /// [TranscriptMarkdown] — a long-lived instance carries `_inFence` and
+  /// the pending-table buffer across calls, which is exactly the
+  /// persistent-parser state the per-call object lost.
+  List<String> consumeLine(String line) {
+    if (!_inFence && _isTableRow(line)) {
+      _tableBuffer.add(line);
+      return const [];
+    }
+    return [..._flushTable(), formatLine(line)];
+  }
+
+  /// Whether table rows are buffered awaiting their separator/closing row
+  /// (a sync-time commit boundary is invalid until this drains).
+  bool get hasPendingTable => _tableBuffer.isNotEmpty;
+
+  /// Restores the cross-line state captured at a commit boundary (see
+  /// [TranscriptMarkdown]). Same library, so private fields are reachable;
+  /// takes copies defensively.
+  void restoreState({required bool inFence, required List<String> table}) {
+    _inFence = inFence;
+    _tableBuffer
+      ..clear()
+      ..addAll(table);
+  }
+
+  /// Current cross-line state snapshot (see [restoreState]).
+  (bool, List<String>) snapshotState() => (_inFence, List.of(_tableBuffer));
+
+  /// Lines longer than this render verbatim (no inline span substitution).
+  /// See [_formatInline] for the quadratic-input rationale.
+  static const inlineFormatMaxChars = 4096;
+
+  /// Formats the whole output buffer, preserving the line count 1:1.
+  /// Table rows are buffered until the table ends so column widths can be
+  /// computed across every row before rendering.
+  List<String> formatAll(List<String> lines) {
+    final out = <String>[];
+    for (final line in lines) {
+      out.addAll(consumeLine(line));
+    }
+    out.addAll(_flushTable());
+    return out;
+  }
+
+  /// Formats one raw output line, updating fence state. Does NOT handle
+  /// tables (see [formatAll]). Inline spans are resolved inside a single
+  /// line only (matches how deltas arrive).
+  String formatLine(String line) {
+    // Pre-styled lines (the user echo carries a background): pad the
+    // background out to the CURRENT width — the stored line predates any
+    // terminal resize.
+    final preStyled = _formatPreStyled(line);
+    if (preStyled != null) return preStyled;
+
+    // Full-width rules are stored baked at submit-time width; re-render them
+    // at the current width so a resize never leaves ragged bars behind.
+    // Skip the ANSI strip when the line carries no escape codes (the common
+    // case during streaming).
+    final stripped = line.codeUnits.any((c) => c == 0x1b)
+        ? line.replaceAll(_ansiRe, '')
+        : line;
+    if (stripped.length > 2 && _ruleRe.hasMatch(stripped)) {
+      return '$_dim${'─' * width}$_reset';
+    }
+
+    final fenced = _formatFence(line, stripped);
+    if (fenced != null) return fenced;
+
+    return _formatMarkdownLine(line);
+  }
+
+  /// Pre-styled background lines padded to the current width; null for
+  /// ordinary lines. Padding is cell-width aware: the renderer measures
+  /// grapheme clusters, so `padRight` (UTF-16 units) underpads any echo
+  /// carrying wide characters and stale cells survive on the right.
+  ///
+  /// The background AND text SGR are re-applied from the CURRENT session
+  /// theme, not the stored prefix — a mid-session `/theme` switch repaints
+  /// the whole transcript (issue #279, E1); the stored escape only marks
+  /// the line as a user echo so markdown leaves it alone. The text
+  /// foreground is part of that contract (gh-671): the old path re-rendered
+  /// bg only, so the echo text fell back to the terminal default fg —
+  /// invisible over the light userMessageBg band on light palettes.
+  String? _formatPreStyled(String line) {
+    if (!line.startsWith('\x1b[48')) return null;
+    final lead = _ansiRe.firstMatch(line)!.group(0)!;
+    final role = FaThemeController.instance.preStyledRole(lead);
+    final visible = line.replaceAll(_ansiRe, '');
+    if (role == null) {
+      // Unknown tint (a card stored under a since-removed user palette):
+      // keep the stored bytes — repainting would GUESS a role, and the
+      // sniff must never mislabel (JVtX). Still padded, but with the
+      // stored prefix untouched so the original band survives.
+      final pad = width - tuiTextWidth(visible);
+      return pad <= 0 ? line : '$line${' ' * pad}$_reset';
+    }
+    if (role == 'bubble') {
+      // User-message bubble: repaint the band from the CURRENT theme.
+      final pad = width - tuiTextWidth(visible);
+      final bg = tuiUserMessageBgSgr();
+      final fg = tuiUserMessageTextSgr();
+      if (pad <= 0) return '$bg$fg$visible$_reset';
+      return '$bg$fg$visible${' ' * pad}$_reset';
+    }
+    // Tool-card row: repaint the PHASE TINT from the current theme —
+    // the stored tint only MARKS the row's role (a `/theme` switch
+    // repaints it, same contract as the bubble). Interior styles (the
+    // accent title, the bright error line) survive: everything after the
+    // lead SGR is kept verbatim; the tint pad re-fills to the current
+    // width INSIDE the tint, before the stored reset.
+    final tint = FaThemeController.instance.preStyledTintSgr(role);
+    final rest = line.substring(lead.length);
+    final pad = width - tuiTextWidth(visible);
+    final body = rest.endsWith(_reset)
+        ? rest.substring(0, rest.length - _reset.length)
+        : rest;
+    return '$tint$body${pad > 0 ? ' ' * pad : ''}$_reset';
+  }
+
+  /// Code fences swallow everything between the markers verbatim (pi:
+  /// content indented 2 spaces, no background, dim border lines). Null for
+  /// markdown content outside a fence.
+  String? _formatFence(String line, [String? stripped]) {
+    // gh-1755: regex-test the ANSI-STRIPPED text — a fence line carrying
+    // SGR bytes (e.g. the compaction report's dimmed ```) fails _fenceRe
+    // on the raw line, the fence state never latches, and every row after
+    // an unbalanced fence renders verbatim. When the raw line already IS
+    // the text (no escapes), dim as before; otherwise the caller-styled
+    // bytes stand — re-dimming would stack SGR (no double-styling).
+    final text =
+        stripped ??
+        (line.codeUnits.any((c) => c == 0x1b)
+            ? line.replaceAll(_ansiRe, '')
+            : line);
+    if (_fenceRe.hasMatch(text)) {
+      _inFence = !_inFence;
+      return text == line ? '$_dim$line$_reset' : line;
+    }
+    if (_inFence) {
+      return '  $line';
+    }
+    return null;
+  }
+
+  /// Markdown block forms: headers, horizontal rules, quotes, bullets —
+  /// anything else goes through inline formatting.
+  String _formatMarkdownLine(String line) {
+    // Hot path: ~10M calls, most lines are plain text. Skip 4 regex
+    // firstMatch calls when the line carries no markdown block marker.
+    if (_isBlockCandidate(line)) {
+      return _formatHeader(line) ??
+          _formatHr(line) ??
+          _formatQuote(line) ??
+          _formatBulletLine(line) ??
+          _formatInline(line);
+    }
+    return _formatInline(line);
+  }
+
+  /// Quick first-char dispatch: returns false for lines that cannot be a
+  /// markdown block form (plain text — skip the regex scans).
+  bool _isBlockCandidate(String line) {
+    if (line.isEmpty) return false;
+    final c = line.codeUnitAt(0);
+    if (_blockMarkerChars.contains(c)) return true;
+    return c >= 0x30 && c <= 0x39 /*0-9*/;
+  }
+
+  /// Header line formatting (H1 bold+underline, H2 bold, H3+ keeps prefix).
+  String? _formatHeader(String line) {
+    final header = _headerRe.firstMatch(line);
+    if (header == null) return null;
+    final level = header.group(1)!.length;
+    final text = header.group(2)!;
+    return switch (level) {
+      1 => '$_indigo$_bold$_underline$text$_reset',
+      2 => '$_indigo$_bold$text$_reset',
+      _ => '$_indigo$_bold${header.group(1)} $text$_reset',
+    };
+  }
+
+  /// Horizontal rule formatting (capped at 80 chars).
+  String? _formatHr(String line) {
+    if (!_hrRe.hasMatch(line)) return null;
+    final ruleWidth = width < 80 ? width : 80;
+    return '$_dim${'─' * ruleWidth}$_reset';
+  }
+
+  /// Block-quote formatting.
+  String? _formatQuote(String line) {
+    final quote = _quoteRe.firstMatch(line);
+    if (quote == null) return null;
+    final body = _formatInline(quote.group(3)!);
+    return '${quote.group(1)}$_dim│$_reset $_dim$_italic$body$_reset';
+  }
+
+  /// Bullet / numeric list formatting.
+  String? _formatBulletLine(String line) {
+    final bullet = _bulletRe.firstMatch(line);
+    if (bullet == null) return null;
+    return _formatBullet(bullet);
+  }
+
+  /// Bullet and task-list lines: `-`/`+` markers become a teal `•`, numeric
+  /// markers stay literal; task items keep their checkbox (pi renders
+  /// [x] / [ ]).
+  String _formatBullet(RegExpMatch bullet) {
+    final marker = bullet.group(2)!;
+    final body = bullet.group(3)!;
+    final task = _taskRe.firstMatch(body);
+    // One-char marker = a `-`*`+` bullet (numeric markers are `12.` —
+    // always longer), so no regex is needed on this per-line hot path.
+    final renderedMarker = marker.length == 1
+        ? '$_teal•$_reset'
+        : '$_teal$marker$_reset';
+    if (task != null) {
+      final checked = task.group(1)!.toLowerCase() == 'x';
+      final box = checked ? '$_teal[✓]$_reset' : '$_dim[ ]$_reset';
+      return '${bullet.group(1)}$renderedMarker $box '
+          '${_formatInline(task.group(2)!)}';
+    }
+    return '${bullet.group(1)}$renderedMarker ${_formatInline(body)}';
+  }
+
+  /// Inline spans: links, inline code, bold, strikethrough, italic. Code
+  /// spans are formatted before emphasis so markers inside them stay
+  /// literal; every span is self-contained (SGR + reset).
+  String _formatInline(String text) {
+    // Hot path: ~11M calls, the vast majority are plain text with no inline
+    // markdown markers at all. Skip 5 chained replaceAllMapped regex scans
+    // when none of the trigger characters are present.
+    if (!text.contains('[') &&
+        !text.contains('`') &&
+        !text.contains('*') &&
+        !text.contains('~') &&
+        !text.contains('_')) {
+      return text;
+    }
+    // Hard cost bound for huge lines. The inline scans are quadratic on
+    // degenerate input — a long line dense with `[` candidates makes
+    // _linkRe backtrack per candidate (a 16 KB ANSI-dense thinking burst
+    // measured ~10 s PER LINE, freezing the whole TUI: the streaming
+    // event loop never reached its next timer). A markdown span crossing
+    // more than a few KB of one line is degenerate anyway; render such
+    // lines verbatim (fences/rules/table state still apply upstream).
+    if (text.length > inlineFormatMaxChars) return text;
+    var out = text;
+    out = out.replaceAllMapped(
+      _linkRe,
+      (m) => '$_underline${m[1]}$_reset$_dim (${m[2]})$_reset',
+    );
+    out = out.replaceAllMapped(_codeSpanRe, (m) => '$_teal${m[1]}$_reset');
+    out = out.replaceAllMapped(_boldRe, (m) => '$_bold${m[1]}$_reset');
+    out = out.replaceAllMapped(_strikeRe, (m) => '$_strike${m[1]}$_reset');
+    out = out.replaceAllMapped(_italicRe, (m) => '$_italic${m[1]}$_reset');
+    return out;
+  }
+
+  // ---------------------------------------------------------------- tables
+
+  bool _isTableRow(String line) => _tableRowRe.hasMatch(line);
+
+  List<String> _splitCells(String row) {
+    var r = row.trim();
+    if (r.startsWith('|')) r = r.substring(1);
+    if (r.endsWith('|')) r = r.substring(0, r.length - 1);
+    return r.split('|').map((c) => c.trim()).toList();
+  }
+
+  /// Renders the buffered table rows as a compact box grid (header bold,
+  /// dim separator row), one output line per source line. Falls back to
+  /// raw markdown when the table is malformed or does not fit the width.
+  List<String> _flushTable() {
+    if (_tableBuffer.isEmpty) return const [];
+    final rows = List.of(_tableBuffer);
+    _tableBuffer.clear();
+
+    final cells = [for (final row in rows) _splitCells(row)];
+    final columnCount = cells.first.length;
+    final uniform = cells.every((c) => c.length == columnCount);
+    final hasSeparator =
+        rows.length >= 2 &&
+        cells[1].every((c) => _tableSeparatorCellRe.hasMatch(c));
+    if (!uniform || columnCount < 2 || !hasSeparator) {
+      // Not a clean table: emit raw, inline-formatted like any other line.
+      return _rawTableRows(rows);
+    }
+
+    final widths = List<int>.filled(columnCount, 0);
+    // Column widths come from the FORMATTED cells: inline markers (the
+    // backticks of `code`, ** of bold, ...) render away, so sizing columns
+    // by raw text would push the separators right of the header's grid.
+    final formatted = _formattedCells(rows, cells, widths);
+    // Grid overhead: ' cell ' per column plus the ' │ ' joiners between
+    // columns plus the single leading/trailing space.
+    final overhead = (columnCount - 1) * 3 + 2;
+    final caps = columnCaps(widths, width - overhead);
+    if (caps == null) {
+      // Degenerate budget — a tiny terminal or very many columns: even the
+      // minimum column width would not produce a readable grid. Raw rows.
+      return _rawTableRows(rows);
+    }
+
+    return _renderTableRows(rows, caps, formatted);
+  }
+
+  /// Raw rows, inline-formatted like any other line (malformed or
+  /// degenerate-budget tables).
+  List<String> _rawTableRows(List<String> rows) {
+    return [for (final row in rows) _formatInline(row)];
+  }
+
+  /// The inline-formatted cells keyed by row (the separator row carries no
+  /// content width), with per-column max visible widths accumulated into
+  /// [widths].
+  Map<int, List<String>> _formattedCells(
+    List<String> rows,
+    List<List<String>> cells,
+    List<int> widths,
+  ) {
+    final formatted = <int, List<String>>{};
+    for (var r = 0; r < rows.length; r++) {
+      if (r == 1) continue; // separator row has no content width
+      formatted[r] = [
+        for (var c = 0; c < cells[r].length; c++) _formatInline(cells[r][c]),
+      ];
+      for (var c = 0; c < cells[r].length; c++) {
+        final visible = _visibleLength(formatted[r]![c]);
+        if (visible > widths[c]) widths[c] = visible;
+      }
+    }
+    return formatted;
+  }
+
+  /// Minimum readable column width: below this the wrapped grid degrades
+  /// into letter-soup and the raw fallback serves better.
+  static const int _minColumnWidth = 6;
+
+  /// Caps natural column widths into the available frame [budget]
+  /// (terminal width minus joiner/padding overhead).
+  ///
+  /// Fit-preserving water-filling — the share rule an HTML auto table
+  /// layout uses. Every column may claim an equal fair share of the
+  /// budget; columns whose natural width fits that share keep it in
+  /// FULL, and the freed budget is re-shared among the rest until only
+  /// oversized columns remain. Those then split the pool proportionally
+  /// to their natural width, floored at [_minColumnWidth]. A short
+  /// column therefore never wraps while a long-text column still has
+  /// slack above its natural width — the defect this rule replaced
+  /// (issue #686): the spare budget was weighted by need-beyond-floor,
+  /// letting one long column out-vote every cheap column.
+  ///
+  /// Returns null when even the floor does not fit (degenerate — the
+  /// caller falls back to raw). Caps never stretch a column past its
+  /// natural width, and the result is deterministic: integer rounding
+  /// leftovers are repaid widest-first, ties left-to-right.
+  @visibleForTesting
+  static List<int>? columnCaps(List<int> natural, int budget) {
+    if (budget < natural.length * _minColumnWidth) return null;
+    final sumNatural = natural.fold<int>(0, (a, b) => a + b);
+    if (sumNatural <= budget) return List.of(natural);
+
+    final caps = List<int>.filled(natural.length, 0);
+    var pool = budget;
+    var pending = [for (var c = 0; c < natural.length; c++) c];
+    while (pending.isNotEmpty) {
+      final fair = pool ~/ pending.length;
+      final fitted = [
+        for (final c in pending)
+          if (natural[c] <= fair) c,
+      ];
+      if (fitted.isEmpty) break;
+      for (final c in fitted) {
+        caps[c] = natural[c];
+        pool -= natural[c];
+      }
+      final fittedSet = Set.of(fitted);
+      pending = [
+        for (final c in pending)
+          if (!fittedSet.contains(c)) c,
+      ];
+    }
+    _shareOversized(caps, pending, natural, pool);
+    return caps;
+  }
+
+  /// Splits [pool] among the still-uncapped [pending] columns
+  /// proportionally to natural width, floored at [_minColumnWidth], and
+  /// settles the integer rounding widest-first (ties left-to-right):
+  /// truncation leftovers are repaid up to the natural width, over-budget
+  /// floor clamps are reclaimed down to the floor.
+  static void _shareOversized(
+    List<int> caps,
+    List<int> pending,
+    List<int> natural,
+    int pool,
+  ) {
+    if (pending.isEmpty) return;
+    final sumNat = pending.fold<int>(0, (a, c) => a + natural[c]);
+    var used = 0;
+    for (final c in pending) {
+      final grant = pool * natural[c] ~/ sumNat;
+      caps[c] = grant < _minColumnWidth ? _minColumnWidth : grant;
+      used += caps[c];
+    }
+    // Widest first, ties left-to-right — one deterministic order for
+    // both settlement directions.
+    final order = [...pending]
+      ..sort((a, b) {
+        final byWidth = natural[b].compareTo(natural[a]);
+        return byWidth != 0 ? byWidth : a.compareTo(b);
+      });
+    final over = used - pool;
+    if (over > 0) used -= _reclaimOverdraft(caps, order, over);
+    _repayLeftover(caps, order, natural, pool - used);
+  }
+
+  /// Takes back an over-budget floor clamp from the widest columns,
+  /// down to the floor — the only way a proportional split can exceed
+  /// the pool.
+  static int _reclaimOverdraft(List<int> caps, List<int> order, int over) {
+    var remaining = over;
+    for (final c in order) {
+      if (remaining <= 0) break;
+      final reclaimable = caps[c] - _minColumnWidth;
+      if (reclaimable > 0) {
+        final take = reclaimable < remaining ? reclaimable : remaining;
+        caps[c] -= take;
+        remaining -= take;
+      }
+    }
+    return over - remaining;
+  }
+
+  /// Repays truncation leftovers to the widest columns, up to each
+  /// column's natural width (caps never stretch a column).
+  static void _repayLeftover(
+    List<int> caps,
+    List<int> order,
+    List<int> natural,
+    int left,
+  ) {
+    for (final c in order) {
+      if (left <= 0) break;
+      final room = natural[c] - caps[c];
+      if (room > 0) {
+        final give = room < left ? room : left;
+        caps[c] += give;
+        left -= give;
+      }
+    }
+  }
+
+  /// Wraps every cell of every logical row (the separator row is a
+  /// single-line placeholder), then emits the physical rows.
+  List<String> _renderTableRows(
+    List<String> rows,
+    List<int> widths,
+    Map<int, List<String>> formatted,
+  ) {
+    // Per logical row: the wrapped fragments of every cell, and the tallest
+    // cell's line count (the physical height of that logical row).
+    final fragments = <List<List<String>>>[];
+    final heights = <int>[];
+    for (var r = 0; r < rows.length; r++) {
+      if (r == 1) {
+        fragments.add(const []);
+        heights.add(1);
+        continue;
+      }
+      final wrapped = <List<String>>[
+        for (var c = 0; c < widths.length; c++)
+          wrapAnsiLine(formatted[r]![c], widths[c]),
+      ];
+      var h = 1;
+      for (final lines in wrapped) {
+        if (lines.length > h) h = lines.length;
+      }
+      fragments.add(wrapped);
+      heights.add(h);
+    }
+    return _paintTableRows(rows, widths, fragments, heights);
+  }
+
+  /// Emits the grid rows from the wrapped fragments: padded cells joined by
+  /// dim `│`, the separator row as a dim `───┼───` line, the header row
+  /// bold. A cell wider than its column WRAPS ([wrapAnsiLine], done by the
+  /// caller) onto continuation physical rows that keep every border
+  /// aligned — an overflowing table stays a real grid instead of collapsing
+  /// to raw markdown. Each physical row is padded to the full frame:
+  /// continuation cells render as blanks under the already-shown part of
+  /// their column.
+  List<String> _paintTableRows(
+    List<String> rows,
+    List<int> widths,
+    List<List<List<String>>> fragments,
+    List<int> heights,
+  ) {
+    final out = <String>[];
+    for (var r = 0; r < rows.length; r++) {
+      if (r == 1) {
+        out.add(
+          '$_dim${[for (var c = 0; c < widths.length; c++) '─' * (widths[c] + 2)].join('┼')}$_reset',
+        );
+        continue;
+      }
+      final isHeader = r == 0;
+      for (var k = 0; k < heights[r]; k++) {
+        final renderedCells = <String>[];
+        for (var c = 0; c < widths.length; c++) {
+          final lines = fragments[r][c];
+          final frag = k < lines.length ? lines[k] : '';
+          // Header bold re-opens per fragment: a wrapped fragment must not
+          // leak bold into its trailing padding or into the joiner.
+          final styled = isHeader && frag.isNotEmpty
+              ? '$_bold$frag$_reset'
+              : frag;
+          renderedCells.add(styled + ' ' * (widths[c] - _visibleLength(frag)));
+        }
+        out.add(' ${renderedCells.join(' $_dim│$_reset ')} ');
+      }
+    }
+    return out;
+  }
+
+  /// Visible cell width of a styled fragment: ANSI stripped, then measured
+  /// in terminal cells (grapheme clusters — an emoji is 2 cells even though
+  /// it is 1–2 UTF-16 units). Table column sizing must match the renderer
+  /// or the grid separators drift out of alignment.
+  static int _visibleLength(String text) =>
+      tuiTextWidth(text.replaceAll(_ansiRe, ''));
+}
+
+/// First-byte markers for markdown block candidates (#, >, -, *, +, space).
+const _blockMarkerChars = {0x23, 0x3E, 0x2D, 0x2A, 0x2B, 0x20};
+
+/// One batched wrap token: a maximal run of same-width plain runes, one
+/// SGR escape, one zero-width rune, or a boundary space. Batching is what
+/// makes the wrap single-allocation per RUN instead of per character (the
+/// old per-char regex tokenizer allocated a String and a width call for
+/// every visible cell, which dominated transcript render profiles).
+/// [runeWidth] is the per-rune cell width; [runes] the rune count;
+/// [isStyle] marks SGR escapes (and lone ESC bytes, which the old
+/// tokenizer's `.` alternative matched as a visible zero-width rune and
+/// writeToken parked in the active-style list — reproduced verbatim);
+/// [isSpace] marks the word-boundary space event.
+final class _WrapPart {
+  _WrapPart(this.text, this.runeWidth, this.runes)
+    : isStyle = false,
+      isSpace = false;
+
+  _WrapPart.style(this.text)
+    : runeWidth = 0,
+      runes = 0,
+      isStyle = true,
+      isSpace = false;
+
+  _WrapPart.space()
+    : text = ' ',
+      runeWidth = 1,
+      runes = 1,
+      isStyle = false,
+      isSpace = true;
+
+  final String text;
+  final int runeWidth;
+  final int runes;
+  final bool isStyle;
+  final bool isSpace;
+}
+
+/// Mutable wrap cursor shared by the wrap helpers: emitted rows, the row
+/// under construction, SGR codes active at the write position (since the
+/// last reset), the current visible column, and the word being accumulated
+/// (whole parts + its visible length — widths are carried on the parts; the
+/// old code re-measured every token inside flushWord).
+final class _WrapState {
+  _WrapState(this.width);
+
+  final int width;
+  final rows = <String>[];
+  final row = StringBuffer();
+  final activeSgr = <String>[];
+  final wordParts = <_WrapPart>[];
+  var wordVisible = 0;
+  var col = 0;
+  // True while the current row holds ONLY a boundary space carried across
+  // the wrap (its word ended exactly at the last column): a following word
+  // that no longer fits hard-cuts across rows from here instead of pushing
+  // the space onto its own blank row, and an end-of-line row holding only
+  // the carried space is dropped like trailing whitespace (gh-1510,
+  // gh-1517 review).
+  var carriedBoundarySpace = false;
+}
+
+/// Closes the row under construction: active styles end with a reset, and
+/// the continuation row re-opens them (dart_tui redraws rows independently,
+/// so terminal state never carries across a newline).
+void _wrapCloseRow(_WrapState s) {
+  if (s.activeSgr.isNotEmpty) s.row.write(AnsiMarkdown._reset);
+  s.rows.add(s.row.toString());
+  s.row
+    ..clear()
+    ..writeAll(s.activeSgr);
+  s.col = 0;
+}
+
+/// Writes one SGR token, tracking the active-style list that closeRow
+/// re-emits (`\x1b[0m` clears; anything else stacks).
+void _wrapWriteStyle(_WrapState s, String token) {
+  s.row.write(token);
+  if (token == AnsiMarkdown._reset) {
+    s.activeSgr.clear();
+  } else {
+    s.activeSgr.add(token);
+  }
+}
+
+/// True for the bytes the SGR body accepts between `[` and `m`.
+bool _isSgrParamByte(int unit) =>
+    (unit >= 0x30 && unit <= 0x39) || unit == 0x3b;
+
+/// Length of the complete SGR escape starting at unit [i]
+/// (`ESC [ [0-9;]* m` — the exact shape the old wrap regex matched), or 0
+/// when the ESC byte does not head one.
+int _sgrTokenLength(List<int> units, int i, int n) {
+  var k = i + 1;
+  if (k >= n || units[k] != 0x5b) return 0;
+  k++;
+  while (k < n && _isSgrParamByte(units[k])) {
+    k++;
+  }
+  if (k < n && units[k] == 0x6d) return k + 1 - i;
+  return 0;
+}
+
+/// True when [i] sits on a high surrogate paired with a low surrogate —
+/// the two units are ONE rune (the old unicode-aware regex `.` matched
+/// them as a single token).
+bool _isSurrogatePairAt(List<int> units, int i, int unit) =>
+    unit >= 0xd800 &&
+    unit <= 0xdbff &&
+    i + 1 < units.length &&
+    units[i + 1] >= 0xdc00 &&
+    units[i + 1] <= 0xdfff;
+
+/// Hard-cut one same-width run across rows: per-rune equivalence with the
+/// old token walk — close before the first rune that overflows a
+/// non-empty row; a rune landing on a fresh row is written even when it
+/// alone overflows (never an empty overflowing row).
+///
+/// The char offset of the rune cursor is carried FORWARD incrementally
+/// (one decode step per rune, O(runes) per part) — re-walking from the
+/// start per slice made non-ASCII hard-cuts O(runes²). Whole-unit runs
+/// (`runes == unit count`: all ASCII, all BMP CJK) skip the decode.
+void _wrapWriteRunSliced(_WrapState s, _WrapPart part) {
+  final w = part.runeWidth;
+  final units = part.text.codeUnits;
+  final oneUnitRunes = part.runes == part.text.length;
+  var from = 0; // rune cursor
+  var off = 0; // char offset of rune [from]
+  while (from < part.runes) {
+    if (s.col > 0 && s.col + w > s.width) _wrapCloseRow(s);
+    final cap = s.col == 0
+        ? (w > s.width ? 1 : s.width ~/ w)
+        : (s.width - s.col) ~/ w;
+    if (cap <= 0) continue; // row was full: _wrapCloseRow above emptied it
+    var take = cap < part.runes - from ? cap : part.runes - from;
+    final start = off;
+    if (oneUnitRunes) {
+      off += take;
+    } else {
+      for (var r = 0; r < take; r++) {
+        off += _isSurrogatePairAt(units, off, units[off]) ? 2 : 1;
+      }
+    }
+    s.row.write(part.text.substring(start, off));
+    s.col += take * w;
+    from += take;
+  }
+}
+
+/// The hard-cut branch of [_wrapFlushWord]: a word wider than [width].
+/// Styles are written wherever the cursor is (the old walk only closed on
+/// visible tokens); zero-width runes keep the same close check as any
+/// token — `col + 0 > width` is false on rows within the width, but a row
+/// already overflowing (a wide rune written on an empty row) closes before
+/// the rune, exactly like the old per-token walk.
+void _wrapFlushHardCut(_WrapState s) {
+  for (final part in s.wordParts) {
+    if (part.isStyle) {
+      _wrapWriteStyle(s, part.text);
+    } else if (part.runeWidth == 0) {
+      if (s.col > s.width) _wrapCloseRow(s);
+      s.row.write(part.text);
+    } else {
+      _wrapWriteRunSliced(s, part);
+    }
+  }
+}
+
+/// The fitting branch of [_wrapFlushWord]: the whole word goes on the
+/// current row once it fits (after at most one close).
+void _wrapFlushFit(_WrapState s) {
+  if (s.col > 0 && s.col + s.wordVisible > s.width) _wrapCloseRow(s);
+  for (final part in s.wordParts) {
+    if (part.isStyle) {
+      _wrapWriteStyle(s, part.text);
+    } else {
+      s.row.write(part.text);
+      s.col += part.runes * part.runeWidth;
+    }
+  }
+}
+
+/// Emits one accumulated word: hard-cut when it is wider than the row (or
+/// no longer fits after a carried boundary space), else written whole after
+/// a possible single close. A pure-style word (zero visible width, e.g. a
+/// trailing reset after a boundary space) leaves the carried-space state
+/// untouched, so the end-of-line drop guard treats 'aaaa \x1b[0m'
+/// exactly like 'aaaa '.
+void _wrapFlushWord(_WrapState s) {
+  if (s.wordParts.isEmpty) return;
+  final carried = s.carriedBoundarySpace;
+  if (s.wordVisible > 0) s.carriedBoundarySpace = false;
+  // A word one cell short of the full width still fits after a carried
+  // space; at `width` or more it hard-cuts across rows starting here.
+  if (s.wordVisible > s.width || (carried && s.wordVisible >= s.width)) {
+    // A single word longer than the row (or than the row minus a carried
+    // boundary space): hard-cut it across rows, keeping a carried-space
+    // row open as the starting row.
+    if (s.col > 0 && !carried) _wrapCloseRow(s);
+    _wrapFlushHardCut(s);
+  } else {
+    _wrapFlushFit(s);
+  }
+  s.wordParts.clear();
+  s.wordVisible = 0;
+}
+
+/// Tokenizes [line] into [_WrapPart]s: maximal same-width plain runs, SGR
+/// escapes (or lone ESC bytes), zero-width runes, and boundary spaces. The
+/// old tokenizer emitted one token per rune; batching adjacent equal-width
+/// runes into one substring keeps the token stream's semantics (order,
+/// widths, close positions) while removing the per-character regex match +
+/// String allocation.
+List<_WrapPart> _tokenizeWrapParts(String line) {
+  final parts = <_WrapPart>[];
+  // Pending same-width plain run, flushed when a rune of another class
+  // arrives ([end] = index just past the run's last unit).
+  var runStart = -1;
+  var runWidth = 0;
+  var runRunes = 0;
+
+  void endRun(int end) {
+    if (runStart < 0) return;
+    parts.add(_WrapPart(line.substring(runStart, end), runWidth, runRunes));
+    runStart = -1;
+  }
+
+  final units = line.codeUnits;
+  final n = units.length;
+  var i = 0;
+  while (i < n) {
+    final u = units[i];
+    if (u == 0x20) {
+      endRun(i);
+      parts.add(_WrapPart.space());
+      i++;
+      continue;
+    }
+    if (u == 0x1b) {
+      endRun(i);
+      // SGR escape, or a lone visible ESC byte (the regex's `.`
+      // alternative matched it as a zero-width rune).
+      final len = _sgrTokenLength(units, i, n);
+      if (len > 0) {
+        parts.add(_WrapPart.style(line.substring(i, i + len)));
+        i += len;
+      } else {
+        parts.add(_WrapPart.style('\x1b'));
+        i++;
+      }
+      continue;
+    }
+    // Decode one rune (surrogate pairs stay one token).
+    int rune;
+    var len = 1;
+    if (_isSurrogatePairAt(units, i, u)) {
+      rune = 0x10000 + ((u - 0xd800) << 10) + (units[i + 1] - 0xdc00);
+      len = 2;
+    } else {
+      rune = u;
+    }
+    final w = tuiRuneCellWidth(rune);
+    if (w == 0) {
+      endRun(i);
+      parts.add(_WrapPart(line.substring(i, i + len), 0, 1));
+      i += len;
+      continue;
+    }
+    if (runStart < 0 || w != runWidth) {
+      endRun(i);
+      runStart = i;
+      runWidth = w;
+      runRunes = 1;
+    } else {
+      runRunes++;
+    }
+    i += len;
+  }
+  endRun(n);
+  return parts;
+}
+
+/// Wraps one ANSI-styled line to [width] visible CELL columns WITHOUT
+/// cutting inside SGR escape sequences — dart_tui's viewport wrap slices raw
+/// text and leaks escape tails (e.g. `212m`) as visible text.
+///
+/// Widths are measured in terminal cells (grapheme clusters, see
+/// [tuiTextWidth]) so the rows we emit never exceed what the renderer can
+/// place: an emoji or CJK character occupies 2 cells despite being 1–2
+/// UTF-16 units, and counting it as one column overflowed every wrapped row
+/// that contained one (the "markdown breaks after emoji" corruption).
+///
+/// Two correctness rules beyond the escape safety:
+///
+/// - Word-aware: breaks at spaces when possible (a hard mid-word cut only
+///   happens for a single word longer than [width]); a boundary space that
+///   fits stays at the end of the closing row, and one that lands exactly
+///   at the wrap edge CARRIES to the continuation row (terminal autowrap)
+///   instead of being dropped — a dropped space collapses the two words in
+///   the rendered screen buffer ("memory round-tripcomplete", gh-1510).
+///   Reassembling the rows therefore reproduces the original text up to
+///   trailing whitespace — the one documented drop is a row holding only
+///   the line's trailing boundary space (invisible either way), with or
+///   without trailing SGR codes.
+/// - SGR state carries across the cut EXPLICITLY: the closed row ends with
+///   a reset and the continuation row re-opens the active styles. dart_tui
+///   redraws rows independently, so relying on the terminal to keep SGR
+///   across a newline loses styling on every wrapped styled span.
+///
+/// The unicode flag makes `.` match whole runes, keeping emoji intact.
+List<String> wrapAnsiLine(String line, int width) {
+  if (width <= 0) return [line];
+  // Skip the ANSI strip on plain-text lines (the common case).
+  final hasAnsi = line.codeUnits.any((c) => c == 0x1b);
+  final visible = hasAnsi
+      ? tuiTextWidth(line.replaceAll(AnsiMarkdown.ansiSgrPattern, ''))
+      : tuiTextWidth(line);
+  if (visible <= width) return [line];
+
+  final s = _WrapState(width);
+  for (final part in _tokenizeWrapParts(line)) {
+    if (part.isSpace) {
+      _wrapFlushWord(s);
+      // A boundary space ends the closing row when it fits; at the very
+      // edge (the word filled the row exactly) it CARRIES to the
+      // continuation row — terminal autowrap — so the rendered screen
+      // buffer keeps the separating space instead of collapsing the
+      // words (gh-1510). A further space keeps the carried state (a
+      // multi-space run fills the continuation row before wrapping), as
+      // do trailing SGR codes (handled in _wrapFlushWord); only a
+      // visible word ends it.
+      if (s.col + 1 <= width) {
+        s.row.write(' ');
+        s.col++;
+      } else {
+        _wrapCloseRow(s);
+        s.row.write(' ');
+        s.col = 1;
+        s.carriedBoundarySpace = true;
+      }
+    } else {
+      s.wordParts.add(part);
+      if (!part.isStyle) s.wordVisible += part.runes * part.runeWidth;
+    }
+  }
+  _wrapFlushWord(s);
+  // A row holding only re-emitted SGR codes (no visible columns), or only
+  // a trailing boundary space (the line's trailing whitespace — invisible
+  // either way), is dropped.
+  if (s.col > 0 && !s.carriedBoundarySpace) _wrapCloseRow(s);
+  return s.rows;
+}
+
+/// Incremental transcript formatter backing the fa TUI's `_WrapCache`
+/// (docs/performance-cli-tui.md). The per-call [AnsiMarkdown.formatAll] is
+/// O(transcript) and ran on every coalesced streaming flush (~20/s):
+/// measured 26.96 ms per pass over a 2000-line history — over half of each
+/// 50 ms flush interval spent between keystrokes. This class keeps ONE
+/// long-lived [AnsiMarkdown] whose cross-line state persists across calls
+/// (yoxterm rule §4, persistent parser state) and durably commits
+/// formatted+wrapped results through a boundary index (rule §2, damage
+/// tracking via a boundary instead of content diffs).
+///
+/// Correctness contract: after `sync(src)` the exposed views equal
+/// `AnsiMarkdown(width).formatAll(src)` followed by the same wrap pass —
+/// pinned adversarially in transcript_markdown_perf_test.dart. Tables open
+/// across syncs re-render their tail from the last clean snapshot every
+/// call: a table is the only block whose rendering depends on input that
+/// has not arrived yet.
+/// One consume-walk's results: per-line outputs aligned to src[from..),
+/// the last step index that ended with an EMPTY pending-table buffer
+/// (-1 when none), fence state at that step, whether a table was still
+/// open at end-of-walk, and the end-flush output.
+final class _WalkResult {
+  _WalkResult(
+    this.outsPerLine,
+    this.lastClean,
+    this.fenceAtClean,
+    this.pendingEnd,
+    this.trailing,
+    this.fenceAfter,
+    this.tableBefore,
+    this.pendingStartAt,
+  );
+
+  final List<List<String>> outsPerLine;
+  final int lastClean;
+  final bool fenceAtClean;
+  final bool pendingEnd;
+  final List<String> trailing;
+
+  /// Fence state after each consumed line (index i = state after src
+  /// line from+i) — lets the commit edge remember the state just BEFORE
+  /// the boundary line so a one-line rollback can restore it.
+  final List<bool> fenceAfter;
+
+  /// Whether the pending-table buffer was NON-EMPTY just BEFORE each
+  /// consumed line (index i = state before src line from+i). A `true` at
+  /// the commit boundary means the boundary line CLOSED a streamed table:
+  /// its committed outputs embed the flushed grid, which the grown-tail
+  /// rollback can only reproduce by re-seeding the walk with the buffered
+  /// rows (gh-1573).
+  final List<bool> tableBefore;
+
+  /// Absolute src index where the pending span currently walked began, per
+  /// consumed line (-1 when no table was pending before that line). Only
+  /// meaningful where [tableBefore] is true; -1-seeded walks derive it
+  /// from the seed length so a re-latched boundary keeps the TRUE span
+  /// start across rollback cycles.
+  final List<int> pendingStartAt;
+}
+
+/// Per-step walk state shared by the incremental [_walk] and the full
+/// [_rebuild] pass — the pending-table boundary-latch bookkeeping
+/// (gh-1573) lives in exactly ONE place: a drift between the two loops
+/// would silently desynchronize the commit boundary between the
+/// incremental and rebuild paths.
+final class _TableWalkState {
+  _TableWalkState();
+
+  /// Formatted outputs per consumed source line.
+  final List<List<String>> outsPerLine = [];
+
+  /// Fence state after each consumed line (see [_WalkResult.fenceAfter]).
+  final List<bool> fenceAfter = [];
+
+  /// Whether the pending-table buffer was NON-EMPTY just BEFORE each
+  /// consumed line (see [_WalkResult.tableBefore]).
+  final List<bool> tableBefore = [];
+
+  /// Absolute src index where the pending span began, per consumed line
+  /// (see [_WalkResult.pendingStartAt]).
+  final List<int> pendingStartAt = [];
+
+  /// Absolute src index where the in-flight pending span began (-1 when
+  /// none is open). A seeded walk starts inside (or at the head of) an
+  /// already-open span: the seed occupies src[from-seed.length..from).
+  int pendingStart = -1;
+
+  /// Step whose completion last left no pending table (-1 = none yet).
+  int lastClean = -1;
+
+  /// Fence state after [lastClean].
+  bool fenceAtClean = false;
+}
+
+/// Consumes one source [line] at absolute src index [i] into [state]
+/// through [fmt] — the per-step bookkeeping both walk loops share:
+/// latch the span start, snapshot the pre-line state, consume, then
+/// update the clean-step / span tracking from the post-line state.
+void _tableWalkStep(AnsiMarkdown fmt, String line, int i, _TableWalkState s) {
+  if (fmt.hasPendingTable && s.pendingStart < 0) s.pendingStart = i;
+  s.tableBefore.add(fmt.hasPendingTable);
+  s.pendingStartAt.add(s.pendingStart);
+  s.outsPerLine.add(fmt.consumeLine(line));
+  s.fenceAfter.add(fmt.inFence);
+  if (fmt.hasPendingTable) {
+    // This step may have OPENED the span (buffered its first row).
+    if (s.pendingStart < 0) s.pendingStart = i;
+  } else {
+    s.pendingStart = -1;
+    s.lastClean = s.outsPerLine.length - 1;
+    s.fenceAtClean = fmt.inFence;
+  }
+}
+
+final class TranscriptMarkdown {
+  TranscriptMarkdown({required this.width}) : _fmt = AnsiMarkdown(width: width);
+
+  /// Wrap/format width (terminal columns). Changed only via
+  /// [widthOverrideForTest], which drops all caches onto the rebuild path.
+  int width;
+
+  AnsiMarkdown _fmt;
+
+  /// Committed source-line count: rendering of src[0.._through) provably
+  /// never changes with future input, so its caches are final.
+  var _through = 0;
+
+  // Raw first/last source lines at the commit boundary: cheap O(1)
+  // identity sentinels. Copies keep element identity ([...history, d] /
+  // sublist), so first-mismatch proves a FRONT drop (history-cap trim)
+  // and last-mismatch proves the line just under the boundary was
+  // REPLACED (callers regenerating their tail) — either lands on the
+  // documented full-rebuild path rather than serving stale rows.
+  String? _boundaryFirst;
+  String? _boundaryLast;
+
+  // Durable caches for src[0.._through): formatted lines, wrapped rows and
+  // the line-to-row start index (total-row sentinel appended).
+  // MUTATED IN PLACE by [_commitTo]/[_rollbackGrownTail] — copying the
+  // whole accumulated arrays on every sync was O(transcript) per flush,
+  // O(total²) across a session (gh-1496). Published views are re-exposed
+  // by [_expose] on every sync, so no stale alias is ever served.
+  List<String> _formatted = <String>[];
+  List<String> _rows = <String>[];
+  List<int> _starts = <int>[0];
+
+  // Published views = durable caches (plus nothing today: an open-table
+  // tail re-renders wholesale on the NEXT sync instead of being frozen
+  // stale between calls, which keeps one source of truth).
+  List<String> _viewFormatted = const [];
+  List<String> _viewRows = const [];
+  List<int> _viewStarts = const [0];
+
+  // Pipeline state captured at the commit boundary ([_through]).
+  var _savedFence = false;
+
+  /// Fence state just BEFORE the boundary source line — the restore point
+  /// used by the grown-tail rollback (streaming without newlines).
+  var _fenceBeforeBoundaryLine = false;
+
+  /// Whether the boundary source line CLOSED a pending table when it was
+  /// consumed (gh-1573): its committed outputs embed the flushed grid, so
+  /// the grown-tail rollback must re-seed the resumed walk with the
+  /// buffered rows (from [_boundaryPendingFrom]) or the grid vanishes
+  /// from the view. False when the boundary line is table-free.
+  var _boundaryClosedPendingTable = false;
+
+  /// Absolute src index of the first row of the pending span the boundary
+  /// line closed (-1 when [_boundaryClosedPendingTable] is false).
+  var _boundaryPendingFrom = -1;
+
+  /// Pending-table rows the next [_walk] must resume with (armed by a
+  /// seeded grown-tail rollback, consumed by that walk; survives the
+  /// ~10 Hz tail throttle so the unchanged src re-offer keeps it).
+  List<String>? _pendingSeedTable;
+
+  /// Start index into [_formatted] per SOURCE line (sentinel = current
+  /// length) — lets the rollback drop exactly one source line's formatted
+  /// output without a per-line map on the hot path.
+  List<int> _srcFmtStarts = <int>[0];
+
+  /// Start row into [_rows] per SOURCE line (sentinel = current length).
+  List<int> _srcRowStarts = <int>[0];
+
+  // Work counters — contract tests assert these, never timings.
+  static int debugFullRebuilds = 0;
+  static int debugResumedPasses = 0;
+  static int debugLinesFormatted = 0;
+
+  /// Growing-tail throttle (see [sync]): skips counted here.
+  static int debugTailThrottled = 0;
+
+  /// Only lines longer than this are throttled — test streams (and real
+  /// short lines) must keep their byte-exact immediate behavior.
+  static const int _tailThrottleMinLength = 8192;
+
+  /// ~10 Hz re-render cap for an expensive still-growing tail line.
+  static const int _tailThrottleIntervalMs = 100;
+  int _lastTailProcessMs = -1000;
+
+  /// Zeroes the debug counters.
+  static void resetDebugCounters() {
+    debugFullRebuilds = 0;
+    debugResumedPasses = 0;
+    debugLinesFormatted = 0;
+    debugTailThrottled = 0;
+  }
+
+  /// Test seam: forces the next [sync] onto the rebuild path (simulates a
+  /// terminal resize without constructing a new instance).
+  void widthOverrideForTest(int newWidth) => width = newWidth;
+
+  /// Test seams exposing internal progress for diagnostics.
+  int get debugThroughForTest => _through;
+  String? get debugBoundaryFirstForTest => _boundaryFirst;
+
+  /// Formatted lines rendered so far.
+  ///
+  /// Live view: the lists published by the last [sync] — clean commits
+  /// publish the durable caches directly (gh-1496 removed the per-sync
+  /// spread copies, so a clean sync is zero-copy), never partially
+  /// mutated between syncs. Treat as read-only: mutate your own copy.
+  List<String> get formattedLines => _viewFormatted;
+
+  /// Wrapped physical rows rendered so far. Live view — see
+  /// [formattedLines].
+  List<String> get wrappedRows => _viewRows;
+
+  /// `lineStartRows[i]` = first wrapped row of rendered line `i`; final
+  /// entry is the total-row-count sentinel (the exact shape `_WrapCache`
+  /// stores). Live view — see [formattedLines].
+  List<int> get lineStartRows => _viewStarts;
+
+  /// Brings every view in line with [src]; returns [formattedLines].
+  /// Whether the incremental walk can resume from the frozen boundary
+  /// state (same width, boundary identity intact).
+  bool _resumable(List<String> src) {
+    return width == _fmt.width &&
+        src.length >= _through &&
+        (_through == 0 ||
+            (src.isNotEmpty &&
+                identical(src.first, _boundaryFirst) &&
+                identical(src[_through - 1], _boundaryLast)));
+  }
+
+  /// The growing-tail throttle decision: the ONLY pending change is one
+  /// still-growing line (no trailing newline yet) and it was re-rendered
+  /// less than [_tailThrottleIntervalMs] ago.
+  bool _tailThrottled(List<String> src) {
+    if (src.length != _through + 1) return false;
+    if (src.last.length <= _tailThrottleMinLength) return false;
+    final elapsed = DateTime.now().millisecondsSinceEpoch - _lastTailProcessMs;
+    return elapsed < _tailThrottleIntervalMs;
+  }
+
+  List<String> sync(List<String> src) {
+    if (!_resumable(src) && !_rollbackGrownTail(src)) {
+      _rebuild(src);
+      return _viewFormatted;
+    }
+    if (src.length == _through) {
+      return _viewFormatted; // nothing new: pure cache hit
+    }
+    // Growing-tail throttle: a streamed paragraph whose last line has no
+    // newline yet re-formats + re-wraps that line on EVERY flush — O(line
+    // length), so a long thinking burst (tens of KB in one line) saturated
+    // the event loop at the 16ms flush cadence: the screen froze (neither
+    // the thinking nor typed input rendered) until the chunk ended. When
+    // the ONLY pending change is such a line and it is expensive, process
+    // it at ~10 Hz instead — the paragraph accumulates, everything else
+    // (typing, other lines, the final newline) stays instant. Bytes are
+    // never dropped: the unchanged `src` is re-offered on the next flush.
+    if (_tailThrottled(src)) {
+      debugTailThrottled++;
+      return _viewFormatted;
+    }
+    if (src.length == _through + 1) {
+      _lastTailProcessMs = DateTime.now().millisecondsSinceEpoch;
+    }
+    debugResumedPasses++;
+    debugLinesFormatted += src.length - _through;
+
+    final r = _walk(src, from: _through);
+    _commitTo(r, src, from: _through);
+    _expose(r, src);
+    return _viewFormatted;
+  }
+
+  /// A streaming flush WITHOUT a trailing newline grows the last source
+  /// line into a NEW string with the SAME prefix. The boundary identity
+  /// sentinel reads that as a "replaced tail" and used to take the full
+  /// rebuild path — measured ~220ms per flush on a large transcript, i.e.
+  /// per streamed chunk, starving the UI loop so keystrokes queued behind
+  /// it (the typing-lag-while-streaming bug). A strictly prefix-extended
+  /// tail can instead roll the durable caches back ONE source line and
+  /// resume: only that line re-formats and re-wraps.
+  ///
+  /// The same holds when the caller hard-split that growing tail into
+  /// chunk lines (fa_tui caps the tail at 32KB by re-splitting it into
+  /// 16KB chunks — fresh substring identities on every split): the
+  /// chunks concatenate back to a prefix-extension of the boundary line,
+  /// so the region is still faithful growth. Rolling back the FIRST
+  /// chunk re-walks the rest as fresh lines; without this the split
+  /// re-triggered a full rebuild every ~16KB of streamed thinking.
+  bool _rollbackGrownTail(List<String> src) {
+    if (width != _fmt.width) return false;
+    if (_through <= 0 || src.length < _through) return false;
+    final boundary = _boundaryLast;
+    if (boundary == null || _boundaryFirst == null) return false;
+    if (src.isEmpty || !identical(src.first, _boundaryFirst)) return false;
+    if (!_tailIsFaithfulGrowth(src, boundary)) {
+      return false; // replaced, not grown — keep the documented safe path
+    }
+    final (rollbackOk, seed) = _rollbackTableSeed(src);
+    if (!rollbackOk) return false;
+    final edge = _through - 1;
+    final fmtKept = _srcFmtStarts[edge];
+    final rowKept = _srcRowStarts[edge];
+    // In-place truncation: sublist+spread copied the whole per-session
+    // arrays on EVERY no-newline chunk, so cost grew with session length.
+    _formatted.length = fmtKept;
+    _rows.length = rowKept;
+    _starts.length = fmtKept;
+    _starts.add(_rows.length);
+    _srcFmtStarts.length = edge;
+    _srcFmtStarts.add(_formatted.length);
+    _srcRowStarts.length = edge;
+    _srcRowStarts.add(_rows.length);
+    _through = edge;
+    _boundaryLast = edge > 0 ? src[edge - 1] : null;
+    _savedFence = _fenceBeforeBoundaryLine;
+    // The re-walk re-latches the boundary state from its own commit (the
+    // seeded walk's boundary step closes the restored span again); until
+    // then the conservative defaults hold for the new boundary line.
+    _boundaryClosedPendingTable = false;
+    _boundaryPendingFrom = -1;
+    _pendingSeedTable = seed;
+    return true;
+  }
+
+  /// The pending-table half of the gh-1573 grown-tail rollback: the
+  /// boundary line CLOSED a streamed table, so its committed outputs
+  /// embed the flushed grid. A rollback that re-walks the line with an
+  /// empty parser buffer would re-emit only the bare line — the whole
+  /// grid drops out of the view. Returns the rows to restore (the
+  /// contiguous table-row source lines right before the boundary) so the
+  /// resumed walk re-flushes the identical grid. The chunk-split shape
+  /// stays on the rebuild path: a chunk prefix can re-classify as a fresh
+  /// table row (`| … |`), which would render the split differently than
+  /// the committed whole line did.
+  ///
+  /// Returns `(false, _)` when the rollback must be REFUSED (the caller
+  /// falls back to the full rebuild) and `(true, seed)` otherwise — seed
+  /// is null when the boundary line is table-free.
+  (bool, List<String>?) _rollbackTableSeed(List<String> src) {
+    if (!_boundaryClosedPendingTable) return (true, null);
+    if (src.length != _through) return (false, null);
+    final from = _boundaryPendingFrom;
+    if (from < 0 || from >= _through - 1) return (false, null);
+    return (true, List<String>.of(src.sublist(from, _through - 1)));
+  }
+
+  /// True when the boundary line was hard-split into the chunk lines
+  /// src[_through-1..): the chunks concatenate back to a prefix-extension
+  /// of it, so the tail region is still faithful growth of the committed
+  /// content. One O(boundary) string compare per suspected split —
+  /// rebuilds cost O(transcript), this must stay cheap to answer.
+  bool _boundarySurvivesAsChunks(List<String> src, String boundary) {
+    final concat = StringBuffer();
+    for (var i = _through - 1; i < src.length; i++) {
+      concat.write(src[i]);
+      if (concat.length >= boundary.length) break;
+    }
+    return concat.toString().startsWith(boundary);
+  }
+
+  /// True when src[_through-1..) is still the committed boundary line
+  /// faithfully growing: either extended in place (a longer string that
+  /// starts with it) or hard-split into chunk lines whose concatenation
+  /// prefix-extends it (fa_tui's 32KB tail cap). Any other shape means
+  /// the caller replaced content — that stays on the rebuild path.
+  bool _tailIsFaithfulGrowth(List<String> src, String boundary) {
+    final grown = src[_through - 1];
+    if (grown.length > boundary.length) return grown.startsWith(boundary);
+    if (grown.length == boundary.length) return false;
+    if (!boundary.startsWith(grown)) return false;
+    return _boundarySurvivesAsChunks(src, boundary);
+  }
+
+  /// Consume-walk over src[from..) seeded with the frozen boundary state.
+  /// A seeded walk (gh-1573 rollback of a table-closing boundary) resumes
+  /// with the pending-table rows restored, so the boundary line re-flushes
+  /// the exact grid it committed with.
+  _WalkResult _walk(List<String> src, {required int from}) {
+    final seed = _pendingSeedTable;
+    _fmt.restoreState(inFence: _savedFence, table: seed ?? const []);
+    _pendingSeedTable = null;
+    final s = _TableWalkState()
+      // The seed occupies src[from-seed.length..from), so a seeded walk
+      // starts inside (or at the head of) an already-open span.
+      ..pendingStart = seed == null || seed.isEmpty ? -1 : from - seed.length;
+    for (var i = from; i < src.length; i++) {
+      _tableWalkStep(_fmt, src[i], i, s);
+    }
+    return _WalkResult(
+      s.outsPerLine,
+      s.lastClean,
+      s.fenceAtClean,
+      _fmt.hasPendingTable,
+      _fmt.flushTrailing(),
+      s.fenceAfter,
+      s.tableBefore,
+      s.pendingStartAt,
+    );
+  }
+
+  /// Folds everything UP TO THE LAST CLEAN STEP into the durable caches.
+  ///
+  /// The boundary NEVER advances past a still-open table's first row:
+  /// rendering for those rows is not final (column widths may still grow),
+  /// and the frozen snapshot carries only fence state. Advancing into the
+  /// open span would lose buffered rows on the next resume. Found
+  /// adversarially by transcript_table_render_test.dart.
+  void _commitTo(_WalkResult r, List<String> src, {required int from}) {
+    final upto = r.lastClean + 1; // count of leading final steps
+    if (upto <= 0) return;
+    // In-place append (gh-1496): the old spread-copies rebuilt the ENTIRE
+    // accumulated arrays on every sync — O(transcript) per flush and
+    // O(total²) per session. [_expose] republishes fresh views right
+    // after, so aliases are never served stale (same pattern as
+    // [_rollbackGrownTail]).
+    _starts.removeLast(); // per formatted line
+    _srcFmtStarts.removeLast(); // per source line
+    _srcRowStarts.removeLast(); // per source line
+    for (var step = 0; step < upto; step++) {
+      _srcFmtStarts.add(_formatted.length);
+      _srcRowStarts.add(_rows.length);
+      for (final line in r.outsPerLine[step]) {
+        _starts.add(_rows.length);
+        _formatted.add(line);
+        _rows.addAll(wrapAnsiLine(line, width));
+      }
+    }
+    _starts.add(_rows.length);
+    _srcFmtStarts.add(_formatted.length);
+    _srcRowStarts.add(_rows.length);
+    _through = from + upto;
+    if (from == 0) _boundaryFirst ??= src.first;
+    _boundaryLast = src[_through - 1];
+    _fenceBeforeBoundaryLine = upto >= 2 ? r.fenceAfter[upto - 2] : _savedFence;
+    // gh-1573: remember whether the boundary line consumed a non-empty
+    // pending table (it closed a streamed span — its outputs embed the
+    // flushed grid) and where that span began, so the grown-tail rollback
+    // can re-seed the walk instead of dropping the grid.
+    _boundaryClosedPendingTable = r.tableBefore[upto - 1];
+    _boundaryPendingFrom = _boundaryClosedPendingTable
+        ? r.pendingStartAt[upto - 1]
+        : -1;
+    _savedFence = r.fenceAtClean;
+  }
+
+  /// Publishes caches + whatever this walk produced beyond the commit
+  /// edge (an open-table span and/or the end-flush) as fresh view lists;
+  /// durable caches stay untouched by provisional bytes.
+  void _expose(_WalkResult r, List<String> src) {
+    final tailStartStep = r.lastClean + 1;
+    final tailLines = <String>[
+      for (var step = tailStartStep; step < r.outsPerLine.length; step++)
+        ...r.outsPerLine[step],
+      ...r.trailing,
+    ];
+    if (tailLines.isEmpty) {
+      _publishCleanViews();
+      return;
+    }
+    final tailRows = <String>[];
+    final tailStarts = <int>[];
+    final rowOffset = _rows.length;
+    final past = <int>[..._starts.sublist(0, _starts.length - 1)];
+    for (final line in tailLines) {
+      tailStarts.add(rowOffset + tailRows.length);
+      tailRows.addAll(wrapAnsiLine(line, width));
+    }
+    final total = rowOffset + tailRows.length;
+    _viewFormatted = [..._formatted, ...tailLines];
+    _viewRows = [..._rows, ...tailRows];
+    _viewStarts = [...past, ...tailStarts, total];
+  }
+
+  void _publishCleanViews() {
+    _viewFormatted = _formatted;
+    _viewRows = _rows;
+    _viewStarts = _starts;
+  }
+
+  /// Full-rebuild fallback: width change, head-trimmed or shrunk source.
+  /// Legacy behavior byte-for-byte (one formatAll + wrap pass), adopted as
+  /// the durable baseline.
+  void _rebuild(List<String> src) {
+    debugFullRebuilds++;
+    debugLinesFormatted += src.length;
+    _pendingSeedTable = null; // a refused rollback's seed never survives
+    final fmt = AnsiMarkdown(width: width);
+    final s = _TableWalkState();
+    for (var i = 0; i < src.length; i++) {
+      _tableWalkStep(fmt, src[i], i, s);
+    }
+    final hadPending = fmt.hasPendingTable;
+    final trailing = fmt.flushTrailing();
+
+    _fmt = fmt;
+    _formatted = [];
+    _rows = [];
+    // Empty-but-sentineled shape: the commit drops the trailing sentinel
+    // via removeLast, so fresh caches must already carry [0].
+    _starts = [0];
+    _srcFmtStarts = [0];
+    _srcRowStarts = [0];
+    _fenceBeforeBoundaryLine = false;
+    _through = 0;
+    _boundaryFirst = src.isEmpty ? null : src.first;
+    _boundaryLast = src.isEmpty ? null : src.last;
+    _savedFence = false;
+    final r = _WalkResult(
+      s.outsPerLine,
+      s.lastClean,
+      s.fenceAtClean,
+      hadPending,
+      trailing,
+      s.fenceAfter,
+      s.tableBefore,
+      s.pendingStartAt,
+    );
+    _commitTo(r, src, from: 0);
+    _savedFence = s.fenceAtClean; // even without a durable edge yet
+    _expose(r, src);
+  }
+}
+
+/// How [MarkdownSurface.render] emits assistant markdown.
+enum MarkdownSurfaceMode {
+  /// ANSI-rendered: an interactive terminal with color.
+  ansi,
+
+  /// Structure without SGR: a TTY under `NO_COLOR` / `TERM=dumb` — the
+  /// same renderer with escapes stripped, layout (bullets, indents, table
+  /// grids, heading emphasis) kept, zero escape bytes.
+  plain,
+
+  /// Byte-identical raw passthrough: pipes, redirects, `--no-format` /
+  /// `FA_NO_FORMAT` — scripts and files never receive ANSI.
+  raw,
+}
+
+/// The one-place markdown→terminal policy (issue #774): every human-read
+/// CLI surface renders assistant markdown through [render] — the line-mode
+/// REPL and headless runs directly; the TUI through its incremental
+/// [TranscriptMarkdown] engine, which shares the same [AnsiMarkdown]
+/// grammar. No surface formats on its own.
+final class MarkdownSurface {
+  /// Creates a policy in an explicit [mode]. The default is [raw] —
+  /// byte-identical to the pre-#774 behavior, so a host that does not
+  /// resolve a surface keeps today's output. [profile] RECORDS the host's
+  /// single theme resolution (issue #774) for consumers — AgentCli pins
+  /// `FaThemeController.instance` (the palette the engine reads) from it
+  /// and aligns its styling; render() itself never writes globals.
+  const MarkdownSurface({
+    this.mode = MarkdownSurfaceMode.raw,
+    this.width = 80,
+    this.profile,
+  });
+
+  /// Resolves the policy from host-detected surface facts: a pipe/redirect
+  /// or a `--no-format`/`FA_NO_FORMAT` request renders raw; `NO_COLOR` /
+  /// `TERM=dumb` on a TTY renders plain; a color terminal renders ANSI.
+  factory MarkdownSurface.resolving({
+    required bool tty,
+    required bool color,
+    bool format = true,
+    int width = 80,
+    ColorProfile? profile,
+  }) => MarkdownSurface(
+    mode: !format || !tty
+        ? MarkdownSurfaceMode.raw
+        : color
+        ? MarkdownSurfaceMode.ansi
+        : MarkdownSurfaceMode.plain,
+    width: width,
+    profile: profile,
+  );
+
+  final MarkdownSurfaceMode mode;
+
+  /// Wrap/table-fit width, resolved at construction and frozen: line mode
+  /// and headless are one-shot renders per message, so a mid-session
+  /// terminal resize applies to the NEXT process (the TUI, the only
+  /// repaintable surface, re-renders at the live viewport width).
+  final int width;
+
+  /// The theme palette [AnsiMarkdown] emits in [ansi]/[plain] passes.
+  final ColorProfile? profile;
+
+  /// Renders one COMPLETE assistant text (a whole message — never a
+  /// streaming delta). Every call owns a fresh [AnsiMarkdown], so
+  /// cross-line state cannot leak between messages: an unclosed fence at
+  /// end-of-stream renders as a code block and the next message renders
+  /// formatted (issue #774 AC6).
+  String render(String text) => switch (mode) {
+    MarkdownSurfaceMode.raw => text,
+    MarkdownSurfaceMode.ansi => _renderWhole(text),
+    MarkdownSurfaceMode.plain => _renderWhole(
+      text,
+    ).replaceAll(_ansiEscapeRe, ''),
+  };
+
+  String _renderWhole(String text) {
+    // Palette discipline (issue #778 round 2): the policy NEVER writes
+    // process globals. The engine reads FaThemeController.instance, which
+    // the HOST pins once (bin/fah.dart resolves the surface; AgentCli's
+    // constructor pins the controller from surface.profile) — render()
+    // only formats.
+    return AnsiMarkdown(
+      width: width,
+    ).formatAll(resolveSetextHeadings(text.split('\n'))).join('\n');
+  }
+}
+
+/// The host's ONE markdown-surface resolution for the process (issue
+/// #774): terminal capability + environment + the `--no-format` flag →
+/// the [MarkdownSurface] every non-TUI surface routes assistant text
+/// through. Kept pure (facts as parameters, no `dart:io`) so the exact
+/// production resolution is unit-testable (issue #778 round 2); the
+/// executable calls it with `stdout.supportsAnsiEscapes` /
+/// `Platform.environment` / `parsed.noFormat` / `io.columns`.
+///
+/// [ansiSupported] is `stdout.supportsAnsiEscapes`: false means piped or
+/// redirected, so the surface is [MarkdownSurfaceMode.raw] regardless of
+/// environment. A terminal degrades per [MarkdownSurface.resolving]
+/// (`NO_COLOR` / `TERM=dumb` → plain). The resolved profile rides on the
+/// surface ([MarkdownSurface.profile]) so the host's CLI styling can
+/// align with the SAME source of truth (`useColor := profile != null`).
+MarkdownSurface resolveMarkdownSurface({
+  required bool ansiSupported,
+  Map<String, String> environment = const {},
+  bool noFormatFlag = false,
+  int width = 80,
+}) {
+  final profile = detectThemeProfile(
+    ansiSupported: ansiSupported,
+    environment: environment,
+  );
+  return MarkdownSurface.resolving(
+    tty: ansiSupported,
+    color: profile != null,
+    format: !noFormatFlag && !isTruthyEnvValue(environment['FA_NO_FORMAT']),
+    width: width,
+    profile: profile,
+  );
+}
+
+/// Rewrites setext heading pairs (`paragraph` + `===`/`---` underline) to
+/// their ATX equivalents (`# paragraph`), so the whole-message render
+/// path parses both heading grammars with one engine (issue #774 AC5).
+///
+/// The streaming engine is deliberately untouched: its zero-lookahead
+/// commit contract is what keeps the TUI's per-flush cost O(delta), and a
+/// held paragraph line would invalidate that (the perf tests pin it). So
+/// setext coverage lives HERE — the one-place policy layer used by
+/// line-mode and headless — not in TranscriptMarkdown; the TUI transcript
+/// keeps rendering a bare `---` line as a horizontal rule (pre-existing,
+/// documented engine behavior).
+///
+/// A `---` with no preceding paragraph line stays a horizontal rule;
+/// pairs inside fences are left alone; blank lines end a paragraph.
+List<String> resolveSetextHeadings(List<String> lines) {
+  final out = List<String>.of(lines);
+  var inFence = false;
+  for (var i = 0; i < out.length - 1; i++) {
+    if (AnsiMarkdown._fenceRe.hasMatch(out[i])) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    final level = _setextUnderline1Re.hasMatch(out[i + 1])
+        ? 1
+        : _setextUnderline2Re.hasMatch(out[i + 1])
+        ? 2
+        : 0;
+    if (level == 0 || !_canOpenSetext(out[i])) continue;
+    // CommonMark: the WHOLE contiguous paragraph above the underline
+    // becomes the heading, not just its last line — otherwise the first
+    // lines keep paragraph styling while the last gains heading emphasis.
+    final start = _paragraphStart(out, i);
+    out[start] = '${'#' * level} ${out.sublist(start, i + 1).join(' ')}';
+    out.removeRange(start + 1, i + 2);
+    i = start - 1;
+  }
+  return out;
+}
+
+/// First line of the contiguous plain-paragraph run ending at [i].
+int _paragraphStart(List<String> out, int i) {
+  var start = i;
+  while (start > 0 && _canOpenSetext(out[start - 1])) {
+    start--;
+  }
+  return start;
+}
+
+/// Whether [line] can open a setext heading: a plain paragraph line —
+/// not blank and not any other block form (fence, ATX heading, quote,
+/// bullet, thematic break). A whitespace-only line counts as blank.
+bool _canOpenSetext(String line) {
+  if (line.trim().isEmpty) return false;
+  if (AnsiMarkdown._fenceRe.hasMatch(line)) return false;
+  if (AnsiMarkdown._headerRe.hasMatch(line)) return false;
+  if (AnsiMarkdown._hrRe.hasMatch(line)) return false;
+  if (AnsiMarkdown._quoteRe.hasMatch(line)) return false;
+  if (AnsiMarkdown._bulletRe.hasMatch(line)) return false;
+  return true;
+}
+
+final _setextUnderline1Re = RegExp(r'^ {0,3}=+ *$');
+final _setextUnderline2Re = RegExp(r'^ {0,3}-+ *$');
+
+/// Every ANSI escape shape renderer output or model text can carry: CSI
+/// sequences (SGR, cursor movement, erasing) and OSC strings (e.g.
+/// `\x1b]8;;url\x1b\\` hyperlinks), BEL- or ST-terminated. [plain] mode
+/// strips these so its zero-escape-byte contract holds for model noise
+/// the renderer itself never emits.
+final _ansiEscapeRe = RegExp(
+  r'\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\))',
+);

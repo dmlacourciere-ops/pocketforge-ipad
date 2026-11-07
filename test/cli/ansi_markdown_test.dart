@@ -1,0 +1,594 @@
+import 'package:flutter_agent_harness/src/cli/ansi_markdown.dart';
+import 'package:flutter_agent_harness/src/cli/tui_theme.dart';
+import 'package:flutter_agent_harness/src/cli/tui_text_width.dart';
+import 'package:test/test.dart';
+
+void main() {
+  group('AnsiMarkdown', () {
+    test('h1 renders bold+underline indigo without the # prefix', () {
+      final out = AnsiMarkdown().formatLine('# Title');
+      expect(out, contains('\x1b[1m'));
+      expect(out, contains('\x1b[4m'));
+      expect(out, contains('\x1b[38;2;129;140;248m'));
+      expect(out, contains('Title'));
+      expect(out, isNot(contains('# Title')));
+    });
+
+    test('h3 keeps the literal ### prefix', () {
+      final out = AnsiMarkdown().formatLine('### Sub');
+      expect(out, contains('### Sub'));
+    });
+
+    test('inline bold, italic, strike and code spans get SGR styles', () {
+      final md = AnsiMarkdown();
+      expect(md.formatLine('a **b** c'), contains('\x1b[1mb\x1b[0m'));
+      expect(md.formatLine('a *b* c'), contains('\x1b[3mb\x1b[0m'));
+      expect(md.formatLine('a ~~b~~ c'), contains('\x1b[9mb\x1b[0m'));
+      expect(
+        md.formatLine('a `b` c'),
+        contains('\x1b[38;2;94;234;212mb\x1b[0m'),
+      );
+    });
+
+    test('partial emphasis from an in-flight stream stays unstyled', () {
+      expect(AnsiMarkdown().formatLine('a **bol'), 'a **bol');
+    });
+
+    test('unordered and ordered list markers become accent bullets', () {
+      final md = AnsiMarkdown();
+      final bullet = md.formatLine('- item');
+      expect(bullet, contains('•'));
+      expect(bullet, contains('item'));
+      final numbered = md.formatLine('3. item');
+      expect(numbered, contains('\x1b[38;2;94;234;212m3.\x1b[0m'));
+    });
+
+    test('task list items keep a styled checkbox', () {
+      expect(AnsiMarkdown().formatLine('- [x] done'), contains('[✓]'));
+      expect(AnsiMarkdown().formatLine('- [ ] todo'), contains('[ ]'));
+    });
+
+    test('code fences toggle verbatim indented content', () {
+      final md = AnsiMarkdown();
+      expect(md.formatLine('```dart'), contains('```dart'));
+      final code = md.formatLine('final **x** = 1;');
+      // Inside a fence the markdown markers stay literal and unstyled.
+      expect(code, '  final **x** = 1;');
+      expect(md.formatLine('```'), contains('```'));
+      // After the fence closes, markdown works again.
+      expect(md.formatLine('a **b**'), contains('\x1b[1mb\x1b[0m'));
+    });
+
+    test('blockquote gets a bar and dim italic body', () {
+      final out = AnsiMarkdown().formatLine('> quoted');
+      expect(out, contains('│'));
+      expect(out, contains('quoted'));
+    });
+
+    test('horizontal rule renders as a dim full-width rule capped at 80', () {
+      final out = AnsiMarkdown(width: 120).formatLine('---');
+      expect(out, contains('─' * 80));
+    });
+
+    test('links underline the text and dim the url', () {
+      final out = AnsiMarkdown().formatLine('see [docs](https://x.dev)');
+      expect(out, contains('\x1b[4mdocs\x1b[0m'));
+      expect(out, contains('(https://x.dev)'));
+    });
+
+    test('pre-styled background lines are padded to the current width', () {
+      const line = '\x1b[48;2;30;34;42mhello **world**\x1b[0m';
+      final out = AnsiMarkdown(width: 40).formatLine(line);
+      // No markdown formatting inside, but the background spans the width.
+      expect(out, contains('hello **world**'));
+      expect(out.replaceAll(RegExp(r'\x1b\[[0-9;]*m'), '').length, 40);
+    });
+
+    test('stored full-width rules re-render at the current width', () {
+      final stored = '\x1b[2m${'─' * 200}\x1b[0m';
+      final out = AnsiMarkdown(width: 80).formatLine(stored);
+      expect(out.replaceAll(RegExp(r'\x1b\[[0-9;]*m'), ''), '─' * 80);
+    });
+
+    test('user echo bg repaints with the CURRENT theme at emit time', () {
+      final controller = FaThemeController.instance;
+      controller
+        ..reset()
+        ..profile = ColorProfile.trueColor;
+      addTearDown(controller.reset);
+      // Stored by _echoAppend under the default theme.
+      const line = '\x1b[48;2;30;34;42mhello\x1b[0m';
+      expect(
+        AnsiMarkdown(width: 40).formatLine(line),
+        contains('\x1b[48;2;30;34;42m'),
+      );
+      // Mid-session /theme pi: the SAME stored line renders with pi's
+      // userMessageBg — the palette of the submit must not leak forever.
+      controller.switchTo('pi');
+      final out = AnsiMarkdown(width: 40).formatLine(line);
+      expect(out, contains('\x1b[48;2;52;53;65m'));
+      expect(out, isNot(contains('\x1b[48;2;30;34;42m')));
+      expect(out, contains('hello'));
+    });
+
+    test('stored rules re-render in the CURRENT theme dim color', () {
+      final controller = FaThemeController.instance;
+      controller
+        ..reset()
+        ..profile = ColorProfile.trueColor;
+      addTearDown(controller.reset);
+      final stored = '\x1b[2m${'─' * 200}\x1b[0m';
+      controller.switchTo('pi');
+      final out = AnsiMarkdown(width: 80).formatLine(stored);
+      // pi's muted (dim + #989898 — gh-671 readability lightening of
+      // #666666), not the bare default faint.
+      expect(out, contains('\x1b[38;2;152;152;152m'));
+    });
+
+    group('wrapAnsiLine', () {
+      test('never cuts inside an SGR escape at the wrap boundary', () {
+        // A styled inline-code span straddling the wrap column: the escape
+        // must stay whole on one side (dart_tui's wrap leaks e.g. `212m`).
+        const teal = '\x1b[38;2;94;234;212m';
+        const reset = '\x1b[0m';
+        final line = '${'x' * 8}(${teal}lsp$reset): text';
+        final rows = wrapAnsiLine(line, 10);
+        for (final row in rows) {
+          final visible = row.replaceAll(AnsiMarkdown.ansiSgrPattern, '');
+          expect(visible.length, lessThanOrEqualTo(10));
+          // No stray escape fragments: every \x1b starts a complete SGR.
+          expect(row.contains(RegExp(r'\x1b(?!\[[0-9;]*m)')), isFalse);
+        }
+        // Reassembled visible text is unchanged.
+        expect(
+          rows.join().replaceAll(AnsiMarkdown.ansiSgrPattern, ''),
+          line.replaceAll(AnsiMarkdown.ansiSgrPattern, ''),
+        );
+      });
+
+      test('short lines pass through unwrapped', () {
+        expect(wrapAnsiLine('hello', 10), ['hello']);
+      });
+
+      test('wraps long lines at the width', () {
+        final rows = wrapAnsiLine('x' * 25, 10);
+        expect(rows, ['x' * 10, 'x' * 10, 'x' * 5]);
+      });
+
+      test('wraps at word boundaries instead of mid-word', () {
+        final rows = wrapAnsiLine('aaa bb cc', 5);
+        expect(rows, ['aaa ', 'bb cc']);
+      });
+
+      test('a boundary space at the exact wrap edge carries to the '
+          'continuation row (terminal autowrap) — gh-1510', () {
+        // The word ends exactly at the last column, so the separating space
+        // no longer fits on the closing row. Dropping it collapses the two
+        // words in the rendered screen buffer ("memory round-tripcomplete" —
+        // the nightly subagent memory test failure); a real terminal wraps
+        // the space onto the continuation row instead.
+        expect(wrapAnsiLine('aaaa bbbb', 4), ['aaaa', ' bbb', 'b']);
+        // The carried space is visible in the buffer and the round trip
+        // reproduces the text exactly.
+        expect(wrapAnsiLine('aaaa bbbb', 4).join(), 'aaaa bbbb');
+        // The common case is unaffected: the space fits at the row tail.
+        expect(wrapAnsiLine('aaaa bbbb', 5), ['aaaa ', 'bbbb']);
+      });
+
+      test('a trailing boundary space at end of line is not turned into a '
+          'blank continuation row', () {
+        expect(wrapAnsiLine('aaaa ', 4), ['aaaa']);
+      });
+
+      test('a trailing boundary space followed only by SGR codes drops the '
+          'carried-space row, exactly like the unstyled case', () {
+        // Regression: flushWord() snapshotted and cleared the carried-space
+        // flag even for a zero-visible-width word (a trailing reset), so a
+        // styled line ending 'aaaa \x1b[0m' at the exact wrap edge emitted
+        // a one-space continuation row while the unstyled 'aaaa ' case was
+        // dropped — inconsistent layout for a rare input.
+        final rows = wrapAnsiLine('\x1b[1maaaa \x1b[0m', 4);
+        expect(rows, hasLength(1));
+        expect(rows.single.replaceAll(AnsiMarkdown.ansiSgrPattern, ''), 'aaaa');
+      });
+
+      test('a multi-space run at the exact wrap edge fills the continuation '
+          'row before wrapping (terminal-faithful) — review on #1517', () {
+        // Regression: the carried-state guard in writeToken() ended the
+        // carried state on ANY visible token including a second boundary
+        // space, so the next word started on its own row and the
+        // continuation row held only spaces ('aaaa' / '  ' / 'bbbb'). A
+        // real terminal with deferred autowrap fills the row first.
+        expect(wrapAnsiLine('aaaa  bbbb', 4), ['aaaa', '  bb', 'bb']);
+        // The single-space behavior is unchanged.
+        expect(wrapAnsiLine('aaaa bbbb', 4), ['aaaa', ' bbb', 'b']);
+      });
+
+      test('property: seeded random text at random widths round-trips '
+          'through the wrap (visible text preserved) — gh-1510', () {
+        // Never-again for the space-eating class: whatever the wrap point,
+        // joining the stripped rows must reproduce the original text. The
+        // generator avoids trailing whitespace (the one documented drop).
+        var seed = 0xC0FFEE;
+        int next() {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          return seed;
+        }
+
+        final words = ['a', 'bb', 'ccc', 'dddd', 'eeeee', 'ffffff', 'gg'];
+        for (var trial = 0; trial < 200; trial++) {
+          final wordCount = 1 + next() % 12;
+          final parts = <String>[
+            for (var w = 0; w < wordCount; w++)
+              words[next() % words.length],
+          ];
+          // Sprinkle multi-space runs every few trials.
+          final text = parts
+              .join(trial % 5 == 0 ? '  ' : ' ')
+              .trimRight();
+          final width = 3 + next() % 30;
+          final rows = wrapAnsiLine(text, width);
+          for (final row in rows) {
+            final visible = row.replaceAll(AnsiMarkdown.ansiSgrPattern, '');
+            expect(
+              visible.length,
+              lessThanOrEqualTo(width),
+              reason: 'width $width row overflows: "$row" (text "$text")',
+            );
+          }
+          expect(
+            rows.join().replaceAll(AnsiMarkdown.ansiSgrPattern, ''),
+            text,
+            reason: 'width $width mangled "$text"',
+          );
+        }
+      });
+
+      test('SGR state carries across the wrap: reset at the cut, re-opened '
+          'on the continuation row', () {
+        const bold = '\x1b[1m';
+        const reset = '\x1b[0m';
+        // Bold span straddling the wrap: the continuation must re-open bold
+        // (dart_tui redraws rows independently — terminal state does not
+        // carry across rows).
+        final line = 'aa ${bold}bbbb bbbb$reset cc';
+        final rows = wrapAnsiLine(line, 6);
+        expect(rows.length, greaterThan(1));
+        // The row where bold opens but does not close ends with a reset…
+        final opened = rows.firstWhere((r) => r.contains(bold));
+        expect(opened.endsWith(reset), isTrue);
+        // …and the continuation re-opens it.
+        final index = rows.indexOf(opened);
+        expect(rows[index + 1].startsWith(bold), isTrue);
+        // Reassembled visible text is unchanged.
+        expect(
+          rows.join().replaceAll(AnsiMarkdown.ansiSgrPattern, ''),
+          line.replaceAll(AnsiMarkdown.ansiSgrPattern, ''),
+        );
+      });
+
+      test('wide characters count as two cells so rows never overflow', () {
+        // ✅ occupies 2 terminal cells (dart_tui's renderer measures
+        // grapheme clusters) but 1 UTF-16 unit. Column math by code units
+        // packed 10 of them into a width-10 row and the renderer desynced —
+        // the "formatting slides after an emoji" corruption.
+        const check = '✅';
+        final rows = wrapAnsiLine('${check * 5} tail', 10);
+        for (final row in rows) {
+          expect(
+            tuiTextWidth(row),
+            lessThanOrEqualTo(10),
+            reason: 'row overflows: $row',
+          );
+        }
+        // The five emoji fill the row exactly (5 × 2 cells), so the boundary
+        // space carries to the continuation row (gh-1510 terminal-autowrap)
+        // and the reassembled text is byte-identical to the input.
+        expect(rows.join(), '${check * 5} tail');
+      });
+
+      test('a wide word longer than the width hard-cuts on cell columns', () {
+        final rows = wrapAnsiLine('✅✅✅✅✅✅', 7);
+        for (final row in rows) {
+          expect(
+            tuiTextWidth(row),
+            lessThanOrEqualTo(7),
+            reason: 'row overflows: $row',
+          );
+        }
+        expect(rows.join(), '✅' * 6);
+      });
+
+      test('cyrillic text wraps by cells exactly like latin', () {
+        // Cyrillic is narrow (1 cell per char) — width math must not treat
+        // it as wide or wrapping regresses for Russian transcripts.
+        final rows = wrapAnsiLine('дом лес озеро', 5);
+        for (final row in rows) {
+          expect(
+            row.replaceAll(AnsiMarkdown.ansiSgrPattern, '').length,
+            lessThanOrEqualTo(5),
+          );
+        }
+        expect(rows.join(), 'дом лес озеро');
+      });
+    });
+
+    group('cell widths (tui_text_width)', () {
+      test('emoji measure two cells, cyrillic one, combining zero', () {
+        expect(tuiTextWidth('a'), 1);
+        expect(tuiTextWidth('✅'), 2);
+        expect(tuiTextWidth('🎉'), 2);
+        expect(tuiTextWidth('ж'), 1);
+        expect(tuiTextWidth('中'), 2);
+        expect(tuiTextWidth('─'), 1);
+        expect(tuiTextWidth('e\u0301'), 1); // e + combining acute
+        expect(tuiPadRight('ab✅', 8), 'ab✅    ');
+        expect(tuiFitWidth('abc✅def', 6), 'abc✅…');
+      });
+    });
+
+    group('tables', () {
+      final table = [
+        '| № | Название | Описание |',
+        '|:--- | :--- | :--- |',
+        '| 1 | **Инструменты** | Использование `ls` |',
+        '| 2 | AI/LSP | Диагностика |',
+      ];
+
+      test('renders a compact box grid with a dim separator', () {
+        final out = AnsiMarkdown(width: 80).formatAll(table);
+        expect(out, hasLength(table.length)); // 1:1 line mapping
+        // Header row: bold, padded to column width, │ cell separators.
+        expect(out[0], contains('\x1b[1m'));
+        expect(out[0], contains('│'));
+        // Separator row: dim box-drawing.
+        expect(out[1], contains('┼'));
+        expect(out[1], contains('─'));
+        // Data rows keep inline formatting (bold/cyan code).
+        expect(out[2], contains('\x1b[1mИнструменты\x1b[0m'));
+        expect(out[2], contains('\x1b[38;2;94;234;212mls\x1b[0m'));
+        expect(out[3], contains('AI/LSP'));
+        // The grid is rectangular: every row has the same visible length and
+        // the │ separators land in the same visible columns on every row
+        // (inline markers like `code` backticks must not skew the widths).
+        final ansi = RegExp(r'\x1b\[[0-9;]*m');
+        final visible = [for (final l in out) l.replaceAll(ansi, '')];
+        final lengths = visible.map((l) => l.length).toSet();
+        expect(lengths, hasLength(1));
+        List<int> columnsOf(String line, String char) => [
+          for (var i = 0; i < line.length; i++)
+            if (line[i] == char) i,
+        ];
+        final headerColumns = columnsOf(visible[0], '│');
+        // Data rows share the header's │ columns; the separator's ┼ columns
+        // line up with them too.
+        for (final row in visible.skip(2)) {
+          expect(columnsOf(row, '│'), headerColumns);
+        }
+        expect(columnsOf(visible[1], '┼'), headerColumns);
+      });
+
+      test('formats at exactly the table width, not four columns over', () {
+        // Regression: the width budget used to add 4 extra columns, so a table
+        // whose rendered grid is exactly N characters only formatted when the
+        // terminal was at least N+4 wide.
+        final wideTable = [
+          '| A | B | C |',
+          '|---|---|---|',
+          '| x | ${"y" * 40} | ${"z" * 30} |',
+          '| a | b | c |',
+        ];
+        final out = AnsiMarkdown(width: 89).formatAll(wideTable);
+        expect(out[0], contains('│'));
+        expect(out[1], contains('┼'));
+        final ansi = RegExp(r'\x1b\[[0-9;]*m');
+        final visible = out.map((l) => l.replaceAll(ansi, '')).toList();
+        expect(visible.map((l) => l.length).toSet(), hasLength(1));
+      });
+
+      test('falls back to raw lines when the table does not fit', () {
+        final out = AnsiMarkdown(width: 20).formatAll(table);
+        for (var i = 0; i < table.length; i++) {
+          expect(out[i], contains('|'));
+        }
+      });
+
+      test('malformed tables (no separator row) pass through raw', () {
+        final out = AnsiMarkdown().formatAll(['| a | b |', '| 1 | 2 |']);
+        expect(out[0], contains('| a | b |'));
+      });
+    });
+
+    group('inline format budget', () {
+      test('huge lines render verbatim (no span substitution)', () {
+        // A degenerate 100 KB line: spans crossing more than
+        // inlineFormatMaxChars are meaningless; the budget exists to cap
+        // the quadratic regex scans (see _formatInline).
+        final huge =
+            'prefix [link](x) ${'a' * AnsiMarkdown.inlineFormatMaxChars} '
+            '[tail](y) *b* `c`';
+        final out = AnsiMarkdown().formatLine(huge);
+        expect(out, huge); // byte-identical pass-through
+      });
+
+      test('lines at the budget still format spans', () {
+        final line = '[link](http://x) ${'a' * 100}';
+        final out = AnsiMarkdown().formatLine(line);
+        expect(out, isNot(same(line)));
+        expect(out, contains('http://x'));
+      });
+
+      test('a dense burst formats fast (regression: 10 s TUI freeze)', () {
+        // 2000 dim pairs over 185 KB — the thinking-burst shape that used
+        // to stall the event loop for seconds per format pass.
+        final buf = StringBuffer();
+        for (var i = 0; i < 2000; i++) {
+          buf.write(
+            '\x1b[2mstep $i: weigh the ${i}th angle carefully; '
+            '\x1b[0m',
+          );
+        }
+        final lines = <String>['', 'user: think hard', ''];
+        // One coalesced flush appends the whole burst as one tail line;
+        // the 32 KB tail cap splits it into 16 KB chunks.
+        lines[lines.length - 1] += buf.toString();
+        const maxTail = 32 * 1024;
+        const chunk = 16 * 1024;
+        if (lines.last.length > maxTail) {
+          final tail = lines.last;
+          lines
+            ..removeLast()
+            ..addAll([
+              for (var i = 0; i < tail.length; i += chunk)
+                tail.substring(i, (i + chunk).clamp(0, tail.length)),
+            ]);
+        }
+        final sw = Stopwatch()..start();
+        final tx = TranscriptMarkdown(width: 80);
+        tx.sync(lines);
+        expect(sw.elapsedMilliseconds, lessThan(2000));
+        expect(tx.wrappedRows, isNotEmpty);
+      });
+    });
+  });
+
+  group('setext headings via MarkdownSurface (issue #774 AC5)', () {
+    const surface = MarkdownSurface(mode: MarkdownSurfaceMode.plain);
+
+    test('paragraph + === renders as h1, underline gone', () {
+      final out = surface.render('Title\n===\n');
+      expect(out, contains('Title'));
+      expect(out.contains('==='), isFalse);
+    });
+
+    test('paragraph + --- renders as h2, not a horizontal rule', () {
+      final out = surface.render('Title\n---\n');
+      expect(out, contains('Title'));
+      expect(out.contains('─'), isFalse);
+    });
+
+    test('a standalone --- stays a horizontal rule', () {
+      expect(surface.render('---\n'), contains('─'));
+    });
+
+    test('a --- after the pair closed stays a horizontal rule', () {
+      expect(surface.render('Title\n===\n\n---\n'), contains('─'));
+    });
+
+    test('plain paragraphs render one line each', () {
+      expect(
+        surface.render('first para\nsecond para\n'),
+        'first para\nsecond para\n',
+      );
+    });
+
+    test('setext is inert inside a fence', () {
+      final out = surface.render('```\nTitle\n===\n```\n');
+      expect(out, contains('Title'));
+      expect(out, contains('==='));
+    });
+
+    test('a whitespace-only line is blank — the --- stays a rule', () {
+      final out = surface.render('Title\n  \n---\n');
+      expect(out, contains('Title'));
+      expect(out, contains('─'));
+      expect(out.contains('---'), isFalse);
+    });
+
+    test('a multi-line paragraph becomes ONE heading (CommonMark)', () {
+      final out = surface.render('one\ntwo\n===\n');
+      expect(out, contains('one two'));
+      // 'one' no longer ends its own paragraph line.
+      expect(out.contains('one\n'), isFalse);
+    });
+
+    test('plain mode strips non-SGR escapes too (OSC hyperlinks)', () {
+      const noisy = 'see \x1b]8;;https://x.example\x1b\\docs\x1b]8;;\x1b\\ '
+          'and \x1b[?25lraw';
+      final out = surface.render(noisy);
+      expect(out.contains('\x1b'), isFalse);
+      expect(out, contains('see docs and raw'));
+    });
+
+    test('bullets and quotes never become headings', () {
+      expect(surface.render('- item\n---\n'), contains('─'));
+      expect(surface.render('> quoted\n---\n'), contains('─'));
+    });
+
+    test('ATX and setext render byte-identically (ansi)', () {
+      final ansi = MarkdownSurface(mode: MarkdownSurfaceMode.ansi);
+      expect(ansi.render('Title\n===\n'), ansi.render('# Title\n'));
+      expect(ansi.render('Sub\n---\n'), ansi.render('## Sub\n'));
+    });
+  });
+
+  group('MarkdownSurface (issue #774)', () {
+    // The owner-reported repro input: heading + list + table + fence.
+    const repro =
+        '# Plan\n\n- **step** one\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n'
+        '```dart\nvar x = 1;\n```\n';
+
+    test('ansi mode renders every pinned construct', () {
+      final out = MarkdownSurface(
+        mode: MarkdownSurfaceMode.ansi,
+      ).render(repro);
+      expect(out, contains('\x1b[4mPlan')); // h1: bold+underline, # stripped
+      expect(out, isNot(contains('# Plan')));
+      expect(out, contains('•')); // bullet list
+      expect(out, contains('\x1b[1mstep')); // inline bold
+      expect(out, contains('│')); // table grid
+      expect(out, contains('  var x = 1;')); // fence content indented
+    });
+
+    test('plain mode keeps structure with zero escape bytes (AC4)', () {
+      final out = MarkdownSurface(
+        mode: MarkdownSurfaceMode.plain,
+      ).render(repro);
+      expect(out.contains('\x1b'), isFalse); // byte-scan: no SGR at all
+      expect(out, contains('Plan'));
+      expect(out, isNot(contains('# Plan'))); // heading layout kept
+      expect(out, contains('•'));
+      expect(out, contains('│'));
+      expect(out, contains('  var x = 1;'));
+    });
+
+    test('raw mode is byte-identical passthrough (AC3)', () {
+      expect(
+        MarkdownSurface(mode: MarkdownSurfaceMode.raw).render(repro),
+        repro,
+      );
+    });
+
+    test('resolving maps surface facts to modes', () {
+      expect(
+        MarkdownSurface.resolving(tty: true, color: true).mode,
+        MarkdownSurfaceMode.ansi,
+      );
+      expect(
+        MarkdownSurface.resolving(tty: true, color: false).mode,
+        MarkdownSurfaceMode.plain,
+      );
+      expect(
+        MarkdownSurface.resolving(tty: false, color: true).mode,
+        MarkdownSurfaceMode.raw,
+      );
+      // --no-format / FA_NO_FORMAT forces raw even on a color TTY.
+      expect(
+        MarkdownSurface.resolving(tty: true, color: true, format: false).mode,
+        MarkdownSurfaceMode.raw,
+      );
+    });
+
+    test('fence state resets per message; the next one renders (AC6)', () {
+      final surface = MarkdownSurface(mode: MarkdownSurfaceMode.ansi);
+      // Unclosed fence at end-of-stream: content renders as a code block.
+      final first = surface.render('```dart\nfinal x = 1;');
+      expect(first, contains('```dart'));
+      expect(first, contains('  final x = 1;'));
+      // The NEXT message renders formatted — no leaked fence state.
+      final second = surface.render('- **fresh** item');
+      expect(second, contains('•'));
+      expect(second, contains('\x1b[1mfresh\x1b[0m'));
+    });
+  });
+}

@@ -1,0 +1,119 @@
+# Fa CLI Integration Tests
+
+End-to-end tests that spawn the Fa CLI (`dart bin/fah.dart`) as a real
+subprocess attached to a PTY, send keystrokes, and verify terminal output
+through an xterm emulator.
+
+## Running
+
+```bash
+dart test --tags integration
+```
+
+The `integration` tag is excluded from the pre-commit gate (see
+`dart_test.yaml`). First-time boot can take up to ~90 s.
+
+### The FA_BIN AOT seam (gh-1300)
+
+Every test spawn pays a JIT cost: VM start + CFE kernel compile of the
+whole harness (~30 s per spawn on loaded ARM CI runners; ~9 s even on a
+warm dev box). Set `FA_BIN` to a prebuilt binary to skip it:
+
+```bash
+dart build cli --target=bin/fah.dart --output=fa-local
+FA_BIN=$PWD/fa-local/bundle/bin/fah dart test --tags integration
+```
+
+CI compiles the bundle ONCE per run (`fa-aot-build` job; nightly builds
+in-job) and exports `FA_BIN` for the PTY/CLI legs — every spawn (the PTY
+harness and the headless helpers, via `faCliCommand`) then runs the AOT
+binary (~0.01 s). Isolation is untouched: a spawn is still a fresh
+process with its own env/cwd — the per-spawn reset contract is documented
+on `FaCliHarness` in `pty_harness.dart`. The per-shard duration budgets
+this optimizes live in `scripts/test_shard_budgets.json`
+(`scripts/check_shard_durations.py` gates them and auto-files the
+`[ENH]` issue on breach).
+
+Visual (screenshot) tests live in `flutter_app/test/cli_visual/` — they run
+the same PTY harness but render every step through the real Flutter
+`TerminalView` (JetBrainsMono, Fa palette) into
+`test/integration/screenshots/NN_name.png` (+ `.txt` twins with the exact
+screen text). Run them with:
+
+```bash
+cd flutter_app && flutter test test/cli_visual --tags integration
+```
+
+## Structure
+
+- `pty_harness.dart` — PTY-based test harness (spawn, send keys, capture
+  output, xterm screen model)
+- `fa_cli_integration_test.dart` — test scenarios
+
+## Load-sensitive (PTY/grid timing) tests — gh-1026 protocol
+
+PTY and grid assertions are load-sensitive: on a busy host the CLI's raw
+echo settles long before the render loop repaints, so a fixed sleep plus a
+single frame read is a lottery. The rules every integration test follows:
+
+- Assert on the PAINTED viewport through a bounded poller
+  (`waitForScreen`, or a viewport-state poll loop like
+  `expectNewline` in `fa_cli_newline_wires_test.dart` and
+  `_oneRowTickDiffPair` in `composer_tui_grid_pty_test.dart`) — never a
+  fixed sleep ahead of a frame read.
+- State-dependent menus whose content rides a bounded probe (the `/dap`
+  menu's 1 s `/healthz` hub probe) re-open under a bounded retry until the
+  probed shape paints (`_openRunningHubMenu` in `dap_tui_menu_test.dart`).
+- Quarantine (`skip: 'flake: gh-XXXX …'`) is the LAST resort, only when a
+  case cannot be made deterministic (gh-1007/gh-1012/gh-1014).
+
+Files hardened under gh-1026 after 3 red pre-commit gate runs on an
+unchanged head: `fa_cli_newline_wires_test.dart`,
+`composer_tui_grid_pty_test.dart` (grid integrity mid-run),
+`dap_tui_menu_test.dart` (running-hub leading row).
+
+Local gate flake budget: `FA_GATE_PTY_RETRIES=N` makes the gate's
+integration-mock stage rerun ONLY its failed files, up to N times
+(scripts/ci_fast_gate.sh + scripts/gate_failed_targets.py), instead of
+costing a full leg per ambient flake. Default 0 = single-shot.
+
+## Writing new tests
+
+1. Spawn: `final harness = await FaCliHarness.spawn(extraEnv: {'HOME': tempHome.path})`
+   — always override `HOME` with a temp dir containing a minimal
+   `.fah/config.yaml` so tests are isolated from the developer's real
+   config and keys. `approvalMode: yolo` avoids approval gates.
+2. Wait for boot: `await harness.waitForBoot()` — waits for the banner's
+   `[Model]` block and lets the frame redraws settle. NOTE: in TUI mode the
+   input zone renders NO `fa> ` prefix (that prompt is line-mode only), so
+   never wait for `fa>` under a PTY.
+3. Send keys: `harness.sendText('/command')`, `harness.sendEnter()`,
+   `harness.sendArrowDown()`, `harness.sendEscape()`
+4. Slash commands: prefer `await harness.runSlashCommand('/exit')` — in TUI
+   mode typing a bare slash command opens the completion menu where Enter
+   only accepts the highlighted item; `runSlashCommand` closes the menu
+   with Escape first so Enter always submits. Commands WITH arguments
+   (e.g. `/approval always-ask`) close the menu while typing and submit
+   with a plain Enter.
+5. Pickers (provider wizard, confirmations): arrows navigate, Enter
+   selects, Esc cancels. Typing does NOT pick a numbered option in TUI
+   mode — that's line mode only.
+6. Assert: `expect(harness.screenText, contains('expected'))` (screen model)
+   or match the raw stream via the `waitForText` return value.
+7. Close: `await harness.close()` — kills the process and cancels the
+   output subscription (an open subscription keeps the test runner's event
+   loop alive and hangs the run).
+
+## pty2 0.5.3 API notes
+
+- `PseudoTerminal.start(exe, args, workingDirectory:, environment:, raw:)`
+  — no size parameters; call `pty.resize(columns, rows)` right after start
+  (default is 80x20).
+- Spawn `dart bin/fah.dart`, NOT `dart run bin/fah.dart`: `dart run` spawns
+  a separate child VM that escapes `pty.kill()` and keeps the PTY (and the
+  whole test run) alive.
+- `pty.out` is a `Stream<String>` (already decoded); `pty.write(String)`.
+- The child env inherits only TERM/LANG/LOGNAME/USER/DISPLAY/LC_TYPE/HOME/
+  PATH from the parent plus the explicit `environment:` map — the harness
+  passes `PUB_CACHE` through so package resolution still works when `HOME`
+  is overridden.

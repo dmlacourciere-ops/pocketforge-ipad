@@ -1,0 +1,2174 @@
+import 'dart:io';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:flutter_agent_harness/src/cli/waiting_heartbeat.dart';
+import 'package:flutter_agent_harness/io.dart';
+import 'package:test/test.dart';
+import 'package:yaml/yaml.dart';
+
+void main() {
+  group('CliConfig', () {
+    late Directory tmp;
+
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-config-test-');
+    });
+
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+
+    test('returns defaults when config file is missing', () {
+      final config = loadCliConfig(tmp.path);
+      expect(config.providerKind, 'openai-completions');
+      expect(config.modelId, 'openai/gpt-4o-mini');
+      expect(config.baseUrl, 'https://openrouter.ai/api/v1');
+      expect(config.mode, 'code');
+    });
+
+    test('loads saved config', () async {
+      final original = CliConfig(
+        providerKind: 'anthropic',
+        modelId: 'claude-sonnet-4',
+        baseUrl: 'https://api.anthropic.com',
+        mode: 'architect',
+      );
+      await saveCliConfig(tmp.path, original);
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.providerKind, 'anthropic');
+      expect(loaded.modelId, 'claude-sonnet-4');
+      expect(loaded.baseUrl, 'https://api.anthropic.com');
+      expect(loaded.mode, 'architect');
+    });
+
+    test('falls back to defaults on malformed yaml', () async {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('not yaml: [unclosed');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.modelId, 'openai/gpt-4o-mini');
+    });
+
+    test('a yaml-hostile provider entry name survives the roundtrip', () async {
+      // Issue #555: `name: ?` written bare throws "Mapping keys are not
+      // allowed here" on load — the next start fell back to defaults and
+      // the user's saved config was effectively lost.
+      final original = CliConfig().withCustomProviders([
+        CustomProviderEntry(
+          name: '?',
+          apiType: 'openai',
+          baseUrl: 'https://x.example.com/v1',
+          modelId: 'm1',
+        ),
+      ]);
+      await saveCliConfig(tmp.path, original);
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.customProviders.single.name, '?');
+      expect(loaded.customProviders.single.baseUrl, 'https://x.example.com/v1');
+      expect(loaded.customProviders.single.modelId, 'm1');
+    });
+    test(
+      'a programmatic save persists the links: section (no silent revert)',
+      () async {
+        // withCustomProviders must carry `links` — its old copy silently
+        // reverted to the default, so any save whose in-memory links
+        // differed from disk (a fresh file, a programmatic save) lost the
+        // section and only disk re-attachment masked it (issue #691).
+        const links = LinksConfig(
+          appstore: 'https://apps.apple.com/us/app/fa-ai-agent/id6793815163',
+          banner: false,
+        );
+        await saveCliConfig(
+          tmp.path,
+          CliConfig(links: links).withCustomProviders([
+            CustomProviderEntry(
+              name: 'p1',
+              apiType: 'openai',
+              baseUrl: 'https://x.example.com/v1',
+              modelId: 'm1',
+            ),
+          ]),
+        );
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.links.appstore, links.appstore);
+        expect(loaded.links.banner, isFalse);
+      },
+    );
+    test('approval settings default when absent from the file', () {
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.approvalMode, 'yolo');
+      expect(loaded.allowedTools, isEmpty);
+    });
+
+    test('round-trips approval settings', () async {
+      final original = CliConfig(
+        approvalMode: 'write',
+        allowedTools: const ['bash', 'write'],
+      );
+      await saveCliConfig(tmp.path, original);
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.approvalMode, 'write');
+      expect(loaded.allowedTools, ['bash', 'write']);
+    });
+
+    test('round-trips an empty always-allow set', () async {
+      await saveCliConfig(tmp.path, CliConfig(approvalMode: 'always-ask'));
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.approvalMode, 'always-ask');
+      expect(loaded.allowedTools, isEmpty);
+    });
+
+    test('loads without model roles when the section is absent', () {
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.modelRoles, isNull);
+    });
+
+    test('round-trips model roles, overrides, and retry knobs', () async {
+      final roles = ModelRolesConfig.fromYaml(
+        loadYaml('''
+roles:
+  default:
+    - openrouter/anthropic/claude-sonnet-4
+    - provider: openai
+      model: gpt-4o
+  smol:
+    - openrouter/openai/gpt-4o-mini
+modelOverrides:
+  - path: ~/work/acme
+    roles:
+      plan:
+        - anthropic/claude-opus-4-5
+retry:
+  retriesPerEntry: 3
+''')
+            as YamlMap,
+      );
+      await saveCliConfig(tmp.path, CliConfig(modelRoles: roles));
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.modelId, 'openai/gpt-4o-mini'); // legacy fields intact
+      final loadedRoles = loaded.modelRoles!;
+      expect(loadedRoles.roles['default'], hasLength(2));
+      expect(loadedRoles.roles['smol']!.single.modelId, 'openai/gpt-4o-mini');
+      expect(loadedRoles.pathOverrides.single.pattern, '~/work/acme');
+      expect(loadedRoles.retry.retriesPerEntry, 3);
+      // Full yaml fidelity: emitting again reproduces the same document.
+      expect(loaded.toYaml(), CliConfig(modelRoles: roles).toYaml());
+    });
+
+    test(
+      'surfaces invalid model roles instead of resetting to defaults',
+      () async {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('''
+provider: anthropic
+roles:
+  bogus-role:
+    - openai/gpt-4o
+''');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('unknown model role'),
+            ),
+          ),
+        );
+      },
+    );
+
+    test('loads without ttsr when the section is absent', () {
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.ttsr, isNull);
+    });
+
+    test('round-trips the ttsr section', () async {
+      final ttsr = TtsrConfig.fromYaml(
+        loadYaml('''
+contextMode: keep
+rules:
+  - name: no-console
+    pattern: "console\\\\.log\\\\("
+    body: Do not use console.log.
+    scope: [text, tool:edit]
+'''),
+        sourcePath: '~/.fah/config.yaml',
+      );
+      await saveCliConfig(tmp.path, CliConfig(ttsr: ttsr));
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.modelId, 'openai/gpt-4o-mini'); // legacy fields intact
+      final loadedTtsr = loaded.ttsr!;
+      expect(loadedTtsr.settings.contextMode, TtsrContextMode.keep);
+      expect(loadedTtsr.rules.single.name, 'no-console');
+      expect(loadedTtsr.rules.single.patterns, [r'console\.log\(']);
+      expect(loadedTtsr.rules.single.scope.toolNames, {'edit'});
+      // Full yaml fidelity: emitting again reproduces the same document.
+      expect(loaded.toYaml(), CliConfig(ttsr: ttsr).toYaml());
+    });
+
+    test('surfaces an invalid ttsr section instead of dropping it', () async {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('''
+provider: anthropic
+ttsr:
+  contextMode: sideways
+''');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('ttsr.contextMode'),
+          ),
+        ),
+      );
+    });
+
+    test('loads without prompt overrides when the section is absent', () {
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.promptOverrides, isEmpty);
+    });
+
+    test('round-trips the prompts section', () async {
+      await saveCliConfig(
+        tmp.path,
+        CliConfig(
+          promptOverrides: const {
+            'system': '~/prompts/my_system.md',
+            'cli/mode_review': 'You are a terse reviewer.\nNever refactor.',
+            'compaction/summary': './prompts/sum.md',
+          },
+        ),
+      );
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.modelId, 'openai/gpt-4o-mini'); // legacy fields intact
+      expect(loaded.promptOverrides, {
+        'system': '~/prompts/my_system.md',
+        'cli/mode_review': 'You are a terse reviewer.\nNever refactor.',
+        'compaction/summary': './prompts/sum.md',
+      });
+      // Full yaml fidelity: emitting again reproduces the same document.
+      const raw = {
+        'system': '~/prompts/my_system.md',
+        'cli/mode_review': 'You are a terse reviewer.\nNever refactor.',
+        'compaction/summary': './prompts/sum.md',
+      };
+      expect(loaded.toYaml(), CliConfig(promptOverrides: raw).toYaml());
+    });
+
+    test('parses the prompts section from raw yaml', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('''
+provider: google
+prompts:
+  system: ~/prompts/sys.md
+  cli/mode_review: "You are a terse reviewer."
+''');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.providerKind, 'google');
+      expect(loaded.promptOverrides['system'], '~/prompts/sys.md');
+      expect(
+        loaded.promptOverrides['cli/mode_review'],
+        'You are a terse reviewer.',
+      );
+    });
+
+    test('surfaces an invalid prompts section instead of dropping it', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('''
+prompts:
+  bogus/name: "text"
+''');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown prompt override'),
+          ),
+        ),
+      );
+    });
+
+    test('parses providerTimeouts and round-trips them', () async {
+      final original = CliConfig(
+        providerTimeouts: const ProviderTimeoutsOverride(
+          connect: Duration(seconds: 120),
+          streamIdle: Duration(minutes: 5),
+        ),
+      );
+      await saveCliConfig(tmp.path, original);
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.providerTimeouts?.connect, const Duration(seconds: 120));
+      expect(loaded.providerTimeouts?.streamIdle, const Duration(minutes: 5));
+    });
+
+    test('providerTimeouts defaults to null when absent', () {
+      expect(loadCliConfig(tmp.path).providerTimeouts, isNull);
+    });
+
+    test('rejects a malformed providerTimeouts section', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('providerTimeouts:\n  connectTimeoutMs: "x"\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('connectTimeoutMs'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects unknown providerTimeouts keys', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('providerTimeouts:\n  bogusMs: 5\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('bogusMs'),
+          ),
+        ),
+      );
+    });
+
+    test('parses the images section and round-trips it', () async {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync(
+        'images:\n  registry: false\n  maxPerRequest: 4\n'
+        '  maxBytesPerRequest: 1048576\n',
+      );
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.images?.enabled, isFalse);
+      expect(loaded.images?.maxPerRequest, 4);
+      expect(loaded.images?.maxBytesPerRequest, 1048576);
+
+      await saveCliConfig(tmp.path, loaded);
+      final reloaded = loadCliConfig(tmp.path);
+      expect(reloaded.images?.enabled, isFalse);
+      expect(reloaded.images?.maxPerRequest, 4);
+      expect(reloaded.images?.maxBytesPerRequest, 1048576);
+    });
+
+    test(
+      'parses images.autoInspect and round-trips it (gh-1984 AC3)',
+      () async {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('images:\n  autoInspect: false\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.images?.autoInspect, isFalse);
+
+        await saveCliConfig(tmp.path, loaded);
+        final reloaded = loadCliConfig(tmp.path);
+        expect(reloaded.images?.autoInspect, isFalse);
+      },
+    );
+
+    test('images.autoInspect defaults to true (gh-1984 AC2)', () {
+      // Absent section AND section without the key both default on: the
+      // auto-route is the default behavior, `false` is the explicit opt-out.
+      expect(const ImageRegistryConfig().autoInspect, isTrue);
+      expect(
+        parseImagesSection(loadYaml('registry: true'))?.autoInspect,
+        isTrue,
+      );
+    });
+
+    test('images rejects a non-bool autoInspect', () {
+      expect(
+        () => parseImagesSection(loadYaml('autoInspect: "off"')),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('images.autoInspect'),
+          ),
+        ),
+      );
+    });
+
+    test('images defaults to null when absent', () {
+      expect(loadCliConfig(tmp.path).images, isNull);
+    });
+
+    test('parses the power section and round-trips it (issue #325)', () async {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('power:\n  sleepPrevention: system\n');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.powerSleepPrevention, PowerAssertionLevel.system);
+
+      await saveCliConfig(tmp.path, loaded);
+      final reloaded = loadCliConfig(tmp.path);
+      expect(reloaded.powerSleepPrevention, PowerAssertionLevel.system);
+    });
+
+    test('parses the power hold lifecycle and round-trips it (#326)', () async {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync(
+        'power:\n  sleepPrevention: display\n  hold: session\n',
+      );
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.powerSleepPrevention, PowerAssertionLevel.display);
+      expect(loaded.powerHold, PowerAssertionHold.session);
+
+      await saveCliConfig(tmp.path, loaded);
+      final reloaded = loadCliConfig(tmp.path);
+      expect(reloaded.powerSleepPrevention, PowerAssertionLevel.display);
+      expect(reloaded.powerHold, PowerAssertionHold.session);
+      // The per-run default stays absent when not configured.
+      expect(loadCliConfig(tmp.path).powerHold, PowerAssertionHold.session);
+    });
+
+    test(
+      'hold alone round-trips (level stays absent → idle default)',
+      () async {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('power:\n  hold: session\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.powerSleepPrevention, isNull);
+        expect(loaded.powerHold, PowerAssertionHold.session);
+        await saveCliConfig(tmp.path, loaded);
+        expect(loadCliConfig(tmp.path).powerHold, PowerAssertionHold.session);
+      },
+    );
+
+    test('rejects a bad power.hold value', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('power:\n  hold: forever\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('"power.hold" must be per-run or session'),
+          ),
+        ),
+      );
+    });
+
+    test('power defaults to null when absent (the host applies idle)', () {
+      expect(loadCliConfig(tmp.path).powerSleepPrevention, isNull);
+    });
+
+    test('rejects a bad power.sleepPrevention value', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('power:\n  sleepPrevention: sometimes\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains(
+              '"power.sleepPrevention" must be off, idle, display or '
+              'system',
+            ),
+          ),
+        ),
+      );
+    });
+
+    test('rejects unknown images keys', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('images:\n  bogus: 1\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('images'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects a malformed images section', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('images:\n  registry: "yes"\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('images.registry'),
+          ),
+        ),
+      );
+      file.writeAsStringSync('images:\n  maxPerRequest: 0\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('images.maxPerRequest'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects a non-map images section (issue #195 F1)', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('images: 42\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('images must be a map'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects a negative images.maxPerRequest (issue #195 F1)', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('images:\n  maxPerRequest: -3\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('images.maxPerRequest'),
+          ),
+        ),
+      );
+    });
+
+    test('an empty images section keeps the defaults (issue #195 F1)', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('images: {}\n');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.images, isNull);
+    });
+
+    test('partial images section round-trips with core defaults '
+        '(issue #195 F1)', () async {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('images:\n  maxPerRequest: 7\n');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.images?.enabled, isTrue);
+      expect(loaded.images?.maxPerRequest, 7);
+
+      await saveCliConfig(tmp.path, loaded);
+      final reloaded = loadCliConfig(tmp.path);
+      expect(reloaded.images?.enabled, isTrue);
+      expect(reloaded.images?.maxPerRequest, 7);
+    });
+
+    group('skills section', () {
+      test('defaults to granted and shell execution enabled', () {
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.skillsAccess, SkillsAccess.granted);
+        expect(loaded.skillsDisableShellExecution, isFalse);
+      });
+
+      test('parses granted access', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('skills:\n  access: granted\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.skillsAccess, SkillsAccess.granted);
+      });
+
+      test('parses denied access and disabled shell execution', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'skills:\n  access: denied\n  disableShellExecution: true\n',
+        );
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.skillsAccess, SkillsAccess.denied);
+        expect(loaded.skillsDisableShellExecution, isTrue);
+      });
+
+      test('rejects a non-map skills section', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('skills: not-a-map\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('skills must be a map'),
+            ),
+          ),
+        );
+      });
+
+      test('rejects an invalid access value', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('skills:\n  access: maybe\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('skills.access must be ask'),
+            ),
+          ),
+        );
+      });
+
+      test('rejects a non-boolean disableShellExecution value', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('skills:\n  disableShellExecution: "yes"\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('skills.disableShellExecution must be a boolean'),
+            ),
+          ),
+        );
+      });
+
+      test('rejects malformed per-skill skills keys', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('skills:\n  bogus: 1\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              // Per-skill keys are legal since issue #1151; only a bad
+              // value shape is rejected now.
+              contains('skills.bogus must be on/off'),
+            ),
+          ),
+        );
+      });
+
+      test('omits skills section with default settings', () {
+        expect(CliConfig().toYaml(), isNot(contains('skills:')));
+      });
+
+      test('emits skills access when not granted (the default)', () {
+        final yaml = CliConfig(skillsAccess: SkillsAccess.denied).toYaml();
+        expect(yaml, contains('skills:\n  access: denied'));
+        expect(yaml, isNot(contains('disableShellExecution')));
+      });
+
+      test('emits disabled shell execution alone when access is ask', () {
+        final yaml = CliConfig(skillsDisableShellExecution: true).toYaml();
+        expect(yaml, contains('skills:\n  disableShellExecution: true'));
+        expect(yaml, isNot(contains('access:')));
+      });
+
+      test('emits both skills fields when changed', () {
+        final yaml = CliConfig(
+          skillsAccess: SkillsAccess.denied,
+          skillsDisableShellExecution: true,
+        ).toYaml();
+        expect(yaml, contains('skills:'));
+        expect(yaml, contains('access: denied'));
+        expect(yaml, contains('disableShellExecution: true'));
+      });
+
+      test('omits jobs section with default settings', () {
+        expect(CliConfig().toYaml(), isNot(contains('jobs:')));
+      });
+
+      test('emits jobs section only when knobs deviate', () {
+        final yaml = CliConfig(
+          jobs: const JobsConfig(staleHours: 48, logRetentionDays: 7),
+        ).toYaml();
+        expect(yaml, contains('jobs:\n  staleHours: 48'));
+        expect(yaml, contains('logRetentionDays: 7'));
+      });
+
+      group('cube section', () {
+        test('absent section parses as null', () {
+          expect(loadCliConfig(tmp.path).cube, isNull);
+        });
+
+        test('round-trips enabled config path', () async {
+          await saveCliConfig(
+            tmp.path,
+            CliConfig(cube: CubeSettings(configPath: '.fah/cubes/dev.yaml')),
+          );
+          final loaded = loadCliConfig(tmp.path);
+          expect(loaded.cube?.enabled, isTrue);
+          expect(loaded.cube?.configPath, '.fah/cubes/dev.yaml');
+          // Full yaml fidelity: emitting again reproduces the section.
+          expect(
+            loaded.toYaml(),
+            contains('cube:\n  config: .fah/cubes/dev.yaml\n'),
+          );
+        });
+
+        test('round-trips disabled without a path', () async {
+          await saveCliConfig(
+            tmp.path,
+            CliConfig(cube: CubeSettings(enabled: false)),
+          );
+          final loaded = loadCliConfig(tmp.path);
+          expect(loaded.cube?.enabled, isFalse);
+          expect(loaded.cube?.configPath, isNull);
+          expect(loaded.toYaml(), contains('cube:\n  enabled: false\n'));
+        });
+
+        test('rejects unknown cube keys', () async {
+          final file = File('${tmp.path}/.fah/config.yaml');
+          file.createSync(recursive: true);
+          file.writeAsStringSync('cube:\n  bogus: 1\n');
+          expect(
+            () => loadCliConfig(tmp.path),
+            throwsA(
+              isA<ConfigException>().having(
+                (e) => e.message,
+                'message',
+                contains('unknown "cube" key'),
+              ),
+            ),
+          );
+        });
+
+        test('rejects a non-boolean enabled', () async {
+          final file = File('${tmp.path}/.fah/config.yaml');
+          file.createSync(recursive: true);
+          file.writeAsStringSync('cube:\n  enabled: yes-please\n');
+          expect(
+            () => loadCliConfig(tmp.path),
+            throwsA(isA<ConfigException>()),
+          );
+        });
+      });
+    });
+
+    group('agent section (issue #273)', () {
+      test('absent section leaves the cap null', () {
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.contextWindowCap, isNull);
+      });
+
+      test('parses a valid contextWindowCap', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  contextWindowCap: 256000\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.contextWindowCap, 256000);
+      });
+
+      test('UT-W3 (#729): parses a cap ABOVE the catalog window', () {
+        // The raise path: the strict validation intentionally permits a
+        // cap above the catalog window — the override sets the effective
+        // window in whichever direction it points.
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  contextWindowCap: 1000000\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.contextWindowCap, 1000000);
+      });
+
+      test('rejects an unknown agent key', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'agent:\n  contextWindowCap: 256000\n'
+          '  temperature: 0\n',
+        );
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('unknown "agent" key'),
+            ),
+          ),
+        );
+      });
+
+      test('rejects a non-integer cap', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  contextWindowCap: big\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('must be a positive integer'),
+            ),
+          ),
+        );
+      });
+
+      test('rejects a cap below the compaction reserve (AC5)', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  contextWindowCap: 16383\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('at least 16384'),
+            ),
+          ),
+        );
+      });
+
+      test('parses agent.mode = pi (issue #679)', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: pi\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.agentMode, 'pi');
+      });
+
+      test('agent.mode = default normalizes to null', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: default\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.agentMode, isNull);
+      });
+
+      test('parses agent.misuseBreaker = false (issue #862)', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  misuseBreaker: false\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.misuseBreaker, isFalse);
+      });
+
+      test('misuseBreaker defaults to true when the key is absent '
+          '(issue #862)', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: pi\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.misuseBreaker, isTrue);
+      });
+
+      test('rejects a non-boolean misuseBreaker with the exact message '
+          '(issue #862)', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  misuseBreaker: "off"\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              '"agent.misuseBreaker" must be a boolean',
+            ),
+          ),
+        );
+      });
+
+      test('rejects an unknown agent.mode value', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: turbo\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('"agent.mode" must be one of'),
+            ),
+          ),
+        );
+      });
+
+      test('toYaml persists the cap for the round-trip', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  contextWindowCap: 256000\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(
+          loaded.withCustomProviders(loaded.customProviders).toYaml(),
+          contains('agent:\n  contextWindowCap: 256000'),
+        );
+      });
+
+      test('rejects a non-map agent section', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent: 256000\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('agent must be a map'),
+            ),
+          ),
+        );
+      });
+
+      test('parses agent.mode = omp and persists it back', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: omp\n');
+        final loaded = loadCliConfig(tmp.path);
+        expect(loaded.agentLoadMode, 'omp');
+        expect(
+          loaded.withCustomProviders(loaded.customProviders).toYaml(),
+          contains('agent:\n  mode: omp\n'),
+        );
+      });
+
+      test('parses agent.mode = pi', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: pi\n');
+        expect(loadCliConfig(tmp.path).agentLoadMode, 'pi');
+      });
+
+      test('agent.mode = default normalizes to null', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: default\n');
+        expect(loadCliConfig(tmp.path).agentLoadMode, isNull);
+      });
+
+      test('rejects an unknown agent.mode value', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: turbo\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('"agent.mode" must be one of'),
+            ),
+          ),
+        );
+      });
+
+      test('toYaml persists cap and mode together for the round-trip', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'agent:\n  contextWindowCap: 256000\n  mode: omp\n',
+        );
+        final loaded = loadCliConfig(tmp.path);
+        expect(
+          loaded.withCustomProviders(loaded.customProviders).toYaml(),
+          contains('agent:\n  contextWindowCap: 256000\n  mode: omp\n'),
+        );
+      });
+
+      test('absent agent.stuckTool parses to null', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: omp\n');
+        expect(loadCliConfig(tmp.path).stuckTool, isNull);
+      });
+
+      test('parses agent.stuckTool and persists only non-defaults back', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'agent:\n'
+          '  stuckTool:\n'
+          '    floorSeconds: 42\n'
+          '    heartbeatSeconds: 7\n'
+          '    followUp: advisory\n'
+          '    excludeTools: [task]\n',
+        );
+        final loaded = loadCliConfig(tmp.path);
+        final stuck = loaded.stuckTool;
+        expect(stuck, isNotNull);
+        expect(stuck!.floor, const Duration(seconds: 42));
+        expect(stuck.heartbeatInterval, const Duration(seconds: 7));
+        expect(stuck.followUp, StuckFollowUpMode.advisory);
+        expect(stuck.excludeTools, ['task']);
+        final yaml = loaded
+            .withCustomProviders(loaded.customProviders)
+            .toYaml();
+        expect(
+          yaml,
+          contains(
+            '  stuckTool:\n'
+            '    followUp: advisory\n'
+            '    floorSeconds: 42\n'
+            '    heartbeatSeconds: 7\n'
+            '    excludeTools: [task]\n',
+          ),
+        );
+      });
+
+      test('rejects an unknown agent.stuckTool key', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'agent:\n  stuckTool:\n    floorSeconds: 10\n    turbo: true\n',
+        );
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('unknown "agent.stuckTool" key'),
+            ),
+          ),
+        );
+      });
+      test(
+        'gh-1632 I1: the autonomous default applies in EVERY mode — advisory '
+        'only via explicit config',
+        () {
+          // gh-1632: the incident (fa 1.0.580 hung 27 min on a dead git
+          // fetch) was an interactive session running the implicit advisory
+          // default — the stuck flag fired but nothing ever escalated.
+          // `advisory` is an explicit opt-out only; the default is
+          // autonomous everywhere (supersedes the gh-1054 review stance).
+          AgentCliConfig cli({bool headless = false, StuckToolConfig? stuck}) =>
+              AgentCliConfig(
+                model: const Model(
+                  id: 'm',
+                  api: 'test-api',
+                  provider: 'test-provider',
+                  baseUrl: 'https://example.test',
+                  contextWindow: 100000,
+                  maxTokens: 4096,
+                ),
+                apiKey: 'k',
+                env: MemoryExecutionEnv(cwd: '/work'),
+                sessionRoot: '/sessions',
+                headlessRun: headless,
+                stuckTool: stuck,
+              );
+          expect(
+            cli().effectiveStuckTool().followUp,
+            StuckFollowUpMode.autonomous,
+            reason:
+                'REPL/TUI default-config sessions recover too (gh-1632 I1) '
+                '— the 27-minute hang happened exactly here',
+          );
+          expect(
+            cli(headless: true).effectiveStuckTool().followUp,
+            StuckFollowUpMode.autonomous,
+            reason: 'fa run: unattended — the autonomous default',
+          );
+          const explicit = StuckToolConfig(
+            followUp: StuckFollowUpMode.advisory,
+          );
+          expect(
+            cli(headless: true, stuck: explicit).effectiveStuckTool(),
+            same(explicit),
+            reason: 'an explicit agent.stuckTool wins in both modes',
+          );
+          expect(
+            cli(stuck: explicit).effectiveStuckTool(),
+            same(explicit),
+            reason: 'advisory stays reachable ONLY via explicit config (I1)',
+          );
+        },
+      );
+
+      test('absent foregroundCall leaves parse to null (issue #1786)', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  mode: omp\n');
+        expect(loadCliConfig(tmp.path).foregroundCall, isNull);
+      });
+
+      test('parses the foregroundCall leaves into the budget config', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'agent:\n'
+          '  foregroundCallBudgetSeconds: 300\n'
+          '  foregroundCallAutoConvert: auto\n',
+        );
+        final fg = loadCliConfig(tmp.path).foregroundCall;
+        expect(fg, isNotNull);
+        expect(fg!.budget, const Duration(seconds: 300));
+        expect(fg.autoConvert, isTrue);
+        // One leaf present keeps the other's default (fromLeaves).
+        file.writeAsStringSync('agent:\n  foregroundCallBudgetSeconds: 90\n');
+        final half = loadCliConfig(tmp.path).foregroundCall;
+        expect(half!.budget, const Duration(seconds: 90));
+        expect(half.autoConvert, isFalse);
+      });
+
+      test('rejects a bad foregroundCallBudgetSeconds', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        // 0, negative, non-int all hit the same strict positive-integer
+        // error; a quoted "600" is a string, not an int.
+        for (final raw in ['0', '-5', '"600"', 'true']) {
+          file.writeAsStringSync(
+            'agent:\n  foregroundCallBudgetSeconds: $raw\n',
+          );
+          expect(
+            () => loadCliConfig(tmp.path),
+            throwsA(
+              isA<ConfigException>().having(
+                (e) => e.message,
+                'message',
+                contains(
+                  '"agent.foregroundCallBudgetSeconds" must be a positive '
+                  'integer',
+                ),
+              ),
+            ),
+            reason: 'foregroundCallBudgetSeconds: $raw',
+          );
+        }
+        // A per-tool override map is rejected in the core tier too.
+        file.writeAsStringSync(
+          'agent:\n  foregroundCallBudgetSeconds:\n    bash: 30\n',
+        );
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains(
+                '"agent.foregroundCallBudgetSeconds" must be a positive '
+                'integer',
+              ),
+            ),
+          ),
+        );
+      });
+
+      test('rejects a bad foregroundCallAutoConvert', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync('agent:\n  foregroundCallAutoConvert: 5\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('"agent.foregroundCallAutoConvert" must be a string'),
+            ),
+          ),
+        );
+        file.writeAsStringSync('agent:\n  foregroundCallAutoConvert: maybe\n');
+        expect(
+          () => loadCliConfig(tmp.path),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('"agent.foregroundCallAutoConvert" must be "offer"'),
+            ),
+          ),
+        );
+      });
+
+      test('toYaml keeps non-default foreground leaves, omits defaults', () {
+        final file = File('${tmp.path}/.fah/config.yaml');
+        file.createSync(recursive: true);
+        file.writeAsStringSync(
+          'agent:\n'
+          '  foregroundCallBudgetSeconds: 300\n'
+          '  foregroundCallAutoConvert: auto\n',
+        );
+        final loaded = loadCliConfig(tmp.path);
+        expect(
+          loaded.withCustomProviders(loaded.customProviders).toYaml(),
+          contains(
+            'agent:\n'
+            '  foregroundCallBudgetSeconds: 300\n'
+            '  foregroundCallAutoConvert: auto\n',
+          ),
+        );
+        // Explicit defaults round-trip to absence (the file stays
+        // minimal).
+        file.writeAsStringSync(
+          'agent:\n'
+          '  foregroundCallBudgetSeconds: 600\n'
+          '  foregroundCallAutoConvert: offer\n',
+        );
+        final defaults = loadCliConfig(tmp.path);
+        expect(
+          defaults.withCustomProviders(defaults.customProviders).toYaml(),
+          isNot(contains('foregroundCall')),
+        );
+      });
+    });
+  });
+
+  group('provider watchdog overrides', () {
+    tearDown(() => providerTimeoutsOverride = null);
+
+    test('defaults apply without an override', () {
+      expect(effectiveProviderConnectTimeout, providerConnectTimeout);
+      expect(effectiveProviderStreamIdleTimeout, providerStreamIdleTimeout);
+    });
+
+    test('the override wins field-wise', () {
+      providerTimeoutsOverride = const ProviderTimeoutsOverride(
+        connect: Duration(seconds: 7),
+      );
+      expect(effectiveProviderConnectTimeout, const Duration(seconds: 7));
+      // Untouched field keeps the default.
+      expect(effectiveProviderStreamIdleTimeout, providerStreamIdleTimeout);
+    });
+  });
+
+  group('FA_PROVIDER_TIMEOUT_SECONDS env fold (issue #1036)', () {
+    test('blank/unset keeps the parsed section untouched', () {
+      final base = ProviderTimeoutsOverride(connect: Duration(seconds: 9));
+      expect(applyProviderTimeoutEnvOverride(base, null), same(base));
+      expect(applyProviderTimeoutEnvOverride(base, ''), same(base));
+      expect(applyProviderTimeoutEnvOverride(base, '  '), same(base));
+      expect(applyProviderTimeoutEnvOverride(null, null), isNull);
+    });
+
+    test('a valid seconds value sets fetchRead, keeping the section', () {
+      final base = ProviderTimeoutsOverride(
+        connect: Duration(seconds: 9),
+        streamIdle: Duration(seconds: 11),
+      );
+      final folded = applyProviderTimeoutEnvOverride(base, '45');
+      expect(folded!.connect, const Duration(seconds: 9));
+      expect(folded.streamIdle, const Duration(seconds: 11));
+      expect(folded.fetchRead, const Duration(seconds: 45));
+    });
+
+    test('a valid seconds value works without a parsed section', () {
+      final folded = applyProviderTimeoutEnvOverride(null, '60');
+      expect(folded!.fetchRead, const Duration(seconds: 60));
+      expect(folded.connect, isNull);
+      expect(folded.streamIdle, isNull);
+    });
+
+    test('a bad value fails loud naming the env var', () {
+      for (final raw in ['abc', '0', '-5', '1.5']) {
+        expect(
+          () => applyProviderTimeoutEnvOverride(null, raw),
+          throwsA(
+            isA<ConfigException>().having(
+              (e) => e.message,
+              'message',
+              contains('FA_PROVIDER_TIMEOUT_SECONDS'),
+            ),
+          ),
+          reason: 'raw: $raw',
+        );
+      }
+    });
+  });
+
+  group('project cube section', () {
+    late Directory tmp;
+
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-config-test-');
+    });
+
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+
+    void writeProjectConfig(String yaml) {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync(yaml);
+    }
+
+    test('missing project file loads as null', () {
+      expect(loadProjectCubeSettings(tmp.path), isNull);
+    });
+
+    test('parses the project cube section', () {
+      writeProjectConfig('cube:\n  config: .fah/cubes/dev.yaml\n');
+      final loaded = loadProjectCubeSettings(tmp.path);
+      expect(loaded?.enabled, isTrue);
+      expect(loaded?.configPath, '.fah/cubes/dev.yaml');
+    });
+
+    test('absent section loads as null', () {
+      writeProjectConfig('provider: anthropic\n');
+      expect(loadProjectCubeSettings(tmp.path), isNull);
+    });
+
+    test('invalid section throws ConfigException', () {
+      writeProjectConfig('cube:\n  bogus: 1\n');
+      expect(
+        () => loadProjectCubeSettings(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown "cube" key'),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('project spills section', () {
+    late Directory tmp;
+
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-config-test-');
+    });
+
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+
+    void writeProjectConfig(String yaml) {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync(yaml);
+    }
+
+    test('missing project file loads as null', () {
+      expect(loadProjectSpillsConfig(tmp.path), isNull);
+    });
+
+    test('parses the project spills section', () {
+      writeProjectConfig('spills:\n  enabled: false\n  threshold: 4096\n');
+      final loaded = loadProjectSpillsConfig(tmp.path);
+      expect(loaded?.enabled, isFalse);
+      expect(loaded?.threshold, 4096);
+    });
+
+    test('absent section loads as null', () {
+      writeProjectConfig('provider: anthropic\n');
+      expect(loadProjectSpillsConfig(tmp.path), isNull);
+    });
+
+    test('invalid section falls back to defaults, never throws', () {
+      // Tolerant by design (issue #678 AC11): a typo must not kill a
+      // session, so unlike the strict sections this never rethrows.
+      writeProjectConfig('spills:\n  bogus: 1\n');
+      final loaded = loadProjectSpillsConfig(tmp.path);
+      expect(loaded?.enabled, isTrue);
+      expect(loaded?.threshold, 8192);
+      expect(loaded?.notes, isNotEmpty);
+    });
+
+    test('malformed yaml loads as null', () {
+      writeProjectConfig('not yaml: [unclosed');
+      expect(loadProjectSpillsConfig(tmp.path), isNull);
+    });
+
+    test('non-map yaml doc loads as null', () {
+      writeProjectConfig('just-a-string\n');
+      expect(loadProjectSpillsConfig(tmp.path), isNull);
+    });
+  });
+
+  group('projectContext section (issue #1761)', () {
+    late Directory tmp;
+
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-config-test-');
+    });
+
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+
+    test('loads as null when the section is absent (default budget)', () {
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.projectContext, isNull);
+    });
+
+    test('round-trips a custom maxBytes', () async {
+      await saveCliConfig(
+        tmp.path,
+        CliConfig(projectContext: const ProjectContextConfig(maxBytes: 65536)),
+      );
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.projectContext?.maxBytes, 65536);
+      // Full yaml fidelity: emitting again reproduces the same document.
+      expect(
+        loaded.toYaml(),
+        CliConfig(
+          projectContext: const ProjectContextConfig(maxBytes: 65536),
+        ).toYaml(),
+      );
+    });
+
+    test('maxBytes 0 survives the save (explicit opt-out)', () async {
+      await saveCliConfig(
+        tmp.path,
+        CliConfig(projectContext: const ProjectContextConfig(maxBytes: 0)),
+      );
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.projectContext?.maxBytes, 0);
+      expect(loaded.projectContext?.isDisabled, isTrue);
+    });
+
+    test('unknown keys are tolerated with a note, never a boot failure', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('projectContext:\n  bogus: 1\n');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.projectContext?.maxBytes, 32768);
+      expect(
+        loaded.projectContext?.notes,
+        contains('projectContext.bogus: unknown key (ignored)'),
+      );
+    });
+  });
+
+  group('project agent section (gh-1077)', () {
+    late Directory tmp;
+
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-config-test-');
+    });
+
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+
+    void writeProjectConfig(String yaml) {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync(yaml);
+    }
+
+    test('missing project file loads as null', () {
+      expect(loadProjectContextWindowCap(tmp.path), isNull);
+    });
+
+    test('parses the project-level owner cap', () {
+      writeProjectConfig('agent:\n  contextWindowCap: 128000\n');
+      expect(loadProjectContextWindowCap(tmp.path), 128000);
+    });
+
+    test('absent agent section loads as null', () {
+      writeProjectConfig('provider: anthropic\n');
+      expect(loadProjectContextWindowCap(tmp.path), isNull);
+    });
+
+    test('empty agent section loads as null', () {
+      writeProjectConfig('agent: {}\n');
+      expect(loadProjectContextWindowCap(tmp.path), isNull);
+    });
+
+    test('malformed yaml loads as null', () {
+      writeProjectConfig('agent: [unclosed');
+      expect(loadProjectContextWindowCap(tmp.path), isNull);
+    });
+
+    test('non-map yaml doc loads as null', () {
+      writeProjectConfig('just-a-string\n');
+      expect(loadProjectContextWindowCap(tmp.path), isNull);
+    });
+
+    test('present-but-invalid cap throws ConfigException (strict)', () {
+      // Below the compaction-reserve floor — the same strict rule the
+      // user config applies.
+      writeProjectConfig('agent:\n  contextWindowCap: 100\n');
+      expect(
+        () => loadProjectContextWindowCap(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('contextWindowCap'),
+          ),
+        ),
+      );
+    });
+
+    test('unknown agent key throws ConfigException (strict)', () {
+      writeProjectConfig('agent:\n  bogus: 1\n');
+      expect(
+        () => loadProjectContextWindowCap(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown "agent" key'),
+          ),
+        ),
+      );
+    });
+  });
+
+  group('save preserves every parsed section (issue #288 drift)', () {
+    late Directory tmp;
+
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-config-save-');
+    });
+
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+
+    test(
+      'a caller that carries no static sections keeps them on disk',
+      () async {
+        // The shape of bin/fah.dart's persistConfig before the fix: the
+        // caller re-saves the LOADED config minus the sections it forgot to
+        // carry — the file must not lose them.
+        final seed = '''
+provider: openai-completions
+model: openai/gpt-4o-mini
+baseUrl: https://openrouter.ai/api/v1
+mode: code
+approvalMode: yolo
+memory:
+  projectPath: ./memory
+  userPath: ~/longterm
+compaction:
+  engine: structured
+a2a:
+  servers:
+    translator:
+      url: https://agents.example.com/translator
+      token: literal-token
+providerTimeouts:
+  connectTimeoutMs: 8000
+''';
+        File('${tmp.path}/.fah/config.yaml')
+          ..createSync(recursive: true)
+          ..writeAsStringSync(seed);
+        final loaded = loadCliConfig(tmp.path);
+
+        // The forgetful caller: carries only what persistConfig used to.
+        await saveCliConfig(
+          tmp.path,
+          CliConfig(
+            providerKind: loaded.providerKind,
+            modelId: loaded.modelId,
+            baseUrl: loaded.baseUrl,
+            mode: loaded.mode,
+            approvalMode: loaded.approvalMode,
+          ),
+        );
+
+        final saved = loadCliConfig(tmp.path);
+        expect(saved.memory?.projectPath, './memory');
+        expect(saved.memory?.userPath, '~/longterm');
+        expect(saved.compactionEngine, CompactionEngine.structured);
+        expect(
+          saved.a2a?.servers['translator']?.url,
+          'https://agents.example.com/translator',
+        );
+        expect(saved.providerTimeouts?.connect?.inMilliseconds, 8000);
+      },
+    );
+
+    test('a rendered section still wins over the disk block', () async {
+      final seed = '''
+compaction:
+  engine: classic
+''';
+      File('${tmp.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync(seed);
+
+      await saveCliConfig(
+        tmp.path,
+        CliConfig(compactionEngine: CompactionEngine.structured),
+      );
+
+      expect(
+        loadCliConfig(tmp.path).compactionEngine,
+        CompactionEngine.structured,
+      );
+    });
+
+    test('compaction.judgeBudgetSeconds round-trips (issue #541)', () async {
+      final original = CliConfig(compactionJudgeBudgetSeconds: 300);
+      await saveCliConfig(tmp.path, original);
+      expect(loadCliConfig(tmp.path).compactionJudgeBudgetSeconds, 300);
+    });
+
+    test('compaction.judgeBudgetSeconds defaults to null when absent '
+        '(issue #541)', () {
+      expect(loadCliConfig(tmp.path).compactionJudgeBudgetSeconds, isNull);
+    });
+
+    test('a junk compaction.judgeBudgetSeconds is a strict config error '
+        '(issue #541)', () async {
+      File('${tmp.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('compaction:\n  judgeBudgetSeconds: soon\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('judgeBudgetSeconds'),
+          ),
+        ),
+      );
+    });
+
+    test('a non-positive compaction.judgeBudgetSeconds is a strict config '
+        'error (issue #541)', () async {
+      File('${tmp.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('compaction:\n  judgeBudgetSeconds: 0\n');
+      expect(() => loadCliConfig(tmp.path), throwsA(isA<ConfigException>()));
+    });
+
+    test('the disk a2a block survives verbatim (byte-for-byte)', () async {
+      // The block is copied as raw text, never re-rendered from the typed
+      // config — `${NAME}` env-token references stay literal (a typed
+      // round-trip would materialize the resolved secret into the file).
+      final seed = '''
+a2a:
+  servers:
+    translator:
+      url: https://agents.example.com/translator
+      token: literal-token
+''';
+      final file = File('${tmp.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync(seed);
+      await saveCliConfig(tmp.path, CliConfig());
+      expect(file.readAsStringSync(), contains(seed.trimRight()));
+    });
+
+    test('only a column-0 `key:` line counts as rendered — a scalar or '
+        'nested key mentioning the section does not', () async {
+      // The guard was an unanchored contains('memory:'): any scalar
+      // (a prompt override's text, an `xmemory:`-style key, a comment)
+      // containing the substring `memory:`/`a2a:` made the saver
+      // believe the caller had rendered the section, silently dropping
+      // the real on-disk block. The match must be anchored: a top-level
+      // `key:` line at column 0.
+      final seed = '''
+memory:
+  projectPath: ./memory
+  userPath: ~/longterm
+a2a:
+  servers:
+    translator:
+      url: https://agents.example.com/translator
+''';
+      File('${tmp.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync(seed);
+
+      // The caller renders the prompts and roles sections; the poison
+      // rides both shapes an unanchored contains would bite on — a
+      // scalar VALUE mentioning `memory:`/`a2a:` as plain words, and a
+      // NESTED key line (`  memory:` under `roles:`, the `xmemory:`
+      // shape from the review) whose text contains the substring.
+      final roles = ModelRolesConfig.fromYaml(
+        loadYaml('''
+roles:
+  memory:
+    - openrouter/anthropic/claude-sonnet-4
+''')
+            as YamlMap,
+      );
+      await saveCliConfig(
+        tmp.path,
+        CliConfig(
+          promptOverrides: {
+            'compaction/summary': 'consult memory: and a2a: before answering',
+          },
+          modelRoles: roles,
+        ),
+      );
+
+      final saved = loadCliConfig(tmp.path);
+      expect(saved.memory?.projectPath, './memory');
+      expect(saved.memory?.userPath, '~/longterm');
+      expect(
+        saved.a2a?.servers['translator']?.url,
+        'https://agents.example.com/translator',
+      );
+    });
+
+    test(
+      'a column-0 comment inside a preserved section does not truncate it',
+      () async {
+        // Comments are invisible to yaml indentation: a `# …` line at
+        // column 0 between the section's own lines is still INSIDE the
+        // section. The block extractor used to stop at it, preserving
+        // only the lines above the comment (here: losing userPath).
+        final seed = '''
+memory:
+  projectPath: ./memory
+# userPath is referenced by the weekly export
+  userPath: ~/longterm
+''';
+        File('${tmp.path}/.fah/config.yaml')
+          ..createSync(recursive: true)
+          ..writeAsStringSync(seed);
+
+        await saveCliConfig(tmp.path, CliConfig());
+
+        final saved = loadCliConfig(tmp.path);
+        expect(saved.memory?.projectPath, './memory');
+        expect(saved.memory?.userPath, '~/longterm');
+      },
+    );
+  });
+
+  group('trajectory section (issue #385)', () {
+    late Directory tmp;
+    setUp(() {
+      tmp = Directory.systemTemp.createTempSync('fah-trajectory-config-');
+    });
+    tearDown(() {
+      tmp.deleteSync(recursive: true);
+    });
+    test('wireDump: true parses through the user config', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n  wireDump: true\n');
+      expect(loadCliConfig(tmp.path).wireDump, isTrue);
+      file.writeAsStringSync('trajectory:\n  wireDump: false\n');
+      expect(loadCliConfig(tmp.path).wireDump, isFalse);
+    });
+
+    test('an empty section defaults wireDump to false', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n');
+      expect(loadCliConfig(tmp.path).wireDump, isFalse);
+    });
+
+    test('gh-1745: requestBlobs defaults ON; the rotation knobs parse', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n');
+      var config = loadCliConfig(tmp.path);
+      expect(config.trajectoryRequestBlobs, isTrue);
+      expect(config.trajectoryRequestBlobMaxMb, 50);
+      expect(config.trajectoryRequestBlobTtlDays, 30);
+
+      file.writeAsStringSync(
+        'trajectory:\n'
+        '  requestBlobs: false\n'
+        '  requestBlobMaxMb: 10\n'
+        '  requestBlobTtlDays: 7\n',
+      );
+      config = loadCliConfig(tmp.path);
+      expect(config.trajectoryRequestBlobs, isFalse);
+      expect(config.trajectoryRequestBlobMaxMb, 10);
+      expect(config.trajectoryRequestBlobTtlDays, 7);
+    });
+
+    test('gh-1745: rejects bad requestBlob scalars and keys stay strict', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n  requestBlobMaxMb: 0\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains(
+              '"trajectory.requestBlobMaxMb" must be a positive '
+              'integer',
+            ),
+          ),
+        ),
+      );
+      file.writeAsStringSync('trajectory:\n  requestBlobTtlDays: soon\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains(
+              '"trajectory.requestBlobTtlDays" must be a positive '
+              'integer',
+            ),
+          ),
+        ),
+      );
+      file.writeAsStringSync('trajectory:\n  requestBlobs: 1\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('"trajectory.requestBlobs" must be a boolean'),
+          ),
+        ),
+      );
+    });
+
+    test('gh-1745 rework: the byte budget threads the section getter '
+        '(requestBlobMaxBytes)', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n  requestBlobMaxMb: 10\n');
+      expect(loadCliConfig(tmp.path).trajectoryRequestBlobMaxBytes, 10 << 20);
+      // The default budget matches the store's default.
+      file.writeAsStringSync('trajectory:\n');
+      expect(loadCliConfig(tmp.path).trajectoryRequestBlobMaxBytes, 50 << 20);
+      // The bytes value is DERIVED from the Mb knob — the save path never
+      // emits it (the file stays minimal, Mb remains the yaml surface).
+      expect(
+        CliConfig(trajectoryRequestBlobMaxMb: 10).toYaml(),
+        isNot(contains('requestBlobMaxBytes')),
+      );
+    });
+
+    test('gh-1745: the save path emits requestBlobs/knobs only when '
+        'non-default, and they round-trip', () async {
+      // Defaults are never written — the file-stays-minimal convention.
+      expect(CliConfig().toYaml(), isNot(contains('trajectory:')));
+      // The kill switch saves (the reviewer's pinned shape).
+      final off = CliConfig(trajectoryRequestBlobs: false).toYaml();
+      expect(off, contains('trajectory:\n  requestBlobs: false'));
+      // Non-default knobs save; the derived bytes value never does.
+      final tuned = CliConfig(
+        trajectoryRequestBlobs: false,
+        trajectoryRequestBlobMaxMb: 10,
+        trajectoryRequestBlobTtlDays: 7,
+      ).toYaml();
+      expect(tuned, contains('requestBlobs: false'));
+      expect(tuned, contains('requestBlobMaxMb: 10'));
+      expect(tuned, contains('requestBlobTtlDays: 7'));
+      // Full save→load round-trip: what the emitter writes parses back.
+      await saveCliConfig(tmp.path, CliConfig(trajectoryRequestBlobs: false));
+      final reloaded = loadCliConfig(tmp.path);
+      expect(reloaded.trajectoryRequestBlobs, isFalse);
+      expect(reloaded.trajectoryRequestBlobMaxMb, 50);
+      expect(reloaded.trajectoryRequestBlobTtlDays, 30);
+      await saveCliConfig(
+        tmp.path,
+        CliConfig(
+          trajectoryRequestBlobs: true,
+          trajectoryRequestBlobMaxMb: 10,
+          trajectoryRequestBlobTtlDays: 7,
+        ),
+      );
+      final tunedReloaded = loadCliConfig(tmp.path);
+      expect(tunedReloaded.trajectoryRequestBlobs, isTrue);
+      expect(tunedReloaded.trajectoryRequestBlobMaxMb, 10);
+      expect(tunedReloaded.trajectoryRequestBlobTtlDays, 7);
+    });
+
+    test('gh-1745: loadProjectTrajectorySection carries the whole section', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('other: 1\n');
+      expect(loadProjectTrajectorySection(tmp.path), isNull);
+      file.writeAsStringSync(
+        'trajectory:\n  requestBlobs: false\n  requestBlobMaxMb: 5\n',
+      );
+      final section = loadProjectTrajectorySection(tmp.path);
+      expect(section, isNotNull);
+      expect(section!.requestBlobs, isFalse);
+      expect(section.requestBlobMaxMb, 5);
+      expect(section.requestBlobTtlDays, 30);
+      // The legacy wireDump loader still resolves through the same parse.
+      expect(loadProjectWireDump(tmp.path), isFalse);
+    });
+
+    test('rejects unknown trajectory keys', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n  bogus: 1\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('unknown "trajectory" key'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects a non-boolean wireDump', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory:\n  wireDump: "yes"\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('"trajectory.wireDump" must be a boolean'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects a non-map trajectory section', () {
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('trajectory: 42\n');
+      expect(
+        () => loadCliConfig(tmp.path),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('trajectory must be a map'),
+          ),
+        ),
+      );
+    });
+
+    test('loadProjectWireDump: absent file, section, and value cases', () {
+      final missing = Directory.systemTemp.createTempSync('fah-proj');
+      expect(loadProjectWireDump(missing.path), isNull);
+      missing.deleteSync(recursive: true);
+
+      final file = File('${tmp.path}/.fah/config.yaml');
+      file.createSync(recursive: true);
+      file.writeAsStringSync('other:\n  key: 1\n');
+      expect(loadProjectWireDump(tmp.path), isNull);
+
+      file.writeAsStringSync('trajectory:\n  wireDump: true\n');
+      expect(loadProjectWireDump(tmp.path), isTrue);
+
+      file.writeAsStringSync('trajectory:\n  wireDump: bogus\n');
+      expect(
+        () => loadProjectWireDump(tmp.path),
+        throwsA(isA<ConfigException>()),
+      );
+
+      // A scalar document is not a config map: treated as absent.
+      file.writeAsStringSync('just-a-string\n');
+      expect(loadProjectWireDump(tmp.path), isNull);
+    });
+  });
+
+  group('startup cube precedence', () {
+    const project = CubeSettings(configPath: '.fah/cubes/dev.yaml');
+    const user = CubeSettings(configPath: '.fah/cubes/user.yaml');
+
+    test('an explicit --cube-config flag wins over everything', () {
+      expect(
+        resolveStartupCubeSource(
+          flagConfigPath: 'pinned.yaml',
+          flagName: 'named',
+          project: project,
+          user: user,
+        ),
+        'pinned.yaml',
+      );
+    });
+
+    test('an explicit --cube name wins over the config sections', () {
+      expect(
+        resolveStartupCubeSource(
+          flagName: 'named',
+          project: project,
+          user: user,
+        ),
+        'named',
+      );
+    });
+
+    test('the project section beats the user section when both set', () {
+      expect(
+        resolveStartupCubeSource(project: project, user: user),
+        '.fah/cubes/dev.yaml',
+      );
+    });
+
+    test('a disabled project section falls through to the user one', () {
+      expect(
+        resolveStartupCubeSource(
+          project: const CubeSettings(enabled: false, configPath: 'x'),
+          user: user,
+        ),
+        '.fah/cubes/user.yaml',
+      );
+    });
+
+    test('a disabled or absent user section starts unsandboxed', () {
+      expect(resolveStartupCubeSource(), isNull);
+      expect(
+        resolveStartupCubeSource(user: const CubeSettings(enabled: false)),
+        isNull,
+      );
+      expect(
+        resolveStartupCubeSource(project: const CubeSettings(enabled: true)),
+        isNull,
+        reason: 'enabled with no config path has nothing to resolve',
+      );
+    });
+  });
+  group('logFileFromEnv', () {
+    test('absent or blank yields null', () {
+      expect(logFileFromEnv({}), isNull);
+      expect(logFileFromEnv({'FA_LOG_FILE': ''}), isNull);
+      expect(logFileFromEnv({'FA_LOG_FILE': '   '}), isNull);
+    });
+
+    test('returns the path', () {
+      expect(
+        logFileFromEnv({'FA_LOG_FILE': '/tmp/trace.log'}),
+        '/tmp/trace.log',
+      );
+    });
+  });
+
+  group('saved provider canonicalization (issue #772)', () {
+    CliConfig configOf(String yaml) =>
+        CliConfig.fromYaml(loadYaml(yaml) as YamlMap);
+
+    test('the CLI-written name-shape loads as the kind (AC1)', () {
+      expect(
+        configOf('provider: chatgpt\nmodel: gpt-5\n').providerKind,
+        'chatgpt-codex',
+      );
+    });
+
+    test('the app-written kind-shape loads unchanged (AC1)', () {
+      expect(
+        configOf('provider: chatgpt-codex\nmodel: gpt-5\n').providerKind,
+        'chatgpt-codex',
+      );
+    });
+
+    test('the alias spelling canonicalizes too (E1)', () {
+      expect(
+        configOf('provider: chatgpt.com\nmodel: gpt-5\n').providerKind,
+        'chatgpt-codex',
+      );
+    });
+
+    test('both shapes boot identically (AC1)', () {
+      final fromName = configOf('provider: chatgpt\nmodel: gpt-5\n');
+      final fromKind = configOf('provider: chatgpt-codex\nmodel: gpt-5\n');
+      expect(fromName.providerKind, fromKind.providerKind);
+    });
+
+    test('shared-kind names stay — the baseUrl carries that identity', () {
+      expect(configOf('provider: openrouter\n').providerKind, 'openrouter');
+      expect(configOf('provider: openai\n').providerKind, 'openai');
+      expect(configOf('provider: kimi\n').providerKind, 'kimi');
+    });
+
+    test(
+      'a kind-id no version knows stays verbatim (E2, warn-dont-mutate)',
+      () {
+        expect(
+          configOf('provider: from-the-future\n').providerKind,
+          'from-the-future',
+        );
+      },
+    );
+
+    test('an absent provider keeps the default', () {
+      expect(configOf('mode: code\n').providerKind, 'openai-completions');
+    });
+
+    test('a type-invalid provider value degrades to the default', () {
+      // `provider: 123` used to throw a cast error; now it degrades with
+      // a named note (stderr) instead of silently swallowing the key.
+      final config = CliConfig.fromYaml(loadYaml('provider: 123\n') as YamlMap);
+      expect(config.providerKind, 'openai-completions');
+    });
+
+    test('the next save persists the kind (write-back on save only)', () async {
+      final tmp = Directory.systemTemp.createTempSync('fah-canonical-');
+      addTearDown(() => tmp.deleteSync(recursive: true));
+      final file = File('${tmp.path}/.fah/config.yaml')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('provider: chatgpt\nmodel: gpt-5\n');
+      final loaded = loadCliConfig(tmp.path);
+      expect(loaded.providerKind, 'chatgpt-codex');
+      expect(file.readAsStringSync(), contains('provider: chatgpt'));
+      await saveCliConfig(tmp.path, loaded);
+      expect(file.readAsStringSync(), contains('provider: chatgpt-codex'));
+    });
+  });
+
+  group('output.streamThinking (gh-1198)', () {
+    bool streamThinkingOf(String yaml) =>
+        CliConfig.fromYaml(loadYaml(yaml) as YamlMap).streamThinking;
+
+    test('defaults to false when the section is absent (byte-identical '
+        'legacy)', () {
+      expect(streamThinkingOf('mode: code\n'), isFalse);
+      final tmp = Directory.systemTemp.createTempSync('fah-output-');
+      addTearDown(() => tmp.deleteSync(recursive: true));
+      expect(loadCliConfig(tmp.path).streamThinking, isFalse);
+    });
+
+    test('parses the section', () {
+      expect(streamThinkingOf('output:\n  streamThinking: true\n'), isTrue);
+      expect(streamThinkingOf('output:\n  streamThinking: false\n'), isFalse);
+    });
+
+    test('rejects unknown output keys', () {
+      expect(
+        () => streamThinkingOf('output:\n  bogus: true\n'),
+        throwsA(
+          isA<ConfigException>().having(
+            (e) => e.message,
+            'message',
+            contains('bogus'),
+          ),
+        ),
+      );
+    });
+
+    test('rejects a non-boolean streamThinking', () {
+      expect(
+        () => streamThinkingOf('output:\n  streamThinking: "yes"\n'),
+        throwsA(isA<ConfigException>()),
+      );
+      expect(
+        () => streamThinkingOf('output: true\n'),
+        throwsA(isA<ConfigException>()),
+      );
+    });
+  });
+}

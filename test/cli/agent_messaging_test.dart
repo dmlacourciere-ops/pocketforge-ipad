@@ -1,0 +1,324 @@
+@TestOn('vm')
+library;
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+import 'agent_cli_test_support.dart';
+
+final class _SingleMessagePlugin implements FahPlugin {
+  _SingleMessagePlugin(this.message);
+
+  final AgentMessage message;
+
+  @override
+  String get name => 'single-message-test';
+
+  @override
+  void register(PluginContext context) {
+    var pending = true;
+    context.registerExternalInbox(
+      ExternalInbox(
+        drain: () async {
+          if (!pending) return const <AgentMessage>[];
+          pending = false;
+          return [message];
+        },
+      ),
+    );
+  }
+}
+
+/// Cross-instance messaging: two Fa CLIs (two "terminals") sharing one
+/// session repo exchange messages through the file messaging fabric.
+void main() {
+  late MemoryExecutionEnv env;
+
+  setUp(() {
+    env = MemoryExecutionEnv(cwd: '/work');
+  });
+
+  AgentCli cliFor(FakeCliIO io, FakeStreamFunction fake) => AgentCli(
+    config: AgentCliConfig(
+      model: testModel,
+      apiKey: 'test-key',
+      env: env,
+      sessionRoot: '/sessions',
+    ),
+    io: io,
+    streamFunction: fake.call,
+  );
+
+  test('a message from instance B lands in instance A main inbox, is injected '
+      'at the next turn and persisted in A history', () async {
+    final ioA = FakeCliIO();
+    final ioB = FakeCliIO();
+    final fakeA = FakeStreamFunction([textTurn('got your message')]);
+    final cliA = cliFor(ioA, fakeA);
+    final cliB = cliFor(ioB, FakeStreamFunction([]));
+
+    final runA = cliA.run();
+    final runB = cliB.run();
+    // Both instances booted → session ids became the mailbox prefixes.
+    await waitForIt(
+      () =>
+          cliA.subagentManager.mailboxPrefix.isNotEmpty &&
+          cliB.subagentManager.mailboxPrefix.isNotEmpty,
+    );
+    final prefixA = cliA.subagentManager.mailboxPrefix;
+    final prefixB = cliB.subagentManager.mailboxPrefix;
+    expect(prefixA, isNot(prefixB));
+
+    // Instance B messages instance A's main agent (absolute mailbox).
+    await cliB.subagentManager.enqueueMessage(
+      '$prefixA/main',
+      SubagentMessage(
+        fromId: 'main',
+        text: 'hello from B',
+        sentAt: DateTime.now().toUtc().toIso8601String(),
+      ),
+    );
+    // A sees the pending message in its /agents panel.
+    expect(await cliA.subagentManager.pendingInboxCount('main'), 1);
+
+    // A's next turn starts with the message as a steering user message.
+    ioA.sendLine('anything');
+    await waitForIt(() => fakeA.calls == 1);
+    final seen = fakeA.contexts[0].messages
+        .whereType<UserMessage>()
+        .map((m) => m.content)
+        .join('\n');
+    expect(seen, contains('from $prefixB/main: hello from B'));
+
+    // The message is part of A's persisted history (visible on resume).
+    final repo = JsonlSessionRepo(fs: env, sessionsRoot: '/sessions');
+    final sessions = await repo.list(cwd: '/work');
+    Session? sessionA;
+    for (final metadata in sessions) {
+      if (metadata.id == prefixA) sessionA = await repo.open(metadata);
+    }
+    expect(sessionA, isNotNull);
+    final entries = await sessionA!.getEntries();
+    final persisted = entries
+        .whereType<MessageRecord>()
+        .map((r) => r.message)
+        .whereType<UserMessage>()
+        .map((m) => m.content)
+        .join('\n');
+    expect(persisted, contains('from $prefixB/main: hello from B'));
+
+    ioA.sendLine('/exit');
+    ioB.sendLine('/exit');
+    await runA;
+    await runB;
+    await ioA.close();
+    await ioB.close();
+  });
+
+  test(
+    'unknown absolute mailboxes are deliverable; local unknown ids are not',
+    () async {
+      final io = FakeCliIO();
+      final cli = cliFor(io, FakeStreamFunction([]));
+      final run = cli.run();
+      await waitForIt(() => cli.subagentManager.mailboxPrefix.isNotEmpty);
+
+      // Absolute cross-instance address: no local handle needed.
+      await cli.subagentManager.enqueueMessage(
+        'other-session/main',
+        SubagentMessage(
+          fromId: 'main',
+          text: 'cross-instance note',
+          sentAt: DateTime.now().toUtc().toIso8601String(),
+        ),
+      );
+      final fabric = cli.subagentManager.messaging!;
+      expect(await fabric.peek('other-session/main'), hasLength(1));
+
+      // Bare unknown id: rejected as before.
+      expect(
+        () => cli.subagentManager.enqueueMessage(
+          'ghost',
+          SubagentMessage(
+            fromId: 'main',
+            text: 'x',
+            sentAt: DateTime.now().toUtc().toIso8601String(),
+          ),
+        ),
+        throwsStateError,
+      );
+
+      io.sendLine('/exit');
+      await run;
+      await io.close();
+    },
+  );
+
+  test(
+    'mail arriving while IDLE wakes the agent into a turn (no user input)',
+    () async {
+      final ioA = FakeCliIO();
+      final ioB = FakeCliIO();
+      final fakeA = FakeStreamFunction([textTurn('answering the mail')]);
+      final cliA = cliFor(ioA, fakeA);
+      final cliB = cliFor(ioB, FakeStreamFunction([]));
+      final runA = cliA.run();
+      final runB = cliB.run();
+      await waitForIt(
+        () =>
+            cliA.subagentManager.mailboxPrefix.isNotEmpty &&
+            cliB.subagentManager.mailboxPrefix.isNotEmpty,
+      );
+
+      // B → A; A is idle at the prompt. The inbox watcher (2s tick) must
+      // start a run by itself — no user input on A.
+      await cliB.subagentManager.enqueueMessage(
+        '${cliA.subagentManager.mailboxPrefix}/main',
+        SubagentMessage(
+          fromId: 'main',
+          text: 'wake up and read this',
+          sentAt: DateTime.now().toUtc().toIso8601String(),
+        ),
+      );
+      await waitForIt(() => fakeA.calls == 1);
+
+      // The run saw the mail as a sender-attributed user message…
+      final seen = fakeA.contexts[0].messages
+          .whereType<UserMessage>()
+          .map((m) => m.content)
+          .join('\n');
+      expect(seen, contains('wake up and read this'));
+      // …and the transcript told the user about the arrival.
+      expect(ioA.out.toString(), contains('[mail] 1 new message(s)'));
+
+      ioA.sendLine('/exit');
+      ioB.sendLine('/exit');
+      await runA;
+      await runB;
+      await ioA.close();
+      await ioB.close();
+    },
+  );
+
+  test('the system prompt carries the own mailbox address', () async {
+    final io = FakeCliIO();
+    final fake = FakeStreamFunction([textTurn('ok')]);
+    final cli = cliFor(io, fake);
+    final run = cli.run();
+    await waitForIt(() => cli.subagentManager.mailboxPrefix.isNotEmpty);
+    io.sendLine('hello');
+    await waitForIt(() => fake.calls == 1);
+    final prompt = fake.contexts[0].systemPrompt ?? '';
+    final mailbox = cli.subagentManager.mailboxOf('main');
+    expect(prompt, contains('## Agent messaging'));
+    expect(prompt, contains(mailbox));
+    expect(prompt, contains('agent_directory'));
+    io.sendLine('/exit');
+    await run;
+    await io.close();
+  });
+
+  Future<String> deliver(
+    String ownName,
+    String text, {
+    String toId = '#kb',
+    String? fromName,
+  }) async {
+    final cli = AgentCli(
+      config: AgentCliConfig(
+        model: testModel,
+        apiKey: 'test-key',
+        env: MemoryExecutionEnv(cwd: '/work'),
+        sessionRoot: '/sessions',
+        providerKind: 'openai-completions',
+        dapDisplayNameResolver: () => ownName,
+        plugins: [
+          _SingleMessagePlugin(
+            AgentMessage(
+              id: 'channel-message',
+              fromId: 'human-app',
+              toId: toId,
+              text: text,
+              sentAt: DateTime.now().toUtc().toIso8601String(),
+              fromName: fromName,
+            ),
+          ),
+        ],
+      ),
+      io: FakeCliIO(),
+    );
+    final steering = cli.agent.externalSteeringSource;
+    expect(steering, isNotNull);
+    final messages = await steering!();
+    expect(messages, hasLength(1));
+    return (messages.single as UserMessage).content as String;
+  }
+
+  test(
+    'channel mail with a sender name attributes the human, not the relay id',
+    () async {
+      // App members write through the fa_network relay: the wire sender is
+      // the relay's hub agentId, the payload carries the human's name. The
+      // steering line must lead with the human (name + wire id) — otherwise
+      // agents greet the relay ("Hello 3cfaee1aa054fe6e!").
+      final line = await deliver('kb-agent', 'hello', fromName: 'Uladzimir');
+      expect(line, contains('from Uladzimir (human-app) in #kb: hello'));
+      expect(
+        line,
+        contains('[reply into this channel with agent_message to: "#kb"]'),
+      );
+    },
+  );
+
+  test(
+    'a channel @-mention is marked only for the addressed DAP name',
+    () async {
+      final mentioned = await deliver(
+        'kb-agent',
+        'Please review this, @kb-agent.',
+      );
+      expect(
+        mentioned,
+        contains(
+          'from human-app in #kb: Please review this, @kb-agent. '
+          '[mentions you — you are @kb-agent]',
+        ),
+      );
+      expect(
+        mentioned,
+        contains('[reply into this channel with agent_message to: "#kb"]'),
+      );
+
+      final otherAgent = await deliver(
+        'research-agent',
+        'Please review this, @kb-agent.',
+      );
+      expect(otherAgent, isNot(contains('mentions you')));
+    },
+  );
+
+  test(
+    'channel mention matching is case-insensitive and word-bounded',
+    () async {
+      final upperCase = await deliver('kb-agent', '@KB-AGENT please review');
+      expect(upperCase, contains('[mentions you — you are @kb-agent]'));
+
+      for (final text in ['@kb-agent2 is a different agent', 'x@kb-agent']) {
+        final delivered = await deliver('kb-agent', text);
+        expect(delivered, isNot(contains('mentions you')), reason: text);
+      }
+    },
+  );
+
+  test(
+    'a direct message containing the own name is not channel-marked',
+    () async {
+      final delivered = await deliver(
+        'kb-agent',
+        '@kb-agent this is a DM',
+        toId: '0123456789abcdef',
+      );
+      expect(delivered, isNot(contains('mentions you')));
+    },
+  );
+}

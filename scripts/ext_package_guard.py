@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Extension packaging hygiene guard (issue #291).
+
+Chrome Web Store hard-rejects any package with more than one manifest
+("More than one manifest found in package: manifest.json,
+panel/app/manifest.json") — the exact failure that killed the 2026-09-13
+fa-extension.zip upload: the Flutter web build staged under
+browser_ext/panel/app ships its own PWA manifest. This script encodes the
+store's structural rules as build-time assertions so that whole failure
+class dies in CI (and locally), never again at upload.
+
+Two verbs, both wired from scripts/build_browser_ext.sh:
+
+  strip <dir>   Remove the PWA manifest from a STAGED app dir (the
+                gitignored browser_ext/panel/app copy — sources in
+                flutter_app/web stay untouched): deletes manifest.json and
+                drops the <link rel="manifest"> tag from index.html.
+                Idempotent (a Flutter template without the tag is a no-op,
+                #291 E3). DELETION, not a rename to .webmanifest: inside
+                an extension page the PWA manifest is functionally dead
+                (extension pages are not installable PWAs, and the CSP
+                blocks nothing the manifest needs) — a rename would pass
+                the store while shipping dead weight and keeping a link
+                nothing consumes.
+
+  check <zip>   Assert the packaged zip's CWS shape and fail loudly:
+                  - exactly one manifest.json, at the archive root
+                  - no duplicate entry names
+                  - no .DS_Store / __MACOSX junk entries
+                  - no empty directory entries
+                  - the root manifest parses and is manifest_version 3
+                  - every icon the root manifest references exists in zip
+
+Errors print as GitHub Actions annotations (::error ...) — rendered by
+CI, plain readable text locally — and exit non-zero, failing the build.
+"""
+
+import json
+import os
+import re
+import sys
+
+# E2 escape hatch: a future LEGIT nested manifest (e.g. a packaged
+# sub-extension) must be allowlisted HERE, in reviewable source, never
+# silently. Any manifest.json not at the root and not in this list fails
+# the build on purpose.
+ALLOW_NESTED_MANIFESTS: "list[str]" = []
+
+
+def error(rule: str, detail: str) -> None:
+    """One ::error workflow-command line; single-line by contract."""
+    print(f"::error title={rule}::{detail}", file=sys.stderr)
+
+
+def cmd_strip(staged_dir: str) -> int:
+    index_path = os.path.join(staged_dir, "index.html")
+    if not os.path.isfile(index_path):
+        error(
+            "ext-package-strip",
+            f"strip: {staged_dir}/index.html not found — the staged app "
+            "dir is malformed (the Flutter web build always emits one)",
+        )
+        return 1
+
+    # 1) Delete the nested PWA manifest (missing already → fine, E3).
+    manifest_path = os.path.join(staged_dir, "manifest.json")
+    removed_manifest = False
+    if os.path.isfile(manifest_path):
+        os.remove(manifest_path)
+        removed_manifest = True
+
+    # 2) Drop the <link rel="manifest"> tag — any attribute order, single
+    #    or double quotes. Zero matches → no-op (E3: a Flutter template
+    #    change that drops the tag must not fail the build).
+    html = open(index_path, encoding="utf-8").read()
+    html2, n = re.subn(r'<link\b[^>]*\brel=["\']manifest["\'][^>]*>\s*', "", html)
+    if n:
+        open(index_path, "w", encoding="utf-8").write(html2)
+
+    what = []
+    if removed_manifest:
+        what.append("manifest.json deleted")
+    if n:
+        what.append(f"{n} <link rel=manifest> tag(s) dropped")
+    print(
+        "strip: " + ("; ".join(what) if what else "nothing to strip (clean)")
+        + f" [{staged_dir}]"
+    )
+    return 0
+
+
+def cmd_check(zip_path: str) -> int:
+    import zipfile
+
+    if not os.path.isfile(zip_path):
+        error("ext-package-check", f"check: zip not found: {zip_path}")
+        return 1
+
+    failures = 0
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+
+        # --- single root manifest (THE CWS rule, #291) ------------------
+        manifests = sorted(n for n in names if os.path.basename(n) == "manifest.json")
+        allowed = {"manifest.json", *ALLOW_NESTED_MANIFESTS}
+        offenders = [m for m in manifests if m not in allowed]
+        if "manifest.json" not in names or offenders:
+            error(
+                "single-manifest (CWS)",
+                f"{zip_path}: {len(manifests)} manifest.json entries — the "
+                "Chrome Web Store rejects any package with more than one "
+                f"manifest (and it must be at the root): {', '.join(manifests) or 'none found'}. "
+                "Strip nested PWA manifests in packaging; a legit nested "
+                "manifest needs an explicit ALLOW_NESTED_MANIFESTS entry.",
+            )
+            failures += 1
+
+        # --- duplicate entry names (appending zip tooling) --------------
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        if dupes:
+            error(
+                "duplicate-entries",
+                f"{zip_path}: duplicate entry names: {', '.join(dupes)}",
+            )
+            failures += 1
+
+        # --- junk entries -----------------------------------------------
+        junk = sorted(
+            n for n in names if os.path.basename(n) == ".DS_Store" or n.startswith("__MACOSX/")
+        )
+        if junk:
+            error(
+                "zip-junk",
+                f"{zip_path}: store-hostile junk entries: {', '.join(junk)}",
+            )
+            failures += 1
+
+        # --- empty directories ------------------------------------------
+        empty_dirs = sorted(
+            n
+            for n in names
+            if n.endswith("/") and not any(o.startswith(n) and o != n for o in names)
+        )
+        if empty_dirs:
+            error(
+                "empty-dirs",
+                f"{zip_path}: empty directory entries: {', '.join(empty_dirs)}",
+            )
+            failures += 1
+
+        # --- root manifest shape: MV3 parse + icons exist ---------------
+        if "manifest.json" in names:
+            raw = z.read("manifest.json").decode("utf-8")
+            # STRICT parse, no comment stripping: the Chrome Web Store
+            # uploader rejects // comments ("manifest.json:17:2: missing
+            # value", owner report 2026-10-11) even though Chrome's local
+            # loader tolerates them. The build script ships a stripped
+            # manifest in the zip; the // commenting stays allowed only in
+            # the SOURCE file. A zip whose manifest needs stripping to
+            # parse is exactly the failure this guard exists to kill.
+            try:
+                manifest = json.loads(raw)
+            except json.JSONDecodeError as e:
+                error(
+                    "manifest-parse",
+                    f"{zip_path}: root manifest.json is not STRICT JSON "
+                    f"(CWS rejects // comments — the build must package a "
+                    f"stripped manifest): {e}",
+                )
+                failures += 1
+                manifest = None
+            if isinstance(manifest, dict):
+                if "key" in manifest:
+                    # CWS upload rule (owner report 2026-10-11: "key field
+                    # is not allowed in manifest"): the store owns the
+                    # signing key; the source manifest's dev "key" pins the
+                    # local id only and must be stripped at packaging.
+                    error(
+                        "manifest-key",
+                        f"{zip_path}: root manifest.json carries \"key\" — "
+                        "CWS rejects it on upload (the store owns the key; "
+                        "the build must strip the dev pin)",
+                    )
+                    failures += 1
+                if manifest.get("manifest_version") != 3:
+                    error(
+                        "manifest-mv3",
+                        f"{zip_path}: root manifest.json manifest_version="
+                        f"{manifest.get('manifest_version')!r} — the store "
+                        "requires 3",
+                    )
+                    failures += 1
+                # gh-1630 AC5 + F2′: the four Purple-Potassium permissions
+                # are gone and stay gone — a manifest regression here means
+                # the extension requests capabilities its shipped code
+                # never calls (a hard CWS rejection). `downloads` is
+                # RETAINED (F2′ owner decision): the `download` agent tool
+                # is its shipped static call site (browser_api_tools.dart).
+                dead = {"contentSettings", "fontSettings",
+                        "identity", "desktopCapture"}
+                declared = set(manifest.get("permissions") or []) | set(
+                    manifest.get("optional_permissions") or []
+                )
+                resurrected = sorted(declared & dead)
+                if resurrected:
+                    error(
+                        "manifest-dead-permissions (gh-1630)",
+                        f"{zip_path}: root manifest.json re-declares "
+                        f"{', '.join(resurrected)} — removed by gh-1630 "
+                        "(CWS Purple Potassium: requested-but-unused); "
+                        "re-add only together with the shipping code that "
+                        "calls it",
+                    )
+                    failures += 1
+                # gh-1630 I5/AC5: CSP = self + wasm-unsafe-eval, never a
+                # remote origin.
+                csp = (manifest.get("content_security_policy") or {}).get(
+                    "extension_pages", ""
+                )
+                if csp:
+                    if "'wasm-unsafe-eval'" not in csp or "'self'" not in csp:
+                        error(
+                            "manifest-csp-wasm (gh-1630)",
+                            f"{zip_path}: extension_pages CSP {csp!r} lacks "
+                            "'self' 'wasm-unsafe-eval' — the vendored "
+                            "pyodide/onnxruntime/quickjs wasm cannot boot",
+                        )
+                        failures += 1
+                    if re.search(r"https?://", csp):
+                        error(
+                            "manifest-csp-remote",
+                            f"{zip_path}: extension_pages CSP {csp!r} "
+                            "mentions a remote origin — CSP must keep "
+                            "blocking every remote host",
+                        )
+                        failures += 1
+                icons: "set[str]" = set()
+                top = manifest.get("icons")
+                if isinstance(top, dict):
+                    icons.update(str(v) for v in top.values() if isinstance(v, str))
+                action = manifest.get("action")
+                if isinstance(action, dict):
+                    di = action.get("default_icon")
+                    if isinstance(di, str):
+                        icons.add(di)
+                    elif isinstance(di, dict):
+                        icons.update(str(v) for v in di.values() if isinstance(v, str))
+                missing = sorted(i for i in icons if i not in names)
+                if missing:
+                    error(
+                        "manifest-icons",
+                        f"{zip_path}: icons referenced by the root manifest "
+                        f"missing from the zip: {', '.join(missing)}",
+                    )
+                    failures += 1
+
+        # --- remote-code scan (gh-1630 AC1, Blue Argon) -----------------
+        # Every packaged byte is scanned for remote-hosting markers: CWS
+        # rejects the PRESENCE of a remotely-hosted-code URL, even on
+        # never-executed paths, and reviewers read the shipped sources.
+        # This is the mechanical REG-1 backstop for the dart-define
+        # tree-shaking that keeps the CDN constants out of the compiled
+        # panel bundle (see flutter_app/lib/sandbox/web_interpreters_urls.dart)
+        # and for the lock-declared rewrites that strip remote constants
+        # out of the vendored bundles.
+        remote_marker = re.compile(rb"jsdelivr|unpkg|cdnjs|https://cdn\.")
+        hits = []
+        for name in names:
+            if name.endswith("/"):
+                continue
+            try:
+                content = z.read(name)
+            except (zipfile.BadZipFile, RuntimeError):
+                continue
+            match = remote_marker.search(content)
+            if match:
+                context = content[
+                    max(0, match.start() - 40): match.end() + 40
+                ]
+                hits.append(f"{name}: …{context.decode('utf-8', 'replace')}…")
+        if hits:
+            error(
+                "remote-hosted-code (gh-1630 AC1)",
+                f"{zip_path}: {len(hits)} packaged file(s) carry "
+                "remote-code markers (jsdelivr/unpkg/cdnjs/https://cdn.) — "
+                "CWS Blue Argon rejects the PRESENCE of remote code, "
+                "reachability irrelevant. First offenders: "
+                f"{'; '.join(hits[:5])}",
+            )
+            failures += 1
+
+    if failures:
+        error(
+            "ext-package-check",
+            f"{zip_path}: {failures} packaging-shape failure(s) — fix the "
+            "build, do not upload this zip (Chrome Web Store would reject "
+            "it)",
+        )
+        return 1
+
+    print(
+        f"check: {zip_path} OK — single root manifest.json (MV3), "
+        f"{len(names)} entries, icons present, no junk"
+    )
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if len(args) != 2 or args[0] not in ("strip", "check"):
+        print(
+            "usage: ext_package_guard.py strip <staged-app-dir> | "
+            "check <zip>",
+            file=sys.stderr,
+        )
+        return 2
+    return cmd_strip(args[1]) if args[0] == "strip" else cmd_check(args[1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

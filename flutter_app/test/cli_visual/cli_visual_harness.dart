@@ -1,0 +1,632 @@
+/// PTY + real [TerminalView] harness for Fa CLI visual tests.
+///
+/// Spawns `dart bin/fah.dart` as a real subprocess attached to a
+/// pseudo-terminal (via package:pty2), feeds every output byte into an xterm
+/// [Terminal], and renders screenshots through the REAL Flutter
+/// [TerminalView] widget with the bundled JetBrainsMono font — the same
+/// rendering pipeline a Flutter terminal app (e.g. YoLoIT) uses, so the
+/// PNGs show exactly what a user sees: real glyphs, real box-drawing, real
+/// colors. No hand-rolled rasterizer.
+///
+/// Async discipline: PTY I/O and wait loops are real-async, so they MUST run
+/// inside `tester.runAsync` (flutter_test otherwise freezes timers in the
+/// fake zone). Every waiting method of this harness wraps itself via
+/// [_live]; widget pumping stays in the normal zone. Test bodies never call
+/// `tester.runAsync` directly.
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:ui' as ui;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show bundledCatalogEndpoints, bundledCatalogModelIds;
+import 'package:flutter_agent_harness/src/cli/pty_wait_budget.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:pty2/pty2.dart';
+import 'package:xterm/xterm.dart';
+
+/// Fa dark terminal palette (matches `lib/src/cli/fa_tui.dart`).
+const faTerminalTheme = TerminalTheme(
+  cursor: Color(0xFF5EEAD4),
+  selection: Color(0x555EEAD4),
+  foreground: Color(0xFFE8EEF7),
+  background: Color(0xFF070A10),
+  black: Color(0xFF000000),
+  red: Color(0xFFF87171),
+  green: Color(0xFF22C55E),
+  yellow: Color(0xFFFACC15),
+  blue: Color(0xFF3B82F6),
+  magenta: Color(0xFFA855F7),
+  cyan: Color(0xFF5EEAD4),
+  white: Color(0xFFFFFFFF),
+  brightBlack: Color(0xFF64748B),
+  brightRed: Color(0xFFFF8A80),
+  brightGreen: Color(0xFF34D399),
+  brightYellow: Color(0xFFFEBC2E),
+  brightBlue: Color(0xFF818CF8),
+  brightMagenta: Color(0xFFC084FC),
+  brightCyan: Color(0xFF5EEAD4),
+  brightWhite: Color(0xFFFFFFFF),
+  searchHitBackground: Color(0xFF3B82F6),
+  searchHitBackgroundCurrent: Color(0xFF5EEAD4),
+  searchHitForeground: Color(0xFF070A10),
+);
+
+/// Text style for the terminal surface: the app's bundled JetBrainsMono,
+/// loaded by `ensureGoldenFonts()`.
+const faTerminalStyle = TerminalStyle(fontFamily: 'JetBrainsMono');
+
+/// The Fa CLI running in a PTY, mirrored into an xterm [Terminal].
+///
+/// Hermetic by default (issue #508): [spawn] gives the child a fresh temp
+/// HOME unless the caller passes an explicit one, so an omitted override
+/// can never boot the CLI against the developer's real `~/.fah` — and the
+/// leak guard fails any test whose screen shows a marker of the real
+/// config (see [screenshot]).
+final class CliVisualHarness {
+  CliVisualHarness._({
+    required this.pty,
+    required this.terminal,
+    required this.sandboxHome,
+  });
+
+  /// Spawns the Fa CLI with a PTY. The PTY starts at pty2's default size;
+  /// [pumpTerminalView] resizes it to the real view size before boot
+  /// completes, so the CLI draws its first frame at the final geometry.
+  ///
+  /// [repoRoot] is the flutter_agent repo root (the CLI's working
+  /// directory). [extraEnv] overrides env vars. When it carries no `HOME`
+  /// the harness creates a fresh temp HOME for the child (exposed as
+  /// [sandboxHome], deleted by [close]) — a test that forgets the override
+  /// can no longer read the developer's real `~/.fah` (issue #508).
+  static Future<CliVisualHarness> spawn({
+    required String repoRoot,
+    Map<String, String>? extraEnv,
+    List<String> args = const [],
+    String executable = 'dart',
+    List<String>? executableArgs,
+    String? workingDirectory,
+  }) async {
+    final (env, sandboxHome) = resolveSpawnEnv(extraEnv);
+    final (exe, exeArgs) = resolveFaCommand(
+      args: args,
+      executable: executable,
+      executableArgs: executableArgs,
+    );
+    final pty = PseudoTerminal.start(
+      exe,
+      exeArgs,
+      // [workingDirectory] overrides the default (the fa repo root) — the
+      // omp REG captures boot in a GIT-CLEAN sandbox so the git segment is
+      // hidden on BOTH sides of the parity diff (issue #810). Pass an
+      // absolute script path in [executableArgs] when overriding.
+      workingDirectory: workingDirectory ?? repoRoot,
+      environment: env,
+      raw: true,
+    );
+    final harness = CliVisualHarness._(
+      pty: pty,
+      terminal: Terminal(maxLines: 200),
+      sandboxHome: sandboxHome,
+    );
+    harness.startListening();
+    // Answer the CLI's terminal queries (device attributes etc.) so it
+    // does not wait out a response timeout on every boot.
+    harness.terminal.onOutput = pty.write;
+    return harness;
+  }
+
+  /// The child environment for [spawn] plus the temp HOME the harness
+  /// created when [extraEnv] carried no `HOME` (null otherwise). Split from
+  /// spawn so the sandbox default is unit-testable without a PTY.
+  static (Map<String, String>, Directory?) resolveSpawnEnv(
+    Map<String, String>? extraEnv,
+  ) {
+    final env = <String, String>{
+      'TERM': 'xterm-256color',
+      'COLORTERM': 'truecolor',
+      // Deterministic kaomoji frames (issue #1374): the busy row's face
+      // is production-random; fixtures must capture ONE deterministic
+      // frame, so the pipeline pins face 0 for every spawn.
+      'FA_KAOMOJI_FACE': '0',
+      // `dart` resolves packages from the pub cache, which lives under the
+      // REAL home; pty2 only forwards a fixed env whitelist, so pass it
+      // explicitly. Without this a HOME override breaks package resolution.
+      if (Platform.environment['PUB_CACHE'] != null)
+        'PUB_CACHE': Platform.environment['PUB_CACHE']!,
+      ...?extraEnv,
+    };
+    if (env.containsKey('HOME')) return (env, null);
+    // Hermetic default: a fresh HOME so an omitted override cannot boot
+    // the CLI against the developer's real ~/.fah (issue #508).
+    final sandbox = Directory.systemTemp.createTempSync('fa_visual_home_');
+    env['HOME'] = sandbox.path;
+    return (env, sandbox);
+  }
+
+  /// The CLI command for [spawn] under the gh-1300 FA_BIN seam: an
+  /// ambient `FA_BIN` (the `dart build cli` AOT bundle, compiled once per
+  /// CI job) replaces the default `dart bin/fah.dart` JIT spawn, dropping
+  /// per-test boot from the VM+CFE compile (~30 s on loaded ARM runners)
+  /// to ~1 s. A caller that PINNED a spawn spec ([executable]/
+  /// [executableArgs] passed explicitly — e.g. the omp REG capture pins an
+  /// absolute script path) is never overridden. [ambientFaBin] is
+  /// injectable so the unit test pins the environment (an empty string
+  /// reads as unset — CI may export it blank; `useAmbientFaBin: false`
+  /// makes the default-shape case deterministic on hosts that export
+  /// FA_BIN for the leg).
+  static (String, List<String>) resolveFaCommand({
+    required List<String> args,
+    String executable = 'dart',
+    List<String>? executableArgs,
+    bool useAmbientFaBin = true,
+    String? ambientFaBin,
+  }) {
+    final pinned = executableArgs != null || executable != 'dart';
+    final faBin =
+        ambientFaBin ??
+        (useAmbientFaBin ? Platform.environment['FA_BIN'] : null);
+    if (!pinned && faBin != null && faBin.isNotEmpty) return (faBin, args);
+    // Default `dart bin/fah.dart`, NOT `dart run ...`: `dart run` spawns
+    // a separate child VM that escapes pty.kill() and keeps the PTY (and
+    // the whole test run) alive. Direct execution runs in-process, so
+    // kill() in close() actually terminates the CLI. (An AOT binary is
+    // direct execution too — the kill() property holds.)
+    return (executable, executableArgs ?? ['bin/fah.dart', ...args]);
+  }
+
+  /// The pseudo-terminal running the CLI process.
+  final PseudoTerminal pty;
+
+  /// The xterm terminal emulator — receives all PTY output.
+  final Terminal terminal;
+
+  /// The temp HOME this harness created for the child (null when the
+  /// caller supplied a HOME explicitly — then the caller owns cleanup).
+  final Directory? sandboxHome;
+
+  /// The widget tester driving the [TerminalView]; set by [attach].
+  late final WidgetTester _tester;
+
+  final _boundaryKey = GlobalKey();
+
+  /// Accumulated raw output (with ANSI escape sequences).
+  final _rawBuffer = StringBuffer();
+
+  var _listening = false;
+  StreamSubscription<String>? _outputSub;
+
+  /// Binds the harness to the test's [WidgetTester]. Call once per test,
+  /// right after [spawn].
+  void attach(WidgetTester tester) => _tester = tester;
+
+  /// Load-aware wait budgets (issue #1391): every [timeout] this harness
+  /// waits by is multiplied by the ambient `FA_PTY_BUDGET_SCALE` (unset →
+  /// 1.0 → exact legacy budgets). The merge-blocking Terminal-visual leg
+  /// exports 2 — SM dispatch waves pack the hosted-arm pool and stretch
+  /// every JIT spawn / round-trip / repaint past the quiet-runner budgets;
+  /// see `lib/src/cli/pty_wait_budget.dart` for the rationale.
+  static double get waitBudgetScale => resolvePtyWaitBudgetScale(
+    envValue: Platform.environment[kPtyWaitBudgetScaleEnv],
+  );
+
+  /// Runs [body] in the real-async zone (PTY I/O and timer-based waits
+  /// freeze in the widget test's fake zone). runAsync completes with null
+  /// for void bodies (the common case here), so the nullable result is
+  /// cast blindly — a genuine null for non-void T only happens when the
+  /// tester is torn down mid-await, and the surrounding expect/timeout
+  /// already reports the real failure.
+  Future<T> _live<T>(Future<T> Function() body) async =>
+      (await _tester.runAsync(body)) as T;
+
+  /// Starts listening to PTY output, feeding both [_rawBuffer] and
+  /// [terminal]. Called automatically by [spawn]; idempotent.
+  void startListening() {
+    if (_listening) return;
+    _listening = true;
+    _outputSub = pty.out.listen((text) {
+      _rawBuffer.write(text);
+      terminal.write(text);
+    });
+  }
+
+  /// Pumps the [TerminalView] into the test surface and resizes the PTY to
+  /// the geometry the view actually computed (autoResize measures the
+  /// JetBrainsMono cell size), so the CLI redraws at exactly the size the
+  /// screenshots show. Call right after [spawn] — BEFORE [waitForBoot] — so
+  /// the CLI's first frame already lands at the final size.
+  Future<void> pumpTerminalView({Size size = const Size(1040, 600)}) async {
+    _tester.view.physicalSize = size;
+    _tester.view.devicePixelRatio = 1.0;
+    addTearDown(_tester.view.reset);
+    await _tester.pumpWidget(
+      MaterialApp(
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(
+          backgroundColor: faTerminalTheme.background,
+          body: Padding(
+            padding: const EdgeInsets.all(8),
+            child: RepaintBoundary(
+              key: _boundaryKey,
+              child: TerminalView(
+                terminal,
+                theme: faTerminalTheme,
+                textStyle: faTerminalStyle,
+                readOnly: true,
+                // Respect the app's cursor visibility (?25h/?25l): with
+                // alwaysShowCursor the view would paint a cursor even where
+                // the CLI deliberately hides it (prompt/picker focus).
+                // Focus is needed for the cursor to paint at all (idle
+                // input), so autofocus stays on.
+                autofocus: true,
+                hardwareKeyboardOnly: true,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    // First pump lays out; the view's autoResize reports the cell-fit size
+    // to the terminal on the next frame.
+    await _tester.pump();
+    await _tester.pump();
+    pty.resize(terminal.viewWidth, terminal.viewHeight);
+  }
+
+  /// Renders the current terminal screen to `<dir>/<name>.png` (2x pixels)
+  /// plus a `<name>.txt` twin with the exact screen text — the xterm buffer
+  /// is the source of truth, so the text twin lets anyone verify content
+  /// without reading pixels.
+  Future<void> screenshot(String dir, String name) async {
+    await _live(
+      () => waitForOutput(settleMs: 300, timeout: const Duration(seconds: 5)),
+    );
+    await _tester.pump();
+    final bytes = await _live(() async {
+      final boundary =
+          _boundaryKey.currentContext!.findRenderObject()!
+              as RenderRepaintBoundary;
+      final image = await boundary.toImage(pixelRatio: 2);
+      final data = await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
+      return data!.buffer.asUint8List();
+    });
+    File('$dir/$name.png').writeAsBytesSync(bytes);
+    File('$dir/$name.txt').writeAsStringSync(screenText);
+    final hit = findConfigLeak(screenText, realConfigMarkers());
+    if (hit != null) _leakHits.add('$name: "$hit"');
+  }
+
+  /// Screens whose `.txt` twin contained a real-config marker, as
+  /// `<screen>: "<marker>"` — reported (and failed) by [close] so the PTY
+  /// is always cleaned up before the suite goes red.
+  final _leakHits = <String>[];
+
+  /// Sends text (arrives as keystrokes on the raw PTY).
+  void sendText(String text) => pty.write(text);
+
+  /// Sends Enter (CR — dart_tui maps both CR and LF to 'enter').
+  void sendEnter() => pty.write('\r');
+
+  /// Sends Escape.
+  void sendEscape() => pty.write('\x1b');
+
+  /// Sends Arrow Down.
+  void sendArrowDown() => pty.write('\x1b[B');
+
+  /// Arrow up keystroke (queue pop / input-history browsing).
+  void sendArrowUp() => pty.write('\x1b[A');
+
+  /// Waits for the REPL boot to finish: the banner's `[Model]` block is on
+  /// screen and the frame redraws have settled.
+  ///
+  /// NOTE: in TUI mode the input zone renders NO `fa> ` prefix (that prompt
+  /// string is line-mode only) — the banner + status line are the reliable
+  /// boot markers.
+  Future<String> waitForBoot({
+    Duration timeout = const Duration(seconds: 90),
+  }) async {
+    final output = await _live(() => waitForText('[Model]', timeout: timeout));
+    // The TUI repaints the full frame once more after its terminal
+    // capability queries resolve; let that settle before interacting.
+    await _live(
+      () => waitForOutput(settleMs: 400, timeout: const Duration(seconds: 15)),
+    );
+    return output;
+  }
+
+  /// Types [command] and submits it, closing the slash menu first.
+  ///
+  /// In TUI mode, typing a bare slash command opens the slash-completion
+  /// menu, where Enter only ACCEPTS the highlighted item instead of
+  /// submitting. Sending Escape first closes the menu so the Enter that
+  /// follows always submits the typed text. Commands with arguments
+  /// (e.g. `/approval always-ask`) close the menu on their own while
+  /// typing; the extra Escape is a harmless no-op then.
+  Future<void> runSlashCommand(String command) async {
+    await _live(() async {
+      sendText(command);
+      // Let the slash menu open between the last keystroke and Escape.
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      sendEscape();
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      sendEnter();
+    });
+  }
+
+  /// Waits for [pattern] (real-async wrapped) — the variant test bodies
+  /// must use; plain [waitForText] would freeze in the fake zone.
+  Future<String> liveWaitForText(
+    Pattern pattern, {
+    Duration timeout = const Duration(seconds: 10),
+  }) => _live(() => waitForText(pattern, timeout: timeout));
+
+  /// Waits until the PAINTED terminal screen contains [pattern] (real-async
+  /// wrapped) and returns the screen text. Unlike [liveWaitForText] this
+  /// never matches the raw byte stream, so a returned frame is one the
+  /// renderer has actually shown — anchor keypresses and screenText
+  /// assertions here when raw-match racing bit a test (load-flake family:
+  /// the raw buffer streams picker bytes before the widget paints/focuses,
+  /// so an Enter keyed on a raw match can fall into the void).
+  ///
+  /// With [settle], the wait additionally holds until the match has survived
+  /// the CLI's raw output going quiet (or a bounded grace expired) and
+  /// returns the SETTLED screen. The renderer paints frames as incremental
+  /// cell diffs and the harness terminal does not answer the DEC 2026
+  /// DECRQM probe, so a matching screen can be a PARTIALLY applied frame
+  /// under load (gh-1204: the `[Approval mode]` title row was painted while
+  /// the item rows carrying `(current)` were still streaming in — the
+  /// assertion then read a torn frame and flagged main red). Settle on any
+  /// wait whose match is a persistent screen state the test asserts on;
+  /// keep it off for mid-run streaming states (the busy spinner emits bytes
+  /// every ~100ms, so the quiet gate would wait out the whole run).
+  Future<String> liveWaitForScreen(
+    Pattern pattern, {
+    Duration timeout = const Duration(seconds: 10),
+    bool settle = false,
+  }) => _live(() async {
+    final deadline = DateTime.now().add(
+      scalePtyWaitBudget(timeout, waitBudgetScale),
+    );
+    while (DateTime.now().isBefore(deadline)) {
+      final screen = screenText;
+      if (screen.contains(pattern)) {
+        if (!settle) return screen;
+        // Frame-completion gate: hold until the byte stream has been quiet
+        // for two settle turns (the frame is fully applied) — bounded by a
+        // grace so a still-streaming screen (spinner ticks) cannot hang the
+        // wait past legacy semantics. If the pattern vanished while
+        // settling (a transient state), keep polling for a stable match.
+        await waitForRawSettle(
+          settleMs: 200,
+          grace: const Duration(seconds: 2),
+        );
+        final settled = screenText;
+        if (settled.contains(pattern)) return settled;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    throw TimeoutException(
+      'Timed out waiting for "$pattern" on screen.\n--- screen ---\n'
+      '$screenText\n--- raw tail ---\n${_rawTail()}',
+      timeout,
+    );
+  });
+
+  /// Waits until the accumulated raw output has seen no new bytes for
+  /// [settleMs] twice in a row, or [grace] expires (returns false then —
+  /// the caller falls back to the last matched screen). Same stability rule
+  /// as [waitForOutput], bounded, for frame-completion gates.
+  Future<bool> waitForRawSettle({
+    int settleMs = 200,
+    Duration grace = const Duration(seconds: 2),
+  }) => _rawQuiet(
+    settleMs,
+    DateTime.now().add(scalePtyWaitBudget(grace, waitBudgetScale)),
+  );
+
+  /// True when no new raw bytes arrived for [settleMs] twice in a row
+  /// before [deadline] (bounded by it). The ONE stability loop behind
+  /// [waitForOutput] and [waitForRawSettle] — a tweak to the settle rule
+  /// lands here, never in a copy (gh-1204 review: duplicated loops drift,
+  /// and a drifted settle rule silently reintroduces the torn-frame race).
+  Future<bool> _rawQuiet(int settleMs, DateTime deadline) async {
+    var lastLength = -1;
+    var stableTurns = 0;
+    while (DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(Duration(milliseconds: settleMs));
+      if (_rawBuffer.length == lastLength) {
+        if (++stableTurns >= 2) return true;
+      } else {
+        stableTurns = 0;
+        lastLength = _rawBuffer.length;
+      }
+    }
+    return false;
+  }
+
+  /// Lets pending output settle (real-async wrapped) — the variant test
+  /// bodies must use; plain [waitForOutput] would freeze in the fake zone.
+  Future<String> settle({
+    int settleMs = 200,
+    Duration timeout = const Duration(seconds: 10),
+  }) => _live(() => waitForOutput(settleMs: settleMs, timeout: timeout));
+
+  /// Reads output until no new data arrives for [settleMs] milliseconds
+  /// twice in a row, or [timeout] expires. Returns the accumulated raw
+  /// output.
+  Future<String> waitForOutput({
+    int settleMs = 200,
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    await _rawQuiet(
+      settleMs,
+      DateTime.now().add(scalePtyWaitBudget(timeout, waitBudgetScale)),
+    );
+    return _rawBuffer.toString();
+  }
+
+  /// Waits for [pattern] to appear in the accumulated raw output OR on the
+  /// current terminal screen, then returns the raw output. The screen check
+  /// catches text whose raw form is interrupted by ANSI styling.
+  Future<String> waitForText(
+    Pattern pattern, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final deadline = DateTime.now().add(
+      scalePtyWaitBudget(timeout, waitBudgetScale),
+    );
+    while (DateTime.now().isBefore(deadline)) {
+      final output = _rawBuffer.toString();
+      if (output.contains(pattern) || screenText.contains(pattern)) {
+        return output;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+    throw TimeoutException(
+      'Timed out waiting for "$pattern" in output.\n--- screen ---\n'
+      '$screenText\n--- raw tail ---\n${_rawTail()}',
+      timeout,
+    );
+  }
+
+  /// The last 2000 characters of raw output, for timeout diagnostics.
+  String _rawTail() {
+    final raw = _rawBuffer.toString();
+    return raw.length <= 2000 ? raw : raw.substring(raw.length - 2000);
+  }
+
+  /// Every line of the visible viewport (blank lines kept, trailing
+  /// whitespace preserved) — the layout-faithful view for screenshots.
+  List<String> get viewportLines {
+    final lines = <String>[];
+    final buf = terminal.buffer;
+    for (var i = buf.scrollBack; i < buf.lines.length; i++) {
+      lines.add(buf.lines[i].getText());
+    }
+    return lines;
+  }
+
+  /// The terminal screen as text lines (ANSI-stripped, empty lines dropped).
+  List<String> get screenLines => [
+    for (final line in viewportLines)
+      if (line.trim().isNotEmpty) line,
+  ];
+
+  /// The terminal screen as a single string (newline-separated lines).
+  String get screenText => screenLines.join('\n');
+
+  /// Kills the CLI process, cancels the output subscription (otherwise an
+  /// open stream keeps the test runner's event loop alive), deletes a
+  /// harness-created [sandboxHome], waits for the process to exit — and
+  /// fails the test when [screenshot] recorded a real-config leak
+  /// (issue #508), naming every offending screen.
+  Future<void> close() async {
+    await _live(() async {
+      pty.kill();
+      await pty.exitCode.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () => -1,
+      );
+      await _outputSub?.cancel();
+    });
+    final sandbox = sandboxHome;
+    if (sandbox != null && sandbox.existsSync()) {
+      sandbox.deleteSync(recursive: true);
+    }
+    if (_leakHits.isNotEmpty) {
+      throw StateError(
+        'cli_visual leaked the real user config onto ${_leakHits.length} '
+        'screen(s) — boot without an explicit HOME is no longer possible, '
+        'so a fixture is showing real data:\n  ${_leakHits.join('\n  ')}',
+      );
+    }
+  }
+}
+
+/// The real user config's markers on THIS machine: every value a leaked
+/// screen could show — the top-level `model:`/`baseUrl:`, every
+/// `customProviders` name/modelId/baseUrl, and every live-fetched id from
+/// `~/.fah/model_cache.json`. API keys are deliberately NOT markers (the
+/// CLI never prints them and they must never appear in a failure message).
+/// Empty on machines without a real config (CI) — nothing real to leak.
+///
+/// Pure helper split ([configLeakMarkers]) so the extraction is
+/// unit-testable; the result is cached per process.
+Set<String> realConfigMarkers() {
+  final home = Platform.environment['HOME'];
+  if (home == null) return const {};
+  final config = File('$home/.fah/config.yaml');
+  final cache = File('$home/.fah/model_cache.json');
+  return _markerCache ??= configLeakMarkers(
+    config.existsSync() ? config.readAsStringSync() : '',
+    cache.existsSync() ? cache.readAsStringSync() : '',
+  );
+}
+
+Set<String>? _markerCache;
+
+/// Extracts leak markers from a real config's text: scalar values of the
+/// model-identifying keys plus, when [modelCacheText] parses as JSON, every
+/// fetched model id (the cache's shape is `{"<provider>": {"ids": [...]}}`).
+/// Ids the CLI can show WITHOUT any config (the bundled offline catalog)
+/// are subtracted — a hermetic screen legitimately renders them, so they
+/// are not leak evidence (issue #508).
+Set<String> configLeakMarkers(String configText, String modelCacheText) {
+  final markers = <String>{
+    // `key: value` scalars, including `- name: x` list items (the
+    // customProviders shape) — a yaml block: no quoted values in practice,
+    // URLs and ids never carry spaces.
+    for (final match in RegExp(
+      r'^\s*(?:-\s+)?(model|baseUrl|name|modelId):\s*(\S+)\s*$',
+      multiLine: true,
+    ).allMatches(configText))
+      if (match.group(2)!.length >= 3) match.group(2)!,
+  };
+  try {
+    final cache = jsonDecode(modelCacheText);
+    if (cache is Map) {
+      for (final provider in cache.values) {
+        if (provider is Map) {
+          final ids = provider['ids'];
+          if (ids is List) {
+            markers.addAll(
+              ids.whereType<String>().where((id) => id.length >= 3),
+            );
+          }
+        }
+      }
+    }
+  } on FormatException {
+    // A non-JSON cache file contributes no markers.
+  }
+  // Drop bundled-catalog content: the /models screen renders catalog ids
+  // and the provider picker renders catalog endpoints on any machine. A
+  // real id is dropped when its bare form equals, extends or is extended
+  // by a catalog name — 'openai/gpt-4o-mini' and the live id
+  // 'openai/gpt-4.1' (a prefix of the catalog's 'gpt-4.1-mini') both
+  // collide with legitimate catalog rows; a distinctive id like
+  // 'epam/secret-model' stays. URLs match by exact catalog membership.
+  final bundled = {...bundledCatalogModelIds, ...bundledCatalogEndpoints};
+  bool ambiguousWithCatalog(String marker) {
+    if (bundled.contains(marker)) return true;
+    if (marker.contains('://')) return false;
+    final bare = marker.split('/').last;
+    return bundled.any((b) => b.startsWith(bare) || bare.startsWith(b));
+  }
+
+  markers.removeWhere(ambiguousWithCatalog);
+  return markers;
+}
+
+/// The first [markers] entry appearing in [screenText], or null.
+String? findConfigLeak(String screenText, Set<String> markers) {
+  for (final marker in markers) {
+    if (screenText.contains(marker)) return marker;
+  }
+  return null;
+}

@@ -1,0 +1,624 @@
+/// The `checkpoint`/`rewind` tools: self-service context hygiene for
+/// exploratory detours, plus the controller that applies the rewind to the
+/// live agent and the session tree.
+///
+/// Ported from oh-my-pi (`packages/coding-agent/src/tools/checkpoint.ts` +
+/// `docs/tools/checkpoint.md` + `docs/tools/rewind.md`). The model marks the
+/// conversation with `checkpoint(goal)`, investigates with intermediate tool
+/// calls, then calls `rewind(report)`: everything after the mark is pruned
+/// from the live context and replaced by the report (kept verbatim), while
+/// the dropped history stays in the session tree as an abandoned branch —
+/// nothing is lost.
+///
+/// omp splits the flow between dumb tools and an `AgentSession` that captures
+/// state on `tool_execution_end` and applies the rewind on `turn_end`; here
+/// the [CheckpointRewindController] plays the session role: it subscribes to
+/// agent events (capture on the checkpoint tool-result message, apply on
+/// turn end) and wraps [Agent.prepareNextTurn] so the ongoing run continues
+/// with the pruned context. omp's subagent gate does not exist (no subagent
+/// sessions yet), and omp's yield guard is not ported.
+///
+/// Persistence model: hosts persist in-memory messages to the session on
+/// their own schedule (the CLI batches at run end). The controller therefore
+/// drives persistence of everything it anchors or drops through the
+/// [CheckpointSessionSink] — the checkpoint prefix at capture time and the
+/// whole detour at rewind time — so the tree always mirrors the anchors.
+library;
+
+// The public named parameters map to private fields; initializing formals
+// would make the parameter names private and unusable outside this library.
+// ignore_for_file: prefer_initializing_formals
+
+import '../agent/agent.dart';
+import '../agent/agent_loop.dart';
+import '../agent/agent_tool.dart';
+import '../approval/approval.dart';
+import '../cancel_token.dart';
+import '../context.dart';
+import '../prompts/prompts.g.dart';
+import '../session/session_tree.dart';
+import '../types.dart';
+import '../user_text.dart';
+
+/// The `checkpoint` tool name.
+const checkpointToolName = 'checkpoint';
+
+/// The `rewind` tool name.
+const rewindToolName = 'rewind';
+
+/// The `custom_message` type carrying the retained rewind report in the
+/// session tree (omp's `rewind-report` custom message).
+const rewindReportCustomType = 'rewind-report';
+
+/// The `custom_message` type marking an auto-closed stale checkpoint (the
+/// audit trail for issue #286: why protection ended, with reason, goal,
+/// and anchors in `details`).
+const checkpointAutoClosedCustomType = 'checkpoint_auto_closed';
+
+/// Why an active checkpoint was auto-closed instead of blocking a new one
+/// (issue #286: a checkpoint never outlives its detour scope).
+enum CheckpointAutoCloseReason {
+  /// A user turn arrived inside the detour scope — a detour never spans
+  /// user turns, so the checkpoint outlived its scope.
+  userTurn('a user turn arrived after the checkpoint'),
+
+  /// The in-memory span the checkpoint anchors is gone: the host rebuilt
+  /// the transcript (session reload, compaction) below the anchor.
+  anchorGone('the anchored transcript span is gone (reload or compaction)');
+
+  const CheckpointAutoCloseReason(this.label);
+
+  /// Human-readable reason used in notes and audit records.
+  final String label;
+}
+
+/// Host notification for a checkpoint auto-close (gh-1425 AC4): the reason
+/// plus the checkpoint that closed. Fired after the audit record persisted.
+typedef CheckpointAutoCloseCallback =
+    Future<void> Function(
+      CheckpointAutoCloseReason reason,
+      CheckpointState checkpoint,
+    );
+
+/// The captured checkpoint mark (omp's `CheckpointState`).
+final class CheckpointState {
+  /// Creates a [CheckpointState].
+  const CheckpointState({
+    required this.messageCount,
+    required this.startedAt,
+    this.entryId,
+    this.goal,
+  });
+
+  /// In-memory message count at the mark, AFTER the checkpoint tool result
+  /// was appended (omp semantics). The rewind prunes back to this count.
+  final int messageCount;
+
+  /// Session-tree anchor: the [CheckpointRecord] id written at the mark, or
+  /// `null` when the host has no session. The rewind navigates the tree back
+  /// to this record.
+  final String? entryId;
+
+  /// When the checkpoint was created.
+  final DateTime startedAt;
+
+  /// Optional investigation goal given by the model.
+  final String? goal;
+}
+
+/// A completed rewind retained for the repeat-call guard (omp's
+/// `CompletedRewindState`).
+final class CompletedRewind {
+  /// Creates a [CompletedRewind].
+  const CompletedRewind({
+    required this.report,
+    required this.startedAt,
+    required this.rewoundAt,
+  });
+
+  /// The report retained after the rewind, verbatim.
+  final String report;
+
+  /// When the rewound checkpoint was created.
+  final DateTime startedAt;
+
+  /// When the rewind completed.
+  final DateTime rewoundAt;
+}
+
+/// The host seam for session persistence the controller drives.
+///
+/// Hosts persist the in-memory transcript on their own schedule; the
+/// controller needs precise anchors, so it flushes the messages it relies on
+/// through [persistMessage] itself (idempotent for hosts that persist live —
+/// [persistedMessageCount] then already covers them).
+final class CheckpointSessionSink {
+  /// Creates a [CheckpointSessionSink].
+  const CheckpointSessionSink({
+    required this.session,
+    required this.persistedMessageCount,
+    required this.persistMessage,
+  });
+
+  /// The current session, or `null` when the host has none (the controller
+  /// then degrades to in-memory pruning only).
+  final Session? Function() session;
+
+  /// How many leading in-memory messages the host has already persisted.
+  final int Function() persistedMessageCount;
+
+  /// Persists one in-memory [message] at the session leaf and bumps the
+  /// host's persisted counter. Returns the new record id.
+  final Future<String> Function(Message message) persistMessage;
+}
+
+/// A rewind/checkpoint guard failure reported to the model with a clean
+/// message — a `StateError` would render as "Bad state: ...", which reads
+/// like an internal crash rather than guidance.
+final class _RewindGuardError implements Exception {
+  const _RewindGuardError(this.message);
+
+  /// The model-facing guidance.
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// Orchestrates the `checkpoint`/`rewind` flow for one [Agent].
+///
+/// Created once per agent (the CLI creates one next to [builtinTools]); the
+/// [tools] register next to the other built-ins. Capture and application
+/// ride the agent's event stream, so the tools themselves stay simple.
+final class CheckpointRewindController {
+  /// Creates a controller and attaches it to [agent]: subscribes to the
+  /// event stream and wraps [Agent.prepareNextTurn] (preserving any existing
+  /// hook, the same composition pattern `attachApproval` uses).
+  ///
+  /// [onRewindApplied] fires after each applied rewind with the new
+  /// in-memory message count, so the host can realign its persistence cursor
+  /// (the pruned detour and the report are already persisted by then).
+  ///
+  /// [onAutoClose] fires after each auto-close, with the reason and the
+  /// closed checkpoint — the audit record is already persisted. The host
+  /// hooks its budget guard here (gh-1425 AC4: a user turn that ends a
+  /// detour leaves the FULL detour history live; the host caps it against
+  /// its compaction budget before the next request).
+  CheckpointRewindController({
+    required Agent agent,
+    required CheckpointSessionSink sink,
+    void Function(int messageCount)? onRewindApplied,
+    CheckpointAutoCloseCallback? onAutoClose,
+  }) : _agent = agent,
+       _sink = sink,
+       _onRewindApplied = onRewindApplied,
+       _onAutoClose = onAutoClose {
+    _unsubscribe = _agent.subscribe(_onAgentEvent);
+    _wrapPrepareNextTurn();
+  }
+
+  final Agent _agent;
+  final CheckpointSessionSink _sink;
+  final void Function(int messageCount)? _onRewindApplied;
+  final CheckpointAutoCloseCallback? _onAutoClose;
+
+  CheckpointState? _active;
+  CompletedRewind? _lastCompleted;
+  bool _checkpointPending = false;
+  String? _pendingGoal;
+  String? _pendingReport;
+  bool _contextSwapPending = false;
+  PrepareNextTurnHook? _previousPrepareNextTurn;
+  PrepareNextTurnHook? _wrappedPrepareNextTurn;
+  void Function()? _unsubscribe;
+
+  /// The `checkpoint` and `rewind` tools bound to this controller.
+  late final List<AgentTool> tools = [
+    _buildCheckpointTool(),
+    _buildRewindTool(),
+  ];
+
+  /// The active checkpoint, if any.
+  CheckpointState? get activeCheckpoint => _active;
+
+  /// The last completed rewind, if any (drives the repeat-call guard).
+  CompletedRewind? get lastCompletedRewind => _lastCompleted;
+
+  /// Clears all checkpoint/rewind state (e.g. when the host resets the
+  /// session).
+  void clear() {
+    _active = null;
+    _lastCompleted = null;
+    _checkpointPending = false;
+    _pendingGoal = null;
+    _pendingReport = null;
+    _contextSwapPending = false;
+  }
+
+  /// gh-1425 AC4: arms a context resync at the next turn boundary — the
+  /// loop's live context is stale because the host replaced
+  /// `state.messages` MID-RUN (the restore-budget compaction after a
+  /// user-turn checkpoint auto-close), so the next `prepareNextTurn` must
+  /// swap in the authoritative transcript. The same adoption the rewind
+  /// rides; the run continues on the capped context without re-sending an
+  /// over-budget request.
+  void requestContextResync() => _contextSwapPending = true;
+
+  /// Whether [checkpoint] outlived its detour scope: the transcript no
+  /// longer matches the span it anchored. Evaluated lazily at the next
+  /// checkpoint attempt — until then the checkpoint stays rewindable (a
+  /// detour may legitimately span runs), so the normal round-trip and the
+  /// cross-run rewind are unchanged.
+  ///
+  /// Stale when a user message landed inside the detour scope (a detour
+  /// never spans user turns: the model answered, steering interrupted, or a
+  /// later prompt arrived) or when the transcript was rebuilt below the
+  /// anchor (session reload / compaction replaced the anchored span).
+  /// Only REAL user turns end the scope: synthetic user-role injections
+  /// (widget events, system notices, rule interrupts, ext follow-ups,
+  /// agent mail, projected branch summaries) are machine traffic, not the
+  /// user steering the conversation (review of PR #292).
+  CheckpointAutoCloseReason? _stalenessReason(CheckpointState checkpoint) {
+    final messages = _agent.state.messages;
+    if (checkpoint.messageCount > messages.length) {
+      return CheckpointAutoCloseReason.anchorGone;
+    }
+    for (var i = checkpoint.messageCount; i < messages.length; i++) {
+      final message = messages[i];
+      if (message is UserMessage && _isRealUserTurn(message)) {
+        return CheckpointAutoCloseReason.userTurn;
+      }
+    }
+    return null;
+  }
+
+  /// Whether [message] is a real user turn (the user's own words) rather
+  /// than a synthetic user-role injection. The predicate is the ONE copy
+  /// in `../user_text.dart` (issue #1380 review consolidation — this used
+  /// to be a drifted local regex); it subsumes the historical
+  /// widget/extension/TTSR prefixes, whitespace-tolerant agent mail, and
+  /// system-notice envelopes anywhere in the text.
+  static bool _isRealUserTurn(UserMessage message) {
+    return !isSyntheticUserText(userMessageText(message.content));
+  }
+
+  /// Auto-closes the active checkpoint: clears it and writes the
+  /// `checkpoint_auto_closed` audit record through the sink so every host
+  /// sharing the session sees the close. Idempotent — closing again is a
+  /// no-op returning `null`. Returns the human-readable note.
+  Future<String?> _autoClose(CheckpointAutoCloseReason reason) async {
+    final checkpoint = _active;
+    if (checkpoint == null) return null;
+    _active = null;
+    final note =
+        'Previous checkpoint auto-closed (${reason.label}; '
+        'goal: ${checkpoint.goal ?? 'none'}; anchored at message '
+        '${checkpoint.messageCount}). The detour history stays in the '
+        'session tree.';
+    final session = _sink.session();
+    if (session != null) {
+      // Flush the host-pending detour BEFORE appending the audit record
+      // (the sink model: the controller persists everything it anchors or
+      // drops) — otherwise the record lands above messages the host
+      // persists later, and the tree tells the close out of order
+      // (review of PR #292).
+      final messages = _agent.state.messages;
+      for (var i = _sink.persistedMessageCount(); i < messages.length; i++) {
+        await _sink.persistMessage(messages[i]);
+      }
+      await session.appendCustomMessageEntry(
+        customType: checkpointAutoClosedCustomType,
+        content: note,
+        display: false,
+        details: {
+          'reason': reason.name,
+          'goal': ?checkpoint.goal,
+          'messageCount': checkpoint.messageCount,
+          'entryId': checkpoint.entryId,
+          'startedAt': checkpoint.startedAt.toIso8601String(),
+          'closedAt': DateTime.now().toIso8601String(),
+        },
+      );
+    }
+    // gh-1425 AC4: the host learns about every close AFTER the audit
+    // record persisted (the tree mirrors the close; the host's budget
+    // guard can act on it — the CLI caps the restored context there).
+    final onAutoClose = _onAutoClose;
+    if (onAutoClose != null) {
+      await onAutoClose(reason, checkpoint);
+    }
+    return note;
+  }
+
+  /// Compact age of a checkpoint for refusal messages (snapshot-friendly:
+  /// stable within the sub-minute span tests run in).
+  static String _formatAge(Duration age) {
+    if (age.inMinutes < 1) return '<1m';
+    if (age.inHours < 1) return '${age.inMinutes}m';
+    return '${age.inHours}h ${age.inMinutes % 60}m';
+  }
+
+  /// Detaches from the agent: unsubscribes the event listener and restores
+  /// the [Agent.prepareNextTurn] hook this controller wrapped.
+  void dispose() {
+    _unsubscribe?.call();
+    _unsubscribe = null;
+    if (identical(_agent.prepareNextTurn, _wrappedPrepareNextTurn)) {
+      _agent.prepareNextTurn = _previousPrepareNextTurn;
+    }
+  }
+
+  void _wrapPrepareNextTurn() {
+    _previousPrepareNextTurn = _agent.prepareNextTurn;
+    final previous = _previousPrepareNextTurn;
+    _wrappedPrepareNextTurn = (nextTurn) async {
+      if (_contextSwapPending) {
+        _contextSwapPending = false;
+        // The live transcript was replaced under the loop (a rewind's
+        // pruning, or the AC4 restore-budget compaction): the loop's
+        // context still holds the pre-replacement messages, so swap in the
+        // authoritative one — the run continues from `state.messages`.
+        // The copy matters: AgentState.messages is an unmodifiable view,
+        // and the loop appends tool results to its context list.
+        return AgentLoopTurnUpdate(
+          context: Context(
+            systemPrompt: nextTurn.context.systemPrompt,
+            messages: List.of(_agent.state.messages),
+            tools: nextTurn.context.tools,
+          ),
+        );
+      }
+      return previous?.call(nextTurn);
+    };
+    _agent.prepareNextTurn = _wrappedPrepareNextTurn;
+  }
+
+  Future<void> _onAgentEvent(AgentEvent event, CancelToken cancelToken) async {
+    switch (event) {
+      case MessageEndEvent(:final message):
+        // The checkpoint mark is captured once its tool result is part of
+        // the transcript, so the count matches omp's "after the checkpoint
+        // tool result has already been appended".
+        if (message is ToolResultMessage &&
+            message.toolName == checkpointToolName) {
+          await _captureCheckpoint(message);
+        }
+      case TurnEndEvent():
+        // omp applies the rewind on turn_end, never inside the tool call.
+        if (_pendingReport != null) await _applyRewind();
+      default:
+    }
+  }
+
+  Future<void> _captureCheckpoint(ToolResultMessage result) async {
+    if (!_checkpointPending) return;
+    _checkpointPending = false;
+    final goal = _pendingGoal;
+    _pendingGoal = null;
+    if (result.isError) return;
+
+    final messages = _agent.state.messages;
+    final count = messages.length;
+    final session = _sink.session();
+    String? entryId;
+    if (session != null) {
+      // Flush the host-pending prefix (the prompt and the checkpoint
+      // exchange) so the tree anchor and the in-memory anchor point at the
+      // same conversation position, then mark it with a checkpoint record.
+      for (var i = _sink.persistedMessageCount(); i < count; i++) {
+        await _sink.persistMessage(messages[i]);
+      }
+      entryId = await session.appendCheckpoint(messageCount: count, goal: goal);
+    }
+    _active = CheckpointState(
+      messageCount: count,
+      entryId: entryId,
+      startedAt: DateTime.now(),
+      goal: goal,
+    );
+  }
+
+  Future<void> _applyRewind() async {
+    final checkpoint = _active;
+    final report = _pendingReport;
+    _pendingReport = null;
+    if (checkpoint == null || report == null) return;
+    final rewoundAt = DateTime.now();
+
+    final messages = _agent.state.messages;
+    final keepCount = _resolveDanglingToolCalls(
+      messages,
+      checkpoint.messageCount.clamp(0, messages.length),
+    );
+
+    final session = _sink.session();
+    if (session != null) {
+      // Persist the whole detour BEFORE moving the leaf: the dropped history
+      // stays in the tree as an abandoned branch (omp semantics — rewind is
+      // not destructive to persisted session history).
+      for (var i = _sink.persistedMessageCount(); i < messages.length; i++) {
+        await _sink.persistMessage(messages[i]);
+      }
+      final anchor = checkpoint.entryId;
+      final targetId = anchor != null && await session.getEntry(anchor) != null
+          ? anchor
+          : null;
+      // Branch back to the checkpoint record, carrying the report as the
+      // branch summary (omp's `branchWithSummary`), then retain the report
+      // verbatim as a hidden rewind-report message on the new branch.
+      await session.moveTo(targetId, summary: report);
+      await session.appendCustomMessageEntry(
+        customType: rewindReportCustomType,
+        content: report,
+        display: false,
+        details: {
+          'startedAt': checkpoint.startedAt.toIso8601String(),
+          'rewoundAt': rewoundAt.toIso8601String(),
+        },
+      );
+    }
+
+    _agent.state.messages = [
+      ...messages.sublist(0, keepCount),
+      UserMessage.text(report),
+    ];
+    _onRewindApplied?.call(_agent.state.messages.length);
+    _active = null;
+    _lastCompleted = CompletedRewind(
+      report: report,
+      startedAt: checkpoint.startedAt,
+      rewoundAt: rewoundAt,
+    );
+    _contextSwapPending = true;
+  }
+
+  /// Extends [keepCount] past any tool results still answering tool calls
+  /// inside the kept prefix, so a checkpoint batched with other calls never
+  /// leaves a dangling tool call in the pruned context.
+  static int _resolveDanglingToolCalls(List<Message> messages, int keepCount) {
+    var end = keepCount;
+    while (end < messages.length) {
+      final called = <String>{};
+      final answered = <String>{};
+      for (var i = 0; i < end; i++) {
+        final message = messages[i];
+        if (message is AssistantMessage) {
+          for (final call in message.content.whereType<ToolCall>()) {
+            called.add(call.id);
+          }
+        } else if (message is ToolResultMessage) {
+          answered.add(message.toolCallId);
+        }
+      }
+      if (called.difference(answered).isEmpty) return end;
+      end++;
+    }
+    return end;
+  }
+
+  AgentTool _buildCheckpointTool() {
+    return AgentTool(
+      name: checkpointToolName,
+      label: 'checkpoint',
+      tier: ApprovalTier.read,
+      // Sequential batches make the capture deterministic when the model
+      // batches checkpoint with other calls (omp effectively assumes
+      // standalone calls).
+      executionMode: ToolExecutionMode.sequential,
+      description: checkpointToolDescriptionPrompt,
+      parameters: const {
+        'type': 'object',
+        'properties': {
+          'goal': {
+            'type': 'string',
+            'description': 'Investigation goal for this checkpoint',
+          },
+        },
+      },
+      execute: (arguments, cancelToken, onUpdate) async {
+        String? autoClosedNote;
+        if (_active != null) {
+          final staleReason = _stalenessReason(_active!);
+          if (staleReason == null) {
+            // Still inside its detour scope: refuse, naming the checkpoint
+            // so the model can close it with a rewind (issue #286: the
+            // refusal must be actionable, never a dead end).
+            final checkpoint = _active!;
+            throw _RewindGuardError(
+              'Checkpoint already active '
+              '(goal: ${checkpoint.goal ?? 'none'}; '
+              'age: ${_formatAge(DateTime.now().difference(checkpoint.startedAt))}; '
+              'anchored at message ${checkpoint.messageCount} of '
+              '${_agent.state.messages.length}). '
+              'Call rewind with your investigation findings to close it '
+              'before creating another checkpoint.',
+            );
+          }
+          if (_pendingReport != null) {
+            // A rewind for the active checkpoint is already queued in THIS
+            // same batch (review of PR #292: steering landed mid-detour
+            // and the model answered with one [rewind, checkpoint] tool
+            // phase). The checkpoint is already closing — the rewind
+            // applies at turn end — so it is not stale: auto-closing it
+            // here would destroy that rewind (the anchor the pending
+            // report needs vanishes, and the report would attach to the
+            // checkpoint this call creates). Refuse cleanly instead, like
+            // the in-scope case; the model checkpoints after the rewind
+            // applies.
+            throw _RewindGuardError(
+              'Rewind already requested for the active checkpoint '
+              '(goal: ${_active!.goal ?? 'none'}); it applies when this '
+              'turn ends. Create the checkpoint after the rewind applies.',
+            );
+          }
+          // The checkpoint outlived its scope (issue #286): auto-close it
+          // with a visible note and an audit record instead of blocking.
+          autoClosedNote = await _autoClose(staleReason);
+        }
+        _checkpointPending = true;
+        final goal = (arguments['goal'] as String?)?.trim();
+        _pendingGoal = goal == null || goal.isEmpty ? null : goal;
+        // The exact count is captured when the checkpoint tool result lands
+        // in the transcript; this prediction matches it for standalone calls.
+        final count = _agent.state.messages.length + 1;
+        return ToolExecutionResult.text(
+          [
+            ?autoClosedNote,
+            'Checkpoint created (message count: $count).',
+            if (_pendingGoal != null) 'Goal: $_pendingGoal',
+            'Run your investigation, then call rewind with a concise report.',
+          ].join('\n'),
+        );
+      },
+    );
+  }
+
+  AgentTool _buildRewindTool() {
+    return AgentTool(
+      name: rewindToolName,
+      label: 'rewind',
+      tier: ApprovalTier.read,
+      executionMode: ToolExecutionMode.sequential,
+      description: rewindToolDescriptionPrompt,
+      parameters: const {
+        'type': 'object',
+        'properties': {
+          'report': {
+            'type': 'string',
+            'description': 'Investigation findings retained after the rewind',
+          },
+        },
+        'required': ['report'],
+      },
+      execute: (arguments, cancelToken, onUpdate) async {
+        if (_active == null) {
+          if (_lastCompleted != null) {
+            // A second rewind after a completed one is not an error to
+            // recover from — tell the model to simply continue with the
+            // retained report (no "Bad state:" crash look).
+            return ToolExecutionResult.text(
+              'The checkpoint was already rewound — continue from the '
+              'retained report above; no second rewind is needed.',
+            );
+          }
+          throw const _RewindGuardError(
+            'No active checkpoint. Create a checkpoint before calling rewind.',
+          );
+        }
+        if (_pendingReport != null) {
+          throw const _RewindGuardError(
+            'Rewind already requested; it applies when the turn ends.',
+          );
+        }
+        final report = (arguments['report'] as String).trim();
+        if (report.isEmpty) {
+          throw const _RewindGuardError('Report cannot be empty.');
+        }
+        _pendingReport = report;
+        return ToolExecutionResult.text(
+          'Rewind requested.\nReport captured for context replacement.',
+        );
+      },
+    );
+  }
+}

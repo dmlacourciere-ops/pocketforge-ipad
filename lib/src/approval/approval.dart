@@ -1,0 +1,441 @@
+/// Tool approval: capability tiers, per-tool policy, and session modes.
+///
+/// Shaped after oh-my-pi's approval model (`packages/coding-agent/src/tools/
+/// approval.ts` + `docs/approval-mode.md`), reduced to a static per-tool
+/// [ApprovalTier] plus a critical-pattern interceptor for `bash`
+/// (`bash_interceptor.dart`). The check runs inside the agent loop's
+/// `beforeToolCall` phase (see `approval_hook.dart`), so a denied call never
+/// executes: it becomes an error tool result the model can react to.
+///
+/// Policy model:
+///
+/// - Every tool has an [ApprovalTier]: [ApprovalTier.read] (reads data),
+///   [ApprovalTier.write] (mutates workspace state), [ApprovalTier.exec]
+///   (runs code / shells out). Tools that do not declare a tier — custom and
+///   plugin tools — default to [ApprovalTier.exec], the safe choice.
+/// - The session runs in one [ApprovalMode]:
+///   [ApprovalMode.alwaysAsk] prompts for every call, [ApprovalMode.write]
+///   auto-allows read-tier and prompts for write/exec, [ApprovalMode.yolo]
+///   auto-allows everything, and [ApprovalMode.unattended] is yolo plus
+///   critical-pattern pass-through (for runs with no user present).
+/// - Per-tool [ApprovalPolicy] overrides (`allow`/`deny`/`prompt`) and the
+///   session always-allow set (filled by "approve always" decisions) take
+///   precedence over the mode.
+/// - A `bash` command matching a critical pattern forces a prompt in every
+///   interactive mode ([ApprovalMode.alwaysAsk], [ApprovalMode.write],
+///   [ApprovalMode.yolo]) — even a per-tool `allow` cannot silence it. Only
+///   [ApprovalMode.unattended] skips the interceptor, because an unattended
+///   session has nobody to answer a prompt; an explicit per-tool `deny` or
+///   turn-scoped `disallowed-tools` still outranks it there.
+/// - Turn-scoped grants: an invoked skill's `allowed-tools` auto-allows the
+///   named tools and `disallowed-tools` denies them for the current turn
+///   only ([ApprovalManager.grantForTurn]/[ApprovalManager.clearTurnGrants]).
+library;
+
+import 'dart:async';
+
+import 'bash_interceptor.dart';
+
+/// How much damage a tool call can do, worst case.
+enum ApprovalTier {
+  /// Reads data without mutating workspace state (`read`, `ls`).
+  read,
+
+  /// Mutates workspace/session state without executing arbitrary code
+  /// (`write`, `edit`).
+  write,
+
+  /// Executes code, shells out, or performs similarly broad actions
+  /// (`bash`). Default for tools that do not declare a tier.
+  exec,
+}
+
+/// The resolved policy for one tool call.
+enum ApprovalPolicy {
+  /// Execute without asking.
+  allow,
+
+  /// Refuse execution; the model receives an error tool result.
+  deny,
+
+  /// Ask the user (via the [ApprovalPrompt] callback) before executing.
+  prompt,
+}
+
+/// Session-wide approval posture.
+enum ApprovalMode {
+  /// Prompt for every tool call, read-tier included.
+  alwaysAsk,
+
+  /// Auto-allow read-tier calls; prompt for write- and exec-tier calls.
+  write,
+
+  /// Auto-allow every call (critical `bash` patterns still prompt).
+  yolo,
+
+  /// Auto-allow every call, critical `bash` patterns included — the session
+  /// NEVER blocks on an interactive prompt. For runs without a user present
+  /// (overnight/automation); there is nobody to answer a prompt. CLI label
+  /// ([ApprovalModeLabel.label]): `autopilot` (formerly `unattended`).
+  unattended,
+}
+
+/// The user's answer to an approval prompt.
+enum ApprovalDecision {
+  /// Execute this one call; ask again next time.
+  approveOnce,
+
+  /// Execute this call and auto-allow the tool for the rest of the session
+  /// (critical `bash` patterns still prompt).
+  approveAlways,
+
+  /// Refuse execution; the model receives an error tool result.
+  deny,
+}
+
+/// One approval prompt, handed to the [ApprovalPrompt] callback.
+final class ApprovalRequest {
+  const ApprovalRequest({
+    required this.toolName,
+    required this.tier,
+    required this.arguments,
+    required this.reason,
+  });
+
+  /// Name of the tool about to run.
+  final String toolName;
+
+  /// The tool's capability tier.
+  final ApprovalTier tier;
+
+  /// The raw (not yet schema-validated) tool call arguments.
+  final Map<String, dynamic> arguments;
+
+  /// Why approval is required (mode, per-tool prompt policy, or the critical
+  /// pattern that matched).
+  final String reason;
+}
+
+/// Renders an approval prompt and resolves with the user's [ApprovalDecision].
+///
+/// Surfaces (CLI, Flutter, web) inject their own UI through this callback.
+typedef ApprovalPrompt =
+    FutureOr<ApprovalDecision> Function(ApprovalRequest request);
+
+/// The outcome of an [ApprovalManager.authorize] check.
+final class ApprovalOutcome {
+  const ApprovalOutcome._(this.allowed, this.reason);
+
+  /// The call may execute.
+  const ApprovalOutcome.allowed() : this._(true, null);
+
+  /// The call is refused; [reason] goes into the error tool result.
+  const ApprovalOutcome.denied(String reason) : this._(false, reason);
+
+  /// Whether the tool call may execute.
+  final bool allowed;
+
+  /// Denial reason shown to the model (and user); `null` when allowed.
+  final String? reason;
+}
+
+/// Holds the approval state of a session and resolves policy per tool call.
+///
+/// Resolution order (see the library doc for the model):
+///
+/// 1. An explicit per-tool `deny` override refuses the call.
+/// 2. A skill's `disallowed-tools` (turn-scoped) refuses the call.
+/// 3. A critical `bash` pattern forces a prompt — except in `unattended`
+///    mode, where there is no user to answer one.
+/// 4. A per-tool `allow`/`prompt` override applies.
+/// 5. A skill's `allowed-tools` (turn-scoped) auto-allows the call.
+/// 6. The session always-allow set (from "approve always" answers) applies.
+/// 7. The session [mode] compares against the tool's tier.
+///
+/// When resolution lands on [ApprovalPolicy.prompt] and no [prompt] callback
+/// is installed, the call is DENIED with a "no approval UI" reason — the
+/// safe default for headless/non-interactive runs.
+final class ApprovalManager {
+  /// Creates a manager. [overrides] and [alwaysAllow] seed the per-tool
+  /// policy map and the session always-allow set (both are copied).
+  /// [overrideOrigins] names where an override came from (config scope,
+  /// host always-prompt guard, …) — surfaced in the prompt reason so a
+  /// surprise override is self-diagnosing (issue #380 AC3).
+  ApprovalManager({
+    this.mode = ApprovalMode.yolo,
+    Map<String, ApprovalPolicy> overrides = const {},
+    Map<String, String> overrideOrigins = const {},
+    Set<String> alwaysAllow = const {},
+    this.prompt,
+  }) : _overrides = Map.of(overrides),
+       _overrideOrigins = Map.of(overrideOrigins),
+       _alwaysAllow = Set.of(alwaysAllow);
+
+  /// The active session mode. Mutable at runtime (`/approval`, settings UI).
+  ApprovalMode mode;
+
+  /// The prompt surface. When `null`, any call resolving to
+  /// [ApprovalPolicy.prompt] is denied (safe default).
+  ApprovalPrompt? prompt;
+
+  final Map<String, ApprovalPolicy> _overrides;
+
+  /// Where each override came from (see the ctor's [overrideOrigins]).
+  final Map<String, String> _overrideOrigins;
+
+  final Set<String> _alwaysAllow;
+
+  /// Turn-scoped skill grants (`allowed-tools`) / revocations
+  /// (`disallowed-tools`) from an invoked skill's frontmatter. They apply to
+  /// the current turn only and are cleared by [clearTurnGrants] when the
+  /// user sends the next message (Claude semantics). A turn DENY outranks
+  /// mode and grants but never an explicit per-tool `deny`; the critical
+  /// `bash` interceptor still outranks a turn grant.
+  final Set<String> _turnAllow = {};
+  final Set<String> _turnDeny = {};
+
+  /// Grants/revokes tool permissions for the current turn (skill
+  /// `allowed-tools`/`disallowed-tools`).
+  void grantForTurn({
+    Iterable<String> allow = const [],
+    Iterable<String> deny = const [],
+  }) {
+    _turnAllow.addAll(allow);
+    _turnDeny.addAll(deny);
+  }
+
+  /// Clears the turn-scoped grants (called when the user sends a new
+  /// message).
+  void clearTurnGrants() {
+    _turnAllow.clear();
+    _turnDeny.clear();
+  }
+
+  /// Names in the session always-allow set, sorted.
+  List<String> get alwaysAllowedTools =>
+      List.unmodifiable(_alwaysAllow.toList()..sort());
+
+  /// The per-tool override for [toolName], or `null` when unset.
+  ApprovalPolicy? overrideFor(String toolName) => _overrides[toolName];
+
+  /// Where [toolName]'s override came from (see [setOverride]'s [origin]),
+  /// or `null` when unset — the settings-surface hook for showing the
+  /// override's scope (issue #380 AC3).
+  String? overrideOriginFor(String toolName) => _overrideOrigins[toolName];
+
+  /// Sets (or replaces) the per-tool override for [toolName]. [origin]
+  /// names where the override comes from (config scope, host
+  /// always-prompt guard, …) — shown in the prompt reason.
+  void setOverride(String toolName, ApprovalPolicy policy, {String? origin}) {
+    _overrides[toolName] = policy;
+    if (origin == null) {
+      _overrideOrigins.remove(toolName);
+    } else {
+      _overrideOrigins[toolName] = origin;
+    }
+  }
+
+  /// Removes the per-tool override for [toolName].
+  void clearOverride(String toolName) {
+    _overrides.remove(toolName);
+    _overrideOrigins.remove(toolName);
+  }
+
+  /// Adds [toolName] to the session always-allow set.
+  void allowAlways(String toolName) {
+    _alwaysAllow.add(toolName);
+  }
+
+  /// Whether [toolName] is in the session always-allow set.
+  bool isAlwaysAllowed(String toolName) => _alwaysAllow.contains(toolName);
+
+  /// Resolves the policy for one tool call and, when it lands on
+  /// [ApprovalPolicy.prompt], awaits the user's decision via [prompt].
+  Future<ApprovalOutcome> authorize({
+    required String toolName,
+    required ApprovalTier tier,
+    required Map<String, dynamic> arguments,
+  }) async {
+    // 1. An explicit deny wins over everything, the interceptor included.
+    final denied = _denyOverrideOutcome(toolName);
+    if (denied != null) return denied;
+
+    // 1b. A skill's disallowed-tools (turn-scoped) blocks the call.
+    if (_turnDeny.contains(toolName)) {
+      return ApprovalOutcome.denied(
+        'Tool "$toolName" is disallowed by the active skill for this turn.',
+      );
+    }
+
+    // 2. Critical bash patterns force a prompt in interactive modes
+    //    (always-ask/write/yolo). In `unattended` the mode wins: there is
+    //    no user to answer, so the session must never block.
+    if (mode != ApprovalMode.unattended) {
+      final critical = await _criticalBashOutcome(
+        toolName: toolName,
+        tier: tier,
+        arguments: arguments,
+      );
+      if (critical != null) return critical;
+    }
+
+    // 3. Remaining per-tool overrides.
+    final overridden = await _overrideOutcome(
+      toolName: toolName,
+      tier: tier,
+      arguments: arguments,
+    );
+    if (overridden != null) return overridden;
+
+    // 4. A skill's allowed-tools (turn-scoped) auto-allows the call.
+    if (_turnAllow.contains(toolName)) {
+      return const ApprovalOutcome.allowed();
+    }
+
+    // 5. Session always-allow ("approve always" answers, `/allow`).
+    if (_alwaysAllow.contains(toolName)) {
+      return const ApprovalOutcome.allowed();
+    }
+
+    // 6. Session mode vs. tool tier.
+    return _modeOutcome(toolName: toolName, tier: tier, arguments: arguments);
+  }
+
+  ApprovalOutcome? _denyOverrideOutcome(String toolName) {
+    if (_overrides[toolName] == ApprovalPolicy.deny) {
+      return ApprovalOutcome.denied(
+        'Tool "$toolName" is denied by the configured approval policy.',
+      );
+    }
+    return null;
+  }
+
+  Future<ApprovalOutcome>? _criticalBashOutcome({
+    required String toolName,
+    required ApprovalTier tier,
+    required Map<String, dynamic> arguments,
+  }) {
+    if (!criticalCommandToolNames.contains(toolName)) return null;
+    final command = arguments['command'];
+    final label = command is String ? matchCriticalBashCommand(command) : null;
+    if (label == null) return null;
+    return _requestDecision(
+      toolName: toolName,
+      tier: tier,
+      arguments: arguments,
+      reason: 'Critical pattern detected: $label',
+    );
+  }
+
+  Future<ApprovalOutcome?> _overrideOutcome({
+    required String toolName,
+    required ApprovalTier tier,
+    required Map<String, dynamic> arguments,
+  }) async {
+    switch (_overrides[toolName]) {
+      case ApprovalPolicy.allow:
+        return const ApprovalOutcome.allowed();
+      case ApprovalPolicy.prompt:
+        final origin = _overrideOrigins[toolName];
+        return _requestDecision(
+          toolName: toolName,
+          tier: tier,
+          arguments: arguments,
+          reason: origin == null
+              ? 'Tool "$toolName" is set to always ask for approval'
+              : 'Tool "$toolName" is set to always ask for approval '
+                    '(from: $origin)',
+        );
+      case ApprovalPolicy.deny || null:
+        return null; // deny was handled first; nothing overrides here.
+    }
+  }
+
+  Future<ApprovalOutcome> _modeOutcome({
+    required String toolName,
+    required ApprovalTier tier,
+    required Map<String, dynamic> arguments,
+  }) async {
+    switch (mode) {
+      case ApprovalMode.yolo || ApprovalMode.unattended:
+        return const ApprovalOutcome.allowed();
+      case ApprovalMode.write:
+        if (tier == ApprovalTier.read) return const ApprovalOutcome.allowed();
+        return _requestDecision(
+          toolName: toolName,
+          tier: tier,
+          arguments: arguments,
+          reason: 'Mode "write" requires approval for ${tier.name}-tier tools',
+        );
+      case ApprovalMode.alwaysAsk:
+        return _requestDecision(
+          toolName: toolName,
+          tier: tier,
+          arguments: arguments,
+          reason: 'Mode "always-ask" requires approval for every tool call',
+        );
+    }
+  }
+
+  Future<ApprovalOutcome> _requestDecision({
+    required String toolName,
+    required ApprovalTier tier,
+    required Map<String, dynamic> arguments,
+    required String reason,
+  }) async {
+    final callback = prompt;
+    if (callback == null) {
+      return ApprovalOutcome.denied(
+        'Tool "$toolName" requires approval ($reason), but no approval UI is '
+        'available. The call was denied.',
+      );
+    }
+    final decision = await callback(
+      ApprovalRequest(
+        toolName: toolName,
+        tier: tier,
+        arguments: arguments,
+        reason: reason,
+      ),
+    );
+    switch (decision) {
+      case ApprovalDecision.approveOnce:
+        return const ApprovalOutcome.allowed();
+      case ApprovalDecision.approveAlways:
+        _alwaysAllow.add(toolName);
+        return const ApprovalOutcome.allowed();
+      case ApprovalDecision.deny:
+        return ApprovalOutcome.denied(
+          'The user denied the "$toolName" tool call.',
+        );
+    }
+  }
+}
+
+/// The CLI/config spelling of an [ApprovalMode] (`always-ask`, `write`,
+/// `yolo`, `autopilot`).
+extension ApprovalModeLabel on ApprovalMode {
+  /// The stable lowercase label used in config files and slash commands.
+  String get label => switch (this) {
+    ApprovalMode.alwaysAsk => 'always-ask',
+    ApprovalMode.write => 'write',
+    ApprovalMode.yolo => 'yolo',
+    ApprovalMode.unattended => kAutopilotLabel,
+  };
+}
+
+/// The CLI label of the never-blocks approval mode (gh-946): renamed from
+/// `unattended` to `autopilot`. The old spelling stays accepted by
+/// [approvalModeFromLabel] so persisted configs and hosts keep loading.
+const String kAutopilotLabel = 'autopilot';
+
+/// Parses a CLI/config label into an [ApprovalMode]; `null` when unknown.
+ApprovalMode? approvalModeFromLabel(String? value) {
+  return switch (value?.trim()) {
+    'always-ask' || 'alwaysAsk' => ApprovalMode.alwaysAsk,
+    'write' => ApprovalMode.write,
+    'yolo' => ApprovalMode.yolo,
+    kAutopilotLabel || 'unattended' => ApprovalMode.unattended,
+    _ => null,
+  };
+}

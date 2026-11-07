@@ -1,0 +1,885 @@
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+const _model = Model(
+  id: 'test-model',
+  api: 'test-api',
+  provider: 'test-provider',
+  baseUrl: 'https://example.test',
+  contextWindow: 100000,
+  maxTokens: 4096,
+);
+
+AssistantMessage _assistant({
+  List<ContentBlock> content = const [],
+  StopReason stopReason = StopReason.stop,
+}) {
+  return AssistantMessage(
+    content: content,
+    api: 'test-api',
+    provider: 'test-provider',
+    model: 'test-model',
+    usage: Usage.zero,
+    stopReason: stopReason,
+    timestamp: DateTime.utc(2026),
+  );
+}
+
+List<AssistantMessageEvent> _textTurn(String text) {
+  final empty = _assistant();
+  final partial = _assistant(content: [TextContent(text: text)]);
+  return [
+    StartEvent(partial: empty),
+    TextStartEvent(contentIndex: 0, partial: empty),
+    TextDeltaEvent(contentIndex: 0, delta: text, partial: partial),
+    DoneEvent(reason: StopReason.stop, message: partial),
+  ];
+}
+
+List<AssistantMessageEvent> _toolTurn(List<ToolCall> calls) {
+  final empty = _assistant();
+  final partial = _assistant(content: calls, stopReason: StopReason.toolUse);
+  final events = <AssistantMessageEvent>[StartEvent(partial: empty)];
+  for (var i = 0; i < calls.length; i++) {
+    events
+      ..add(ToolCallStartEvent(contentIndex: i, partial: empty))
+      ..add(
+        ToolCallEndEvent(contentIndex: i, toolCall: calls[i], partial: partial),
+      );
+  }
+  events.add(DoneEvent(reason: StopReason.toolUse, message: partial));
+  return events;
+}
+
+/// Scripted [StreamFunction] replaying pre-recorded turns.
+class _FakeStreamFunction {
+  _FakeStreamFunction(this.turns);
+
+  final List<List<AssistantMessageEvent>> turns;
+
+  AssistantMessageEventStream call(
+    Model model,
+    Context context, {
+    CancelToken? cancelToken,
+  }) {
+    final stream = AssistantMessageEventStream();
+    for (final event in turns.removeAt(0)) {
+      stream.push(event);
+    }
+    stream.end();
+    return stream;
+  }
+}
+
+/// An [AgentTool] that records executions and answers with a fixed text.
+class _RecorderTool {
+  _RecorderTool({this.tier = ApprovalTier.exec});
+
+  final ApprovalTier tier;
+  final executions = <Map<String, dynamic>>[];
+
+  AgentTool get tool => AgentTool(
+    name: 'recorder',
+    description: 'Records calls.',
+    tier: tier,
+    execute: (arguments, cancelToken, onUpdate) async {
+      executions.add(arguments);
+      return ToolExecutionResult.text('executed');
+    },
+  );
+}
+
+Agent _agent({
+  required List<List<AssistantMessageEvent>> turns,
+  required List<AgentTool> tools,
+  ApprovalManager? approval,
+  BeforeToolCallHook? beforeToolCall,
+}) {
+  final agent = Agent(
+    model: _model,
+    streamFunction: _FakeStreamFunction(turns).call,
+    toolRegistry: ToolRegistry(tools),
+    beforeToolCall: beforeToolCall,
+  );
+  if (approval != null) attachApproval(agent, approval);
+  return agent;
+}
+
+List<ToolResultMessage> _toolResults(Agent agent) {
+  return agent.state.messages.whereType<ToolResultMessage>().toList();
+}
+
+String _resultText(ToolResultMessage message) {
+  return message.content.whereType<TextContent>().map((b) => b.text).join();
+}
+
+void main() {
+  group('ApprovalTier defaults', () {
+    test('builtin tools carry sensible tiers', () {
+      final tools = {
+        for (final tool in builtinTools(MemoryExecutionEnv())) tool.name: tool,
+      };
+      expect(tools['read']!.tier, ApprovalTier.read);
+      expect(tools['ls']!.tier, ApprovalTier.read);
+      expect(tools['write']!.tier, ApprovalTier.write);
+      expect(tools['edit']!.tier, ApprovalTier.write);
+      expect(tools['bash']!.tier, ApprovalTier.exec);
+    });
+
+    test('inspect_image is read-tier', () {
+      final tool = inspectImageTool(
+        MemoryExecutionEnv(),
+        InspectImageConfig(modelId: 'vision', apiKey: 'key'),
+      );
+      expect(tool.tier, ApprovalTier.read);
+    });
+
+    test('transcribe_audio is read-tier', () {
+      final tool = transcribeAudioTool(
+        MemoryExecutionEnv(),
+        const TranscribeAudioConfig(apiKey: 'key'),
+      );
+      expect(tool.tier, ApprovalTier.read);
+    });
+
+    test('custom tools default to exec (safe default)', () {
+      final tool = AgentTool(
+        name: 'custom',
+        description: 'No tier declared.',
+        execute: (arguments, cancelToken, onUpdate) async =>
+            ToolExecutionResult.text('ok'),
+      );
+      expect(tool.tier, ApprovalTier.exec);
+    });
+  });
+
+  group('policy resolution', () {
+    test('per-tool deny override wins, even under yolo', () async {
+      final manager = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'bash': ApprovalPolicy.deny},
+      );
+      final outcome = await manager.authorize(
+        toolName: 'bash',
+        tier: ApprovalTier.exec,
+        arguments: const {'command': 'ls'},
+      );
+      expect(outcome.allowed, isFalse);
+      expect(
+        outcome.reason,
+        contains('denied by the configured approval policy'),
+      );
+    });
+
+    test('per-tool allow override wins over always-ask', () async {
+      final manager = ApprovalManager(
+        mode: ApprovalMode.alwaysAsk,
+        overrides: const {'write': ApprovalPolicy.allow},
+      );
+      final outcome = await manager.authorize(
+        toolName: 'write',
+        tier: ApprovalTier.write,
+        arguments: const {},
+      );
+      expect(outcome.allowed, isTrue);
+    });
+
+    test('per-tool prompt override forces a prompt under yolo', () async {
+      final requests = <ApprovalRequest>[];
+      final manager = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'bash': ApprovalPolicy.prompt},
+        prompt: (request) {
+          requests.add(request);
+          return ApprovalDecision.approveOnce;
+        },
+      );
+      final outcome = await manager.authorize(
+        toolName: 'bash',
+        tier: ApprovalTier.exec,
+        arguments: const {'command': 'ls'},
+      );
+      expect(outcome.allowed, isTrue);
+      expect(requests, hasLength(1));
+      expect(requests.single.toolName, 'bash');
+    });
+
+    test('a per-tool prompt override names its origin in the reason (issue '
+        '#380 AC3: overrides are self-diagnosing)', () async {
+      final requests = <ApprovalRequest>[];
+      final manager = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'bash': ApprovalPolicy.prompt},
+        overrideOrigins: const {'bash': 'host always-prompt guard'},
+        prompt: (request) {
+          requests.add(request);
+          return ApprovalDecision.approveOnce;
+        },
+      );
+      final outcome = await manager.authorize(
+        toolName: 'bash',
+        tier: ApprovalTier.exec,
+        arguments: const {'command': 'ls'},
+      );
+      expect(outcome.allowed, isTrue);
+      expect(
+        requests.single.reason,
+        'Tool "bash" is set to always ask for approval '
+        '(from: host always-prompt guard)',
+      );
+      // No origin recorded — reason stays as before.
+      final bare = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'write': ApprovalPolicy.prompt},
+        prompt: (request) {
+          requests.add(request);
+          return ApprovalDecision.approveOnce;
+        },
+      );
+      await bare.authorize(
+        toolName: 'write',
+        tier: ApprovalTier.write,
+        arguments: const {},
+      );
+      expect(
+        requests.last.reason,
+        'Tool "write" is set to always ask for approval',
+      );
+    });
+
+    test('mode resolution: always-ask prompts even read-tier tools', () async {
+      var prompts = 0;
+      final manager = ApprovalManager(
+        mode: ApprovalMode.alwaysAsk,
+        prompt: (request) {
+          prompts++;
+          return ApprovalDecision.deny;
+        },
+      );
+      final outcome = await manager.authorize(
+        toolName: 'read',
+        tier: ApprovalTier.read,
+        arguments: const {},
+      );
+      expect(outcome.allowed, isFalse);
+      expect(prompts, 1);
+    });
+
+    test(
+      'mode resolution: write allows read, prompts write and exec',
+      () async {
+        final prompted = <String>[];
+        final manager = ApprovalManager(
+          mode: ApprovalMode.write,
+          prompt: (request) {
+            prompted.add(request.toolName);
+            return ApprovalDecision.approveOnce;
+          },
+        );
+        Future<bool> allowed(String name, ApprovalTier tier) async {
+          final outcome = await manager.authorize(
+            toolName: name,
+            tier: tier,
+            arguments: const {},
+          );
+          return outcome.allowed;
+        }
+
+        expect(await allowed('read', ApprovalTier.read), isTrue);
+        expect(prompted, isEmpty);
+        expect(await allowed('write', ApprovalTier.write), isTrue);
+        expect(await allowed('bash', ApprovalTier.exec), isTrue);
+        expect(prompted, ['write', 'bash']);
+      },
+    );
+
+    test('mode resolution: yolo allows everything', () async {
+      final manager = ApprovalManager(mode: ApprovalMode.yolo);
+      for (final tier in ApprovalTier.values) {
+        final outcome = await manager.authorize(
+          toolName: 'tool-${tier.name}',
+          tier: tier,
+          arguments: const {},
+        );
+        expect(outcome.allowed, isTrue, reason: 'tier ${tier.name}');
+      }
+    });
+
+    test(
+      'approve always adds the tool to the session always-allow set',
+      () async {
+        var prompts = 0;
+        final manager = ApprovalManager(
+          mode: ApprovalMode.write,
+          prompt: (request) {
+            prompts++;
+            return ApprovalDecision.approveAlways;
+          },
+        );
+        Future<ApprovalOutcome> call() => manager.authorize(
+          toolName: 'write',
+          tier: ApprovalTier.write,
+          arguments: const {},
+        );
+
+        expect((await call()).allowed, isTrue);
+        expect(prompts, 1);
+        expect(manager.isAlwaysAllowed('write'), isTrue);
+        expect(manager.alwaysAllowedTools, ['write']);
+        // Second call is auto-allowed without prompting.
+        expect((await call()).allowed, isTrue);
+        expect(prompts, 1);
+      },
+    );
+
+    test('override origins: set, replace, clear, and read (issue #380 AC3 '
+        'surface API)', () {
+      final manager = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'bash': ApprovalPolicy.prompt},
+        overrideOrigins: const {'bash': 'configured scope'},
+      );
+      expect(manager.overrideOriginFor('bash'), 'configured scope');
+      expect(manager.overrideOriginFor('write'), isNull);
+
+      // setOverride with an origin records (and replaces) it.
+      manager.setOverride('write', ApprovalPolicy.prompt, origin: 'guard');
+      expect(manager.overrideOriginFor('write'), 'guard');
+      manager.setOverride('write', ApprovalPolicy.prompt, origin: 'config');
+      expect(manager.overrideOriginFor('write'), 'config');
+
+      // setOverride without an origin drops the recorded one.
+      manager.setOverride('bash', ApprovalPolicy.prompt);
+      expect(manager.overrideOriginFor('bash'), isNull);
+
+      // clearOverride drops the override and its origin together.
+      manager.clearOverride('write');
+      expect(manager.overrideFor('write'), isNull);
+      expect(manager.overrideOriginFor('write'), isNull);
+    });
+
+    test(
+      'null prompt callback denies with a "no approval UI" reason',
+      () async {
+        final manager = ApprovalManager(mode: ApprovalMode.write);
+        final outcome = await manager.authorize(
+          toolName: 'write',
+          tier: ApprovalTier.write,
+          arguments: const {},
+        );
+        expect(outcome.allowed, isFalse);
+        expect(outcome.reason, contains('no approval UI'));
+      },
+    );
+
+    test('mode label round-trip', () {
+      for (final mode in ApprovalMode.values) {
+        expect(approvalModeFromLabel(mode.label), mode);
+      }
+      expect(approvalModeFromLabel('nope'), isNull);
+      expect(approvalModeFromLabel(null), isNull);
+    });
+
+    test(
+      'unattended is labeled autopilot; unattended stays a legacy alias',
+      () {
+        // gh-946: the CLI spelling of the never-blocks mode is `autopilot`.
+        expect(ApprovalMode.unattended.label, 'autopilot');
+        expect(approvalModeFromLabel('autopilot'), ApprovalMode.unattended);
+        // Persisted configs and hosts written before the rename keep loading.
+        expect(approvalModeFromLabel('unattended'), ApprovalMode.unattended);
+        // The other labels are unchanged.
+        expect(ApprovalMode.alwaysAsk.label, 'always-ask');
+        expect(ApprovalMode.write.label, 'write');
+        expect(ApprovalMode.yolo.label, 'yolo');
+      },
+    );
+  });
+
+  group('bash critical-pattern escalation', () {
+    test(
+      'critical commands prompt even under yolo with always-allow',
+      () async {
+        final requests = <ApprovalRequest>[];
+        final manager = ApprovalManager(
+          mode: ApprovalMode.yolo,
+          alwaysAllow: const {'bash'},
+          prompt: (request) {
+            requests.add(request);
+            return ApprovalDecision.deny;
+          },
+        );
+        final outcome = await manager.authorize(
+          toolName: 'bash',
+          tier: ApprovalTier.exec,
+          arguments: const {'command': 'rm -rf /'},
+        );
+        expect(outcome.allowed, isFalse);
+        expect(requests, hasLength(1));
+        expect(requests.single.reason, contains('Critical pattern detected'));
+        expect(requests.single.tier, ApprovalTier.exec);
+        expect(requests.single.arguments['command'], 'rm -rf /');
+      },
+    );
+
+    test('safe bash commands do not escalate under yolo', () async {
+      final manager = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        prompt: (request) => fail('must not prompt for a safe command'),
+      );
+      final outcome = await manager.authorize(
+        toolName: 'bash',
+        tier: ApprovalTier.exec,
+        arguments: const {'command': 'ls -la && git status'},
+      );
+      expect(outcome.allowed, isTrue);
+    });
+
+    test(
+      'issue #460: rm of a /tmp file never escalates in interactive modes',
+      () async {
+        const ownerCommands = [
+          'rm -f /tmp/test_dash.js',
+          'rm -f /tmp/issue_wip_dm.json /tmp/resp_wip.json',
+        ];
+        for (final mode in {
+          ApprovalMode.yolo,
+          ApprovalMode.write,
+          ApprovalMode.alwaysAsk,
+        }) {
+          final requests = <ApprovalRequest>[];
+          final manager = ApprovalManager(
+            mode: mode,
+            prompt: (request) {
+              requests.add(request);
+              return ApprovalDecision.deny;
+            },
+          );
+          for (final command in ownerCommands) {
+            final outcome = await manager.authorize(
+              toolName: 'bash',
+              tier: ApprovalTier.exec,
+              arguments: {'command': command},
+            );
+            expect(
+              requests.where((r) => r.reason.contains('Critical pattern')),
+              isEmpty,
+              reason: 'mode=${mode.name} command=$command',
+            );
+            if (mode == ApprovalMode.yolo) {
+              expect(outcome.allowed, isTrue, reason: command);
+              expect(requests, isEmpty, reason: command);
+            }
+          }
+        }
+      },
+    );
+
+    test('catastrophes escalate in yolo, pass through in unattended', () async {
+      const catastrophes = [
+        'rm -rf /',
+        'rm -rf /*',
+        'rm -rf ~',
+        'rm -rf /usr',
+        'rm -rf \$HOME',
+        'chmod -R 777 /',
+        'chown -R root /',
+      ];
+      for (final command in catastrophes) {
+        final requests = <ApprovalRequest>[];
+        final yolo = ApprovalManager(
+          mode: ApprovalMode.yolo,
+          prompt: (request) {
+            requests.add(request);
+            return ApprovalDecision.deny;
+          },
+        );
+        final outcome = await yolo.authorize(
+          toolName: 'bash',
+          tier: ApprovalTier.exec,
+          arguments: {'command': command},
+        );
+        expect(outcome.allowed, isFalse, reason: command);
+        expect(requests, hasLength(1), reason: command);
+        expect(
+          requests.single.reason,
+          contains('Critical pattern detected'),
+          reason: command,
+        );
+
+        final unattended = ApprovalManager(
+          mode: ApprovalMode.unattended,
+          prompt: (request) => fail('unattended must never prompt: $command'),
+        );
+        final skipped = await unattended.authorize(
+          toolName: 'bash',
+          tier: ApprovalTier.exec,
+          arguments: {'command': command},
+        );
+        expect(skipped.allowed, isTrue, reason: command);
+      }
+    });
+
+    test(
+      'unattended auto-allows critical commands without prompting',
+      () async {
+        // The whole point of unattended mode: there is no user to answer a
+        // prompt, so even a critical-pattern command must not block. An
+        // explicit per-tool deny still outranks the mode.
+        final manager = ApprovalManager(
+          mode: ApprovalMode.unattended,
+          prompt: (request) => fail('unattended must never prompt'),
+        );
+        final outcome = await manager.authorize(
+          toolName: 'bash',
+          tier: ApprovalTier.exec,
+          arguments: const {'command': 'rm -rf /'},
+        );
+        expect(outcome.allowed, isTrue);
+      },
+    );
+
+    test('unattended still honors an explicit per-tool deny', () async {
+      final manager = ApprovalManager(
+        mode: ApprovalMode.unattended,
+        overrides: const {'bash': ApprovalPolicy.deny},
+        prompt: (request) => fail('deny needs no prompt'),
+      );
+      final outcome = await manager.authorize(
+        toolName: 'bash',
+        tier: ApprovalTier.exec,
+        arguments: const {'command': 'ls'},
+      );
+      expect(outcome.allowed, isFalse);
+    });
+
+    test('an explicit deny override outranks the interceptor', () async {
+      final manager = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'bash': ApprovalPolicy.deny},
+        prompt: (request) => fail('must not prompt when denied'),
+      );
+      final outcome = await manager.authorize(
+        toolName: 'bash',
+        tier: ApprovalTier.exec,
+        arguments: const {'command': 'rm -rf /'},
+      );
+      expect(outcome.allowed, isFalse);
+      expect(
+        outcome.reason,
+        contains('denied by the configured approval policy'),
+      );
+    });
+
+    test(
+      'non-bash tools with a command argument are not intercepted',
+      () async {
+        final manager = ApprovalManager(mode: ApprovalMode.yolo);
+        final outcome = await manager.authorize(
+          toolName: 'ssh',
+          tier: ApprovalTier.exec,
+          arguments: const {'command': 'rm -rf /'},
+        );
+        expect(outcome.allowed, isTrue);
+      },
+    );
+  });
+
+  group('agent loop integration', () {
+    test('deny produces an error tool result and the loop continues', () async {
+      final recorder = _RecorderTool();
+      final approval = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'recorder': ApprovalPolicy.deny},
+      );
+      final agent = _agent(
+        turns: [
+          _toolTurn(const [
+            ToolCall(id: 'tc-1', name: 'recorder', arguments: {'x': 1}),
+          ]),
+          _textTurn('adapted'),
+        ],
+        tools: [recorder.tool],
+        approval: approval,
+      );
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      expect(recorder.executions, isEmpty);
+      final results = _toolResults(agent);
+      expect(results, hasLength(1));
+      expect(results.single.isError, isTrue);
+      expect(_resultText(results.single), contains('denied'));
+      // The model saw the error and the run completed with its next turn.
+      expect(
+        agent.state.messages
+            .whereType<AssistantMessage>()
+            .last
+            .content
+            .whereType<TextContent>()
+            .map((b) => b.text)
+            .join(),
+        'adapted',
+      );
+    });
+
+    test(
+      'prompt approve-once executes the tool with the raw arguments',
+      () async {
+        final recorder = _RecorderTool(tier: ApprovalTier.write);
+        final requests = <ApprovalRequest>[];
+        final approval = ApprovalManager(
+          mode: ApprovalMode.write,
+          prompt: (request) {
+            requests.add(request);
+            return ApprovalDecision.approveOnce;
+          },
+        );
+        final agent = _agent(
+          turns: [
+            _toolTurn(const [
+              ToolCall(id: 'tc-1', name: 'recorder', arguments: {'path': 'a'}),
+            ]),
+            _textTurn('done'),
+          ],
+          tools: [recorder.tool],
+          approval: approval,
+        );
+        await agent.prompt('go');
+        await agent.waitForIdle();
+
+        expect(recorder.executions, [
+          {'path': 'a'},
+        ]);
+        expect(requests, hasLength(1));
+        expect(requests.single.toolName, 'recorder');
+        expect(requests.single.tier, ApprovalTier.write);
+        final results = _toolResults(agent);
+        expect(results.single.isError, isFalse);
+        expect(_resultText(results.single), 'executed');
+      },
+    );
+
+    test('yolo honors the real builtin registry end to end (issue #380 AC1: '
+        'ordinary write/edit/ls run with zero prompt invocations)', () async {
+      final tools = builtinTools(
+        MemoryExecutionEnv(),
+      ).where((t) => ['ls', 'write', 'edit'].contains(t.name)).toList();
+      final approval = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        prompt: (request) => fail(
+          'yolo must not prompt for ${request.toolName}: '
+          '${request.reason}',
+        ),
+      );
+      final agent = _agent(
+        turns: [
+          _toolTurn(const [
+            ToolCall(
+              id: 'tc-1',
+              name: 'write',
+              arguments: {'path': 'a.txt', 'content': 'hello'},
+            ),
+            ToolCall(
+              id: 'tc-2',
+              name: 'edit',
+              arguments: {
+                'path': 'a.txt',
+                'oldText': 'hello',
+                'newText': 'world',
+              },
+            ),
+          ]),
+          // ls runs in a follow-up turn: within one batch the loop runs
+          // non-conflicting calls in parallel by design (issue #1084), so a
+          // same-batch ls races the write — the per-path mutation lock keys
+          // on the resolved path (an await ahead of the mutation), which
+          // deterministically lets the parallel ls list the directory
+          // before the write lands. Reads observing same-batch writes is
+          // not a modeled ordering; asserting it pinned accidental
+          // microtask timing.
+          _toolTurn(const [ToolCall(id: 'tc-3', name: 'ls', arguments: {'path': '.'})]),
+          _textTurn('done'),
+        ],
+        tools: tools,
+        approval: approval,
+      );
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      final results = _toolResults(agent);
+      expect(results, hasLength(3));
+      for (final result in results) {
+        expect(result.isError, isFalse, reason: _resultText(result));
+      }
+      expect(_resultText(results[0]), contains('Successfully wrote'));
+      expect(_resultText(results[1]), contains('Edited a.txt'));
+      expect(_resultText(results[2]), contains('a.txt'));
+    });
+
+    test('prompt deny turns the call into an error result', () async {
+      final recorder = _RecorderTool();
+      final approval = ApprovalManager(
+        mode: ApprovalMode.alwaysAsk,
+        prompt: (request) => ApprovalDecision.deny,
+      );
+      final agent = _agent(
+        turns: [
+          _toolTurn(const [
+            ToolCall(id: 'tc-1', name: 'recorder', arguments: {}),
+          ]),
+          _textTurn('done'),
+        ],
+        tools: [recorder.tool],
+        approval: approval,
+      );
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      expect(recorder.executions, isEmpty);
+      final results = _toolResults(agent);
+      expect(results.single.isError, isTrue);
+      expect(_resultText(results.single), contains('user denied'));
+    });
+
+    test('no prompt callback denies the call and names the tool', () async {
+      final recorder = _RecorderTool();
+      final approval = ApprovalManager(mode: ApprovalMode.alwaysAsk);
+      final agent = _agent(
+        turns: [
+          _toolTurn(const [
+            ToolCall(id: 'tc-1', name: 'recorder', arguments: {}),
+          ]),
+          _textTurn('done'),
+        ],
+        tools: [recorder.tool],
+        approval: approval,
+      );
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      final results = _toolResults(agent);
+      expect(results.single.isError, isTrue);
+      expect(_resultText(results.single), contains('recorder'));
+      expect(_resultText(results.single), contains('no approval UI'));
+    });
+
+    test('a plain Tool without a tier is treated as exec', () async {
+      // Tool (not AgentTool) in the context list: the loop's existence check
+      // finds it, the registry refuses execution — but approval runs first
+      // and must classify it as exec-tier (prompt in write mode).
+      final requests = <ApprovalRequest>[];
+      final approval = ApprovalManager(
+        mode: ApprovalMode.write,
+        prompt: (request) {
+          requests.add(request);
+          return ApprovalDecision.approveOnce;
+        },
+      );
+      final recorder = _RecorderTool();
+      final agent = Agent(
+        model: _model,
+        streamFunction: _FakeStreamFunction([
+          _toolTurn(const [
+            ToolCall(id: 'tc-1', name: 'recorder', arguments: {}),
+          ]),
+          _textTurn('done'),
+        ]).call,
+        toolRegistry: ToolRegistry([recorder.tool]),
+        tools: const [
+          Tool(name: 'recorder', description: 'plain shadow', parameters: {}),
+        ],
+      );
+      attachApproval(agent, approval);
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      // Write mode + exec tier → prompted once (then execution fails in the
+      // registry, which is irrelevant to the approval assertion).
+      expect(requests, hasLength(1));
+      expect(requests.single.tier, ApprovalTier.exec);
+    });
+
+    test('approval composes with a user-registered beforeToolCall', () async {
+      final recorder = _RecorderTool();
+      var userHookCalls = 0;
+      final approval = ApprovalManager(mode: ApprovalMode.yolo);
+      final agent = _agent(
+        turns: [
+          _toolTurn(const [
+            ToolCall(id: 'tc-1', name: 'recorder', arguments: {}),
+          ]),
+          _textTurn('done'),
+        ],
+        tools: [recorder.tool],
+        approval: approval,
+        beforeToolCall: (context, cancelToken) {
+          userHookCalls++;
+          return null;
+        },
+      );
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      expect(userHookCalls, 1);
+      expect(recorder.executions, hasLength(1));
+    });
+
+    test('a denied call never reaches the user beforeToolCall hook', () async {
+      final recorder = _RecorderTool();
+      var userHookCalls = 0;
+      final approval = ApprovalManager(
+        mode: ApprovalMode.yolo,
+        overrides: const {'recorder': ApprovalPolicy.deny},
+      );
+      final agent = _agent(
+        turns: [
+          _toolTurn(const [
+            ToolCall(id: 'tc-1', name: 'recorder', arguments: {}),
+          ]),
+          _textTurn('done'),
+        ],
+        tools: [recorder.tool],
+        approval: approval,
+        beforeToolCall: (context, cancelToken) {
+          userHookCalls++;
+          return null;
+        },
+      );
+      await agent.prompt('go');
+      await agent.waitForIdle();
+
+      expect(userHookCalls, 0);
+      expect(recorder.executions, isEmpty);
+    });
+
+    test(
+      'a user hook block still works after approval allows the call',
+      () async {
+        final recorder = _RecorderTool();
+        final approval = ApprovalManager(mode: ApprovalMode.yolo);
+        final agent = _agent(
+          turns: [
+            _toolTurn(const [
+              ToolCall(id: 'tc-1', name: 'recorder', arguments: {}),
+            ]),
+            _textTurn('done'),
+          ],
+          tools: [recorder.tool],
+          approval: approval,
+          beforeToolCall: (context, cancelToken) {
+            return const BeforeToolCallResult(
+              block: true,
+              reason: 'user block',
+            );
+          },
+        );
+        await agent.prompt('go');
+        await agent.waitForIdle();
+
+        expect(recorder.executions, isEmpty);
+        expect(_resultText(_toolResults(agent).single), 'user block');
+      },
+    );
+  });
+}

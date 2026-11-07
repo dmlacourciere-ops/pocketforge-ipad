@@ -1,0 +1,168 @@
+/// Interactive prompt/tool parity guard: every tool factory in the core
+/// package that accepts a host [callback] parameter must be wired in BOTH
+/// the CLI (`agent_cli.dart`) and the Flutter app (`agent_service.dart`),
+/// unless the tool is documented as platform-exempt.
+///
+/// This catches the scenario where a new interactive prompt type is added
+/// to core (e.g. a hypothetical `reviewPlanTool`) but only one platform
+/// implements the handler.
+library;
+
+import 'dart:io';
+
+import 'package:test/test.dart';
+
+/// Interactive tool factories that require a host callback. Each entry is
+/// the factory function name (as it appears in source code) and a human
+/// description. Both platforms must reference every entry.
+const _interactiveTools = <(String factory, String description)>[
+  ('askTool(', 'Structured questions to the user (AskCallback).'),
+  ('requestSecretTool(', 'Credential request (RequestSecretCallback).'),
+];
+
+/// Approval prompt wiring (not a tool factory — it's the ApprovalManager
+/// constructor's `prompt:` parameter). Both platforms must wire it.
+const _approvalWiring = <(String ref, String description)>[
+  ('ApprovalManager(', 'The approval gate — both platforms construct one.'),
+  (
+    'ApprovalPrompt',
+    'The prompt callback typedef — both platforms reference it.',
+  ),
+];
+
+void main() {
+  group('prompt parity', () {
+    late String cliSource;
+    late String appSource;
+
+    setUpAll(() async {
+      cliSource = await File('lib/src/cli/agent_cli.dart').readAsString();
+      // Also read part files (approval, provider, etc.) since methods
+      // are split across them to keep agent_cli.dart under the size gate.
+      const partFiles = [
+        'lib/src/cli/approval_commands.dart',
+        'lib/src/cli/provider_commands.dart',
+        'lib/src/cli/agent_commands.dart',
+        'lib/src/cli/settings_flow.dart',
+      ];
+      for (final part in partFiles) {
+        try {
+          cliSource += await File(part).readAsString();
+        } on Object {
+          // Part file may not exist in all branches.
+        }
+      }
+      // Issue #1079 slice 2: the CLI constructs its stack through
+      // wireAgentCore — the interactive tool factories register in the
+      // builder's tool ASSEMBLY, not in the shell anymore. Scoped to the
+      // assembly region (_buildCoreTools onward): as the other six
+      // profiles land in this file, a factory wired for a NON-CLI
+      // profile must not satisfy the CLI guard.
+      const wiringPath = 'lib/src/hosts/host_agent_wiring.dart';
+      final wiringSource = await File(wiringPath).readAsString();
+      final assemblyStart = wiringSource.indexOf(
+        'List<AgentTool> _buildCoreTools(',
+      );
+      assert(
+        assemblyStart >= 0,
+        '$wiringPath: tool assembly moved — update the parity slice',
+      );
+      cliSource += wiringSource.substring(assemblyStart);
+      appSource = await File(
+        'flutter_app/lib/services/agent_service.dart',
+      ).readAsString();
+      // Issue #1079 slice 5: the app constructs its stack through
+      // wireAgentCore too — the interactive factories register in the
+      // builder's assembly (same region as the CLI scan above); the
+      // shell's half is the callback services in its host-builder part.
+      // Scoped to the part that builds the services: a callback passed
+      // anywhere else must not satisfy the shell guard.
+      const appWiringPath =
+          'flutter_app/lib/services/agent_service_host_builder.dart';
+      appSource += await File(appWiringPath).readAsString();
+      appSource += wiringSource.substring(assemblyStart);
+    });
+
+    test('every interactive tool factory is wired in the CLI', () {
+      for (final (factory, desc) in _interactiveTools) {
+        expect(
+          cliSource,
+          contains(factory),
+          reason: 'CLI does not register $factory — $desc',
+        );
+      }
+    });
+
+    test('every interactive tool factory is wired in the app', () {
+      // Slice 5: the factories live in the builder's assembly (scanned
+      // above via the wiring source); the shell must pass the CALLBACK
+      // services — the app-side half of each interactive wiring.
+      const shellCallbacks = <String, String>{
+        'askTool(': 'onAsk:',
+        'requestSecretTool(': 'onRequestSecret:',
+      };
+      for (final (factory, desc) in _interactiveTools) {
+        expect(
+          appSource,
+          contains(factory),
+          reason: 'The builder assembly lost $factory — $desc',
+        );
+        expect(
+          appSource,
+          contains(shellCallbacks[factory]!),
+          reason:
+              'App does not pass ${shellCallbacks[factory]} (the '
+              '${factory.trimRight()} callback service) — $desc',
+        );
+      }
+    });
+
+    test('approval gate is constructed in both platforms', () {
+      for (final (ref, desc) in _approvalWiring) {
+        expect(
+          cliSource,
+          contains(ref),
+          reason: 'CLI does not reference $ref — $desc',
+        );
+        expect(
+          appSource,
+          contains(ref),
+          reason: 'App does not reference $ref — $desc',
+        );
+      }
+    });
+
+    test('every TuiPromptSpec subtype has a core type counterpart', () {
+      // The CLI's TuiPromptSpec sealed class has subtypes. Each must
+      // correspond to a shared core type. This test verifies the mapping
+      // stays 1:1 — when a new prompt spec is added, a corresponding core
+      // type must exist.
+      //
+      // Current mapping:
+      //   AskPromptSpec       → AskOption / AskAnswer (ask_tool.dart)
+      //   SecretPromptSpec    → RequestSecretResult (request_secret_tool.dart)
+      //   ApprovalPromptSpec  → ApprovalRequest / ApprovalDecision (approval.dart)
+      //   TextPromptSpec      → (no core type — standalone free-text, CLI/app-only)
+      //
+      // The test reads tui_prompt.dart and checks the core types are imported.
+      final tuiPrompt = File('lib/src/cli/tui_prompt.dart').readAsStringSync();
+      expect(
+        tuiPrompt,
+        contains('AskAnswer'),
+        reason: 'AskPromptSpec should use the shared AskAnswer type.',
+      );
+      expect(
+        tuiPrompt,
+        contains('ApprovalRequest'),
+        reason:
+            'ApprovalPromptSpec should use the shared ApprovalRequest type.',
+      );
+      expect(
+        tuiPrompt,
+        contains('RequestSecretResult'),
+        reason:
+            'SecretPromptSpec should use the shared RequestSecretResult type.',
+      );
+    });
+  });
+}

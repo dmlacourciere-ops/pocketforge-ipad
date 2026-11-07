@@ -1,0 +1,326 @@
+# Cubes
+
+A **cube** is a declarative sandbox profile for a Fa run: a strict yaml
+manifest that clamps which commands may execute, which hosts may be
+reached, which paths may be touched, which environment variables the run
+sees, and how much time and disk the run may consume. Manifests live in
+`.fah/cubes/<name>.yaml` inside a project; `/cube` manages them live.
+
+Fa parses cube manifests **strictly**: a wrong `apiVersion`, a bad name,
+or an unknown key at any level is a loud startup error — a broken manifest
+never fails open into an unconfined run.
+
+## A full example
+
+```yaml
+apiVersion: fa/v1
+kind: Cube
+metadata:
+  name: web-scraper
+  description: "Fetches documentation pages and extracts text."
+spec:
+  tools:
+    allow: [curl, wget, "git*"]
+    deny: ["git push"]
+  network:
+    allow:
+      - {host: "*.example.com", ports: [80, 443]}
+      - {host: api.github.com, ports: [443]}
+    deny:
+      - {host: "*", ports: [22, 3389]}
+  filesystem:
+    workspace: /workspace
+    mounts:
+      - {path: /usr/share/doc, access: ro}
+      - {path: ~/.ssh, access: deny}
+  env:
+    - {name: FAH_MODE, value: sandboxed}
+    - {name: SCRAPER_KEY, valueFrom: "env:API_KEY"}
+    - {name: HOME, hidden: true}
+  resources:
+    limits: {cpu: "50%", memory: 512Mi, disk: 100Mi}
+    timeout: 3600s
+  cache:
+    enabled: true
+    paths: [/workspace/.cache]
+    restore: true
+    ttl: 24h
+```
+
+Safe defaults apply to every omitted section: deny-all tools, deny-all
+network, workspace `/workspace` with no mounts, host environment passed
+through unchanged, no resource limits, and caching disabled. A cube with
+no `spec:` at all confines nothing but runs nothing.
+
+## Yaml reference
+
+A JSON Schema for this document lives at `schema/cube_schema.json`
+(draft 2020-12) — it mirrors the parser below.
+
+### Document
+
+| Key | Type | Notes |
+|---|---|---|
+| `apiVersion` | string | Required. Exactly `fa/v1`. |
+| `kind` | string | Required. Exactly `Cube`. |
+| `metadata.name` | string | Required. `^[a-z][a-z0-9-]*$`. |
+| `metadata.description` | string | Optional. |
+| `spec` | map | Optional; every subsection below is optional. |
+
+### `spec.backend`
+
+`policy` (default) or `kernel`. **kernel — OS confinement**: selects the
+hard OS boundary in addition to the Dart policy layer; `policy` enforces
+in Dart only.
+
+An explicit `backend: kernel` is a contract, not a wish: when the host
+cannot deliver kernel isolation, the run is **refused** (a clean
+`fa_cube[<name>]:` error on every command; zero commands run) unless the
+manifest opts into the fallback:
+
+```yaml
+spec:
+  backend: kernel
+  allowDegrade: true   # permit policy-mode fallback when kernel is unavailable
+```
+
+| Host platform | `backend: kernel` | `+ allowDegrade: true` | `backend: policy` |
+|---|---|---|---|
+| macOS (`sandbox-exec`) | kernel | kernel | policy |
+| Linux (user namespaces available) | kernel | kernel | policy |
+| Linux (no user namespaces)¹ | hard launch error¹ | hard launch error¹ | policy |
+| Windows / web (descriptor-only) | refusal | policy (+ loud warning) | policy |
+
+¹ Linux has no user-namespace capability probe: the kernel backend binds
+and every command fails at launch — a clean
+`fa_cube[<name>]: kernel backend unshare failed: Operation not permitted`
+error. Launch failures are **never** degraded, even with
+`allowDegrade: true`; the opt-in covers only hosts with no enforcing
+backend at all.
+
+A refusal names the opt-in (`... set spec.allowDegrade: true to allow the
+degrade`) so the fix is discoverable. The degrade path announces itself
+(`fa_cube[<name>]: kernel backend unavailable, running in policy mode`)
+and the shell exposes `effectiveBackend()` so hosts can display/audit
+what actually ran. `allowDegrade` never rescues a *launch* failure: a
+missing `sandbox-exec`/`unshare` or an EPERM refusal stays a hard error
+regardless. The policy-mode floor keeps its documented limitations (no
+full env scrubbing; inherited variables ride along).
+
+### `spec.tools`
+
+| Key | Type | Notes |
+|---|---|---|
+| `allow` | string list | Command word(s) that may run. An entry matches exactly, as a word-boundary prefix (`git push` matches `git push -f`), or with a trailing `*` as a character-level prefix (`git*` matches `git` and `gitk`). Empty (or absent) = deny everything. |
+| `deny` | string list | Always refused, even when `allow` matches. Deny wins. |
+
+### `spec.network`
+
+`allow` / `deny` rule lists. A rule is a bare host string (any port) or
+`{host, ports}`; omitted or empty `ports` means any port. Hosts match
+exactly (case-insensitive), `*` matches everything, `*.domain` matches
+the apex and any subdomain but never `notexample.com`. IP literals match
+exactly. Deny wins; an empty `allow` denies all network.
+
+The policy gates every model-chosen web egress: `web_fetch` checks the
+requested URL before any socket opens (a denial answers with a
+`fa_cube[<name>]: network …` note — a normal tool result, never an
+error event), `web_search` runs only providers whose endpoint the policy
+allows, and redirect hops are re-checked per hop. Without an active cube
+the gate is allow-all and byte-identical to pre-gate behavior.
+
+### `spec.filesystem`
+
+| Key | Type | Notes |
+|---|---|---|
+| `workspace` | path | Read/write root; absolute or `~/`-relative. Default `/workspace`. |
+| `mounts` | list | `{path, access}` with access `ro`, `rw`, or `deny`. The **longest matching mount wins**; otherwise paths inside the workspace are read/write and everything else is denied. |
+
+Path checks resolve symlinks: every path component is probed and links are
+followed (chains to a fixed depth, `..` applied after resolution, unreadable
+indirections such as Windows reparse points fail closed), so a path is
+judged — and opened — by its real-path target, not its written form. `~` is
+expanded, and a `..` climb above `/` is denied. Without a filesystem probe
+(web hosts, tests) the check degrades to the written form.
+
+### `spec.env`
+
+A list of `{name, value}`, `{name, valueFrom}`, or `{name, hidden}` —
+exactly one of the three per entry, no duplicates:
+
+- `value: <string>` — literal value injected into the run.
+- `valueFrom: "env:NAME"` — read from the host environment at run start;
+  a missing source is simply absent.
+- `hidden: true` — removed from the child environment.
+
+A non-empty `env` starts the run from a clean environment: only `PATH`,
+`HOME` and `TMPDIR` survive from the host (each droppable by declaring it
+hidden or overriding it). An absent `env` section passes the host
+environment through unchanged.
+
+### `spec.resources`
+
+| Key | Type | Notes |
+|---|---|---|
+| `limits.cpu` | string | Kept verbatim (e.g. `"50%"`), interpreted by the enforcing backend. |
+| `limits.memory`, `limits.disk` | size | Integer bytes or `512Mi`-style: `B`, `K`/`KiB` (1024), `KB` (1000), `M`/`Mi`/`MiB`, `MB`, `G`/`GiB`, `GB`, case-insensitive. `disk` prunes old cache entries. |
+| `timeout` | duration | Integer seconds or `3600s` / `5m` / `24h` (single unit; `1h30m` is rejected). Clamps every shell command of the run. |
+
+### `spec.cache`
+
+| Key | Type | Notes |
+|---|---|---|
+| `enabled` | bool | Defaults `true` when the section is present; the absent section disables caching. |
+| `paths` | path list | Cube-relative directories snapshotted between runs. |
+| `restore` | bool | Defaults `true`; restores caches into a fresh sandbox before the run. |
+| `ttl` | duration | Entry lifetime; omitted = no expiry. |
+
+## Resolution order
+
+Which cube applies to a run, highest precedence first:
+
+1. `--cube-config <path>` — explicit manifest file (`~` expanded).
+2. `--cube <name>` — `<cwd>/.fah/cubes/<name>.yaml`.
+3. `cube:` in the project `.fah/config.yaml`.
+4. `cube:` in the user `~/.fah/config.yaml`.
+
+The `cube:` config section takes `enabled:` (default `true`) and
+`config:` — a manifest path (anything containing `/`) or a bare name
+resolved under `.fah/cubes/`. Requesting a missing or invalid cube is a
+hard error, never a silent fallback to an unconfined run.
+
+## CLI surface
+
+Flags:
+
+- `--cube <name>` — apply a cube by name from `.fah/cubes/`.
+- `--cube-config <path>` — apply a cube from an explicit manifest path.
+
+Slash commands (line mode):
+
+| Command | Effect |
+|---|---|
+| `/cube` | Show the active profile: identity, backend, policy summary, cache. |
+| `/cube list` | List manifests in `.fah/cubes/` plus the built-in security presets. |
+| `/cube use <name-or-path>` | Resolve and enforce a manifest from now on (preset ids like `l2-full` resolve through the built-in catalog). `--allow-degrade` opts a kernel manifest into policy-mode fallback on hosts with no enforcing backend (SEC-05; remembered across `/cube reload`). |
+| `/cube off` | Leave sandbox mode (full host access; the boot source is kept for `/cube reload`). |
+| `/cube reload` | Re-resolve the remembered source and enforce it again (re-applying a remembered `--allow-degrade`). |
+| `/cube templates` | List the fa1.dev registry catalog. |
+| `/cube install <id>` | Download a registry manifest into `.fah/cubes/` (sha256-verified). |
+| `/cube cache status` | Show the cache key, root and policy. |
+| `/cube cache clear` | Drop the active cube's cache entry. |
+
+## Enforcement layers
+
+| Concern | Dart policy layer | Kernel layer (`backend: kernel`) |
+|---|---|---|
+| Tools | `SandboxedShell` checks every command of a line (subshells included) against the allow/deny sets; a denied command answers exit 127 with an `fa_cube[<name>]:` note. | Process confinement at exec time. |
+| Network | `web_fetch`/`web_search` gated per request against `network:` (denial = `fa_cube[<name>]:` tool note, zero requests; redirect hops re-checked); lexical URL check on `curl`/`wget` and `gh api <abs-url>` operands. | Coarse egress only: `--net` removes all network when nothing is allowed; it is **not** a per-host filter — once any network is allowed, every host is reachable. |
+| Filesystem | `CubeFsGuard` clamps file operations to the fs policy (lexical, per above); `SandboxedShell` additionally path-checks shell **redirect targets** (`>`, `>>`, `<>`, `&>`, `2>`, `<` as a read; `2>&1` exempt). | macOS: SBPL rules (below). Linux: `ro` mounts re-bound read-only. |
+| Environment | Clean base + declared vars (additive; cannot strip inherited vars). | Full environment isolation. |
+| Resources | Timeout clamp per command; disk cap prunes cache entries. | Backend-interpreted caps. |
+
+### Filesystem confinement per level and mode
+
+What the strongest promise ("everything outside the workspace is denied")
+actually holds, per level and enforcement mode:
+
+| Level | Policy mode (every host) | Kernel mode · macOS (`sandbox-exec`) | Kernel mode · Linux (`unshare`) |
+|---|---|---|---|
+| L1 | Command allowlist plus redirect-target path checks. Command **arguments** are not path-checked (`cat /etc/hosts` passes the name gate). | Writes: only the workspace, plus the persistence-free sinks `/dev/null` and `/dev/fd`. Reads: `/etc` (both spellings) and every user home (`/Users`) denied; the workspace stays readable and the rest of the system remains readable — a blanket read deny is impossible because exec itself must read `/bin/bash` and `/usr/lib/…` (dyld). | Names + redirects only: L1 has no mounts for unshare to re-bind. |
+| L2 | Same policy floor as L1. | Writes: blanket `deny file-write*` with the workspace re-allowed and the `ro /` mount denying writes. Reads: everywhere (the `ro /` mount). | `ro /` re-bound read-only: writes confined, reads everywhere. |
+| L3 | Redirects unrestricted — writes are allowed everywhere by design. | Reads and writes everywhere. | Reads and writes everywhere. |
+
+A `backend: kernel` spec on a host without an enforcing backend (Windows,
+web) is **refused by default** — a clean
+`fa_cube[<name>]:` error on every command, zero commands run, the message
+naming `spec.allowDegrade`. Only an explicit `allowDegrade: true` in the
+manifest (or `/cube use <preset> --allow-degrade`) degrades to policy
+mode, and it announces that loudly:
+`fa_cube[<name>]: kernel backend unavailable, running in policy mode`.
+Linux without user namespaces is different: the kernel backend binds
+there (there is no capability probe) and every command fails at launch
+with the clean `unshare failed` error — launch failures are not
+degrades, and `allowDegrade` does not apply to them.
+The policy-mode floor is the redirect check above, not a kernel boundary.
+`effectiveBackend` always reports what actually runs.
+
+Backend selection follows the host OS: macOS generates a `sandbox-exec`
+SBPL profile, Linux an `unshare` user-namespace argv prefix, and other
+platforms (including Windows) currently report a descriptor-only no-op.
+
+## Confinement contract
+
+- **Denied, not audited.** A refused command or file operation fails with
+  a short note (exit 127 for commands); there is no audit log of denials.
+- **The Dart layer is a convenience, not a boundary.** The command
+  scanner is quote-aware but not a shell parser: redirection targets are
+  extracted and path-checked (`>`/`>>`/`<>`/`&>`/`N>` as writes, `<` as a
+  read, `N>&M` fd duplicates exempt), but quoting inside `$(`, process
+  substitution and `eval` indirection are above its ceiling, and the
+  network scan sees only `curl`/`wget`/`gh api` URL arguments — bare-host
+  operands are unchecked. (The fs guard itself resolves symlinks to the
+  real target — see `spec.filesystem` above; the residual check-to-open
+  swap race is documented on `CubeFsGuard`.)
+- **No side-channel guarantees.** Timing, cache and similar side
+  channels are out of scope for the Dart layer.
+- **Kernel = hard boundary.** As the policy engine's own contract states:
+  the kernel sandbox backends (`lib/src/cube/backends/`) are the hard
+  boundary; everything above is convenience. Where the full proxy egress
+  filtering should live — future work.
+
+## Cache layout
+
+Snapshots land under `<cwd>/.fah/cube-cache/<key>/`, where `<key>` is
+the first 10 hex chars of the md5 over the spec's canonical JSON form.
+Any spec change — one new tool, one extra path — forks a new entry, so
+two runs share caches exactly while their policies agree. Entries expire
+by `ttl`, restore honors `restore:`, and `limits.disk` prunes the oldest
+sibling entries until the total fits. All cache I/O is best-effort: a
+failed copy is skipped, never fatal — a partially restored cache beats a
+crashed run.
+
+## Status (fa_cube issue #8)
+
+- **Phase 1 — landed:** manifest parsing, policy engine, sandboxed
+  shell/env/fs guards, content-addressed cache, resolver, `--cube` /
+  `--cube-config` flags and the `/cube` family.
+- **Kernel activation — landed:** `spec.backend: kernel` wraps every
+  child process in the OS sandbox — macOS `sandbox-exec -f`, Linux
+  `unshare` user namespace (`--net` only when nothing is allowed), clean
+  `env -i` environment, `ulimit` ceilings; profiles staged content-verified
+  under `<home>/.fah/cube-profiles/` — a user-level directory outside
+  every guest-writable area, re-verified against the recomputed profile
+  immediately before every wrapped exec (restaged atomically on
+  mismatch). Enforcement artifacts never live under the workspace: the
+  profile itself grants workspace writes, so a prisoner could otherwise
+  rewrite its own prison. The staging location is trust-checked at bind
+  time and kernel mode is refused (clean `fa_cube[<name>]:` error, no
+  exec) when it cannot be proven guest-unwritable — a `homeDir` inside
+  or relative to the workspace, or a spec mount granting read-write over
+  the staging directory (`~`/`/` mounts); the refusal carries the
+  remediation (`spec.allowDegrade: true` degrades the bind to policy
+  mode and fires `onDegrade`, naming the staging violation). The
+  staging directory is
+  swept once per binding for this profile's own `.tmp` orphans; other
+  bindings' profiles and temp files are never touched. Windows remains
+  descriptor-only. A wrapper that
+  is missing from PATH or refuses the sandbox surfaces as a clean
+  `fa_cube[<name>]:` spawn error, in foreground execs and background jobs
+  alike.
+- **L1 confinement repair (#632) — landed:** the macOS profile denies
+  writes blanket outside the workspace and `rw` mounts (device sinks
+  exempt) and denies reads of `/etc` and user homes for specs without a
+  root mount; the policy engine path-checks shell redirect targets in
+  policy mode; kernel→policy degradation warns loudly. `cat /etc/hosts`
+  under `l1-core` kernel mode on macOS is denied (live-validated by
+  `test/cube/backends/macos_sandbox_live_test.dart`, skipped where
+  `sandbox-exec` is absent).
+- **SBPL rule ordering (#732) — landed:** the kernel applies the LAST
+  matching rule per operation class (not the most specific), so the macOS
+  profile emits mount rules broad→narrow regardless of yaml declaration
+  order, and `rw` mounts emit both read and write allows. On macOS/SBPL a
+  nested rw mount survives a broader `ro` mount declared after it — the
+  ro+rw twin-mount workaround is obsolete. (Linux `unshare` re-binds a
+  `ro` mount VFS-wide, so its kernel nesting is coarse; there the Dart
+  guard's longest-prefix verdict has no kernel counterpart.)

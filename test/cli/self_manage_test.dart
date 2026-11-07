@@ -1,0 +1,2591 @@
+// Copyright (c) 2026, the Flutter Agent Harness authors.
+// Use of this source code is governed by a MIT license that can be found
+// in the LICENSE file.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:archive/archive.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:test/test.dart';
+
+import '../../bin/self_manage.dart';
+
+/// Provenance fixtures for the fake release `v9.9.9`: a throwaway RSA key
+/// (generated once with host openssl for this suite), a tar.gz holding
+/// `bundle/bin/fa` = `new-binary`, a zip holding
+/// `Fa.app/Contents/MacOS/Fa` = `new-zip-binary`, and a SHA256SUMS listing
+/// every prebuilt asset name, signed with the key (RSA PKCS#1 v1.5
+/// SHA-256). Static data — nothing is signed at test time.
+
+/// The test signing key's public half: the `pem:` injection target.
+const _testPem =
+    '-----BEGIN PUBLIC KEY-----\n'
+    'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0oDyFPqAfPdV6/EXT7Sa\n'
+    '/lkqlJUA1chgVeOv3HAPMfOZR5203eS8ObjYEI38WtJHTV8hGYqCHBzv7iJHz1+b\n'
+    'dYf4ky1wpsza5zIsIERmPvGTkJhCeqYfOY7NauOQ9S+6oJDsUn2U4c2/3w6nv7jl\n'
+    'vgsKjoeXSvVOJSHtZ2YtLFVWxq9fIBi+Amc3+XDHEaN3UrfbSeh6/ZdRA1Pn2uYJ\n'
+    '5lnnOsJCfmsY3MqdDc0EArFdYmaisPeQdtRQcqtF4yuCfKVNajBBnPF92SXnuUqp\n'
+    'BqUtNuMpPeYoD9Fre/GqwOHIpAIDx04eAV/stIXIp0+2gNpdjn7qOJboKiW6bO7w\n'
+    'mQIDAQAB\n'
+    '-----END PUBLIC KEY-----';
+
+const _tarGzDigest =
+    'c79e4ee9e0c680a983b24c91d6fc7bff74a1b1f1e439d5a85a80caff6e64e917';
+const _zipDigest =
+    '1b83aa76a0ce4017f7be6c7cc7bfec2b5f3db1ebb629ff435fc83d75176819eb';
+
+/// The signed SHA256SUMS of release `v9.9.9` (every prebuilt asset name,
+/// byte-identical to what [_fixtureSig] signs).
+final _fixtureSums =
+    [
+      'fa-test.tar.gz',
+      'fa-macos-arm64.tar.gz',
+      'fa-macos-x64.tar.gz',
+      'fa-linux-x64.tar.gz',
+      'fa-linux-arm64.tar.gz',
+      'fa-windows-x64.zip',
+    ].map((name) => '$_tarGzDigest  $name\n').join() +
+    [
+      'fa-macos-arm64-mac.zip',
+      'fa-macos-x64-mac.zip',
+    ].map((name) => '$_zipDigest  $name\n').join();
+
+const _fixtureTarGzBase64 =
+    'H4sIAKpExmoAA+2SzQpCIRBGfRRfIBp1Rp9HSSMIF/eH6O2TlEsFXWjhjWjO5tsM+jnHMOfD'
+    'Oe5FTwDAEcl72pqgsWZDKtJWIYImJ0FpZ5WQ1LVVYx4nP5Qq/hjzNL6fK2MprZzT3rHkjxCq'
+    '/3DK/f7A5/4NGfa/CQ/+k+90R9mHRVzxr/SLfwRjhIROfZ74c/85XnZFvh+u327CMAzDbMkN'
+    'YLreMwAMAAA=';
+
+const _fixtureZipBase64 =
+    'UEsDBAoAAAAAAKJ+R10AAAAAAAAAAAAAAAAHABwARmEuYXBwL1VUCQADr0DGaq9Axmp1eAsA'
+    'AQT1AQAABBQAAABQSwMECgAAAAAAon5HXQAAAAAAAAAAAAAAABAAHABGYS5hcHAvQ29udGVu'
+    'dHMvVVQJAAOvQMZqr0DGanV4CwABBPUBAAAEFAAAAFBLAwQKAAAAAACifkddAAAAAAAAAAAA'
+    'AAAAFgAcAEZhLmFwcC9Db250ZW50cy9NYWNPUy9VVAkAA69AxmqvQMZqdXgLAAEE9QEAAAQU'
+    'AAAAUEsDBAoAAAAAAKJ+R11Mw0j8DgAAAA4AAAAYABwARmEuYXBwL0NvbnRlbnRzL01hY09T'
+    'L0ZhVVQJAAOvQMZqr0DGanV4CwABBPUBAAAEFAAAAG5ldy16aXAtYmluYXJ5UEsBAh4DCgAA'
+    'AAAAon5HXQAAAAAAAAAAAAAAAAcAGAAAAAAAAAAQAO1BAAAAAEZhLmFwcC9VVAUAA69Axmp1'
+    'eAsAAQT1AQAABBQAAABQSwECHgMKAAAAAACifkddAAAAAAAAAAAAAAAAEAAYAAAAAAAAABAA'
+    '7UFBAAAARmEuYXBwL0NvbnRlbnRzL1VUBQADr0DGanV4CwABBPUBAAAEFAAAAFBLAQIeAwoA'
+    'AAAAAKJ+R10AAAAAAAAAAAAAAAAWABgAAAAAAAAAEADtQYsAAABGYS5hcHAvQ29udGVudHMv'
+    'TWFjT1MvVVQFAAOvQMZqdXgLAAEE9QEAAAQUAAAAUEsBAh4DCgAAAAAAon5HXUzDSPwOAAAA'
+    'DgAAABgAGAAAAAAAAQAAAKSB2wAAAEZhLmFwcC9Db250ZW50cy9NYWNPUy9GYVVUBQADr0DG'
+    'anV4CwABBPUBAAAEFAAAAFBLBQYAAAAABAAEAF0BAAA7AQAAAAA=';
+
+const _fixtureSigBase64 =
+    'jooUSlgTVIqhxlBPo3O1acm60IG6IO/V9Q5lqSyB+I88BxcHdzzW3G8zTJDarE6eqhgNLkWT'
+    'xxcfuDDpU3fhcC/NXkTtqdbPWT37N/9xejlHXC0Up8uN7buq5oRf014wyiwlfi6Hhx5hm38G'
+    'erEoL43BG4FnbK1ss4h8ZRiLSg0fRe55B/EL3/A3LfqqhHsHbSkPgqap12NhztOX1031Qv4z'
+    'gA7ouX5LKqD7kLZPa9rEBdQhSOtWKXlQCX1k6kRDRkupcpVsVuY7E1Mg9dx11Jny+wUzy8/H'
+    'fif35jUV+DegD50JoXXR1e55DA55mrU8KfWcSJB3OR4AJFRKxcpsmg==';
+
+List<int> get _fixtureTarGz => base64Decode(_fixtureTarGzBase64);
+List<int> get _fixtureZip => base64Decode(_fixtureZipBase64);
+List<int> get _fixtureSig => base64Decode(_fixtureSigBase64);
+
+void main() {
+  late Directory temp;
+
+  setUp(() async {
+    temp = await Directory.systemTemp.createTemp('fa_self_manage_test');
+  });
+
+  tearDown(() async {
+    if (temp.existsSync()) temp.deleteSync(recursive: true);
+  });
+
+  File fakeExe(List<int> magic) {
+    final dir = Directory('${temp.path}/.pub-cache/bin')
+      ..createSync(recursive: true);
+    return File('${dir.path}/fa')..writeAsBytesSync(magic);
+  }
+
+  /// A client serving the fake release v9.9.9: permalink redirect,
+  /// signed provenance fixtures, and the archive ([archiveBytes]).
+  http.Client releaseClient({List<int>? archiveBytes}) =>
+      MockClient((request) async {
+        if (request.url.path.endsWith('/releases/latest')) {
+          return http.Response(
+            '',
+            302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        if (request.url.path.endsWith('SHA256SUMS.sig')) {
+          return http.Response.bytes(_fixtureSig, 200);
+        }
+        if (request.url.path.endsWith('SHA256SUMS')) {
+          return http.Response(_fixtureSums, 200);
+        }
+        return http.Response.bytes(archiveBytes ?? _fixtureTarGz, 200);
+      });
+
+  /// A runProcess seam that actually extracts tar.gz archives instead of
+  /// invoking the system `tar`.
+  Future<ProcessResult> extractingRunProcess(
+    String exe,
+    List<String> args,
+  ) async {
+    if (exe == 'tar') {
+      final destDir = args.last;
+      final archiveFile = args[args.indexOf('-xzf') + 1];
+      final data = File(archiveFile).readAsBytesSync();
+      final decoded = TarDecoder().decodeBytes(GZipDecoder().decodeBytes(data));
+      for (final entry in decoded) {
+        if (entry.isFile) {
+          final parts = entry.name.split('/');
+          final dest = File('$destDir/${parts.join('/')}');
+          dest.parent.createSync(recursive: true);
+          dest.writeAsBytesSync(entry.content as List<int>);
+        }
+      }
+    }
+    return ProcessResult(0, 0, '', '');
+  }
+
+  group('classifyInstall', () {
+    test('a .dart script is a dev run', () {
+      final install = classifyInstall(
+        scriptPath: '/repo/bin/fah.dart',
+        executablePath: '/usr/bin/dart',
+      );
+      expect(install.kind, InstallKind.devRun);
+    });
+
+    test('a pub-cache snapshot is a pub-global install', () {
+      // Kernel snapshots are not native executables (no Mach-O/ELF/PE magic).
+      final exe = fakeExe(const [0x90, 0xAB, 0xCD, 0xEF]);
+      final install = classifyInstall(
+        scriptPath: exe.path,
+        executablePath: exe.path,
+      );
+      expect(install.kind, InstallKind.pubGlobal);
+      expect(install.executable, exe.path);
+    });
+
+    test('a native Mach-O binary under pub-cache is a BINARY install', () {
+      final exe = fakeExe(const [0xCF, 0xFA, 0xED, 0xFE]);
+      final install = classifyInstall(
+        scriptPath: exe.path,
+        executablePath: exe.path,
+      );
+      // The pub activate path cannot rebuild over a native binary — the
+      // release-download swap must be used instead.
+      expect(install.kind, InstallKind.binary);
+      expect(install.executable, exe.path);
+    });
+
+    test('a native ELF binary under pub-cache is a BINARY install', () {
+      final exe = fakeExe(const [0x7F, 0x45, 0x4C, 0x46]);
+      final install = classifyInstall(
+        scriptPath: exe.path,
+        executablePath: exe.path,
+      );
+      expect(install.kind, InstallKind.binary);
+    });
+
+    test('a native PE binary under pub-cache is a BINARY install', () {
+      final exe = fakeExe(const [0x4D, 0x5A, 0x90, 0x00]);
+      final install = classifyInstall(
+        scriptPath: exe.path,
+        executablePath: exe.path,
+      );
+      expect(install.kind, InstallKind.binary);
+    });
+
+    test('a file shorter than 4 bytes does not throw', () {
+      // Regression: the magic-byte matcher must not read past EOF.
+      final stub = fakeExe(const [0x0A]);
+      final install = classifyInstall(
+        scriptPath: stub.path,
+        executablePath: stub.path,
+      );
+      expect(install.kind, InstallKind.pubGlobal);
+    });
+
+    test('a 2-byte MZ stub is still a PE binary', () {
+      final exe = fakeExe(const [0x4D, 0x5A]);
+      final install = classifyInstall(
+        scriptPath: exe.path,
+        executablePath: exe.path,
+      );
+      expect(install.kind, InstallKind.binary);
+    });
+  });
+
+  group('isYesAnswer', () {
+    test('y and yes are affirmative in any casing', () {
+      expect(isYesAnswer('y'), isTrue);
+      expect(isYesAnswer('yes'), isTrue);
+      expect(isYesAnswer('Y'), isTrue);
+      expect(isYesAnswer('Yes'), isTrue);
+      expect(isYesAnswer(' YES '), isTrue);
+    });
+
+    test('anything else — including null and empty — is a NO', () {
+      expect(isYesAnswer(null), isFalse);
+      expect(isYesAnswer(''), isFalse);
+      expect(isYesAnswer('n'), isFalse);
+      expect(isYesAnswer('no'), isFalse);
+      expect(isYesAnswer('yeah'), isFalse);
+    });
+  });
+
+  group('runSelfUpdate', () {
+    /// A client whose permalink request 302s to the given tag's release page.
+    http.Client redirectToTag(String tag) => MockClient((request) async {
+      if (request.url.host == 'github.com' &&
+          request.url.path.endsWith('/releases/latest')) {
+        return http.Response(
+          '',
+          302,
+          headers: {
+            'location':
+                'https://github.com/IstiN/flutter_agent_harness/'
+                'releases/tag/$tag',
+          },
+        );
+      }
+      return http.Response('not found', 404);
+    });
+
+    Install binaryInstall(String path) => Install(InstallKind.binary, path);
+
+    test('a dev run is refused', () async {
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => const Install(InstallKind.devRun, 'bin/fah.dart'),
+      );
+      expect(code, 1);
+    });
+
+    test('already up to date returns 0 without downloading', () async {
+      final client = redirectToTag('v0.1.0');
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => binaryInstall('${temp.path}/fa'),
+        newClient: () => client,
+      );
+      expect(code, 0);
+    });
+
+    test('unreachable GitHub (API fallback fails) returns 1', () async {
+      final client = MockClient((request) async {
+        if (request.url.host == 'github.com') {
+          return http.Response('', 200); // no location header
+        }
+        return http.Response('rate limited', 403);
+      });
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => binaryInstall('${temp.path}/fa'),
+        newClient: () => client,
+      );
+      expect(code, 1);
+    });
+
+    test('binary update downloads and swaps the executable', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final client = MockClient((request) async {
+        if (request.url.path.endsWith('/releases/latest')) {
+          return http.Response(
+            '',
+            302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        if (request.url.path.endsWith('SHA256SUMS.sig')) {
+          return http.Response.bytes(_fixtureSig, 200);
+        }
+        if (request.url.path.endsWith('SHA256SUMS')) {
+          return http.Response(_fixtureSums, 200);
+        }
+        return http.Response.bytes(_fixtureTarGz, 200);
+      });
+      final processes = <List<String>>[];
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => binaryInstall(target.path),
+        newClient: () => client,
+        pem: _testPem,
+        runProcess: (exe, args) async {
+          processes.add([exe, ...args]);
+          if (exe == 'tar') {
+            // Actually extract into the CWD passed as last arg.
+            final destDir = args.last;
+            final archiveFile = args[args.indexOf('-xzf') + 1];
+            final data = File(archiveFile).readAsBytesSync();
+            final decoded = TarDecoder().decodeBytes(
+              GZipDecoder().decodeBytes(data),
+            );
+            for (final entry in decoded) {
+              if (entry.isFile) {
+                final parts = entry.name.split('/');
+                final dest = File('$destDir/${parts.join('/')}');
+                dest.parent.createSync(recursive: true);
+                dest.writeAsBytesSync(entry.content as List<int>);
+              }
+            }
+          }
+          return ProcessResult(0, 0, '', '');
+        },
+      );
+      expect(code, 0);
+      expect(target.readAsStringSync(), 'new-binary');
+      expect(File('${target.path}.new').existsSync(), isFalse);
+      if (!Platform.isWindows) {
+        expect(processes, [
+          ['tar', '-xzf', anything, '-C', anything],
+          ['chmod', '+x', target.path],
+        ]);
+      }
+    });
+
+    test('a failed download returns 1 and keeps the old binary', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final client = MockClient((request) async {
+        if (request.url.host == 'api.github.com') {
+          return http.Response('{"tag_name": "v9.9.9"}', 200);
+        }
+        if (request.url.path.endsWith('/releases/latest')) {
+          // No location header: exercise the JSON API fallback.
+          return http.Response('', 200);
+        }
+        return http.Response('gone', 404);
+      });
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => binaryInstall(target.path),
+        newClient: () => client,
+      );
+      expect(code, 1);
+      expect(target.readAsStringSync(), 'old');
+    });
+
+    test('a tar.gz miss falls back to the stable macOS zip asset', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final client = MockClient((request) async {
+        if (request.url.path.endsWith('/releases/latest')) {
+          return http.Response(
+            '',
+            302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        if (request.url.path.endsWith('SHA256SUMS.sig')) {
+          return http.Response.bytes(_fixtureSig, 200);
+        }
+        if (request.url.path.endsWith('SHA256SUMS')) {
+          return http.Response(_fixtureSums, 200);
+        }
+        if (request.url.path.endsWith('.tar.gz')) {
+          return http.Response('gone', 404);
+        }
+        if (request.url.path.endsWith('-mac.zip')) {
+          return http.Response.bytes(_fixtureZip, 200);
+        }
+        return http.Response('not found', 404);
+      });
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => binaryInstall(target.path),
+        newClient: () => client,
+        pem: _testPem,
+        runProcess: (exe, args) async => ProcessResult(0, 0, '', ''),
+      );
+      if (Platform.isMacOS) {
+        // The archive miss routes into _zipAssetName's stable zip; the
+        // zip is downloaded, then the update aborts on provenance (the
+        // fallback verifies against the pinned release key, and these
+        // are test fixtures) — the old binary is kept.
+        expect(code, 1);
+        expect(target.readAsStringSync(), 'old');
+      } else {
+        // No zip fallback off macOS: the download failure stands.
+        expect(code, 1);
+        expect(target.readAsStringSync(), 'old');
+      }
+    });
+
+    test(
+      'pub-global update reactivates, rebuilding a stale snapshot',
+      () async {
+        final processes = <List<String>>[];
+        final code = await runSelfUpdate(
+          currentVersion: '0.1.0',
+          detectInstall: () =>
+              const Install(InstallKind.pubGlobal, '/home/.pub-cache/bin/fa'),
+          newClient: () => redirectToTag('v9.9.9'),
+          runProcess: (exe, args) async {
+            processes.add(args);
+            final listOut = args.contains('list')
+                ? 'flutter_agent_harness 0.2.0'
+                : '';
+            return ProcessResult(0, 0, listOut, '');
+          },
+        );
+        expect(code, 0);
+        // The 0.2.0 spec is newer than the running 0.1.0: deactivate first.
+        expect(processes[0], ['pub', 'global', 'list']);
+        expect(processes[1], [
+          'pub',
+          'global',
+          'deactivate',
+          'flutter_agent_harness',
+        ]);
+        expect(processes[2], [
+          'pub',
+          'global',
+          'activate',
+          'flutter_agent_harness',
+        ]);
+      },
+    );
+
+    test(
+      'pub-global update without a stale snapshot skips deactivate',
+      () async {
+        final processes = <List<String>>[];
+        final code = await runSelfUpdate(
+          currentVersion: '0.1.0',
+          detectInstall: () =>
+              const Install(InstallKind.pubGlobal, '/home/.pub-cache/bin/fa'),
+          newClient: () => redirectToTag('v9.9.9'),
+          runProcess: (exe, args) async {
+            processes.add(args);
+            final listOut = args.contains('list')
+                ? 'flutter_agent_harness 0.1.0'
+                : '';
+            return ProcessResult(0, 0, listOut, '');
+          },
+        );
+        expect(code, 0);
+        expect(processes.length, 2);
+        expect(processes[1], [
+          'pub',
+          'global',
+          'activate',
+          'flutter_agent_harness',
+        ]);
+      },
+    );
+  });
+
+  group('runSelfUninstall', () {
+    test('a dev run is refused', () async {
+      final code = await runSelfUninstall(
+        detectInstall: () => const Install(InstallKind.devRun, 'bin/fah.dart'),
+      );
+      expect(code, 1);
+    });
+
+    test('declining the confirmation aborts', () async {
+      final code = await runSelfUninstall(
+        detectInstall: () => Install(InstallKind.binary, '${temp.path}/fa'),
+        confirm: (question) async => false,
+      );
+      expect(code, 1);
+    });
+
+    test('pub-global uninstall deactivates via pub', () async {
+      final processes = <List<String>>[];
+      final code = await runSelfUninstall(
+        detectInstall: () =>
+            const Install(InstallKind.pubGlobal, '/home/.pub-cache/bin/fa'),
+        confirm: (question) async => true,
+        runProcess: (exe, args) async {
+          processes.add(args);
+          return ProcessResult(0, 0, '', '');
+        },
+        environment: const {},
+      );
+      expect(code, 0);
+      expect(processes, [
+        ['pub', 'global', 'deactivate', 'flutter_agent_harness'],
+      ]);
+    });
+
+    test(
+      'binary uninstall removes the executable and a confirmed data dir',
+      () async {
+        final exe = File('${temp.path}/fa')..writeAsStringSync('bin');
+        final home = Directory('${temp.path}/home')..createSync();
+        final dataDir = Directory('${home.path}/.fah')..createSync();
+        File('${dataDir.path}/config.yaml').writeAsStringSync('x');
+        final code = await runSelfUninstall(
+          detectInstall: () => Install(InstallKind.binary, exe.path),
+          confirm: (question) async => true,
+          environment: {'HOME': home.path},
+        );
+        expect(code, 0);
+        expect(exe.existsSync(), isFalse);
+        expect(dataDir.existsSync(), isFalse);
+      },
+    );
+
+    test('binary uninstall keeps the data dir when declined', () async {
+      final exe = File('${temp.path}/fa')..writeAsStringSync('bin');
+      final home = Directory('${temp.path}/home')..createSync();
+      final dataDir = Directory('${home.path}/.fah')..createSync();
+      var asks = 0;
+      final code = await runSelfUninstall(
+        detectInstall: () => Install(InstallKind.binary, exe.path),
+        confirm: (question) async => asks++ == 0,
+        environment: {'HOME': home.path},
+      );
+      expect(code, 0);
+      expect(exe.existsSync(), isFalse);
+      expect(dataDir.existsSync(), isTrue);
+    });
+
+    test('no data dir means no second confirmation', () async {
+      final exe = File('${temp.path}/fa')..writeAsStringSync('bin');
+      final home = Directory('${temp.path}/home')..createSync();
+      var asks = 0;
+      final code = await runSelfUninstall(
+        detectInstall: () => Install(InstallKind.binary, exe.path),
+        confirm: (question) async {
+          asks++;
+          return true;
+        },
+        environment: {'HOME': home.path},
+      );
+      expect(code, 0);
+      expect(asks, 1);
+    });
+  });
+
+  group('extractArchive', () {
+    test('extracts a zip with nested directories', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_extract_zip');
+      try {
+        final archive = Archive()
+          ..addFile(ArchiveFile.bytes('bundle/bin/fa', utf8.encode('exe')))
+          ..addFile(
+            ArchiveFile.bytes('bundle/lib/libfa.dylib', utf8.encode('lib')),
+          );
+        final zipBytes = ZipEncoder().encode(archive);
+
+        final error = await extractArchive(
+          zipBytes,
+          'fa-test.zip',
+          tmp,
+          (_, _) async => ProcessResult(0, 0, '', ''),
+        );
+        expect(error, isNull);
+        expect(File('${tmp.path}/bundle/bin/fa').readAsStringSync(), 'exe');
+        expect(
+          File('${tmp.path}/bundle/lib/libfa.dylib').readAsStringSync(),
+          'lib',
+        );
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+
+    test('skips directory entries in a zip', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_extract_zip_dir');
+      try {
+        // Archive with only directory entries (isFile = false).
+        final archive = Archive()..addFile(ArchiveFile('dir/', 0, []));
+        final zipBytes = ZipEncoder().encode(archive);
+
+        final error = await extractArchive(
+          zipBytes,
+          'test.zip',
+          tmp,
+          (_, _) async => ProcessResult(0, 0, '', ''),
+        );
+        expect(error, isNull);
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+
+    test('returns error for unknown archive format', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_extract_unknown');
+      try {
+        final error = await extractArchive(
+          [0, 1, 2],
+          'archive.rar',
+          tmp,
+          (_, _) async => ProcessResult(0, 0, '', ''),
+        );
+        expect(error, 'unknown archive format: archive.rar');
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+  });
+
+  group('copyBundleLibs (gh-1574 installer layout)', () {
+    test(
+      'installs bundle libs where the binary looks: <installDir>/../lib',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('fa_bundle_libs');
+        try {
+          final bundle = Directory('${tmp.path}/bundle')
+            ..createSync(recursive: true);
+          Directory('${bundle.path}/lib').createSync();
+          File(
+            '${bundle.path}/lib/libsqlite3.dylib',
+          ).writeAsStringSync('dylib');
+          File('${bundle.path}/lib/libsqlite3.so').writeAsStringSync('so');
+          final installDir = Directory('${tmp.path}/home/.local/bin')
+            ..createSync(recursive: true);
+          File('${installDir.path}/fa').writeAsStringSync('exe');
+
+          await copyBundleLibs(bundle, installDir);
+
+          // The AOT binary's native-assets resolver reads <exe_dir>/../lib —
+          // with the exe at <installDir>/fa that is <installDir>/../lib.
+          final libDir = Directory('${installDir.parent.path}/lib');
+          expect(
+            File('${libDir.path}/libsqlite3.dylib').readAsStringSync(),
+            'dylib',
+          );
+          expect(File('${libDir.path}/libsqlite3.so').readAsStringSync(), 'so');
+        } finally {
+          if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+        }
+      },
+    );
+
+    test('does not install bundle libs beside the binary '
+        '(the broken gh-1574 layout)', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_bundle_libs_old');
+      try {
+        final bundle = Directory('${tmp.path}/bundle')
+          ..createSync(recursive: true);
+        Directory('${bundle.path}/lib').createSync();
+        File('${bundle.path}/lib/libsqlite3.dylib').writeAsStringSync('dylib');
+        final installDir = Directory('${tmp.path}/home/.local/bin')
+          ..createSync(recursive: true);
+
+        await copyBundleLibs(bundle, installDir);
+
+        expect(
+          Directory('${installDir.path}/lib').existsSync(),
+          isFalse,
+          reason:
+              'libs must not land in <installDir>/lib — the binary '
+              'looks in <exe_dir>/../lib (gh-1574)',
+        );
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+
+    test('a bundle without a lib directory is a no-op', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_bundle_libs_none');
+      try {
+        final bundle = Directory('${tmp.path}/bundle')
+          ..createSync(recursive: true);
+        final installDir = Directory('${tmp.path}/home/.local/bin')
+          ..createSync(recursive: true);
+
+        await copyBundleLibs(bundle, installDir);
+
+        expect(
+          Directory('${installDir.parent.path}/lib').existsSync(),
+          isFalse,
+        );
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+  });
+
+  group('copyBundleClipboardHelper (gh-2040 self-update keeps fa-clip)', () {
+    test(
+      'copies the helper beside the binary and keeps it executable',
+      () async {
+        final tmp = await Directory.systemTemp.createTemp('fa_clip_update');
+        try {
+          final bundle = Directory('${tmp.path}/bundle')
+            ..createSync(recursive: true);
+          Directory('${bundle.path}/bin').createSync();
+          File('${bundle.path}/bin/fa-clip').writeAsBytesSync([1, 2, 3]);
+          final installDir = Directory('${tmp.path}/home/.local/bin')
+            ..createSync(recursive: true);
+
+          await copyBundleClipboardHelper(bundle, installDir, (_, _) async {
+            return ProcessResult(0, 0, '', '');
+          });
+
+          final copied = File('${installDir.path}/fa-clip');
+          expect(copied.existsSync(), isTrue);
+          expect(copied.readAsBytesSync(), [1, 2, 3]);
+        } finally {
+          if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+        }
+      },
+    );
+
+    test('a bundle without the helper is a no-op (AC5 degradation)', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_clip_update_old');
+      try {
+        final bundle = Directory('${tmp.path}/bundle')
+          ..createSync(recursive: true);
+        final installDir = Directory('${tmp.path}/home/.local/bin')
+          ..createSync(recursive: true);
+
+        await copyBundleClipboardHelper(bundle, installDir, (_, _) async {
+          return ProcessResult(0, 0, '', '');
+        });
+
+        expect(File('${installDir.path}/fa-clip').existsSync(), isFalse);
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+
+    test('a failing chmod does not fail the update', () async {
+      final tmp = await Directory.systemTemp.createTemp('fa_clip_update_x');
+      try {
+        final bundle = Directory('${tmp.path}/bundle')
+          ..createSync(recursive: true);
+        Directory('${bundle.path}/bin').createSync();
+        File('${bundle.path}/bin/fa-clip').writeAsBytesSync([1]);
+        final installDir = Directory('${tmp.path}/home/.local/bin')
+          ..createSync(recursive: true);
+
+        await copyBundleClipboardHelper(bundle, installDir, (_, _) async {
+          throw const ProcessException('chmod', ['+x']);
+        });
+
+        expect(
+          File('${installDir.path}/fa-clip').existsSync(),
+          isTrue,
+          reason:
+              'a non-executable helper is the AC5 degradation shape, '
+              'never a blocked update',
+        );
+      } finally {
+        if (tmp.existsSync()) tmp.deleteSync(recursive: true);
+      }
+    });
+  });
+
+  group('installer scripts install libs where the binary looks (gh-1574)', () {
+    // Static layout contract: the AOT binary resolves its bundled sqlite3 as
+    // <exe_dir>/../lib/<name>. With the exe installed flat into the install
+    // directory, every installer must copy bundle libs to
+    // <install_dir>/../lib — never <install_dir>/lib (gh-1574).
+    test('install_local.sh targets <INSTALL_DIR>/../lib', () {
+      final script = File('install_local.sh').readAsStringSync();
+      expect(
+        script,
+        contains(r'"$INSTALL_DIR/../lib/"'),
+        reason: 'bundle libs must be copied to <install_dir>/../lib',
+      );
+      expect(
+        script.contains(r'"$INSTALL_DIR/lib"'),
+        isFalse,
+        reason:
+            'installing into <install_dir>/lib is the gh-1574 bug — '
+            'the binary looks in <exe_dir>/../lib',
+      );
+    });
+
+    test('site/install.sh targets <install_dir>/../lib', () {
+      final script = File('site/install.sh').readAsStringSync();
+      expect(
+        script,
+        contains(r'lib_dir="$install_dir/../lib"'),
+        reason: 'bundle libs must be copied to <install_dir>/../lib',
+      );
+      expect(
+        script.contains(r'"$install_dir/lib"'),
+        isFalse,
+        reason:
+            'installing into <install_dir>/lib is the gh-1574 bug — '
+            'the binary looks in <exe_dir>/../lib',
+      );
+    });
+
+    test('site/install.ps1 keeps <installDir>\\lib (exe lives in bin/)', () {
+      // Windows is correct already: the exe goes to <root>\bin\fa.exe, so
+      // the native-assets lookup <exe_dir>\..\lib resolves to <root>\lib.
+      final script = File('site/install.ps1').readAsStringSync();
+      expect(script, contains(r'Join-Path $installDir "lib"'));
+      expect(script, contains(r'Join-Path $installDir "bin"'));
+    });
+
+    test('site/install.sh.template matches the generated ../lib layout', () {
+      // site/install.sh is GENERATED from the template
+      // (`dart run scripts/gen_installers.dart`); a template left on the
+      // old <install_dir>/lib layout resurrects gh-1574 on the next
+      // regeneration (gh-1574 r2 review).
+      final template = File('site/install.sh.template').readAsStringSync();
+      expect(
+        template,
+        contains(r'lib_dir="$install_dir/../lib"'),
+        reason:
+            'the template feeds the generated installer — bundle libs '
+            'must be copied to <install_dir>/../lib there too',
+      );
+      expect(
+        template.contains(r'"$install_dir/lib"'),
+        isFalse,
+        reason:
+            'installing into <install_dir>/lib is the gh-1574 bug — '
+            'the binary looks in <exe_dir>/../lib',
+      );
+    });
+
+    test('the POSIX installers surface lib-copy failures (gh-1574 r2)', () {
+      // A silently-swallowed lib copy (`2>/dev/null || true`) installs a
+      // binary that reports success but cannot load SQLite — exactly the
+      // gh-1574 symptom, undiscoverable. The copy must be able to fail,
+      // and the failure must name the target directory.
+      for (final path in [
+        'site/install.sh.template',
+        'site/install.sh',
+        'install_local.sh',
+      ]) {
+        final script = File(path).readAsStringSync();
+        final copyLine = script
+            .split('\n')
+            .firstWhere((line) => line.contains('lib/"*'));
+        expect(
+          copyLine.contains('|| true'),
+          isFalse,
+          reason: '$path must not swallow a failed lib copy',
+        );
+        expect(
+          copyLine.contains('2>/dev/null'),
+          isFalse,
+          reason: '$path must not silence a failed lib copy',
+        );
+        expect(
+          script,
+          contains('SQLite reads will fail'),
+          reason: '$path must warn (naming the lib dir) when the copy fails',
+        );
+      }
+    });
+  });
+
+  group('fallbackZipUpdate', () {
+    test('extracts and swaps the macOS binary from a zip asset', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final client = MockClient((request) async {
+        if (request.url.path.endsWith('SHA256SUMS.sig')) {
+          return http.Response.bytes(_fixtureSig, 200);
+        }
+        if (request.url.path.endsWith('SHA256SUMS')) {
+          return http.Response(_fixtureSums, 200);
+        }
+        if (request.url.path.endsWith('fa-macos-arm64-mac.zip')) {
+          return http.Response.bytes(_fixtureZip, 200);
+        }
+        return http.Response('not found', 404);
+      });
+      final processes = <List<String>>[];
+      final code = await fallbackZipUpdate(
+        client,
+        'v9.9.9',
+        'fa-macos-arm64-mac.zip',
+        target.path,
+        '9.9.9',
+        (exe, args) async {
+          processes.add([exe, ...args]);
+          return ProcessResult(0, 0, '', '');
+        },
+        pem: _testPem,
+      );
+      expect(code, 0);
+      expect(target.readAsStringSync(), 'new-zip-binary');
+      if (!Platform.isWindows) {
+        expect(processes, [
+          ['chmod', '+x', target.path],
+        ]);
+      }
+    });
+
+    test('reports a missing binary inside the zip', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final archive = Archive()
+        ..addFile(ArchiveFile('wrong/path', 3, 'abc'.codeUnits));
+      final zipBytes = ZipEncoder().encode(archive);
+      final client = MockClient((request) async {
+        return http.Response.bytes(zipBytes, 200);
+      });
+      final code = await fallbackZipUpdate(
+        client,
+        'v9.9.9',
+        'fa-macos-arm64-mac.zip',
+        target.path,
+        '9.9.9',
+        (exe, args) async => ProcessResult(0, 0, '', ''),
+      );
+      expect(code, 1);
+      expect(target.readAsStringSync(), 'old');
+    });
+
+    test('reports a failed zip download', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final client = MockClient((request) async {
+        return http.Response('gone', 404);
+      });
+      final code = await fallbackZipUpdate(
+        client,
+        'v9.9.9',
+        'fa-macos-arm64-mac.zip',
+        target.path,
+        '9.9.9',
+        (exe, args) async => ProcessResult(0, 0, '', ''),
+      );
+      expect(code, 1);
+      expect(target.readAsStringSync(), 'old');
+    });
+  });
+
+  group('compareVersions', () {
+    test('newer, older, and equal triples', () {
+      expect(compareVersions('0.1.10', '0.1.9'), greaterThan(0));
+      expect(compareVersions('0.1.9', '0.1.10'), lessThan(0));
+      expect(compareVersions('0.2.0', '0.2.0'), 0);
+      expect(compareVersions('v0.1.44', '0.1.44'), 0);
+      expect(compareVersions('0.2', '0.1.9'), greaterThan(0));
+      expect(compareVersions('0.1.10', '0.1.10.0'), 0);
+    });
+  });
+
+  group('archiveNameFor', () {
+    test('covers the five release platforms', () {
+      expect(archiveNameFor('macos_arm64'), 'fa-macos-arm64.tar.gz');
+      expect(archiveNameFor('macos_x64'), 'fa-macos-x64.tar.gz');
+      expect(archiveNameFor('linux_x64'), 'fa-linux-x64.tar.gz');
+      expect(archiveNameFor('linux_arm64'), 'fa-linux-arm64.tar.gz');
+      expect(archiveNameFor('windows_x64'), 'fa-windows-x64.zip');
+      expect(archiveNameFor('ios_arm64'), isNull);
+    });
+  });
+
+  group('rsaPublicKeyFromPem', () {
+    test('parses the pinned release key into a 4096-bit modulus', () {
+      final key = rsaPublicKeyFromPem(kFaReleaseSigningPem);
+      expect(key.n, hasLength(512));
+      expect(key.e, [0x01, 0x00, 0x01]); // 65537
+    });
+
+    test('parses the test fixture key into a 2048-bit modulus', () {
+      final key = rsaPublicKeyFromPem(_testPem);
+      expect(key.n, hasLength(256));
+      expect(key.e, [0x01, 0x00, 0x01]); // 65537
+    });
+  });
+
+  group('verifyReleaseProvenance', () {
+    http.Client signedReleaseClient() => MockClient((request) async {
+      if (request.url.path.endsWith('SHA256SUMS.sig')) {
+        return http.Response.bytes(_fixtureSig, 200);
+      }
+      if (request.url.path.endsWith('SHA256SUMS')) {
+        return http.Response(_fixtureSums, 200);
+      }
+      return http.Response('unexpected: ${request.url}', 404);
+    });
+
+    test('a signed manifest with a matching archive verifies', () async {
+      expect(
+        await verifyReleaseProvenance(
+          client: signedReleaseClient(),
+          tag: 'v9.9.9',
+          archiveName: 'fa-test.tar.gz',
+          archiveBytes: _fixtureTarGz,
+          pem: _testPem,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a tampered archive fails the digest comparison', () async {
+      final tampered = List<int>.of(_fixtureTarGz)..[10] ^= 0x5A;
+      expect(
+        await verifyReleaseProvenance(
+          client: signedReleaseClient(),
+          tag: 'v9.9.9',
+          archiveName: 'fa-test.tar.gz',
+          archiveBytes: tampered,
+          pem: _testPem,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a missing SHA256SUMS asset fails closed', () async {
+      final client = MockClient((request) async {
+        return http.Response('gone', 404);
+      });
+      expect(
+        await verifyReleaseProvenance(
+          client: client,
+          tag: 'v9.9.9',
+          archiveName: 'fa-test.tar.gz',
+          archiveBytes: _fixtureTarGz,
+          pem: _testPem,
+        ),
+        isFalse,
+      );
+    });
+
+    test('an archive absent from the manifest fails closed', () async {
+      expect(
+        await verifyReleaseProvenance(
+          client: signedReleaseClient(),
+          tag: 'v9.9.9',
+          archiveName: 'fa-unlisted.tar.gz',
+          archiveBytes: _fixtureTarGz,
+          pem: _testPem,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a signature from the wrong key fails closed', () async {
+      // _testPem signs _fixtureSums, but the client serves the PINNED key:
+      // verification against it must fail even though the digest matches.
+      expect(
+        await verifyReleaseProvenance(
+          client: signedReleaseClient(),
+          tag: 'v9.9.9',
+          archiveName: 'fa-test.tar.gz',
+          archiveBytes: _fixtureTarGz,
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('applyUpdate', () {
+    Install binaryInstall(String path) => Install(InstallKind.binary, path);
+
+    /// A client serving the fake release v9.9.9: permalink redirect,
+    /// signed provenance fixtures, and the archive ([archiveBytes]).
+    http.Client releaseClient({List<int>? archiveBytes}) =>
+        MockClient((request) async {
+          if (request.url.path.endsWith('/releases/latest')) {
+            return http.Response(
+              '',
+              302,
+              headers: {
+                'location':
+                    'https://github.com/IstiN/flutter_agent_harness/'
+                    'releases/tag/v9.9.9',
+              },
+            );
+          }
+          if (request.url.path.endsWith('SHA256SUMS.sig')) {
+            return http.Response.bytes(_fixtureSig, 200);
+          }
+          if (request.url.path.endsWith('SHA256SUMS')) {
+            return http.Response(_fixtureSums, 200);
+          }
+          return http.Response.bytes(archiveBytes ?? _fixtureTarGz, 200);
+        });
+
+    /// A runProcess seam that actually extracts tar.gz archives instead of
+    /// invoking the system `tar`.
+    Future<ProcessResult> extractingRunProcess(
+      String exe,
+      List<String> args,
+    ) async {
+      if (exe == 'tar') {
+        final destDir = args.last;
+        final archiveFile = args[args.indexOf('-xzf') + 1];
+        final data = File(archiveFile).readAsBytesSync();
+        final decoded = TarDecoder().decodeBytes(
+          GZipDecoder().decodeBytes(data),
+        );
+        for (final entry in decoded) {
+          if (entry.isFile) {
+            final parts = entry.name.split('/');
+            final dest = File('$destDir/${parts.join('/')}');
+            dest.parent.createSync(recursive: true);
+            dest.writeAsBytesSync(entry.content as List<int>);
+          }
+        }
+      }
+      return ProcessResult(0, 0, '', '');
+    }
+
+    test(
+      'downloads, verifies, swaps, keeps .bak, and spawns the successor',
+      () async {
+        final target = File('${temp.path}/fa')..writeAsStringSync('old');
+        final spawnCalls = <List<String>>[];
+        final log = <String>[];
+        final outcome = await applyUpdate(
+          currentVersion: '0.1.0',
+          launchArgs: const ['--session', 'abc'],
+          statePath: '${temp.path}/update-state.json',
+          detectInstall: () => binaryInstall(target.path),
+          newClient: () => releaseClient(),
+          runProcess: extractingRunProcess,
+          spawn: (exe, args) async {
+            spawnCalls.add([exe, ...args]);
+            return true;
+          },
+          pem: _testPem,
+          logLine: log.add,
+        );
+        expect(outcome, ApplyUpdateOutcome.applied);
+        expect(target.readAsStringSync(), 'new-binary');
+        expect(spawnCalls, [
+          [Platform.resolvedExecutable, '--session', 'abc'],
+        ]);
+        expect(log, contains('fa update applied: v0.1.0 -> v9.9.9'));
+        if (!Platform.isWindows) {
+          expect(File('${target.path}.bak').readAsStringSync(), 'old');
+        }
+      },
+    );
+
+    test(
+      'review r3: the download output rides the logLine seam, not stdout',
+      () async {
+        final target = File('${temp.path}/fa')..writeAsStringSync('old');
+        final log = <String>[];
+        final outcome = await applyUpdate(
+          currentVersion: '0.1.0',
+          launchArgs: const [],
+          statePath: '${temp.path}/update-state.json',
+          detectInstall: () => binaryInstall(target.path),
+          newClient: () => releaseClient(),
+          runProcess: extractingRunProcess,
+          spawn: (_, _) async => true,
+          pem: _testPem,
+          logLine: log.add,
+        );
+        expect(outcome, ApplyUpdateOutcome.applied);
+        // The body-phase output — the final speed line, and any
+        // progress/resume lines — must go through the same injectable
+        // seam as every other update message: the boot hook logs it to
+        // fa.log, the /update slash command renders it in-session
+        // (review r3). Raw-stdout output never reaches this capture.
+        expect(
+          log.any((line) => line.startsWith('downloaded ')),
+          isTrue,
+          reason: 'the final download line must use the logLine seam',
+        );
+      },
+    );
+
+    test(
+      'is up to date when the latest tag equals the running version',
+      () async {
+        var requests = 0;
+        final client = MockClient((request) async {
+          requests++;
+          return http.Response(
+            '',
+            302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v0.1.0',
+            },
+          );
+        });
+        final outcome = await applyUpdate(
+          currentVersion: '0.1.0',
+          launchArgs: const [],
+          statePath: '${temp.path}/update-state.json',
+          detectInstall: () => binaryInstall('${temp.path}/fa'),
+          newClient: () => client,
+          spawn: (_, _) async => fail('no successor should be spawned'),
+        );
+        expect(outcome, ApplyUpdateOutcome.upToDate);
+        expect(requests, 1);
+      },
+    );
+
+    test('a tampered archive aborts with provenanceFailed', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final tampered = List<int>.of(_fixtureTarGz)..[20] ^= 0x5A;
+      var spawned = false;
+      final outcome = await applyUpdate(
+        currentVersion: '0.1.0',
+        launchArgs: const [],
+        statePath: '${temp.path}/update-state.json',
+        detectInstall: () => binaryInstall(target.path),
+        newClient: () => releaseClient(archiveBytes: tampered),
+        runProcess: extractingRunProcess,
+        spawn: (_, _) async => spawned = true,
+        pem: _testPem,
+        logLine: (_) {},
+      );
+      expect(outcome, ApplyUpdateOutcome.provenanceFailed);
+      expect(target.readAsStringSync(), 'old');
+      expect(spawned, isFalse);
+    });
+
+    test('a failed archive download reports downloadFailed', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final client = MockClient((request) async {
+        if (request.url.path.endsWith('/releases/latest')) {
+          return http.Response(
+            '',
+            302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        return http.Response('gone', 404);
+      });
+      final outcome = await applyUpdate(
+        currentVersion: '0.1.0',
+        launchArgs: const [],
+        statePath: '${temp.path}/update-state.json',
+        detectInstall: () => binaryInstall(target.path),
+        newClient: () => client,
+        spawn: (_, _) async => fail('no successor should be spawned'),
+      );
+      expect(outcome, ApplyUpdateOutcome.downloadFailed);
+      expect(target.readAsStringSync(), 'old');
+    });
+
+    test('a dev run is refused without touching the network', () async {
+      var requests = 0;
+      final client = MockClient((request) async {
+        requests++;
+        return http.Response('', 500);
+      });
+      final outcome = await applyUpdate(
+        currentVersion: '0.1.0',
+        launchArgs: const [],
+        statePath: '${temp.path}/update-state.json',
+        detectInstall: () => const Install(InstallKind.devRun, 'bin/fah.dart'),
+        newClient: () => client,
+      );
+      expect(outcome, ApplyUpdateOutcome.refusedDevRun);
+      expect(requests, 0);
+    });
+
+    test(
+      'a failed restart keeps the new binary and reports restartFailed',
+      () async {
+        final target = File('${temp.path}/fa')..writeAsStringSync('old');
+        final log = <String>[];
+        final outcome = await applyUpdate(
+          currentVersion: '0.1.0',
+          launchArgs: const [],
+          statePath: '${temp.path}/update-state.json',
+          detectInstall: () => binaryInstall(target.path),
+          newClient: () => releaseClient(),
+          runProcess: extractingRunProcess,
+          spawn: (_, _) async => false,
+          pem: _testPem,
+          logLine: log.add,
+        );
+        expect(outcome, ApplyUpdateOutcome.restartFailed);
+        expect(target.readAsStringSync(), 'new-binary');
+        expect(log, contains('fa update restart failed'));
+      },
+    );
+  });
+
+  group('spawnSuccessor', () {
+    test(
+      'a successor still running after the settle delay counts as started',
+      () async {
+        final started = await spawnSuccessor(
+          launchArgs: const [],
+          spawn: (exe, args) => Process.start('/bin/sleep', const ['5']),
+          settleDelay: const Duration(milliseconds: 300),
+        );
+        expect(started, isTrue);
+      },
+      skip: Platform.isWindows ? 'unix-only process fixtures' : null,
+    );
+
+    test(
+      'a successor that exits non-zero during the settle delay fails',
+      () async {
+        final started = await spawnSuccessor(
+          launchArgs: const [],
+          spawn: (exe, args) =>
+              Process.start('/bin/sh', const ['-c', 'exit 3']),
+          settleDelay: const Duration(milliseconds: 300),
+        );
+        expect(started, isFalse);
+      },
+      skip: Platform.isWindows ? 'unix-only process fixtures' : null,
+    );
+
+    test('an unspawnable successor fails without throwing', () async {
+      final started = await spawnSuccessor(
+        launchArgs: const [],
+        spawn: (exe, args) =>
+            Process.start('${temp.path}/definitely-missing-binary', const []),
+      );
+      expect(started, isFalse);
+    });
+  });
+
+  group('logUpdateLine', () {
+    test('appends timestamped lines to <home>/.fah/logs/fa.log', () {
+      final home = '${temp.path}/home';
+      logUpdateLine('first line', home: home);
+      logUpdateLine('second line', home: home);
+      final log = File('$home/.fah/logs/fa.log').readAsStringSync();
+      expect(
+        log,
+        matches(
+          RegExp(
+            r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)? first line\n'
+            r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)? second line\n$',
+          ),
+        ),
+      );
+    });
+
+    test('never throws when the log directory cannot be created', () {
+      final blocker = File('${temp.path}/blocker')..writeAsStringSync('x');
+      expect(() => logUpdateLine('nope', home: blocker.path), returnsNormally);
+    });
+  });
+
+  group('applyUpdate pub-global branch', () {
+    test(
+      're-activates via dart pub, spawns the fa shim, and records state',
+      () async {
+        final statePath = '${temp.path}/update-state.json';
+        final runCalls = <(String, List<String>)>[];
+        final spawnCalls = <(String, List<String>)>[];
+        final log = <String>[];
+        final outcome = await applyUpdate(
+          currentVersion: '1.0.522',
+          launchArgs: const ['--session', 'live'],
+          detectInstall: () =>
+              Install(InstallKind.pubGlobal, '${temp.path}/pub-cache/bin/fa'),
+          newClient: () => releaseClient(),
+          runProcess: (exe, args) async {
+            runCalls.add((exe, args));
+            // `pub global list` reports the OLD activation; activate
+            // succeeds AND resolves the release version (the honest-log
+            // parse must see an advance).
+            final out = args.contains('list')
+                ? 'flutter_agent_harness 1.0.522'
+                : 'Activated flutter_agent_harness 9.9.9.';
+            return ProcessResult(0, 0, out, '');
+          },
+          spawn: (exe, args) async {
+            spawnCalls.add((exe, args));
+            return true;
+          },
+          pem: _testPem,
+          logLine: log.add,
+          statePath: statePath,
+        );
+        expect(outcome, ApplyUpdateOutcome.applied);
+        // list + activate ran (no deactivate: pub believes an OLDER spec).
+        final verbs = [
+          for (final (_, args) in runCalls)
+            if (args.length >= 3) args[2],
+        ];
+        expect(verbs, containsAll(['list', 'activate']));
+        expect(verbs.where((v) => v == 'deactivate'), isEmpty);
+        // The successor exe is the PATH shim (never the dart VM), and the
+        // original argv — with the live session — rides through.
+        final (spawnExe, spawnArgs) = spawnCalls.single;
+        expect(spawnExe, endsWith('fa'));
+        expect(spawnArgs, containsAllInOrder(['--session', 'live']));
+        expect(log, contains('fa update applied: v1.0.522 -> v9.9.9'));
+        // The convergence state recorded the first attempt at v9.9.9.
+        final state =
+            jsonDecode(File(statePath).readAsStringSync())
+                as Map<String, dynamic>;
+        expect(state['tag'], 'v9.9.9');
+        expect(state['attempts'], 1);
+      },
+    );
+  });
+
+  group('applyUpdate convergence guard', () {
+    test('caps repeat attempts for the same tag at two', () async {
+      final statePath = '${temp.path}/update-state.json';
+      var sumsFetches = 0;
+      http.Client countingClient() => MockClient((request) async {
+        if (request.url.path.endsWith('SHA256SUMS')) sumsFetches++;
+        if (request.url.path.endsWith('/releases/latest')) {
+          return http.Response(
+            '',
+            302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        if (request.url.path.endsWith('SHA256SUMS.sig')) {
+          return http.Response.bytes(_fixtureSig, 200);
+        }
+        if (request.url.path.endsWith('SHA256SUMS')) {
+          return http.Response(_fixtureSums, 200);
+        }
+        return http.Response.bytes(_fixtureTarGz, 200);
+      });
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      Install binaryInstall() => Install(InstallKind.binary, target.path);
+      final common = (
+        currentVersion: '1.0.522',
+        detectInstall: binaryInstall,
+        newClient: countingClient,
+        runProcess: extractingRunProcess,
+        spawn: (_, _) async => true,
+        pem: _testPem,
+        logLine: (String _) {},
+        statePath: statePath,
+      );
+      expect(
+        await applyUpdate(
+          currentVersion: common.currentVersion,
+          launchArgs: const [],
+          detectInstall: common.detectInstall,
+          newClient: common.newClient,
+          runProcess: common.runProcess,
+          spawn: common.spawn,
+          pem: common.pem,
+          logLine: common.logLine,
+          statePath: common.statePath,
+        ),
+        ApplyUpdateOutcome.applied,
+      );
+      expect(
+        await applyUpdate(
+          currentVersion: common.currentVersion,
+          launchArgs: const [],
+          detectInstall: common.detectInstall,
+          newClient: common.newClient,
+          runProcess: common.runProcess,
+          spawn: common.spawn,
+          pem: common.pem,
+          logLine: common.logLine,
+          statePath: common.statePath,
+        ),
+        ApplyUpdateOutcome.applied,
+      );
+      final before = sumsFetches;
+      final log = <String>[];
+      expect(
+        await applyUpdate(
+          currentVersion: common.currentVersion,
+          launchArgs: const [],
+          detectInstall: common.detectInstall,
+          newClient: common.newClient,
+          runProcess: common.runProcess,
+          spawn: common.spawn,
+          pem: common.pem,
+          logLine: log.add,
+          statePath: common.statePath,
+        ),
+        ApplyUpdateOutcome.convergenceGuard,
+      );
+      // The guarded boot never downloaded a third archive.
+      expect(sumsFetches, before);
+      expect(log.join('\n'), contains('not respawning again'));
+    });
+
+    test('a moved tag resets the attempt count', () async {
+      final statePath = '${temp.path}/update-state.json';
+      File(
+        statePath,
+      ).writeAsStringSync(jsonEncode({'tag': 'v0.0.1', 'attempts': 7}));
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final outcome = await applyUpdate(
+        currentVersion: '1.0.522',
+        launchArgs: const [],
+        detectInstall: () => Install(InstallKind.binary, target.path),
+        newClient: () => releaseClient(),
+        runProcess: extractingRunProcess,
+        spawn: (_, _) async => true,
+        pem: _testPem,
+        logLine: (_) {},
+        statePath: statePath,
+      );
+      expect(outcome, ApplyUpdateOutcome.applied);
+      final state =
+          jsonDecode(File(statePath).readAsStringSync())
+              as Map<String, dynamic>;
+      expect(state['tag'], 'v9.9.9');
+      expect(state['attempts'], 1);
+    });
+
+    test('a blackholed network aborts through the outcome matrix', () async {
+      final statePath = '${temp.path}/update-state.json';
+      final hung = Completer<http.Response>().future;
+      final client = MockClient((request) => hung);
+      final outcome = await applyUpdate(
+        currentVersion: '1.0.522',
+        launchArgs: const [],
+        detectInstall: () => Install(InstallKind.binary, '${temp.path}/fa'),
+        newClient: () => client,
+        spawn: (_, _) async => fail('no successor on a network abort'),
+        statePath: statePath,
+        networkTimeout: const Duration(milliseconds: 120),
+      );
+      expect(outcome, ApplyUpdateOutcome.downloadFailed);
+    });
+
+    test('a boot that reports up to date clears the state', () async {
+      final statePath = '${temp.path}/update-state.json';
+      File(
+        statePath,
+      ).writeAsStringSync(jsonEncode({'tag': 'v0.1.0', 'attempts': 2}));
+      final client = MockClient((request) async {
+        return http.Response(
+          '',
+          302,
+          headers: {
+            'location':
+                'https://github.com/IstiN/flutter_agent_harness/'
+                'releases/tag/v0.1.0',
+          },
+        );
+      });
+      final outcome = await applyUpdate(
+        currentVersion: '0.1.0',
+        launchArgs: const [],
+        detectInstall: () => Install(InstallKind.binary, '${temp.path}/fa'),
+        newClient: () => client,
+        spawn: (_, _) async => fail('no successor on the up-to-date path'),
+        statePath: statePath,
+      );
+      expect(outcome, ApplyUpdateOutcome.upToDate);
+      expect(File(statePath).existsSync(), isFalse);
+    });
+  });
+
+  group('successorArgs', () {
+    test('appends the live session when the argv carries none', () {
+      expect(successorArgs(const ['-p', 'hi'], 's1'), const [
+        '-p',
+        'hi',
+        '--session',
+        's1',
+      ]);
+    });
+
+    test('passes the argv through unchanged without a session id', () {
+      const argv = ['-p', 'hi'];
+      expect(identical(successorArgs(argv, null), argv), isTrue);
+    });
+
+    test('never double-flags when the argv already resumes a session', () {
+      expect(successorArgs(const ['--session', 'other'], 's1'), const [
+        '--session',
+        'other',
+      ]);
+      expect(successorArgs(const ['--session=other'], 's1'), const [
+        '--session=other',
+      ]);
+    });
+  });
+
+  group('downloadArchiveBody (gh-2043 stall/progress/resume)', () {
+    // 400 KB chunks: four of them cross printable "few MB" boundaries.
+    const chunk = 409600;
+    const archiveUrl =
+        'https://github.com/IstiN/flutter_agent_harness/releases/'
+        'download/v9.9.9/fa-test.tar.gz';
+
+    List<int> filler(int size, [int seed = 0]) =>
+        List<int>.generate(size, (i) => (i + seed) & 0xFF);
+
+    http.StreamedResponse bytesResponse(
+      List<int> bytes, {
+      int status = 200,
+      int? contentLength,
+      Map<String, String> headers = const {},
+    }) => http.StreamedResponse(
+      Stream<List<int>>.value(bytes),
+      status,
+      contentLength: contentLength,
+      headers: headers,
+    );
+
+    /// A body stream yielding [chunks] [gap] apart — slow but steady,
+    /// the corporate-link shape that the old 2-minute cap killed.
+    Stream<List<int>> steady(
+      List<List<int>> chunks, {
+      Duration gap = const Duration(milliseconds: 15),
+    }) async* {
+      for (final piece in chunks) {
+        await Future<void>.delayed(gap);
+        yield piece;
+      }
+    }
+
+    /// A body stream that yields [chunks] then hangs forever: no error,
+    /// no done — the stalled-link shape (nothing arrives for Ns).
+    Stream<List<int>> stallsAfter(List<List<int>> chunks) async* {
+      for (final piece in chunks) {
+        yield piece;
+      }
+      await Completer<void>().future;
+    }
+
+    /// A body stream that yields [chunks] then dies mid-body — the
+    /// connection-reset shape (curl exit 56).
+    Stream<List<int>> resetsAfter(List<List<int>> chunks) async* {
+      for (final piece in chunks) {
+        yield piece;
+      }
+      throw http.ClientException('connection closed while receiving');
+    }
+
+    /// A body stream that yields [chunks] then dies with a
+    /// non-[Exception] `Error` — the misbehaving-client-wrapper shape
+    /// (review r1): a bare `on Exception` guard would let it crash the
+    /// update with a stack trace instead of a clean failure outcome.
+    Stream<List<int>> errorsAfter(List<List<int>> chunks) async* {
+      for (final piece in chunks) {
+        yield piece;
+      }
+      throw StateError('client wrapper blew up');
+    }
+
+    /// An ENDLESS trickle — one [chunk] every [gap] forever, never done:
+    /// the never-finishing-link shape only the total backstop can end.
+    Stream<List<int>> trickle(List<int> chunk, Duration gap) async* {
+      while (true) {
+        await Future<void>.delayed(gap);
+        yield chunk;
+      }
+    }
+
+    http.Client streamingClient(
+      http.StreamedResponse Function(http.BaseRequest request) handler,
+    ) => MockClient.streaming((request, _) async => handler(request));
+
+    test(
+      'AC1: a slow-but-steady body completes under the stall bound',
+      () async {
+        final body = filler(chunk * 6);
+        final segments = [
+          for (var i = 0; i < 6; i++) body.sublist(chunk * i, chunk * (i + 1)),
+        ];
+        final client = streamingClient(
+          (_) => http.StreamedResponse(
+            steady(segments),
+            200,
+            contentLength: body.length,
+          ),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(milliseconds: 300),
+        );
+        expect(outcome.ok, isTrue);
+        expect(outcome.bytes, body);
+      },
+    );
+
+    test('AC1: a stalled body aborts with the no-progress message', () async {
+      final client = streamingClient(
+        (_) => http.StreamedResponse(
+          stallsAfter([filler(chunk)]),
+          200,
+          contentLength: chunk * 99,
+        ),
+      );
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: (_) {},
+        stallTimeout: const Duration(milliseconds: 250),
+      );
+      expect(outcome.ok, isFalse);
+      // Below HTTP: never a fake status code.
+      expect(outcome.statusCode, isNull);
+      expect(outcome.failureMessage, contains('no progress for'));
+    });
+
+    test(
+      'AC1: the raised total backstop bounds a never-finishing trickle',
+      () async {
+        // An ENDLESS trickle — a chunk every 20ms, never done — so ONLY
+        // the total cap can end it, with no nominal completion time to
+        // race. The 20ms gaps sit 25× under the 500ms stall bound: a
+        // loaded scheduler (GC, a throttled CI shard) cannot flip the
+        // classification into a stall misfire (review r8 — the old
+        // 100ms-gap vs 300ms-stall shape was a 3× margin).
+        final client = streamingClient(
+          (_) => http.StreamedResponse(
+            trickle(filler(4096), const Duration(milliseconds: 20)),
+            200,
+            contentLength: 1 << 30, // far more than any trickle delivers.
+          ),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(milliseconds: 500),
+          totalTimeout: const Duration(milliseconds: 600),
+        );
+        expect(outcome.ok, isFalse);
+        expect(outcome.statusCode, isNull);
+        expect(outcome.failureMessage, contains('exceeded'));
+      },
+    );
+
+    test('AC4: the metadata bound is unchanged, the body bounds are new', () {
+      expect(kFaUpdateNetworkTimeout, const Duration(seconds: 15));
+      expect(kFaUpdateStallTimeout, const Duration(seconds: 45));
+      expect(kFaUpdateTotalTimeout, const Duration(minutes: 15));
+    });
+
+    test(
+      'AC2: progress prints at every step plus a final speed line',
+      () async {
+        final body = filler(chunk * 4); // 1.6 MB
+        final segments = [
+          for (var i = 0; i < 4; i++) body.sublist(chunk * i, chunk * (i + 1)),
+        ];
+        final lines = <String>[];
+        final client = streamingClient(
+          (_) => http.StreamedResponse(
+            steady(segments),
+            200,
+            contentLength: body.length,
+          ),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: lines.add,
+          progressStep: chunk * 2,
+          stallTimeout: const Duration(seconds: 5),
+        );
+        expect(outcome.ok, isTrue);
+        final progress = lines
+            .where((line) => line.startsWith('downloading… '))
+            .toList();
+        // Crossings at 0.8 MB and 1.6 MB.
+        expect(progress, hasLength(2));
+        expect(progress.first, contains('0.8/1.6 MB'));
+        expect(progress.last, contains('1.6/1.6 MB'));
+        final finalLine = lines.last;
+        expect(finalLine, startsWith('downloaded 1.6 MB in '));
+        expect(finalLine, endsWith('/s)'));
+      },
+    );
+
+    test(
+      'AC2: without a content length the progress line has no denominator',
+      () async {
+        final lines = <String>[];
+        final client = streamingClient(
+          (_) => http.StreamedResponse(
+            steady([filler(chunk), filler(chunk, 1)]),
+            200,
+          ),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: lines.add,
+          progressStep: chunk,
+          stallTimeout: const Duration(seconds: 5),
+        );
+        expect(outcome.ok, isTrue);
+        final progress = lines
+            .where((line) => line.startsWith('downloading… '))
+            .toList();
+        expect(progress, ['downloading… 400 KB', 'downloading… 800 KB']);
+        expect(lines.last, startsWith('downloaded 800 KB in '));
+      },
+    );
+    test('AC2: a small archive reports the progress pair in KB', () async {
+      final body = filler(chunk * 2); // 800 KB — both sides below one MiB.
+      final segments = [body.sublist(0, chunk), body.sublist(chunk, chunk * 2)];
+      final lines = <String>[];
+      final client = streamingClient(
+        (_) => http.StreamedResponse(
+          steady(segments),
+          200,
+          contentLength: body.length,
+        ),
+      );
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: lines.add,
+        progressStep: chunk,
+        stallTimeout: const Duration(seconds: 5),
+      );
+      expect(outcome.ok, isTrue);
+      expect(lines.where((line) => line.startsWith('downloading… ')), [
+        'downloading… 400/800 KB',
+        'downloading… 800/800 KB',
+      ]);
+    });
+
+    test(
+      'AC3: a mid-body reset resumes with HTTP Range and completes',
+      () async {
+        final body = filler(chunk * 3);
+        final seen = <http.BaseRequest>[];
+        var first = true;
+        final client = streamingClient((request) {
+          seen.add(request);
+          if (first) {
+            first = false;
+            return http.StreamedResponse(
+              resetsAfter([
+                body.sublist(0, chunk),
+                body.sublist(chunk, chunk * 2),
+              ]),
+              200,
+              contentLength: body.length,
+            );
+          }
+          return http.StreamedResponse(
+            steady([body.sublist(chunk * 2)]),
+            206,
+            contentLength: body.length - chunk * 2,
+          );
+        });
+        final lines = <String>[];
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: lines.add,
+          stallTimeout: const Duration(seconds: 5),
+        );
+        expect(outcome.ok, isTrue);
+        // The reassembled bytes are identical — a resumed completion passes
+        // the same provenance hash check.
+        expect(outcome.bytes, body);
+        expect(seen, hasLength(2));
+        expect(seen.last.headers['range'], 'bytes=${chunk * 2}-');
+        expect(lines.join('\n'), contains('resuming'));
+      },
+    );
+
+    test('AC3: resume attempts are bounded at maxResumeAttempts', () async {
+      var requests = 0;
+      final client = streamingClient((_) {
+        requests++;
+        return http.StreamedResponse(
+          resetsAfter([filler(chunk)]),
+          200,
+          contentLength: chunk * 99,
+        );
+      });
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: (_) {},
+        stallTimeout: const Duration(seconds: 5),
+        maxResumeAttempts: 3,
+      );
+      expect(outcome.ok, isFalse);
+      expect(outcome.statusCode, isNull);
+      // 1 initial + 3 resumes, then give up.
+      expect(requests, 4);
+    });
+
+    test('AC3: a server that ignores Range (200) restarts from zero', () async {
+      final body = filler(chunk * 3);
+      var requests = 0;
+      final client = streamingClient((request) {
+        requests++;
+        if (requests == 1) {
+          return http.StreamedResponse(
+            resetsAfter([body.sublist(0, chunk)]),
+            200,
+            contentLength: body.length,
+          );
+        }
+        expect(request.headers['range'], isNotNull);
+        // 200 to a Range request: the WHOLE body again — no duplicated
+        // prefix may survive.
+        return http.StreamedResponse(
+          steady([body]),
+          200,
+          contentLength: body.length,
+        );
+      });
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: (_) {},
+        stallTimeout: const Duration(seconds: 5),
+      );
+      expect(outcome.ok, isTrue);
+      expect(outcome.bytes, body);
+      expect(requests, 2);
+    });
+
+    test('AC3: a clean close below the promised length resumes too', () async {
+      final body = filler(chunk * 3);
+      var requests = 0;
+      final client = streamingClient((request) {
+        requests++;
+        if (requests == 1) {
+          // Promises 3 chunks, delivers 2, closes WITHOUT an error.
+          return http.StreamedResponse(
+            steady([body.sublist(0, chunk), body.sublist(chunk, chunk * 2)]),
+            200,
+            contentLength: body.length,
+          );
+        }
+        return http.StreamedResponse(
+          steady([body.sublist(chunk * 2)]),
+          206,
+          contentLength: body.length - chunk * 2,
+        );
+      });
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: (_) {},
+        stallTimeout: const Duration(seconds: 5),
+      );
+      expect(outcome.ok, isTrue);
+      expect(outcome.bytes, body);
+      expect(requests, 2);
+    });
+
+    test(
+      'AC2: a resumed 206 totals from Content-Range, not the remainder',
+      () async {
+        final body = filler(chunk * 3);
+        var requests = 0;
+        final client = streamingClient((request) {
+          requests++;
+          if (requests == 1) {
+            // Chunked first attempt: no content length at all.
+            return http.StreamedResponse(
+              resetsAfter([body.sublist(0, chunk)]),
+              200,
+            );
+          }
+          expect(request.headers['range'], 'bytes=$chunk-');
+          // 206 promising the REMAINING 2 chunks; Content-Range names
+          // the full size — the progress denominator must be 1.2 MB,
+          // not 0.8 MB.
+          return http.StreamedResponse(
+            steady([body.sublist(chunk, chunk * 2), body.sublist(chunk * 2)]),
+            206,
+            contentLength: body.length - chunk,
+            headers: {
+              'content-range': 'bytes $chunk-${body.length - 1}/${body.length}',
+            },
+          );
+        });
+        final lines = <String>[];
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: lines.add,
+          progressStep: chunk,
+          stallTimeout: const Duration(seconds: 5),
+        );
+        expect(outcome.ok, isTrue);
+        expect(outcome.bytes, body);
+        expect(
+          lines.where((line) => line.startsWith('downloading… ')),
+          contains('downloading… 0.8/1.2 MB'),
+        );
+      },
+    );
+
+    test(
+      'AC3: a resumed 206 without Content-Range totals received + remainder',
+      () async {
+        final body = filler(chunk * 3);
+        var requests = 0;
+        final client = streamingClient((request) {
+          requests++;
+          if (requests == 1) {
+            return http.StreamedResponse(
+              resetsAfter([body.sublist(0, chunk)]),
+              200,
+            );
+          }
+          if (requests == 2) {
+            // 206 promising 2 more chunks but closing after 1 — only a
+            // CORRECT full total can classify this as an early close and
+            // resume again; a remainder-as-total would "complete" here
+            // with truncated bytes.
+            return http.StreamedResponse(
+              steady([body.sublist(chunk, chunk * 2)]),
+              206,
+              contentLength: body.length - chunk,
+            );
+          }
+          return http.StreamedResponse(
+            steady([body.sublist(chunk * 2)]),
+            206,
+            contentLength: body.length - chunk * 2,
+          );
+        });
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(seconds: 5),
+        );
+        expect(outcome.ok, isTrue);
+        expect(outcome.bytes, body);
+        expect(requests, 3);
+      },
+    );
+
+    test('AC3: a corrupted resume is caught by the provenance hash', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final body = _fixtureTarGz;
+      final half = body.length ~/ 2;
+      var requests = 0;
+      final client = MockClient.streaming((request, _) async {
+        final path = request.url.path;
+        if (path.endsWith('/releases/latest')) {
+          return bytesResponse(
+            const [],
+            status: 302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        if (path.endsWith('SHA256SUMS.sig')) {
+          return bytesResponse(_fixtureSig);
+        }
+        if (path.endsWith('SHA256SUMS')) {
+          return bytesResponse(utf8.encode(_fixtureSums));
+        }
+        requests++;
+        if (requests == 1) {
+          return http.StreamedResponse(
+            resetsAfter([body.sublist(0, half)]),
+            200,
+            contentLength: body.length,
+          );
+        }
+        // The resumed segment is corrupt: one flipped byte.
+        final wrong = List<int>.of(body.sublist(half))..[0] ^= 0x5A;
+        return bytesResponse(wrong, status: 206, contentLength: wrong.length);
+      });
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => Install(InstallKind.binary, target.path),
+        newClient: () => client,
+        pem: _testPem,
+        stallTimeout: const Duration(seconds: 5),
+        runProcess: (_, _) async => ProcessResult(0, 0, '', ''),
+      );
+      expect(code, 1);
+      expect(target.readAsStringSync(), 'old');
+    });
+
+    test(
+      'a headers-phase failure without bytes is a transport failure',
+      () async {
+        final client = streamingClient(
+          (_) => throw http.ClientException('no route to host'),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+        );
+        expect(outcome.ok, isFalse);
+        expect(outcome.statusCode, isNull);
+      },
+    );
+
+    test('an HTTP failure carries the status for the caller', () async {
+      final client = streamingClient(
+        (_) => bytesResponse(const [], status: 404),
+      );
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: (_) {},
+      );
+      expect(outcome.ok, isFalse);
+      expect(outcome.statusCode, 404);
+      expect(outcome.isHttpFailure, isTrue);
+    });
+    test('a non-Exception Error from send is a transport failure', () async {
+      // Review r1 (gh-2043): the "never throws" contract must hold for a
+      // non-[Exception] `Error` thrown by the transport — a misbehaving
+      // client wrapper must not crash `fa update` with a stack trace.
+      final client = streamingClient(
+        (_) => throw StateError('misbehaving client wrapper'),
+      );
+      final outcome = await downloadArchiveBody(
+        client,
+        Uri.parse(archiveUrl),
+        log: (_) {},
+      );
+      expect(outcome.ok, isFalse);
+      expect(outcome.statusCode, isNull);
+      expect(outcome.failureMessage, contains('Bad state: misbehaving'));
+    });
+
+    test(
+      'a non-Exception Error mid-body is a bounded transport failure',
+      () async {
+        var requests = 0;
+        final client = streamingClient((_) {
+          requests++;
+          if (requests == 1) {
+            return http.StreamedResponse(
+              errorsAfter([filler(chunk)]),
+              200,
+              contentLength: chunk * 99,
+            );
+          }
+          // The retry honors the Range (206): one more chunk arrives,
+          // then the same non-Exception death — the offset accumulates.
+          return http.StreamedResponse(
+            errorsAfter([filler(chunk, 1)]),
+            206,
+            contentLength: chunk * 98,
+          );
+        });
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(seconds: 5),
+          maxResumeAttempts: 1,
+        );
+        expect(outcome.ok, isFalse);
+        expect(outcome.statusCode, isNull);
+        expect(outcome.failureMessage, contains('connection lost at 800 KB'));
+        expect(outcome.failureMessage, contains('1 resume attempts exhausted'));
+        // 1 initial + 1 resume, then give up.
+        expect(requests, 2);
+      },
+    );
+
+    test(
+      'AC3: a send failure while resuming spends the same bounded budget',
+      () async {
+        final body = filler(chunk * 3);
+        var requests = 0;
+        var sendCalls = 0;
+        final client = MockClient.streaming((request, _) async {
+          sendCalls++;
+          if (sendCalls == 1) {
+            requests++;
+            return http.StreamedResponse(
+              resetsAfter([body.sublist(0, chunk)]),
+              200,
+              contentLength: body.length,
+            );
+          }
+          if (sendCalls == 2) {
+            // The resume attempt itself cannot connect (the flaky-link
+            // shape): the send failure is soft while the budget allows.
+            throw http.ClientException('no route to host');
+          }
+          requests++;
+          return http.StreamedResponse(
+            steady([body.sublist(chunk, chunk * 2), body.sublist(chunk * 2)]),
+            206,
+            contentLength: body.length - chunk,
+          );
+        });
+        final lines = <String>[];
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: lines.add,
+          stallTimeout: const Duration(seconds: 5),
+          maxResumeAttempts: 2,
+        );
+        expect(outcome.ok, isTrue);
+        expect(outcome.bytes, body);
+        expect(requests, 2);
+        expect(lines.join('\n'), contains('resuming (attempt 2/2)…'));
+      },
+    );
+
+    test('runSelfUpdate survives one mid-body reset and swaps in', () async {
+      final target = File('${temp.path}/fa')..writeAsStringSync('old');
+      final body = _fixtureTarGz;
+      final half = body.length ~/ 2;
+      var archiveRequests = 0;
+      final client = MockClient.streaming((request, _) async {
+        final path = request.url.path;
+        if (path.endsWith('/releases/latest')) {
+          return bytesResponse(
+            const [],
+            status: 302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        if (path.endsWith('SHA256SUMS.sig')) {
+          return bytesResponse(_fixtureSig);
+        }
+        if (path.endsWith('SHA256SUMS')) {
+          return bytesResponse(utf8.encode(_fixtureSums));
+        }
+        archiveRequests++;
+        if (archiveRequests == 1) {
+          return http.StreamedResponse(
+            resetsAfter([body.sublist(0, half)]),
+            200,
+            contentLength: body.length,
+          );
+        }
+        expect(request.headers['range'], 'bytes=$half-');
+        return bytesResponse(
+          body.sublist(half),
+          status: 206,
+          contentLength: body.length - half,
+        );
+      });
+      final code = await runSelfUpdate(
+        currentVersion: '0.1.0',
+        detectInstall: () => Install(InstallKind.binary, target.path),
+        newClient: () => client,
+        pem: _testPem,
+        stallTimeout: const Duration(seconds: 5),
+        runProcess: (exe, args) async {
+          if (exe == 'tar') {
+            final destDir = args.last;
+            final archiveFile = args[args.indexOf('-xzf') + 1];
+            final data = File(archiveFile).readAsBytesSync();
+            final decoded = TarDecoder().decodeBytes(
+              GZipDecoder().decodeBytes(data),
+            );
+            for (final entry in decoded) {
+              if (entry.isFile) {
+                final parts = entry.name.split('/');
+                final dest = File('$destDir/${parts.join('/')}');
+                dest.parent.createSync(recursive: true);
+                dest.writeAsBytesSync(entry.content as List<int>);
+              }
+            }
+          }
+          return ProcessResult(0, 0, '', '');
+        },
+      );
+      expect(code, 0);
+      expect(archiveRequests, 2);
+      expect(target.readAsStringSync(), 'new-binary');
+    });
+
+    test(
+      'AC4: a stalled download never reaches the provenance check',
+      () async {
+        final target = File('${temp.path}/fa')..writeAsStringSync('old');
+        var sumsFetches = 0;
+        var zipTried = false;
+        final client = MockClient.streaming((request, _) async {
+          final path = request.url.path;
+          if (path.endsWith('/releases/latest')) {
+            return bytesResponse(
+              const [],
+              status: 302,
+              headers: {
+                'location':
+                    'https://github.com/IstiN/flutter_agent_harness/'
+                    'releases/tag/v9.9.9',
+              },
+            );
+          }
+          if (path.endsWith('SHA256SUMS')) {
+            sumsFetches++;
+            return bytesResponse(utf8.encode(_fixtureSums));
+          }
+          if (path.endsWith('SHA256SUMS.sig')) {
+            return bytesResponse(_fixtureSig);
+          }
+          if (path.endsWith('-mac.zip')) {
+            zipTried = true;
+            return bytesResponse(const []);
+          }
+          return http.StreamedResponse(
+            stallsAfter([filler(chunk)]),
+            200,
+            contentLength: chunk * 99,
+          );
+        });
+        final code = await runSelfUpdate(
+          currentVersion: '0.1.0',
+          detectInstall: () => Install(InstallKind.binary, target.path),
+          newClient: () => client,
+          stallTimeout: const Duration(milliseconds: 250),
+        );
+        expect(code, 1);
+        expect(target.readAsStringSync(), 'old');
+        expect(
+          sumsFetches,
+          0,
+          reason: 'a network death must not fetch SHA256SUMS',
+        );
+        expect(
+          zipTried,
+          isFalse,
+          reason: 'the zip fallback is for HTTP misses',
+        );
+      },
+    );
+
+    test(
+      'AC5: fallbackZipUpdate resumes a reset zip download and swaps',
+      () async {
+        final target = File('${temp.path}/fa')..writeAsStringSync('old');
+        final body = _fixtureZip;
+        var zipRequests = 0;
+        final client = MockClient.streaming((request, _) async {
+          final path = request.url.path;
+          if (path.endsWith('SHA256SUMS.sig')) {
+            return bytesResponse(_fixtureSig);
+          }
+          if (path.endsWith('SHA256SUMS')) {
+            return bytesResponse(utf8.encode(_fixtureSums));
+          }
+          zipRequests++;
+          if (zipRequests == 1) {
+            return http.StreamedResponse(
+              resetsAfter([body.sublist(0, 10)]),
+              200,
+              contentLength: body.length,
+            );
+          }
+          expect(request.headers['range'], 'bytes=10-');
+          return bytesResponse(
+            body.sublist(10),
+            status: 206,
+            contentLength: body.length - 10,
+          );
+        });
+        final code = await fallbackZipUpdate(
+          client,
+          'v9.9.9',
+          'fa-macos-arm64-mac.zip',
+          target.path,
+          '9.9.9',
+          (_, _) async => ProcessResult(0, 0, '', ''),
+          pem: _testPem,
+        );
+        expect(code, 0);
+        expect(zipRequests, 2);
+        expect(target.readAsStringSync(), 'new-zip-binary');
+      },
+    );
+
+    test('AC1: a stalled archive body fails the boot update fast', () async {
+      final client = MockClient.streaming((request, _) async {
+        final path = request.url.path;
+        if (path.endsWith('/releases/latest')) {
+          return bytesResponse(
+            const [],
+            status: 302,
+            headers: {
+              'location':
+                  'https://github.com/IstiN/flutter_agent_harness/'
+                  'releases/tag/v9.9.9',
+            },
+          );
+        }
+        return http.StreamedResponse(
+          stallsAfter([filler(chunk)]),
+          200,
+          contentLength: chunk * 99,
+        );
+      });
+      final outcome = await applyUpdate(
+        currentVersion: '1.0.522',
+        launchArgs: const [],
+        detectInstall: () => Install(InstallKind.binary, '${temp.path}/fa'),
+        newClient: () => client,
+        spawn: (_, _) async => fail('no successor on a stalled download'),
+        statePath: '${temp.path}/update-state.json',
+        stallTimeout: const Duration(milliseconds: 250),
+      );
+      expect(outcome, ApplyUpdateOutcome.downloadFailed);
+    });
+
+    test(
+      'review r4: the exhausted-resume message names the underlying error',
+      () async {
+        var requests = 0;
+        final client = streamingClient((_) {
+          requests++;
+          return http.StreamedResponse(
+            errorsAfter([filler(chunk)]),
+            200,
+            contentLength: chunk * 99,
+          );
+        });
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(seconds: 5),
+          maxResumeAttempts: 1,
+        );
+        expect(outcome.ok, isFalse);
+        expect(outcome.statusCode, isNull);
+        expect(outcome.failureMessage, contains('connection lost at 400 KB'));
+        expect(outcome.failureMessage, contains('1 resume attempts exhausted'));
+        // The transport error survives into the message: a bug report
+        // must be able to tell a reset from a wrapper blow-up.
+        expect(outcome.failureMessage, contains('client wrapper blew up'));
+        expect(requests, 2);
+      },
+    );
+
+    test(
+      'review r4: a non-Exception body error is called out as non-network',
+      () async {
+        final lines = <String>[];
+        final client = streamingClient(
+          (_) => http.StreamedResponse(
+            errorsAfter([filler(chunk)]),
+            200,
+            contentLength: chunk * 99,
+          ),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: lines.add,
+          stallTimeout: const Duration(seconds: 5),
+          maxResumeAttempts: 0,
+        );
+        expect(outcome.ok, isFalse);
+        // A programmer error must surface in the log seam, not
+        // masquerade as a bad-link day.
+        expect(
+          lines.any(
+            (line) =>
+                line.contains('non-network') && line.contains('StateError'),
+          ),
+          isTrue,
+          reason: 'the unexpected error type must be named in the log',
+        );
+      },
+    );
+
+    test(
+      'review r5: a stream error after the promised bytes still completes',
+      () async {
+        final body = filler(chunk * 3);
+        var requests = 0;
+        final client = streamingClient((request) {
+          requests++;
+          if (requests == 1) {
+            // Delivers EVERY promised byte, then errors instead of
+            // closing cleanly — the reset racing the final byte.
+            return http.StreamedResponse(
+              errorsAfter([
+                body.sublist(0, chunk),
+                body.sublist(chunk, chunk * 2),
+                body.sublist(chunk * 2),
+              ]),
+              200,
+              contentLength: body.length,
+            );
+          }
+          // A well-behaved server answers 416: `bytes=<received>-` names
+          // no remaining range. Reaching this request at all means the
+          // complete archive was treated as a mid-body death — the bug.
+          return bytesResponse(const [], status: 416);
+        });
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(seconds: 5),
+        );
+        expect(
+          outcome.ok,
+          isTrue,
+          reason: 'the complete archive is already in the builder',
+        );
+        expect(outcome.bytes, body);
+        expect(requests, 1, reason: 'no resume may be spent on a full body');
+      },
+    );
+
+    test(
+      'review r6: a synchronous listen throw leaves no armed timer behind',
+      () async {
+        final client = streamingClient(
+          (_) => http.StreamedResponse(
+            const _SyncThrowStream(),
+            200,
+            contentLength: chunk * 99,
+          ),
+        );
+        final outcome = await downloadArchiveBody(
+          client,
+          Uri.parse(archiveUrl),
+          log: (_) {},
+          stallTimeout: const Duration(milliseconds: 50),
+          totalTimeout: const Duration(seconds: 5),
+          maxResumeAttempts: 0,
+        );
+        expect(outcome.ok, isFalse);
+        expect(outcome.statusCode, isNull);
+        expect(
+          outcome.failureMessage,
+          contains('listen exploded synchronously'),
+        );
+        // Outlive the armed stall timer: pre-fix, its late fire cancelled
+        // an unassigned `late final` subscription and crashed the zone
+        // with a LateInitializationError as an uncaught async error.
+        await Future<void>.delayed(const Duration(milliseconds: 200));
+      },
+    );
+  });
+}
+
+/// A body stream whose `listen` throws SYNCHRONOUSLY (review r6): the
+/// timers are armed before `stream.listen(...)` assigns the `late final`
+/// subscription, so a sync throw must be absorbed by the drain's fail
+/// path — never leave the timers armed over an unassigned subscription.
+class _SyncThrowStream extends Stream<List<int>> {
+  const _SyncThrowStream();
+
+  @override
+  StreamSubscription<List<int>> listen(
+    void Function(List<int> event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) {
+    throw StateError('listen exploded synchronously');
+  }
+}

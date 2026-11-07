@@ -1,0 +1,1215 @@
+import 'dart:async';
+
+import 'package:fa/services/agent_service.dart';
+import 'package:fa/l10n/l10n_ext.dart';
+import 'package:fa/services/flutter_session_manager.dart';
+import 'package:fa/services/project_mount_env.dart';
+import 'package:fa/services/session_ui_prefs_store.dart';
+import 'package:fa/services/session_names_store.dart';
+import 'package:fa/ui/widgets/dap_hub_mark.dart';
+import 'package:fa/ui/widgets/rename_session_dialog.dart';
+import 'package:fa/ui/widgets/session_search_field.dart';
+import 'package:fa/ui/widgets/subagent_mark.dart';
+import 'package:fa_ui/fa_ui.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_agent_harness/flutter_agent_harness.dart'
+    show
+        SessionMetadata,
+        groupSessionsByParent,
+        isSubagentSession,
+        subagentParentId;
+import 'package:path/path.dart' as p;
+
+/// The sessions list for the wide-screen sidebar: shows every live session
+/// (from [manager]) plus persisted on-disk sessions not currently live
+/// ([persistedSessions]) with its derived or custom title, the active
+/// session highlighted with a teal dot, and a "New session" button at the
+/// top. Tapping a persisted-only session opens it from disk via
+/// [onOpenPersisted].
+///
+/// When [collapsed] is true the list degrades to a centered column of dots
+/// (active = teal, inactive = dim) with a tooltip per dot — the icon-rail
+/// companion to the collapsed [WideLayoutShell] sidebar.
+class SidebarSessionsList extends StatefulWidget {
+  const SidebarSessionsList({
+    super.key,
+    required this.manager,
+    this.sessionNamesStore,
+    this.onNewSession,
+    this.onSessionTap,
+    this.persistedSessions = const [],
+    this.sessionInfoNames = const {},
+    this.onOpenPersisted,
+    this.onOpenLiveSession,
+    this.collapsed = false,
+    this.hubBoundSessionId,
+    this.pendingSessionId,
+    this.selectedSessionId,
+    this.prefsStore,
+  });
+
+  /// The session the user just asked to open (a `session_open` dispatch is
+  /// in flight): its row highlights AND sorts to the top immediately —
+  /// otherwise the live dot appears to never move (the live session is
+  /// always the freshest row, so the dot sat pinned to the first row until
+  /// the SW poll refreshed the stamps seconds later).
+  final String? pendingSessionId;
+
+  /// The ONE selected id (pending click > hosted live id > manager slot) —
+  /// computed by the host, which owns all three sources.
+  final String? selectedSessionId;
+
+  /// Per-parent expand/collapse persistence (issue #426). Null keeps the
+  /// choice in memory only (tests, injected-store-less hosts).
+  final SessionUiPrefsStore? prefsStore;
+
+  final FlutterSessionManager manager;
+  final SessionNamesStore? sessionNamesStore;
+  final VoidCallback? onNewSession;
+
+  /// Called after a session is tapped and [manager.switchTo] has run.
+  final VoidCallback? onSessionTap;
+
+  /// On-disk sessions (newest first). Entries not live in [manager] render
+  /// below the live ones and open from disk on tap.
+  final List<SessionMetadata> persistedSessions;
+
+  /// Display names read from the sessions' own `session_info` JSONL
+  /// records — what the CLI's `/rename` writes. Resolved per id by the
+  /// host (async, cached); an app-local rename ([sessionNamesStore]) stays
+  /// an override over these.
+  final Map<String, String> sessionInfoNames;
+
+  /// Opens a persisted-only session from disk (see [persistedSessions]).
+  final ValueChanged<SessionMetadata>? onOpenPersisted;
+
+  /// Opens an already-live session by id. Hosted surfaces (extension
+  /// panel / relay shell) MUST dispatch through the relay even for rows
+  /// that have a local slot — [manager.switchTo] on such a row is a
+  /// silent local no-op (the slot only holds the boot attach) and the
+  /// transcript never re-attaches. Null falls back to [switchTo].
+  final ValueChanged<String>? onOpenLiveSession;
+
+  /// When true the list renders as a compact column of session dots.
+  final bool collapsed;
+
+  /// The DAP-bound session (inbound hub mail lands here) — its tile shows
+  /// the agent-network badge (DapBindingStore in the shell feeds this).
+  final String? hubBoundSessionId;
+
+  @override
+  State<SidebarSessionsList> createState() => _SidebarSessionsListState();
+}
+
+class _SidebarSessionsListState extends State<SidebarSessionsList> {
+  /// The applied (debounced) search query — a transient lookup over the
+  /// in-memory projection, never persisted; '' restores the full list.
+  String _query = '';
+  final TextEditingController _searchController = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
+
+  void _onChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// Cmd/Ctrl+F focuses the search field while the expanded list is on
+  /// screen (issue #200). Registered globally — focus may sit anywhere in
+  /// the shell (the composer, a panel) — and never consumes the event.
+  bool _onKey(KeyEvent event) {
+    if (widget.collapsed || event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.keyF) return false;
+    final mods = HardwareKeyboard.instance;
+    if (!mods.isMetaPressed && !mods.isControlPressed) return false;
+    _searchFocus.requestFocus();
+    return false;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.manager.addListener(_onChanged);
+    widget.sessionNamesStore?.addListener(_onChanged);
+    HardwareKeyboard.instance.addHandler(_onKey);
+  }
+
+  @override
+  void didUpdateWidget(covariant SidebarSessionsList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // The wide shell loads the names store lazily — re-subscribe when it
+    // arrives (and when the manager instance is swapped).
+    if (oldWidget.manager != widget.manager) {
+      oldWidget.manager.removeListener(_onChanged);
+      widget.manager.addListener(_onChanged);
+    }
+    if (oldWidget.sessionNamesStore != widget.sessionNamesStore) {
+      oldWidget.sessionNamesStore?.removeListener(_onChanged);
+      widget.sessionNamesStore?.addListener(_onChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_onKey);
+    widget.manager.removeListener(_onChanged);
+    widget.sessionNamesStore?.removeListener(_onChanged);
+    _searchController.dispose();
+    _searchFocus.dispose();
+    super.dispose();
+  }
+
+  /// Parent session ids the user expanded (issue #198 tree); backed by
+  /// [SessionUiPrefsStore] when one is injected so the choice survives an
+  /// app restart (issue #426). Groups within [sessionTreeAutoExpandChildren]
+  /// children render expanded WITHOUT an entry here — the set only carries
+  /// explicit overrides (see [_toggleExpanded]).
+  final Set<String> _localExpandedParents = {};
+
+  /// Explicitly collapsed parents (issue #426): groups at or under the
+  /// auto-expand limit render open by default, so collapsing one is a
+  /// choice that must be remembered just like expanding a big group.
+  final Set<String> _localCollapsedParents = {};
+
+  Set<String> get _expandedParents =>
+      widget.prefsStore?.expandedParents ?? _localExpandedParents;
+  Set<String> get _collapsedParents =>
+      widget.prefsStore?.collapsedParents ?? _localCollapsedParents;
+
+  void _toggleExpanded(String parentId, {required bool expanded}) {
+    final store = widget.prefsStore;
+    if (store != null) {
+      unawaited(store.setExpanded(parentId, !expanded));
+    } else {
+      (expanded ? _localExpandedParents : _localCollapsedParents).remove(
+        parentId,
+      );
+      (expanded ? _localCollapsedParents : _localExpandedParents).add(parentId);
+    }
+    setState(() {});
+  }
+
+  String _titleFor(SessionEntry entry, {bool subagent = false}) {
+    return sessionEntryTitle(
+      context,
+      entry,
+      namesStore: widget.sessionNamesStore,
+      sessionInfoNames: widget.sessionInfoNames,
+      subagent: subagent,
+    );
+  }
+
+  /// The empty state's Clear affordance (E1): reset the query and the
+  /// field in one tap — the full list restores instantly.
+  void _clearSearch() {
+    setState(() => _query = '');
+    _searchController.clear();
+    _searchFocus.unfocus();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = FahColors.of(context);
+    if (widget.collapsed) return _buildCollapsed(colors);
+    return _buildExpanded(colors);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Expanded
+  // ---------------------------------------------------------------------------
+
+  Widget _buildExpanded(FahColors colors) {
+    final live = widget.manager.sessions;
+    final liveIds = live.map((s) => s.id).toSet();
+    // A session keeps the folder it was created in: the live env reports
+    // the app's CURRENT mount for every session, so prefer the persisted
+    // metadata's cwd — otherwise a tile's folder flips when it opens.
+    final persistedCwdById = {
+      for (final m in widget.persistedSessions) m.id: m.cwd,
+    };
+    final persistedById = {for (final m in widget.persistedSessions) m.id: m};
+    // Live sessions plus the persisted ones not currently open — the full
+    // on-disk history stays reachable from the sidebar, like the mobile
+    // chat sheet's persisted tail.
+    final entries = <SessionEntry>[
+      for (final session in live)
+        SessionEntry(
+          id: session.id,
+          // Hosted sessions: the manager slot's stamps are pinned at boot;
+          // after a broadcast session switch the persisted metadata (the
+          // SW poll) carries the LIVE session's real times. Without this
+          // the active dot's row never changes its label.
+          createdAt: persistedById[session.id]?.createdAt ?? session.createdAt,
+          lastUpdatedAt:
+              persistedById[session.id]?.lastUpdatedAt ?? session.lastUpdatedAt,
+          cwd: persistedCwdById[session.id] ?? session.service.env.sessionCwd,
+          live: session,
+        ),
+      for (final metadata in widget.persistedSessions)
+        if (!liveIds.contains(metadata.id))
+          SessionEntry(
+            id: metadata.id,
+            createdAt: metadata.createdAt,
+            lastUpdatedAt: metadata.lastUpdatedAt ?? metadata.createdAt,
+            cwd: metadata.cwd,
+            persisted: metadata,
+          ),
+      // STABLE order: sort by CREATION time, not activity. An activity sort
+      // reshuffles the list on every switch — the just-archived session's
+      // file mtime bumps to now and the re-keyed live slot gets a fresh
+      // stamp, so the row you clicked teleports ("сессии прыгают").
+      // Creation time never changes: clicking moves only the dot, a new
+      // session still lands on top.
+    ]..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    // Live search (issue #200): a pure filter over the in-memory
+    // projection — zero I/O. Name matches rank first; a blank query
+    // keeps the list exactly as it was.
+    final query = _query.trim();
+    final visible = rankSessionEntries(entries, _query, (e) {
+      return (
+        title: _titleFor(e),
+        id: e.id,
+        cwd: e.cwd,
+        updatedAt: e.lastUpdatedAt,
+      );
+    });
+    // AC2 (tree interop): a matching subagent surfaces under its parent.
+    // The parent's own fields may not match — it is pulled in as dimmed
+    // context and force-expanded; non-matching siblings stay hidden
+    // (the rank filter already dropped them). A matching PARENT keeps
+    // its collapse state: nothing is forced for it.
+    final contextParents = <String>{};
+    if (query.isNotEmpty) {
+      final visibleIds = {for (final e in visible) e.id};
+      final entryById = {for (final e in entries) e.id: e};
+      for (final e in visible) {
+        final parentId = subagentParentId(
+          persistedById[e.id] ??
+              SessionMetadata(
+                id: e.id,
+                createdAt: e.createdAt,
+                cwd: e.cwd ?? '',
+                path: '',
+              ),
+        );
+        if (parentId != null &&
+            entryById.containsKey(parentId) &&
+            !visibleIds.contains(parentId)) {
+          contextParents.add(parentId);
+        }
+      }
+      visible.addAll([for (final id in contextParents) entryById[id]!]);
+    }
+    // The click highlights the row IN PLACE (selection =
+    // selectedSessionId); the list never reorders under the finger.
+    final rows = sessionTreeRows(
+      visible,
+      metadataById: persistedById,
+      personalLabel: context.l10n.sessionFolderPersonal,
+      activeSessionId: widget.selectedSessionId,
+      expandedIds: query.isEmpty
+          ? _expandedParents
+          : {..._expandedParents, ...contextParents},
+      collapsedIds: query.isEmpty ? _collapsedParents : const {},
+      dimmedIds: contextParents,
+    );
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 4),
+          child: Row(
+            children: [
+              Text(
+                context.l10n.sidebarSessionsHeader.toUpperCase(),
+                style: TextStyle(
+                  color: colors.dim,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.add_circle_outline),
+                onPressed: widget.onNewSession,
+                tooltip: context.l10n.sidebarNewSessionTooltip,
+                iconSize: 20,
+                color: colors.dim,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+              ),
+            ],
+          ),
+        ),
+        // The search row sits pinned between the header and the list —
+        // it does not scroll away.
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+          child: SessionSearchField(
+            controller: _searchController,
+            focusNode: _searchFocus,
+            onQueryChanged: (q) {
+              if (q != _query) setState(() => _query = q);
+            },
+          ),
+        ),
+        Expanded(
+          child: rows.isEmpty
+              ? (query.isEmpty
+                    ? const SizedBox.shrink()
+                    // E1: no matches → say so, offer a way out.
+                    : sessionSearchEmptyState(
+                        context,
+                        colors,
+                        query,
+                        _clearSearch,
+                      ))
+              : ListView(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  children: [
+                    for (final row in rows)
+                      if (row.isHeader)
+                        _DateHeader(label: row.label!, colors: colors)
+                      else
+                        _sessionTile(row),
+                  ],
+                ),
+        ),
+      ],
+    );
+  }
+
+  void _openEntry(SessionEntry entry) {
+    final live = entry.live;
+    if (live != null) {
+      // Hosted: the slot is just the boot attach keyholder — re-dispatch
+      // through the host so the transcript actually switches (see
+      // [onOpenLiveSession]).
+      final openLive = widget.onOpenLiveSession;
+      if (openLive != null) {
+        openLive(live.id);
+      } else {
+        widget.manager.switchTo(live.id);
+      }
+      widget.onSessionTap?.call();
+      return;
+    }
+    final persisted = entry.persisted;
+    if (persisted != null) widget.onOpenPersisted?.call(persisted);
+  }
+
+  /// One tree row → tile: parents get the collapse chevron + agent count
+  /// badge; child rows indent with the agent glyph (orphans surface
+  /// top-level, marked but not indented).
+  Widget _sessionTile(SessionListRow row) {
+    final entry = row.entry!;
+    final tile = SessionTile(
+      title: _titleFor(entry, subagent: row.isChild),
+      subtitle: sessionTileSubtitle(entry.lastUpdatedAt),
+      // The folder basename IS the group header — a per-tile cwd label
+      // would duplicate it.
+      cwd: null,
+      isActive: entry.id == widget.selectedSessionId,
+      hubBound:
+          widget.hubBoundSessionId != null &&
+          widget.hubBoundSessionId == entry.id,
+      onTap: () => _openEntry(entry),
+      onMenu: (anchor) => _showSessionMenu(entry, anchor),
+      childCount: row.childCount,
+      expanded: row.expanded,
+      onToggleExpand: row.childCount > 0
+          ? () => _toggleExpanded(entry.id, expanded: row.expanded)
+          : null,
+      subagent: row.isChild,
+      indent: row.isChild && !row.orphaned ? sessionChildIndent : 0,
+    );
+    // AC2: a parent pulled in as search context renders faintly — it is
+    // scaffolding for the matching child, not a hit. Still tappable.
+    if (!row.dimmed) return tile;
+    return Opacity(opacity: 0.45, child: tile);
+  }
+
+  /// The 3-dot tile menu: rename (via the shared rename dialog, like the
+  /// CLI `/rename`) and delete (with confirmation). Works for live and
+  /// persisted-only sessions alike — the implementation is shared with the
+  /// mobile chat sheet's sessions drawer (see [showSessionActionsMenu]).
+  Future<void> _showSessionMenu(SessionEntry entry, Rect anchor) =>
+      showSessionActionsMenu(
+        context,
+        anchor: anchor,
+        manager: widget.manager,
+        namesStore: widget.sessionNamesStore,
+        sessionId: entry.id,
+        createdAt: entry.createdAt,
+        live: entry.live,
+        persisted: entry.persisted,
+      );
+
+  // ---------------------------------------------------------------------------
+  // Collapsed (icon rail)
+  // ---------------------------------------------------------------------------
+
+  Widget _buildCollapsed(FahColors colors) {
+    final sessions = widget.manager.sessions;
+    return Column(
+      children: [
+        IconButton(
+          icon: const Icon(Icons.add_circle_outline),
+          onPressed: widget.onNewSession,
+          tooltip: context.l10n.sidebarNewSessionTooltip,
+          iconSize: 18,
+          color: colors.dim,
+          padding: const EdgeInsets.only(top: 8),
+          constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
+        ),
+        Expanded(
+          child: sessions.isEmpty
+              ? const SizedBox.shrink()
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  itemCount: sessions.length,
+                  itemBuilder: (context, index) {
+                    final session = sessions[index];
+                    final isActive = session.id == widget.selectedSessionId;
+                    return Tooltip(
+                      message: _titleFor(
+                        SessionEntry(
+                          id: session.id,
+                          createdAt: session.createdAt,
+                          lastUpdatedAt: session.lastUpdatedAt,
+                          live: session,
+                        ),
+                      ),
+                      child: GestureDetector(
+                        onTap: () {
+                          widget.manager.switchTo(session.id);
+                          widget.onSessionTap?.call();
+                        },
+                        child: Container(
+                          margin: const EdgeInsets.symmetric(vertical: 4),
+                          height: 10,
+                          alignment: Alignment.center,
+                          child: Container(
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: isActive
+                                  ? colors.teal
+                                  : colors.dim.withValues(alpha: 0.35),
+                              shape: BoxShape.circle,
+                            ),
+                          ),
+                        ),
+                      ),
+                    );
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Left indent of a subagent child tile under its parent (both hosts).
+const sessionChildIndent = 20.0;
+
+/// One row in the expanded list: a live [FlutterManagedSession] or a
+/// persisted-only [SessionMetadata] still sitting on disk. Shared by the
+/// wide sidebar and the mobile sessions drawer (issue #198: both hosts
+/// render the SAME tree row model — see [sessionTreeRows]).
+final class SessionEntry {
+  const SessionEntry({
+    required this.id,
+    required this.createdAt,
+    required this.lastUpdatedAt,
+    this.cwd,
+    this.live,
+    this.persisted,
+  });
+
+  final String id;
+  final DateTime createdAt;
+
+  /// When the session was last modified. Drives sorting and the "Today /
+  /// Yesterday / May 7" group headers so active sessions stay on top.
+  final DateTime lastUpdatedAt;
+
+  /// The session's working directory at creation time (CLI sessions store
+  /// the host cwd; macOS app sessions store the Fa sandbox root). Drives
+  /// the folder label rendered next to the title so the user can tell at
+  /// a glance which project/sandbox each session belongs to.
+  final String? cwd;
+  final FlutterManagedSession? live;
+  final SessionMetadata? persisted;
+}
+
+/// tile (a parent heads its subagent children: [childCount] > 0 plus the
+/// group's [expanded] state), or a subagent child tile ([isChild]; an
+/// [orphaned] child renders top-level with the agent glyph).
+final class SessionListRow {
+  const SessionListRow({
+    this.label,
+    this.entry,
+    this.childCount = 0,
+    this.expanded = false,
+    this.isChild = false,
+    this.orphaned = false,
+    this.dimmed = false,
+  });
+
+  /// Folder-header label (set iff this is a header row).
+  final String? label;
+
+  /// The session this tile renders (null for headers).
+  final SessionEntry? entry;
+
+  /// Subagent children under [entry]; > 0 renders the collapse badge.
+  final int childCount;
+
+  /// Whether the child group renders expanded (parent rows only).
+  final bool expanded;
+
+  /// A subagent child tile (agent glyph; indented unless [orphaned]).
+  final bool isChild;
+
+  /// A subagent whose parent is missing from the listed set.
+  final bool orphaned;
+
+  /// Search context (issue #200 AC2): the row's own fields did not match
+  /// the query — it renders only as dimmed context for a matching child.
+  final bool dimmed;
+
+  bool get isHeader => label != null;
+}
+
+/// Groups with at most this many subagent children render EXPANDED by
+/// default (issue #426 user review 2026-09-15: "subagents пусть будут
+/// свернуты" — every group starts collapsed; the count pill shows the
+/// batch size and one tap reveals it). The ACTIVE session's group still
+/// force-opens (E2) regardless of this default.
+const sessionTreeAutoExpandChildren = 0;
+
+/// Folder-grouped, parent-nested rows for a session list (issue #198's
+/// app surface): folder headers stay the top level; under each header the
+/// mains render with their subagent children nested behind a count badge
+/// — expanded at or under [sessionTreeAutoExpandChildren] children,
+/// collapsed above it, and either [expandedIds] / [collapsedIds] override
+/// wins (issue #426's persisted user choice). The ACTIVE session is one
+/// of the group's children (E2: the group forces open so the active row
+/// stays visible) regardless of every default. Orphaned subagents
+/// surface top-level with the glyph. Parents in [dimmedIds] (issue #200
+/// AC2: pulled in as search context for a matching child) carry `dimmed`
+/// for the host to render faintly. Pure projection over [metadataById] —
+/// no extra I/O (AC5): entries missing from it (presence-only rows,
+/// pre-feature headers) are mains.
+List<SessionListRow> sessionTreeRows(
+  List<SessionEntry> entries, {
+  required Map<String, SessionMetadata> metadataById,
+  required String personalLabel,
+  String? activeSessionId,
+  Set<String> expandedIds = const {},
+  Set<String> collapsedIds = const {},
+  Set<String> dimmedIds = const {},
+}) {
+  // Folder groups in first-appearance order (entries arrive pre-sorted).
+  final byFolder = <String, List<SessionEntry>>{};
+  final order = <String>[];
+  for (final entry in entries) {
+    final label = sessionFolderGroupLabel(entry.cwd, personalLabel);
+    if (byFolder.putIfAbsent(label, () => []).isEmpty) order.add(label);
+    byFolder[label]!.add(entry);
+  }
+  // The on-disk header is the `agent`/`parent` classification source.
+  SessionMetadata classify(SessionEntry e) =>
+      metadataById[e.id] ??
+      // No header on disk yet — classify as a main, like the CLI does.
+      SessionMetadata(
+        id: e.id,
+        createdAt: e.createdAt,
+        cwd: e.cwd ?? '',
+        path: '',
+      );
+  // The shared core grouping runs per folder group: a child whose parent
+  // sits in another folder degrades to an orphan marker (the same-cwd
+  // rule as the CLI listing).
+  List<SessionListRow> treeFolder(List<SessionEntry> folderEntries) {
+    final entryById = {for (final e in folderEntries) e.id: e};
+    final rows = <SessionListRow>[];
+    for (final group in groupSessionsByParent([
+      for (final e in folderEntries) classify(e),
+    ])) {
+      final entry = entryById[group.main.id]!;
+      if (group.children.isEmpty) {
+        final orphaned = isSubagentSession(group.main);
+        rows.add(
+          SessionListRow(entry: entry, isChild: orphaned, orphaned: orphaned),
+        );
+        continue;
+      }
+      // Defaults first, then the persisted user choice (issue #426): a
+      // big group starts collapsed, a small one open — an explicit
+      // override beats either. The active child still forces open (E2).
+      final hasActiveChild = group.children.any(
+        (child) => child.id == activeSessionId,
+      );
+      final expanded =
+          hasActiveChild ||
+          (collapsedIds.contains(entry.id)
+              ? false
+              : expandedIds.contains(entry.id) ||
+                    group.children.length <= sessionTreeAutoExpandChildren);
+      rows.add(
+        SessionListRow(
+          entry: entry,
+          childCount: group.children.length,
+          expanded: expanded,
+          dimmed: dimmedIds.contains(entry.id),
+        ),
+      );
+      if (expanded) {
+        for (final child in group.children) {
+          final childEntry = entryById[child.id];
+          // A search filter can drop the child from [entries] while the
+          // parent stays — rendering a null-entry row would crash the
+          // tile; the child simply doesn't show under the (context)
+          // parent.
+          if (childEntry == null) continue;
+          rows.add(SessionListRow(entry: childEntry, isChild: true));
+        }
+      }
+    }
+    return rows;
+  }
+
+  return [
+    for (final label in order) ...[
+      SessionListRow(label: label),
+      ...treeFolder(byFolder[label]!),
+    ],
+  ];
+}
+
+/// The display title for a session row — the app-local rename over the
+/// CLI-written `session_info` name over the derived date title. Unnamed
+/// subagent children degrade to `subagent <short-id>` (never a bare
+/// timestamp), matching the CLI's tree rows.
+String sessionEntryTitle(
+  BuildContext context,
+  SessionEntry entry, {
+  SessionNamesStore? namesStore,
+  Map<String, String> sessionInfoNames = const {},
+  bool subagent = false,
+}) {
+  final named = namesStore?.titleFor(entry.id) ?? sessionInfoNames[entry.id];
+  if (named != null) return named;
+  if (subagent) {
+    final shortId = entry.id.length < 8 ? entry.id : entry.id.substring(0, 8);
+    return context.l10n.sidebarSubagentTitle(shortId);
+  }
+  return derivedSessionTitle(context, id: entry.id, createdAt: entry.createdAt);
+}
+
+/// A small date header label (Today, Yesterday, May 7, ...).
+class _DateHeader extends StatelessWidget {
+  const _DateHeader({required this.label, required this.colors});
+
+  final String label;
+  final FahColors colors;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 2),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: colors.dim,
+          fontSize: 11,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+/// Short timestamp for a session tile's subtitle (e.g. "12:34 PM" or
+/// "May 7"). Shared by the wide sidebar and the mobile sessions drawer so
+/// both render an identical row. Pass the session's last activity time to
+/// reflect recent updates.
+String sessionTileSubtitle(DateTime updated) {
+  final now = DateTime.now();
+  final diff = now.difference(updated);
+  if (diff.inDays == 0) {
+    // Today: show time.
+    final h = updated.hour == 0
+        ? 12
+        : (updated.hour > 12 ? updated.hour - 12 : updated.hour);
+    final m = updated.minute.toString().padLeft(2, '0');
+    final ampm = updated.hour >= 12 ? 'PM' : 'AM';
+    return '$h:$m $ampm';
+  }
+  if (diff.inDays == 1) return 'Yesterday';
+  if (diff.inDays < 7) {
+    const weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    return weekdays[updated.weekday - 1];
+  }
+  const months = [
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
+  ];
+  return '${months[updated.month - 1]} ${updated.day}';
+}
+
+/// The folder label rendered next to the title — the last path segment of
+/// the session's working directory so the user can scan which project each
+/// session belongs to at a glance. Null when the cwd is missing or looks
+/// like an unscoped sandbox root (no useful basename).
+String? sessionTileCwdLabel(String? cwd) {
+  if (cwd == null || cwd.isEmpty) return null;
+  final name = p.basename(cwd);
+  if (name.isEmpty || name == '/' || name == '.') return null;
+  return name;
+}
+
+/// The session-list group label: the basename of the folder the session
+/// was started in (its workspace), or [personalLabel] for sandbox
+/// sessions with no folder. Shared by the wide sidebar and the mobile
+/// drawer so both group identically.
+String sessionFolderGroupLabel(String? cwd, String personalLabel) {
+  return sessionTileCwdLabel(cwd) ?? personalLabel;
+}
+
+/// The session tile's 3-dot menu, shared by the wide sidebar and the
+/// mobile chat sheet's sessions drawer: rename (via the shared rename
+/// dialog, like the CLI `/rename`) and delete (with confirmation). Works
+/// for live and persisted-only sessions alike. [onDeleted] fires after a
+/// successful delete so hosts listing on-disk sessions can resync.
+Future<void> showSessionActionsMenu(
+  BuildContext context, {
+  required Rect anchor,
+  required FlutterSessionManager manager,
+  required SessionNamesStore? namesStore,
+  required String sessionId,
+  required DateTime createdAt,
+  FlutterManagedSession? live,
+  SessionMetadata? persisted,
+  VoidCallback? onDeleted,
+}) async {
+  final l10n = context.l10n;
+  // Hosted rows (extension panel / relay shell) live in the service
+  // worker's storage — this surface has no delete path into it. Offer the
+  // honest "not deletable here" tile instead of a permanent dead-end
+  // (issue #863 review round 2).
+  final hostedListing = manager.isHostedListing;
+  final overlayBox =
+      Overlay.of(context).context.findRenderObject()! as RenderBox;
+  final action = await showMenu<String>(
+    context: context,
+    position: RelativeRect.fromRect(anchor, Offset.zero & overlayBox.size),
+    items: [
+      PopupMenuItem(
+        value: 'rename',
+        child: Row(
+          children: [
+            const Icon(Icons.edit_outlined, size: 16),
+            const SizedBox(width: 8),
+            Text(l10n.sidebarRenameDialogTitle),
+          ],
+        ),
+      ),
+      PopupMenuItem(
+        value: hostedListing ? null : 'delete',
+        enabled: !hostedListing,
+        child: Row(
+          children: [
+            const Icon(Icons.delete_outline, size: 16),
+            const SizedBox(width: 8),
+            // Expanded: the gated reason is long — it wraps inside the
+            // menu instead of overflowing on narrow surfaces.
+            Expanded(
+              child: Text(
+                hostedListing
+                    ? l10n.sidebarDeleteUnavailable
+                    : l10n.sidebarDelete,
+              ),
+            ),
+          ],
+        ),
+      ),
+    ],
+  );
+  if (!context.mounted || action == null) return;
+  switch (action) {
+    case 'rename':
+      final store = namesStore;
+      if (store == null) return;
+      await showRenameSessionDialog(
+        context,
+        store: store,
+        sessionId: sessionId,
+        createdAt: createdAt,
+      );
+    case 'delete':
+      await _deleteSession(
+        context,
+        manager: manager,
+        namesStore: namesStore,
+        sessionId: sessionId,
+        live: live,
+        persisted: persisted,
+        onDeleted: onDeleted,
+      );
+  }
+}
+
+Future<void> _deleteSession(
+  BuildContext context, {
+  required FlutterSessionManager manager,
+  required SessionNamesStore? namesStore,
+  required String sessionId,
+  required FlutterManagedSession? live,
+  required SessionMetadata? persisted,
+  VoidCallback? onDeleted,
+}) async {
+  // Defense in depth for the gated menu entry (issue #863 review round
+  // 2): a hosted row has no delete path from this surface.
+  if (manager.isHostedListing) return;
+  final l10n = context.l10n;
+  final title = namesStore?.titleFor(sessionId);
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(l10n.sidebarDeleteSessionTitle),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title ??
+                l10n.sidebarDeletePersistedContent(
+                  sessionId.length < 8
+                      ? sessionId
+                      : sessionId.substring(0, 8),
+                ),
+            style: const TextStyle(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          Text(l10n.sidebarDeleteSessionContent),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: Text(l10n.commonCancel),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: Text(l10n.sidebarDelete),
+        ),
+      ],
+    ),
+  );
+  if (confirmed != true || !context.mounted) return;
+  try {
+    await manager.deleteSession(sessionId, metadata: persisted);
+    onDeleted?.call();
+    // Deleting the active (and only) session must not strand the shell on
+    // the "No active session" placeholder — mint a fresh one on the same
+    // connection, like the chat screen's ensureActiveSession path.
+    if (manager.active == null) {
+      final service = live?.service;
+      final config = service?.configForClone;
+      if (service != null && config != null) {
+        await manager.ensureActiveSession(
+          config: config,
+          serviceFactory: () async => service.clone(),
+        );
+      }
+    }
+  } on Object catch (error) {
+    if (context.mounted) {
+      showFahErrorSnack(
+        context,
+        l10n.sidebarDeleteSessionFailed(error.toString()),
+        sessionId: sessionId,
+      );
+    }
+  }
+}
+
+/// One row in a session list — the wide sidebar and the mobile sessions
+/// drawer render the SAME tile: an active dot, the title, a relative-time
+/// subtitle, the working-folder label, and a 3-dot actions menu. Tree
+/// rows (issue #198) extend it: a parent heads its collapsed subagent
+/// children behind a chevron + count badge, children indent with the
+/// agent glyph.
+class SessionTile extends StatelessWidget {
+  const SessionTile({
+    super.key,
+    required this.title,
+    required this.subtitle,
+    required this.isActive,
+    this.cwd,
+    this.live = false,
+    this.hubBound = false,
+    this.childCount = 0,
+    this.expanded = false,
+    this.onToggleExpand,
+    this.subagent = false,
+    this.indent = 0,
+    required this.onTap,
+    this.onMenu,
+  });
+
+  final String title;
+  final String subtitle;
+  final String? cwd;
+
+  /// Distinct, monospace basename of the session's working directory.
+  /// Null when the cwd is unknown or the personal (unscoped) sandbox.
+  final bool isActive;
+
+  /// True when a live agent process (a `fa` CLI run) currently owns this
+  /// session — a pulsing green dot marks it and the tap attaches to it.
+  final bool live;
+
+  /// True when inbound hub mail is routed to this session (DAP settings,
+  /// "Incoming messages") — the agent-network badge marks the tile.
+  final bool hubBound;
+  final VoidCallback onTap;
+
+  /// Called with the menu button's global rect when the 3-dot menu button
+  /// is tapped (the popup anchors to it). When null, the menu is hidden.
+  final ValueChanged<Rect>? onMenu;
+
+  /// Subagent children nested under this session (issue #198): > 0
+  /// renders the collapse chevron + "N agents" badge; taps fire
+  /// [onToggleExpand]. The tile body itself still opens the session.
+  final int childCount;
+
+  /// Whether the child group renders expanded (chevron rotation).
+  final bool expanded;
+  final VoidCallback? onToggleExpand;
+
+  /// A subagent child row: the agent glyph marks machinery sessions.
+  final bool subagent;
+
+  /// Left indent (child rows nest under their parent).
+  final double indent;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = FahColors.of(context);
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      child: Material(
+        color: isActive
+            ? (isLight ? const Color(0xFFEEF2FF) : colors.panelAlt)
+            : Colors.transparent,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+            child: Row(
+              children: [
+                if (indent > 0) SizedBox(width: indent),
+                if (live)
+                  // A live CLI process owns the session — green dot, the
+                  // clearest "running right now" marker.
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade400,
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.green.shade400.withValues(alpha: 0.6),
+                          blurRadius: 6,
+                        ),
+                      ],
+                    ),
+                  )
+                else if (isActive)
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: isLight ? colors.indigo : colors.teal,
+                      shape: BoxShape.circle,
+                    ),
+                  )
+                else
+                  const SizedBox(width: 8),
+                const SizedBox(width: 10),
+                if (subagent) ...[
+                  SubagentMark(
+                    size: 12,
+                    color: colors.dim.withValues(alpha: 0.8),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: isActive ? colors.text : colors.dim,
+                          fontSize: 13,
+                          fontWeight: isActive
+                              ? FontWeight.w600
+                              : FontWeight.w400,
+                        ),
+                      ),
+                      if (subtitle.isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          subtitle,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: colors.dim.withValues(alpha: 0.7),
+                            fontSize: 11,
+                          ),
+                        ),
+                      ],
+                      if (cwd != null) ...[
+                        const SizedBox(height: 2),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.folder_outlined,
+                              size: 11,
+                              color: colors.dim.withValues(alpha: 0.6),
+                            ),
+                            const SizedBox(width: 4),
+                            Flexible(
+                              child: Text(
+                                cwd!,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: colors.dim.withValues(alpha: 0.6),
+                                  fontSize: 11,
+                                  fontFamily: 'JetBrainsMono',
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                if (childCount > 0 && onToggleExpand != null) ...[
+                  const SizedBox(width: 8),
+                  // The pill looks compact but its TAP ZONE is a
+                  // comfortable 36px-tall band, vertically centered — the
+                  // user review found the bare pill too short to hit.
+                  SizedBox(
+                    height: 36,
+                    child: InkWell(
+                      onTap: onToggleExpand,
+                      borderRadius: BorderRadius.circular(999),
+                      child: Center(
+                        child: Tooltip(
+                          message: context.l10n.sidebarSubagentSessionCount(
+                            childCount,
+                          ),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 7,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: colors.panelAlt,
+                              borderRadius: BorderRadius.circular(999),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                AnimatedRotation(
+                                  turns: expanded ? 0.25 : 0,
+                                  duration: const Duration(milliseconds: 120),
+                                  child: Icon(
+                                    Icons.keyboard_arrow_right,
+                                    size: 14,
+                                    color: colors.dim,
+                                  ),
+                                ),
+                                const SizedBox(width: 2),
+                                SubagentMark(size: 11, color: colors.dim),
+                                const SizedBox(width: 4),
+                                Text(
+                                  '$childCount',
+                                  style: TextStyle(
+                                    color: colors.dim,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    height: 1.0,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+                if (hubBound)
+                  Tooltip(
+                    message: context.l10n.settingsDapInboundBadgeTooltip,
+                    child: const Padding(
+                      padding: EdgeInsets.only(right: 4),
+                      child: DapHubMark(size: 13),
+                    ),
+                  ),
+                // 3-dot menu (visible on the active tile or on hover): the
+                // glyph stays small but the hit area is a comfortable 36×36
+                // (issue #426 v2 — the old 18×18 target was a mis-tap trap).
+                if (onMenu != null) ...[
+                  const SizedBox(width: 4),
+                  SizedBox(
+                    width: 36,
+                    height: 36,
+                    child: InkWell(
+                      onTap: () {
+                        final box = context.findRenderObject()! as RenderBox;
+                        onMenu!(box.localToGlobal(Offset.zero) & box.size);
+                      },
+                      borderRadius: BorderRadius.circular(8),
+                      child: Icon(
+                        Icons.more_horiz,
+                        size: 16,
+                        color: colors.dim.withValues(alpha: 0.6),
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

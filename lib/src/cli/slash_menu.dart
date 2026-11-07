@@ -1,0 +1,345 @@
+import '../plugins/plugin.dart';
+import 'fuzzy_matcher.dart';
+import '../skills/skills.dart';
+import 'prompt_templates.dart';
+import 'tui_repl.dart';
+
+/// Builds the slash-menu items for [prefix]: builtin commands (matched on
+/// name or description), plugin commands (name only), prompt templates, and
+/// user-invocable skills (name or description). A skill's key carries a
+/// trailing space so accepting it leaves the cursor ready for args.
+List<MenuItem> buildSlashMenuItems(
+  String prefix, {
+  required Map<String, String> slashCommands,
+  required Map<String, SlashCommand> pluginSlashCommands,
+  Map<String, String> pluginSlashDescriptions = const {},
+  Map<String, SlashCommand> extSlashCommands = const {},
+  required List<PromptTemplate> templates,
+  List<Skill> skills = const [],
+}) {
+  final lower = prefix.toLowerCase();
+  // Plugin commands shadow the same-named ext commands: one row per name.
+  final extOnly = Map.of(extSlashCommands)
+    ..removeWhere((key, _) => pluginSlashCommands.containsKey(key));
+  return [
+    ..._builtinMenuItems(slashCommands, lower),
+    ..._pluginMenuItems(pluginSlashCommands, lower, pluginSlashDescriptions),
+    ..._pluginMenuItems(extOnly, lower, const {}),
+    ..._templateMenuItems(templates, lower),
+    ..._skillMenuItems(skills, lower),
+  ];
+}
+
+/// Subsequence fallback for the composer's fuzzy overlay (issue #275):
+/// a candidate survives the substring filter when its key fuzzy-matches
+/// the prefix, so '/e' still surfaces /help and /model.
+bool _fuzzyKeyHit(String key, String prefix) =>
+    prefix.isEmpty || scoreFuzzy(key, prefix) != null;
+
+List<MenuItem> _builtinMenuItems(
+  Map<String, String> slashCommands,
+  String lower,
+) {
+  final items = <MenuItem>[];
+  for (final entry in slashCommands.entries) {
+    if (entry.key.toLowerCase().contains(lower) ||
+        entry.value.toLowerCase().contains(lower) ||
+        _fuzzyKeyHit(entry.key, lower)) {
+      items.add(
+        MenuItem(
+          key: entry.key,
+          label: entry.key,
+          description: entry.value,
+          group: 'commands',
+        ),
+      );
+    }
+  }
+  return items;
+}
+
+List<MenuItem> _pluginMenuItems(
+  Map<String, SlashCommand> pluginSlashCommands,
+  String lower,
+  Map<String, String> descriptions,
+) {
+  final items = <MenuItem>[];
+  for (final entry in pluginSlashCommands.entries) {
+    if (entry.key.toLowerCase().contains(lower) ||
+        _fuzzyKeyHit(entry.key, lower)) {
+      items.add(
+        MenuItem(
+          key: entry.key,
+          label: entry.key,
+          description: descriptions[entry.key] ?? '',
+          group: 'commands',
+        ),
+      );
+    }
+  }
+  return items;
+}
+
+List<MenuItem> _templateMenuItems(
+  List<PromptTemplate> templates,
+  String lower,
+) {
+  final items = <MenuItem>[];
+  for (final t in templates) {
+    final name = '/${t.name}';
+    if (name.toLowerCase().contains(lower) || _fuzzyKeyHit(name, lower)) {
+      items.add(
+        MenuItem(
+          key: name,
+          label: name,
+          description: t.argumentHint ?? '',
+          group: 'commands',
+        ),
+      );
+    }
+  }
+  return items;
+}
+
+List<MenuItem> _skillMenuItems(List<Skill> skills, String lower) {
+  // Normalize the typed prefix to the bare skill-name fragment: '/goal',
+  // 'goal', and '/skill:goal' all must offer '/create-goal' — matching the
+  // raw prefix against '/<name>' breaks on the embedded slash (user report:
+  // typing /goal showed no suggestion).
+  var needle = lower.startsWith('/') ? lower.substring(1) : lower;
+  if (needle.startsWith('skill:')) {
+    needle = needle.substring('skill:'.length);
+  }
+  final items = <MenuItem>[];
+  for (final skill in userInvocableSkills(skills)) {
+    final hint = skill.manifest.argumentHint;
+    // First-party badge (issue #1151 AC5): package-shipped skills are
+    // greppable in completion so users can tell them from project skills.
+    final badge = skill.source == SkillSource.builtin ? ' (builtin)' : '';
+    final description = hint == null || hint.isEmpty
+        ? '${skill.description}$badge'
+        : '${skill.description}$badge $hint';
+    if (skill.name.toLowerCase().contains(needle) ||
+        skill.description.toLowerCase().contains(needle) ||
+        _fuzzyKeyHit('/${skill.name}', needle)) {
+      items.add(
+        MenuItem(
+          key: '/skill:${skill.name} ',
+          label: '/${skill.name}',
+          description: description,
+          group: 'skills',
+        ),
+      );
+    }
+  }
+  return items;
+}
+
+/// The skills offered by the slash menu / line-mode menu: explicit
+/// invocation requires the manifest's `user-invocable` (default true).
+Iterable<Skill> userInvocableSkills(List<Skill> skills) =>
+    skills.where((s) => s.userInvocable);
+
+/// The builtin slash commands, in help/menu order.
+const builtinSlashCommands = <String, String>{
+  '/exit': 'quit',
+  '/reset': 'start a new session',
+  '/compact': 'summarize history to free context',
+  '/stats': 'show token and cost totals',
+  '/tasks': '[cancel <id>] — list background agents',
+  '/transcript':
+      '[expand all|none] — collapsed thinking rows: render or hide the '
+      'persisted text (gh-1933)',
+  '/queue': '[clear] — queued follow-up messages (strip above the input)',
+  '/memory': '[maintain] — memory stats or run consolidation',
+  '/power': 'show sleep prevention (caffeinate) level and state',
+  '/quota': '[refresh] — provider quota: used/limit, reset, updated',
+  '/timer':
+      '[<duration|epoch-ms>|clear] — session deadline countdown '
+      '(25m, 90s, 1h30m)',
+  '/redact': '[on|off|block on|block off|stats|layers] — secret redaction',
+  '/a2a': 'show A2A remote agent servers status',
+  '/skills': 'list discovered skills (invoke with /skill:<name>)',
+  '/ext': '[list|enable|disable|audit|remove|update|reload] — JS extensions',
+  '/jsr':
+      '[widget:test|widget:screenshot] — jsr widget CLI pass-through '
+      '(js_widget_runtime)',
+  '/agents':
+      '[types|<id>|open <id>] — agents hub: fleet tree, transcript, '
+      'observe, open session',
+  '/mail': '[<id>] — deferred messages (btw panels) and their state',
+  '/reply': '<id|agent|mailbox> <text> — answer a panel or agent',
+  '/restart':
+      'abort a stalled run and re-run its saved steering as a fresh turn',
+  '/model': '<provider/model> — select model (opens selector)',
+  '/models': '[filter] | config | set <slot> <model> [baseUrl] | remove <slot>',
+  '/model-edit':
+      '[contextWindow|maxTokens <n>] — show or override token limits',
+  '/provider':
+      '[name] [baseUrl] [token] | add | custom — switch or add provider',
+  '/providers': 'provider queue editor (issue #418)',
+  // /provider-edit removed — edit/delete is now inline in /provider picker.
+  '/mode': '[name] — show or switch the active mode',
+  '/theme': '[name|reset] — switch TUI theme (bare opens picker)',
+  '/session': '[name] — show current or switch/create a named session',
+  '/session-new': '<name> — create a new named session',
+  '/sessions': 'list all sessions across workspaces',
+  '/import':
+      'import omp/claude sessions recorded for this folder into fa',
+  '/resume': 'switch to the most recent session',
+  '/rename-session': '<name> — rename the current session',
+  '/trajectory': '[view|cost|tail|inspect <n>] — session trajectory ledger',
+  '/usage': '[rebuild] — session token-usage ledger (usage.json)',
+  '/images': 'image registry: window, last-request drops, caps, knobs',
+  '/approval': '[mode] — show or set tool approval',
+  '/settings': '— settings hub: provider, model, approval, keys, MCP',
+  '/update': '— check for updates, restart fa (same session)',
+  '/allow': '[tool] — always-allow a tool (or list them)',
+  '/mcp': '[list|reload] — show MCP servers or reload config',
+  '/mouse': '[on|off] — TUI mouse capture: wheel + click hit-regions',
+  '/terminal-setup':
+      'Shift+Enter newline support per terminal (Ctrl+O always works)',
+  '/tools':
+      '[enable|disable <id> [global|project|session]|reload] — tool '
+      'availability',
+  '/code': 'switch to coding mode',
+  '/architect': 'switch to architect mode',
+  '/review': 'switch to review mode',
+  '/help': '[filter] — command summary (/help hotkeys: key table)',
+  '!': '<command> — run a shell command directly',
+};
+
+/// The `/help` listing as styled lines: the (optionally filtered) builtin
+/// commands, then — for the full listing only — plugin commands, prompt
+/// templates, skills, and the steer hint.
+List<String> helpLines({
+  String filter = '',
+  required Map<String, SlashCommand> pluginSlashCommands,
+  Map<String, SlashCommand> extSlashCommands = const {},
+  required List<PromptTemplate> templates,
+  required TuiStyle style,
+  List<Skill> skills = const [],
+}) {
+  final lower = filter.toLowerCase();
+  final entries = builtinSlashCommands.entries
+      .where(
+        (e) =>
+            e.key.toLowerCase().contains(lower) ||
+            e.value.toLowerCase().contains(lower) ||
+            _fuzzyKeyHit(e.key, lower),
+      )
+      .toList();
+  if (entries.isEmpty) return [_helpEmptyLine(filter)];
+  final lines = [
+    style.bold(filter.isEmpty ? '[Commands]' : '[Commands matching "$filter"]'),
+    for (final entry in entries)
+      '  ${style.cyan(entry.key.padRight(18))} ${entry.value}',
+  ];
+  // Plugin commands, prompt templates, skills, and the steer hint are part
+  // of the full listing only, never of a filtered one.
+  if (filter.isNotEmpty) return lines;
+  return [
+    ...lines,
+    ..._helpExtrasLines(
+      pluginSlashCommands,
+      extSlashCommands,
+      templates,
+      style,
+      skills,
+    ),
+  ];
+}
+
+/// The no-match line for a filtered `/help`.
+String _helpEmptyLine(String filter) => filter.isNotEmpty
+    ? 'unknown command: /$filter (try /help)'
+    : 'no commands match "$filter"';
+
+/// The full-listing appendix: plugin commands, prompt templates, skills,
+/// and the steer hint.
+List<String> _helpExtrasLines(
+  Map<String, SlashCommand> pluginSlashCommands,
+  Map<String, SlashCommand> extSlashCommands,
+  List<PromptTemplate> templates,
+  TuiStyle style,
+  List<Skill> skills,
+) {
+  return [
+    if (pluginSlashCommands.isNotEmpty) ...[
+      '',
+      style.bold('[Plugin commands]'),
+      for (final entry in pluginSlashCommands.entries)
+        '  ${style.cyan(entry.key)}',
+      if (extSlashCommands.isNotEmpty) ...[
+        '',
+        style.bold('[Extension commands]'),
+        for (final entry in extSlashCommands.entries)
+          '  ${style.cyan(entry.key)}',
+      ],
+    ],
+    if (templates.isNotEmpty) ...[
+      '',
+      style.bold('[Prompt templates]'),
+      for (final t in templates)
+        '  ${style.cyan('/${t.name}')} ${t.argumentHint ?? ''}',
+    ],
+    if (skills.isNotEmpty) ...[
+      '',
+      style.bold('[Skills]'),
+      for (final s in skills) '  ${style.cyan('/${s.name}')} ${s.description}',
+    ],
+    '',
+    style.dim('While a run streams, type to steer the agent; Ctrl-C aborts.'),
+  ];
+}
+
+/// The numbered entries of the line-mode menu: builtin commands, then
+/// user-invocable skills (a skill choice resolves to `/skill:<name>`).
+List<MenuItem> lineModeMenuEntries(List<Skill> skills) {
+  return [
+    for (final entry in builtinSlashCommands.entries)
+      MenuItem(key: entry.key, label: entry.key, description: entry.value),
+    for (final skill in userInvocableSkills(skills))
+      MenuItem(
+        key: '/skill:${skill.name}',
+        label: '/${skill.name}',
+        description: skill.description,
+      ),
+  ];
+}
+
+/// The numbered command list of the line-mode menu, as styled lines.
+List<String> lineModeMenuLines(
+  TuiStyle style, {
+  List<Skill> skills = const [],
+}) {
+  final entries = lineModeMenuEntries(skills);
+  return [
+    '',
+    style.bold('[Commands]'),
+    for (var i = 0; i < entries.length; i++)
+      '  ${i + 1}) ${style.cyan(entries[i].label)} ${entries[i].description}',
+    '',
+  ];
+}
+
+/// Resolves a line-mode menu answer: a 1-based number over the builtin
+/// commands + skills, or a command/skill name with or without the leading
+/// slash. Null when neither matches.
+String? resolveLineModeMenuChoice(String trimmed, List<Skill> skills) {
+  final entries = lineModeMenuEntries(skills);
+  // Numeric choice.
+  final index = int.tryParse(trimmed);
+  if (index != null && index >= 1 && index <= entries.length) {
+    return entries[index - 1].key;
+  }
+  // Name choice; accept with or without leading slash. Builtins first.
+  final name = trimmed.startsWith('/') ? trimmed : '/$trimmed';
+  if (builtinSlashCommands.containsKey(name)) return name;
+  for (final skill in userInvocableSkills(skills)) {
+    if ('/${skill.name}'.toLowerCase() == name.toLowerCase()) {
+      return '/skill:${skill.name}';
+    }
+  }
+  return null;
+}

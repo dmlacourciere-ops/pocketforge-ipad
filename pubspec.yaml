@@ -1,0 +1,89 @@
+name: flutter_agent_harness
+description: >-
+  Cross-platform AI agent harness for Dart and Flutter: streaming provider
+  adapters, agent loop with tools, session persistence, context compaction.
+# gh-1522: placeholder — the release TAG is the single source of truth.
+# CI stamps the real version into the staged publish tree at publish time
+# (scripts/stamp_staged_release.sh); install_local.sh stamps it from
+# `git describe` for local builds. Never hand-bump this (CI guards it).
+version: 0.0.0-dev
+homepage: https://fa1.dev
+repository: https://github.com/IstiN/flutter_agent_harness
+issue_tracker: https://github.com/IstiN/flutter_agent_harness/issues
+topics:
+  - agent
+  - llm
+  - ai
+  - streaming
+  - flutter
+
+# Test fixtures only: fake one-line PEM stubs used by the ssh builtin tests,
+# not real keys (https://dart.dev/go/false-secrets).
+false_secrets:
+  - flutter_app/test/sandbox_ssh_test.dart
+  # Tracked example Firebase config: public-by-design client identifiers
+  # (see flutter_app/.gitignore), not secrets.
+  - flutter_app/lib/firebase_options.dart
+  # Fake attacker-controlled page content inside a Dart string literal
+  # (quarantine test fixture: a fake PEM + fake .env in UNTRUSTED content),
+  # not a real key — pub publish scans shipped sources for PEM markers.
+  - browser_ext/dart/src/security/quarantine.dart
+
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+
+executables:
+  fah: fah
+  fa: fah
+
+dependencies:
+  archive: ^4.0.9
+  characters: ^1.4.0
+  crypto: ^3.0.3
+  # Direct dep: lib/src/hub/local_hub.dart imports package:cryptography
+  # (payload crypto via fa_hub_client types). Resolves transitively today,
+  # but `pub publish` hard-errors on shipped lib imports without an
+  # explicit declaration — the v0.1.313+ tag releases all died on this.
+  cryptography: ^2.7.0
+  # Hosted for consumers (pub requires hosted deps). The local/CI builds
+  # pin the PATCHED vendor fork via pubspec_overrides.yaml (never
+  # published) — install_local.sh and the release binaries keep the
+  # keyboard-protocol fixes.
+  dart_tui: ^2.0.0
+  # DAP hub client (IstiN/fa_hub_client on GitHub). 0.2.8 carries the
+  # backoff-overflow CPU fix — the dead-hub reconnect tight loop.
+  fa_hub_client: ^0.2.11
+  # 0.2.2/0.2.3: conflict-free deletions — KbTombstoneCapable tombstones
+  # entity files in place (no git delete/modify conflicts), per-record
+  # `deleted/` files + set-difference consolidation progress, union merge
+  # drivers for entity/deleted files. Our ExecutionEnvKbStorage implements
+  # KbTombstoneCapable so the project store gets all of it.
+  flutter_agent_memory: ^0.2.3
+  http: ^1.6.0
+  image: ^4.9.1
+  meta: ^1.18.0
+  mime: ^2.0.0
+  # Direct dep: bin/self_manage.dart verifies release signatures with
+  # pointycastle (package:cryptography's RSA is UnimplementedError on the
+  # VM — issue #1377 review r7). Floor ^3.9.1 per the review; capped <5
+  # and open to 4.x because flutter_app (`fa`, path-depends on this
+  # package) resolves together with dartssh2, which requires pointycastle
+  # ^4.0.0 — a ^3.9.1-only constraint here breaks fa's resolution.
+  pointycastle: ">=3.9.1 <5.0.0"
+  sqlite3: ^3.5.1
+  yaml: ^3.1.3
+
+dev_dependencies:
+  coverage: ^1.15.1
+  # Scripted mock LLM server for integration tests (issue #45).
+  fa_llm_mock:
+    path: packages/fa_llm_mock
+  lints: ^6.1.0
+  # scripts/ (verify_builtin_skills, gen_prompts) and test/ resolve skill
+  # dir names via p.basename — declare the transitive dep directly.
+  path: ^1.9.0
+  pty2: ^0.5.3
+  test: ^1.31.2
+  xterm:
+    path: vendor/xterm
+

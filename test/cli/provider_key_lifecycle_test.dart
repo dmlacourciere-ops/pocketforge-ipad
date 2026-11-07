@@ -1,0 +1,508 @@
+@TestOn('vm')
+library;
+
+import 'dart:async';
+
+import 'package:flutter_agent_harness/flutter_agent_harness.dart';
+import 'package:test/test.dart';
+
+import 'agent_cli_test_support.dart';
+
+/// The provider-key lifecycle: keys of ADDED providers must save to the
+/// secure store under the right scoped name and resolve back on restart —
+/// in legacy AND roles mode, for same-host siblings, across edits and
+/// deletes. Every test drives the real CLI surface (commands/wizards)
+/// against a fake secure store; "restart" = a fresh AgentCli over a fresh
+/// SecureKeyCache preloaded from the SAME store.
+void main() {
+  late MemoryExecutionEnv env;
+  late FakeCliIO io;
+
+  setUp(() {
+    env = MemoryExecutionEnv(cwd: '/work');
+    io = FakeCliIO();
+  });
+
+  tearDown(() => io.close());
+
+  AgentCli cliFor({
+    CustomProviderRegistry? customProviders,
+    SecureKeyCache? secureKeys,
+    ModelRolesResolver? modelRolesResolver,
+    String? Function(String name)? envVarValue,
+    Future<void> Function(String providerKind, String apiKey)?
+    onProviderChanged,
+    String apiKey = 'test-key',
+  }) {
+    return AgentCli(
+      config: AgentCliConfig(
+        model: testModel,
+        apiKey: apiKey,
+        env: env,
+        sessionRoot: '/sessions',
+        customProviders: customProviders,
+        secureKeys: secureKeys,
+        onProviderChanged: onProviderChanged,
+        modelRolesResolver: modelRolesResolver,
+        envVarValue: envVarValue ?? (_) => null,
+        modelsFetcher: (baseUrl, {required apiKey}) async => const [],
+        providerKind: 'openai-completions',
+      ),
+      io: io,
+      streamFunction: FakeStreamFunction([]).call,
+    );
+  }
+
+  Future<SecureKeyCache> cacheOf(FakeSecureKeyStore store, [String? also]) {
+    final names = {...store.map.keys, ?also};
+    return SecureKeyCache(store).preload(names).then((_) {
+      final cache = SecureKeyCache(store);
+      return cache.preload(names).then((_) => cache);
+    });
+  }
+
+  group('provider key lifecycle', () {
+    test('wizard add writes the key under the entry keyName; a restart '
+        'resolves it from the store', () async {
+      final registry = CustomProviderRegistry([]);
+      final store = FakeSecureKeyStore();
+      final cache = SecureKeyCache(store);
+      await cache.probe();
+      final cli = cliFor(customProviders: registry, secureKeys: cache);
+      final run = cli.run();
+
+      // The full add wizard: api type → URL → name → key → model.
+      io.sendLine('/provider custom');
+      await waitForIt(() => io.out.toString().contains('type a number:'));
+      io.sendLine('1'); // openai-like
+      await waitForIt(() => io.out.toString().contains('base URL (empty ='));
+      io.sendLine('https://api.kimi.com/coding/v1');
+      await waitForIt(
+        () => io.out.toString().contains('provider name (empty ='),
+      );
+      io.sendLine('kimi_ira1');
+      await waitForIt(
+        () => io.out.toString().contains('API key (empty for none):'),
+        reason: 'key step',
+      );
+      io.sendLine('sk-ira1-secret');
+      await waitForIt(
+        () => io.out.toString().contains('model id'),
+        reason: 'model step',
+      );
+      io.sendLine('kimi-for-coding');
+      await waitForIt(
+        () => io.out.toString().contains('saved provider kimi_ira1'),
+        reason: 'saved',
+      );
+      io.sendLine('/exit');
+      await run;
+
+      // The key landed in the store under the entry's scoped name.
+      final entry = registry.find('kimi_ira1')!;
+      expect(entry.keyName, 'FA_KEY_API_KIMI_COM_KIMI_IRA1');
+      expect(store.map['FA_KEY_API_KIMI_COM_KIMI_IRA1'], 'sk-ira1-secret');
+      // The token never leaked into the transcript.
+      expect(io.out.toString(), isNot(contains('sk-ira1-secret')));
+
+      // "Restart": a fresh CLI over a fresh cache preloaded from the same
+      // store resolves the key when switching to the saved provider (a
+      // second FakeCliIO: the line stream is single-subscription).
+      final io2 = FakeCliIO();
+      final cache2 = await cacheOf(store);
+      final cli2 = AgentCli(
+        config: AgentCliConfig(
+          model: testModel,
+          apiKey: 'test-key',
+          env: env,
+          sessionRoot: '/sessions',
+          customProviders: registry,
+          secureKeys: cache2,
+          envVarValue: (_) => null,
+          modelsFetcher: (baseUrl, {required apiKey}) async => const [],
+          providerKind: 'openai-completions',
+        ),
+        io: io2,
+        streamFunction: FakeStreamFunction([]).call,
+      );
+      final run2 = cli2.run();
+      await waitForIt(() => io2.out.toString().contains('[Model]'));
+      io2.sendLine('/provider kimi_ira1');
+      await waitForIt(
+        () => io2.out.toString().contains('switched provider to openai'),
+      );
+      io2.sendLine('/exit');
+      await run2;
+
+      expect(
+        io2.out.toString(),
+        contains('/key delete FA_KEY_API_KIMI_COM_KIMI_IRA1'),
+      );
+      await io2.close();
+    });
+
+    test('two providers on one host keep distinct scoped keys', () async {
+      final registry = CustomProviderRegistry([
+        CustomProviderEntry(
+          name: 'kimi_me',
+          apiType: 'openai',
+          baseUrl: 'https://api.kimi.com/coding/v1',
+          modelId: 'kimi-for-coding',
+          keyName: 'FA_KEY_API_KIMI_COM_KIMI_ME',
+        ),
+        CustomProviderEntry(
+          name: 'kimi_ira1',
+          apiType: 'openai',
+          baseUrl: 'https://api.kimi.com/coding/v1',
+          modelId: 'kimi-for-coding',
+          keyName: 'FA_KEY_API_KIMI_COM_KIMI_IRA1',
+        ),
+      ]);
+      final store = FakeSecureKeyStore()
+        ..map['FA_KEY_API_KIMI_COM_KIMI_ME'] = 'sk-me'
+        ..map['FA_KEY_API_KIMI_COM_KIMI_IRA1'] = 'sk-ira1';
+      final cache = await cacheOf(store);
+      final cli = cliFor(customProviders: registry, secureKeys: cache);
+      final run = cli.run();
+
+      io.sendLine('/provider kimi_me');
+      await waitForIt(
+        () => io.out.toString().contains(
+          '/key delete FA_KEY_API_KIMI_COM_KIMI_ME',
+        ),
+      );
+      io.sendLine('/provider kimi_ira1');
+      await waitForIt(
+        () => io.out.toString().contains(
+          '/key delete FA_KEY_API_KIMI_COM_KIMI_IRA1',
+        ),
+      );
+      io.sendLine('/exit');
+      await run;
+
+      // Both keys still intact after the switches.
+      expect(store.map['FA_KEY_API_KIMI_COM_KIMI_ME'], 'sk-me');
+      expect(store.map['FA_KEY_API_KIMI_COM_KIMI_IRA1'], 'sk-ira1');
+    });
+
+    test('roles mode: a token switch persists to the store AND pins the '
+        'chain to that name', () async {
+      final store = FakeSecureKeyStore();
+      final cache = SecureKeyCache(store);
+      await cache.probe();
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'kimi-for-coding',
+                baseUrl: 'https://api.kimi.com/coding/v1',
+                apiKeyName: 'FA_KEY_API_KIMI_COM_KIMI_IRA1',
+              ),
+            ],
+          },
+          retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        ),
+        secrets: const {'FA_KEY_API_KIMI_COM_KIMI_IRA1': 'old-key'},
+        streamFactory: (kind, apiKey) => FakeStreamFunction([]).call,
+      );
+      final cli = cliFor(secureKeys: cache, modelRolesResolver: resolver);
+      final run = cli.run();
+
+      io.sendLine(
+        '/provider openai https://api.kimi.com/coding/v1 sk-fresh-token',
+      );
+      await waitForIt(
+        () => io.out.toString().contains('switched provider to openai'),
+      );
+      io.sendLine('/exit');
+      await run;
+
+      // The token is persisted (restart-safe) under the preserved name…
+      expect(store.map['FA_KEY_API_KIMI_COM_KIMI_IRA1'], 'sk-fresh-token');
+      // …and the chain references it.
+      final chain = resolver.config.roles['default']!;
+      expect(chain.single.apiKeyName, 'FA_KEY_API_KIMI_COM_KIMI_IRA1');
+      // The resolver picked the new secret up live.
+      expect(
+        resolver.config.roles['default']!.single.baseUrl,
+        'https://api.kimi.com/coding/v1',
+      );
+    });
+
+    test('roles mode: /model switch preserves the scoped key name', () async {
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'kimi-for-coding',
+                baseUrl: 'https://api.kimi.com/coding/v1',
+                apiKeyName: 'FA_KEY_API_KIMI_COM_KIMI_IRA1',
+              ),
+            ],
+          },
+          retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        ),
+        secrets: const {'FA_KEY_API_KIMI_COM_KIMI_IRA1': 'kimi-key'},
+        streamFactory: (kind, apiKey) => FakeStreamFunction([]).call,
+      );
+      final cli = cliFor(modelRolesResolver: resolver);
+      final run = cli.run();
+
+      io.sendLine('/model other-kimi-model');
+      await waitForIt(
+        () => io.out.toString().contains('switched model to other-kimi-model'),
+      );
+      io.sendLine('/exit');
+      await run;
+
+      expect(
+        resolver.config.roles['default']!.single.apiKeyName,
+        'FA_KEY_API_KIMI_COM_KIMI_IRA1',
+      );
+    });
+
+    test('roles mode: a cross-provider model pick keeps the endpoint key — '
+        'the stale startup key must not clobber it', () async {
+      // Repro of the copilot-profile 401: the CLI started on a persisted
+      // COPILOT profile, so the startup key field holds the copilot token;
+      // the roles chain drives api.kimi.com with the kimi key. Picking
+      // kimi_me's model in the /model picker first switches to the saved
+      // entry (seeding the chain with the entry's key), then the plain
+      // /model switch re-seeds the SAME key name from the session key
+      // field — the request must still go out with the kimi key.
+      final sentKeys = <String>[];
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(
+                provider: 'openai',
+                modelId: 'k3-256k',
+                baseUrl: 'https://api.kimi.com/coding/v1',
+                apiKeyName: 'FA_KEY_API_KIMI_COM_KIMI_ME',
+              ),
+            ],
+          },
+          retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        ),
+        secrets: const {'FA_KEY_API_KIMI_COM_KIMI_ME': 'sk-kimi-good'},
+        streamFactory: (kind, apiKey) {
+          sentKeys.add(apiKey);
+          return FakeStreamFunction([textTurn('ok')]).call;
+        },
+      );
+      final registry = CustomProviderRegistry([
+        CustomProviderEntry(
+          name: 'kimi_me',
+          apiType: 'openai',
+          baseUrl: 'https://api.kimi.com/coding/v1',
+          modelId: 'k3-256k',
+          keyName: 'FA_KEY_API_KIMI_COM_KIMI_ME',
+        ),
+      ]);
+      final store = FakeSecureKeyStore()
+        ..map['FA_KEY_API_KIMI_COM_KIMI_ME'] = 'sk-kimi-good';
+      final cache = await cacheOf(store);
+      final cli = cliFor(
+        customProviders: registry,
+        secureKeys: cache,
+        modelRolesResolver: resolver,
+        apiKey: 'copilot-token',
+      );
+      final run = cli.run();
+      await waitForIt(() => !cli.isBusy && io.out.toString().isNotEmpty);
+
+      await cli.tuiSelectModelForTest('kimi_me|k3-256k');
+      await waitForIt(
+        () => io.out.toString().contains('switched model to k3-256k'),
+      );
+      io.sendLine('go');
+      await waitForIt(() => sentKeys.isNotEmpty && !cli.isBusy);
+      io.sendLine('/exit');
+      await run;
+
+      expect(sentKeys.last, 'sk-kimi-good');
+    });
+
+    test('deleting a provider keeps its key in the store', () async {
+      final registry = CustomProviderRegistry([
+        CustomProviderEntry(
+          name: 'kimi_ira1',
+          apiType: 'openai',
+          baseUrl: 'https://api.kimi.com/coding/v1',
+          modelId: 'kimi-for-coding',
+          keyName: 'FA_KEY_API_KIMI_COM_KIMI_IRA1',
+        ),
+      ]);
+      final store = FakeSecureKeyStore()
+        ..map['FA_KEY_API_KIMI_COM_KIMI_IRA1'] = 'sk-ira1';
+      final cache = await cacheOf(store);
+      final cli = cliFor(customProviders: registry, secureKeys: cache);
+      final run = cli.run();
+
+      // The delete picker is TUI; line mode exposes it through the registry
+      // removal API the picker calls.
+      await waitForIt(() => io.out.toString().contains('[Model]'));
+      cli.removeProvider(registry.find('kimi_ira1')!);
+      io.sendLine('/exit');
+      await run;
+
+      expect(registry.find('kimi_ira1'), isNull);
+      expect(store.map['FA_KEY_API_KIMI_COM_KIMI_IRA1'], 'sk-ira1');
+    });
+
+    test('/key set writes the store; /key lists it as store-sourced', () async {
+      final store = FakeSecureKeyStore();
+      final cache = SecureKeyCache(store);
+      await cache.probe();
+      final cli = cliFor(secureKeys: cache);
+      final run = cli.run();
+
+      io.sendLine('/key set FA_KEY_API_KIMI_COM_KIMI_IRA1 sk-via-key-set');
+      await waitForIt(
+        () => io.out.toString().contains('FA_KEY_API_KIMI_COM_KIMI_IRA1'),
+      );
+      io.sendLine('/key');
+      await waitForIt(
+        () => io.out.toString().contains('fake store'),
+        reason: 'key listing shows the store as the source',
+      );
+      io.sendLine('/exit');
+      await run;
+
+      expect(store.map['FA_KEY_API_KIMI_COM_KIMI_IRA1'], 'sk-via-key-set');
+      // The value never appears in the transcript.
+      expect(io.out.toString(), isNot(contains('sk-via-key-set')));
+    });
+
+    test(
+      '/key status surfaces save degradations (gh-1059 review: saves '
+      'happen after boot — the status print is where they are live)',
+      () async {
+        final store = FakeSecureKeyStore()..failWrites = true;
+        final cache = SecureKeyCache(store);
+        await cache.probe();
+        final cli = cliFor(secureKeys: cache);
+        final run = cli.run();
+
+        io.sendLine('/key set FA_KEY_DEGRADED_GH1059 sk-v1');
+        await waitForIt(
+          () => io.out.toString().contains('could not save'),
+          reason: 'the loud per-save print still fires',
+        );
+        io.sendLine('/key');
+        await waitForIt(
+          () => io.out.toString().contains('secure storage: fake store'),
+        );
+        io.sendLine('/exit');
+        await run;
+
+        // The degraded save is visible where it happened: a cumulative count
+        // plus the last diagnostic, on the status surface the user already
+        // checks — not only in a boot summary that predates every save.
+        expect(
+          io.out.toString(),
+          contains('1 secure-store save(s) degraded to session-only'),
+        );
+        expect(io.out.toString(), contains('keychain write failed (exit 45)'));
+      },
+    );
+
+    test('copilot entry: env FA_KEY_COPILOT_<NAME> wins over the empty '
+        'store slot (legacy mode)', () async {
+      final registry = CustomProviderRegistry([
+        CustomProviderEntry(
+          name: 'copilot-x',
+          apiType: 'copilot',
+          baseUrl: 'https://api.business.githubcopilot.com',
+          modelId: 'gpt-4.1',
+          keyName: 'FA_KEY_COPILOT_COPILOT_X',
+        ),
+      ]);
+      final store = FakeSecureKeyStore(); // the slot stays EMPTY (CI host)
+      final cache = SecureKeyCache(store);
+      await cache.probe();
+      final changes = <(String, String)>[];
+      final cli = cliFor(
+        customProviders: registry,
+        secureKeys: cache,
+        envVarValue: (name) =>
+            name == 'FA_KEY_COPILOT_COPILOT_X' ? 'env-tok-1' : null,
+        onProviderChanged: (kind, key) async {
+          changes.add((kind, key));
+        },
+      );
+      final run = cli.run();
+
+      io.sendLine('/provider copilot-x');
+      await waitForIt(
+        () => io.out.toString().contains('switched provider to copilot'),
+      );
+      io.sendLine('/exit');
+      await run;
+
+      expect(changes.single.$1, 'copilot');
+      expect(changes.single.$2, 'env-tok-1');
+      // The env value is never persisted anywhere.
+      expect(store.map, isEmpty);
+    });
+
+    test('copilot entry: the FA_KEY_COPILOT_<NAME> env ring (_2) reaches '
+        'the roles key ring', () async {
+      final registry = CustomProviderRegistry([
+        CustomProviderEntry(
+          name: 'copilot-x',
+          apiType: 'copilot',
+          baseUrl: 'https://api.business.githubcopilot.com',
+          modelId: 'gpt-4.1',
+          keyName: 'FA_KEY_COPILOT_COPILOT_X',
+        ),
+      ]);
+      final resolver = ModelRolesResolver(
+        config: ModelRolesConfig(
+          roles: const {
+            'default': [
+              ModelRef(
+                provider: 'copilot',
+                modelId: 'gpt-4.1',
+                baseUrl: 'https://api.business.githubcopilot.com',
+                apiKeyName: 'FA_KEY_COPILOT_COPILOT_X',
+              ),
+            ],
+          },
+          retry: const ModelRolesRetryPolicy(retriesPerEntry: 0),
+        ),
+        // A real restart carries a store-backed base name in the startup
+        // snapshot; the env ring joins it at the runtime switch.
+        secrets: const {'FA_KEY_COPILOT_COPILOT_X': 'startup-key'},
+        streamFactory: (kind, apiKey) => FakeStreamFunction([]).call,
+      );
+      final cli = cliFor(
+        customProviders: registry,
+        modelRolesResolver: resolver,
+        envVarValue: (name) => switch (name) {
+          'FA_KEY_COPILOT_COPILOT_X' => 'env-tok-1',
+          'FA_KEY_COPILOT_COPILOT_X_2' => 'env-tok-2',
+          _ => null,
+        },
+      );
+      final run = cli.run();
+
+      io.sendLine('/provider copilot-x');
+      await waitForIt(
+        () => io.out.toString().contains('switched provider to copilot'),
+      );
+      io.sendLine('/exit');
+      await run;
+
+      final chain = resolver.chainFor('default')!;
+      expect(chain, hasLength(1));
+      expect(chain.single.keyRing.length, 2);
+      expect(chain.single.keyRing.baseName, 'FA_KEY_COPILOT_COPILOT_X');
+    });
+  });
+}

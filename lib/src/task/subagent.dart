@@ -1,0 +1,357 @@
+/// A retained, addressable subagent handle. Phase 3a of the subagents 2.0
+/// plan: every spawned child gets a real JSONL session, its handle persists
+/// in the parent session, and the child can be inspected and resumed.
+library;
+
+import '../cli/tui_theme.dart';
+import 'deliverables.dart';
+
+/// The lifecycle state of a retained subagent.
+enum SubagentStatus { queued, running, idle, completed, failed, aborted }
+
+/// One inter-agent message (Phase 3b `agent_message` / `reply` payloads).
+final class SubagentMessage {
+  const SubagentMessage({
+    required this.fromId,
+    required this.text,
+    required this.sentAt,
+    this.hops = 0,
+    this.isUserInput = false,
+    this.toId = '',
+    this.fromName,
+  });
+
+  /// Sender id (`parent` for parent-originated messages).
+  final String fromId;
+
+  /// Message body.
+  final String text;
+
+  /// ISO 8601 send timestamp.
+  final String sentAt;
+
+  /// Remaining hop budget (sibling-relay cap; 0 refuses further relaying).
+  final int hops;
+
+  /// Recipient id as delivered by the fabric: `#channel` for channel
+  /// traffic, the agent/mailbox id otherwise ('' when unknown). Lets the
+  /// steering renderer teach channel replies instead of DMs (gh-1825).
+  final String toId;
+
+  /// True when the message is user input forwarded by an attached client
+  /// (the Fa app's attach view) — the recipient delivers it as the user's
+  /// own words, not agent chat.
+  final bool isUserInput;
+
+  /// The sender's display name when the transport knows it (hub channel
+  /// mail names the human author behind the fa_network relay's id).
+  final String? fromName;
+
+  SubagentMessage decayed() => SubagentMessage(
+    fromId: fromId,
+    text: text,
+    sentAt: sentAt,
+    hops: hops - 1,
+    isUserInput: isUserInput,
+    toId: toId,
+    fromName: fromName,
+  );
+
+  Map<String, dynamic> toJson() => {
+    'fromId': fromId,
+    'text': text,
+    'sentAt': sentAt,
+    'hops': hops,
+    if (isUserInput) 'isUserInput': true,
+    if (toId.isNotEmpty) 'toId': toId,
+    if (fromName != null && fromName!.isNotEmpty) 'fromName': fromName,
+  };
+
+  factory SubagentMessage.fromJson(Map<String, dynamic> json) =>
+      SubagentMessage(
+        fromId: json['fromId'] as String? ?? 'unknown',
+        text: json['text'] as String? ?? '',
+        sentAt: json['sentAt'] as String? ?? '',
+        hops: json['hops'] as int? ?? 0,
+        isUserInput: json['isUserInput'] as bool? ?? false,
+        toId: json['toId'] as String? ?? '',
+        fromName: (json['fromName'] as String?)?.trim() == ''
+            ? null
+            : json['fromName'] as String?,
+      );
+}
+
+/// A retained subagent handle: the parent (and the user) can query status,
+/// send follow-up messages, and observe the child's transcript at any time.
+final class SubagentHandle {
+  SubagentHandle({
+    required this.id,
+    required this.name,
+    required this.agentType,
+    required this.sessionId,
+    required this.createdAt,
+    this.task = '',
+    this.context = '',
+  }) : status = SubagentStatus.queued,
+       lastActivity = createdAt,
+       tokens = 0,
+       requests = 0;
+
+  /// Unique id (== agent:// id == the id allocated by TaskExecutor).
+  final String id;
+
+  /// Display name (from the agent type or item description).
+  final String name;
+
+  /// The agent type (`task`/`explore`/`review`/discovered type).
+  final String agentType;
+
+  /// The child session id (JSONL path in the parent's session repo).
+  /// Placeholder `<parentId>/<id>` until the executor attaches the real
+  /// session at child completion ([SubagentManager.attachSession]).
+  String sessionId;
+
+  /// Creation timestamp (ISO 8601).
+  final String createdAt;
+
+  /// The initial task prompt.
+  final String task;
+
+  /// The batch `context` the child was spawned with (issue #222 review):
+  /// the resume path re-renders it into the child's system prompt — the
+  /// JSONL transcript does not carry the system prompt, so the handle
+  /// persists it. Empty for children spawned without a batch context.
+  final String context;
+
+  /// Current lifecycle state.
+  SubagentStatus status;
+
+  /// Last activity timestamp (ISO 8601), updated on each spawn/message.
+  String lastActivity;
+
+  /// Error message when status is [SubagentStatus.failed].
+  String? error;
+
+  /// Token usage (input, output, total).
+  int tokens;
+
+  /// Number of model requests made.
+  int requests;
+
+  /// In-flight provider usage of the CURRENT run (issue #383 heartbeat):
+  /// the executor touches it on every completed provider response so the
+  /// parent's digest shows live request/token counts. The lifetime totals
+  /// above only land at completion; a running child adds these on top.
+  int liveTokens = 0;
+
+  /// In-flight provider request count of the current run (see
+  /// [liveTokens]).
+  int liveRequests = 0;
+
+  /// Last-known context pressure of the child (issue #439): the executor
+  /// stamps the estimated request tokens and the effective window at every
+  /// turn boundary, so `task_status` can surface the wall before it is
+  /// hit. Null until the child's first turn. gh-1742: reconciled with the
+  /// provider-reported usage — `max(estimate, observed input+cacheRead)`.
+  int? estTokens;
+
+  /// The window [estTokens] was measured against (see [estTokens]).
+  int? windowTokens;
+
+  /// The provider-reported context of the child's last completed request
+  /// (gh-1742: `usage.input + cacheRead`), null when the child has no
+  /// usage-bearing assistant message yet (fresh transcript, or a gateway
+  /// without usage reporting — estimate-only, E1).
+  int? observedTokens;
+
+  /// Whether [windowTokens] is backed by an endpoint report or a user pin
+  /// (gh-1742 AC6): false means the window is the carried catalog value —
+  /// the pressure rows mark it unverified.
+  bool windowVerified = false;
+
+  /// Completed proactive compactions (issue #439).
+  int compactions = 0;
+
+  /// The actionable parent-visible compaction-failure stamp (issue #1924):
+  /// set when the child's boundary compaction fails repeatedly
+  /// (consecutively, bounded latch in the executor) — the parent should
+  /// `task_resume` the child (its resume compacts before the first
+  /// request) or respawn it. Cleared by the next successful pass. Null =
+  /// compaction is healthy (or has never run).
+  String? compactionError;
+
+  /// Tokens freed by the most recent compaction (see [compactions]).
+  int lastCompactionFreed = 0;
+
+  /// When the most recent compaction ran (ISO 8601), or null.
+  String? lastCompactionAt;
+
+  /// `~NN%` context pressure for status lines, or null when unknown.
+  /// Issue #1924: an at-or-over-window child is marked `OVER WINDOW` so an
+  /// over-wall child reads differently from a mere high-pressure one.
+  String? get contextPressureText {
+    final est = estTokens;
+    final window = windowTokens;
+    if (est == null || window == null || window <= 0) return null;
+    final pct = (est * 100 / window).round();
+    return '~$pct% ctx${est >= window ? ' OVER WINDOW' : ''}';
+  }
+
+  /// One-line last-compaction summary, or null when never compacted.
+  String? get lastCompactionText {
+    if (compactions == 0) return null;
+    return 'freed ${lastCompactionFreed}t · $compactions total'
+        '${lastCompactionAt == null ? '' : ' · $lastCompactionAt'}';
+  }
+
+  /// The model id used for this child.
+  String? modelId;
+
+  /// The child's explicit `reply` text (Phase 3b), if it sent one before
+  /// completing. Null means the child finished without an explicit reply —
+  /// the parent gets a `completed_without_reply` notice with the final-text
+  /// preview instead (prime-agent semantics).
+  String? lastReply;
+
+  /// Duplicate `reply` calls observed after the first (gh-1951 edge case:
+  /// double reply is idempotent — the first reply stays the deliverable,
+  /// later ones are noted here and never overwrite it). Reset per run at
+  /// resume start. In-memory like [deliverables].
+  int duplicateReplies = 0;
+
+  /// The id of the previous same-named handle this child supersedes
+  /// (issue #222): an explicit fresh respawn after a failure links back to
+  /// the old child so UIs can collapse the chain into one logical entry.
+  /// Null for the first generation (the resume path — `task_resume` —
+  /// continues the same handle and never sets this).
+  String? supersedes;
+
+  /// Inter-agent messages addressed to this child and not yet consumed
+  /// (Phase 3b pending queue). Bounded by the manager's size guard.
+  final List<SubagentMessage> pendingMessages = [];
+
+  /// Deliverable artifacts this child produced (issue #1829): over-cap
+  /// reports, salvaged partial text, and chunk-manifest verdicts, in
+  /// capture order. Deliberately IN-MEMORY ONLY — not serialized by
+  /// [toJson]: the artifacts live in the session output store, which is
+  /// in-memory with the same live-session lifetime; a restarted process
+  /// could not resolve the pointers anyway (the store is gone), so a
+  /// persisted list would advertise dead pointers.
+  final List<DeliverableRecord> deliverables = [];
+
+  /// Whether an output-truncated `reply`/`agent_message` call was recorded
+  /// for this child (issue #1829), even when salvage produced no usable
+  /// text. Set by the deliverable capture; cleared never — a later
+  /// successful reply does not unrecord the failure. In-memory like
+  /// [deliverables].
+  bool hadTruncatedDeliverable = false;
+
+  /// True when the child is waiting for input (e.g. an ask tool answer).
+  bool get isWaitingForInput => status == SubagentStatus.idle;
+
+  /// True when the child has finished (success or failure).
+  bool get isTerminal =>
+      status == SubagentStatus.completed ||
+      status == SubagentStatus.failed ||
+      status == SubagentStatus.aborted;
+
+  /// Converts to a JSON map for persistence in the parent session.
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'agentType': agentType,
+    'sessionId': sessionId,
+    'createdAt': createdAt,
+    'task': task,
+    if (context.isNotEmpty) 'context': context,
+    'status': status.name,
+    'lastActivity': lastActivity,
+    'error': error,
+    'tokens': tokens,
+    'requests': requests,
+    'modelId': modelId,
+    'lastReply': lastReply,
+    'liveTokens': liveTokens,
+    'liveRequests': liveRequests,
+    if (estTokens != null) 'estTokens': estTokens,
+    if (windowTokens != null) 'windowTokens': windowTokens,
+    if (observedTokens != null) 'observedTokens': observedTokens,
+    if (windowVerified) 'windowVerified': true,
+    'compactions': compactions,
+    if (compactionError != null) 'compactionError': compactionError,
+    'lastCompactionFreed': lastCompactionFreed,
+    'lastCompactionAt': lastCompactionAt,
+    if (supersedes != null) 'supersedes': supersedes,
+    'pendingMessages': [for (final m in pendingMessages) m.toJson()],
+  };
+
+  /// Reconstructs a handle from a persisted JSON map.
+  factory SubagentHandle.fromJson(Map<String, dynamic> json) {
+    final handle = SubagentHandle(
+      id: json['id'] as String,
+      name: json['name'] as String? ?? json['id'] as String,
+      agentType: json['agentType'] as String? ?? 'task',
+      sessionId: json['sessionId'] as String,
+      createdAt: json['createdAt'] as String? ?? '',
+      task: json['task'] as String? ?? '',
+      context: json['context'] as String? ?? '',
+    );
+    handle.status = SubagentStatus.values.byName(
+      json['status'] as String? ?? 'completed',
+    );
+    handle.lastActivity = json['lastActivity'] as String? ?? handle.createdAt;
+    handle.error = json['error'] as String?;
+    handle.tokens = json['tokens'] as int? ?? 0;
+    handle.requests = json['requests'] as int? ?? 0;
+    handle.modelId = json['modelId'] as String?;
+    handle.liveTokens = json['liveTokens'] as int? ?? 0;
+    handle.liveRequests = json['liveRequests'] as int? ?? 0;
+    handle.estTokens = json['estTokens'] as int?;
+    handle.windowTokens = json['windowTokens'] as int?;
+    handle.observedTokens = json['observedTokens'] as int?;
+    handle.windowVerified = json['windowVerified'] as bool? ?? false;
+    handle.compactions = json['compactions'] as int? ?? 0;
+    handle.compactionError = json['compactionError'] as String?;
+    handle.lastCompactionFreed = json['lastCompactionFreed'] as int? ?? 0;
+    handle.lastCompactionAt = json['lastCompactionAt'] as String?;
+    handle.lastReply = json['lastReply'] as String?;
+    handle.supersedes = json['supersedes'] as String?;
+    for (final entry
+        in (json['pendingMessages'] as List<dynamic>? ?? const [])) {
+      if (entry is Map<String, dynamic>) {
+        handle.pendingMessages.add(SubagentMessage.fromJson(entry));
+      }
+    }
+    return handle;
+  }
+
+  String get statusLine {
+    final parts = <String>['$id ($agentType)'];
+    switch (status) {
+      case SubagentStatus.queued:
+        // gh-1446 AC8: the pending glyph resolves through the central
+        // symbol table — no hardcoded `⏳` outside tui_symbols.dart.
+        parts.add('${FaThemeController.instance.sym('status.pending')} queued');
+      case SubagentStatus.running:
+        parts.add('🔄 running');
+      case SubagentStatus.idle:
+        parts.add('✋ idle');
+      case SubagentStatus.completed:
+        parts.add('✅ completed');
+      case SubagentStatus.failed:
+        parts.add('❌ failed');
+      case SubagentStatus.aborted:
+        parts.add('🛑 aborted');
+    }
+    // Issue #1924: the figure is CUMULATIVE billed usage across the child's
+    // whole life (input+output+cacheWrite per request) — never the live
+    // context. Label it, so a long-running child's 667k lifetime total is
+    // not misread against the model window; the live basis is the ctx%.
+    if (tokens > 0) parts.add('lifetime ${tokens}t');
+    final pressure = contextPressureText;
+    if (pressure != null) parts.add(pressure);
+    if (compactionError != null) parts.add('compaction failing');
+    if (modelId != null) parts.add(modelId!);
+    return parts.join(' · ');
+  }
+}
