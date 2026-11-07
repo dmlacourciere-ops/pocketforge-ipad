@@ -1,0 +1,10 @@
+{
+  "name": "pocketforge-browser-checks",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test browser_runtime.test.cjs starter_game.test.cjs",
+    "test:web": "node check_web.cjs"
+  },
+  "devDependencies": { "playwright": "1.65.0" }
+}

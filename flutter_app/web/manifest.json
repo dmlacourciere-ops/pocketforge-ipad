@@ -1,12 +1,12 @@
 {
-    "name": "Fa",
-    "short_name": "Fa",
+    "name": "PocketForge",
+    "short_name": "PocketForge",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#070a10",
-    "theme_color": "#070a10",
-    "description": "Fa — Flutter Agent Harness: coding agent in your browser.",
-    "orientation": "portrait-primary",
+    "background_color": "#111314",
+    "theme_color": "#111314",
+    "description": "A local game workspace with an AI agent, source editor, and playable preview.",
+    "orientation": "any",
     "prefer_related_applications": false,
     "icons": [
         {

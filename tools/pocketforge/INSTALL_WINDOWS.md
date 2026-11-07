@@ -1,6 +1,6 @@
 # Install the native iPad build from Windows
 
-Checked November 7, 2026. This is a documented signing/install route, **not a report that PocketForge has been signed or tested on your iPad**. The Mac CI build produces `PocketForge-unsigned.ipa`; tapping that file in Files does not install it.
+Checked November 7, 2026. This is a documented signing/install route, **not a report that PocketForge has been signed or tested on your iPad**. A successful Mac CI build will produce `PocketForge-unsigned.ipa`; tapping that file in Files does not install it.
 
 You do not need to own a Mac for this route. CI performs the Apple build; your Windows PC signs the result for your own iPad. Sideloadly supports iPads and free Apple accounts. [Official Sideloadly site](https://sideloadly.io/).
 

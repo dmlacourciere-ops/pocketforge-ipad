@@ -16,7 +16,7 @@ Updated November 7, 2026. This records the Fa-based implementation, separate fro
 | JavaScript/game runtime checks | 6 passed | 3 actual desktop WebKit checks plus 3 simulation checks; neither runs iOS WebKit |
 | iOS build-preparer checks | 4 passed | Tests the source preparation script; does not compile the iOS app |
 | Browser release build | Compiled and booted | Actual Flutter web entrypoint loaded in a desktop browser |
-| Compiled browser tool flow | Passed in Chrome | Seven controlled-provider requests drove the actual compiled app through tool execution, a failing game assertion, a repair, and a passing rerun; no browser errors were reported |
+| Compiled browser tool flow | Passed in Chrome and desktop WebKit | Seven controlled-provider requests per engine drove the compiled app through a failing game assertion, repair, and passing rerun; portrait layout, project persistence across reload, session-only key removal, and no browser errors were verified |
 
 Golden previews use an explicit fake browser backend, so they validate the real Flutter shell and result/status widgets without claiming that a native WebKit engine ran. Browser unit tests, JavaScript runtime tests, and a compiled browser interaction run provide different evidence and must be reported separately.
 
@@ -36,7 +36,7 @@ Full log in the development workspace: `test-results/pocketforge-full-goldens.lo
 
 [PocketForge unsigned iOS verification](.github/workflows/pocketforge-verify.yml) is prepared as a manual workflow. It has **not yet produced a successful iOS build**. Its planned unsigned IPA requires a separate signing step and is not directly installable.
 
-The private development repository has been created at [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). No CI run has started as of this update.
+The private development repository is [dmlacourciere-ops/pocketforge-ipad](https://github.com/dmlacourciere-ops/pocketforge-ipad). GitHub reported `startup_failure` before creating any jobs for the [native workflow](https://github.com/dmlacourciere-ops/pocketforge-ipad/actions/runs/42341866801). A separate [minimal Mac host diagnostic](https://github.com/dmlacourciere-ops/pocketforge-ipad/actions/runs/42342461554), with no checkout or third-party actions, also reported `startup_failure`. The REST API supplied no explanatory annotation or job log. Workflow validation with actionlint passed. The detailed GitHub page error is needed to diagnose this; no Apple compilation result is claimed.
 
 The remaining checks include:
 

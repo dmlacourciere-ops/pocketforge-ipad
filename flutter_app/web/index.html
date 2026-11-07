@@ -1,127 +1,57 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
-
-    The path provided below has to start and end with a slash "/" in order for
-    it to work correctly.
-
-    For more details:
-    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
-
-    This is a placeholder for base href that will be replaced by the value of
-    the `--base-href` argument provided to `flutter build`.
-  -->
   <base href="$FLUTTER_BASE_HREF">
-
   <meta charset="UTF-8">
-  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
-  <meta name="description" content="Fa — Flutter Agent Harness: a coding agent with a real sandbox shell, running entirely in your browser.">
-  <!-- Cache-bust the demo app on every deploy; GitHub Pages caches aggressively. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="PocketForge: a local game workspace with an AI agent, source editor, and playable preview.">
+  <meta name="theme-color" content="#111314">
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-
-  <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <meta name="apple-mobile-web-app-title" content="Fa">
+  <meta name="apple-mobile-web-app-title" content="PocketForge">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
-
-  <!-- Favicon -->
-  <link rel="icon" type="image/svg+xml" href="favicon.svg"/>
-  <link rel="alternate icon" type="image/png" href="favicon.png"/>
-
-  <title>Fa</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="alternate icon" type="image/png" href="favicon.png">
   <link rel="manifest" href="manifest.json">
-</head>
-<body>
-  <!-- Branded loading splash: renders before any JS loads, fades out when the
-       Flutter engine renders its first frame (`flutter-first-frame` event). -->
+  <title>PocketForge</title>
   <style>
-    body { background: #070a10; }
+    html, body { margin: 0; min-height: 100%; background: #111314; }
     #fah-splash {
       position: fixed; inset: 0; z-index: 9999;
-      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px;
-      background:
-        radial-gradient(720px 480px at 12% -6%, rgba(129, 140, 248, 0.16), transparent 70%),
-        radial-gradient(820px 560px at 95% 30%, rgba(94, 234, 212, 0.10), transparent 70%),
-        #070a10;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      transition: opacity 0.3s ease;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 20px; background: #111314; color: #e8edec;
+      font-family: system-ui, -apple-system, sans-serif;
+      transition: opacity 0.25s ease;
     }
     #fah-splash.fah-done { opacity: 0; pointer-events: none; }
-    #fah-splash .fah-name { color: #e8eef7; font-size: 15px; font-weight: 600; letter-spacing: 0.04em; }
-    #fah-splash .fah-bar {
-      width: 168px; height: 3px; border-radius: 2px;
-      background: rgba(148, 163, 184, 0.14); overflow: hidden;
-    }
-    #fah-splash .fah-bar::after {
-      content: ""; display: block; width: 40%; height: 100%; border-radius: 2px;
-      background: linear-gradient(90deg, #818cf8, #5eead4);
-      animation: fah-shimmer 1.2s ease-in-out infinite;
-    }
-    @keyframes fah-shimmer {
-      0% { transform: translateX(-110%); }
-      100% { transform: translateX(430%); }
-    }
+    .forge-name { font-size: 19px; font-weight: 600; letter-spacing: -0.5px; }
+    .forge-note { margin-top: -8px; font-size: 11px; color: #9aa6a4; }
+    .forge-bar { width: 120px; height: 2px; background: #2c3233; overflow: hidden; border-radius: 2px; }
+    .forge-bar::after { content: ""; display: block; width: 40%; height: 100%; background: #8cdac3; animation: forge-loading 1.3s ease-in-out infinite; }
+    @keyframes forge-loading { from { transform: translateX(-120%); } to { transform: translateX(370%); } }
     @media (prefers-reduced-motion: reduce) {
       #fah-splash { transition: none; }
-      #fah-splash .fah-bar::after { animation: none; width: 100%; }
+      .forge-bar::after { animation: none; width: 100%; }
     }
   </style>
-  <div id="fah-splash" role="status" aria-label="Loading flutter_agent_harness">
-    <svg width="72" height="72" viewBox="0 0 64 64" aria-hidden="true">
-      <defs>
-        <linearGradient id="fah-g" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stop-color="#818cf8"/>
-          <stop offset="1" stop-color="#5eead4"/>
-        </linearGradient>
-      </defs>
-      <rect width="64" height="64" rx="14" fill="url(#fah-g)"/>
-      <!-- The brand chevron as a PATH (butt caps + miter joins = sharp
-           tip), same geometry as icon/icon.svg — a font glyph here
-           rendered with rounded stroke terminals. -->
-      <g transform="translate(32.5 32) scale(0.071875) translate(-520 -592)">
-        <path d="M 280 434 L 492 541 L 280 648" fill="none" stroke="#070a10" stroke-width="64" stroke-linecap="butt" stroke-linejoin="miter"/>
-        <rect x="512" y="712" width="248" height="40" fill="#070a10"/>
-      </g>
+</head>
+<body>
+  <!-- The existing lifecycle helper removes this once Flutter paints. -->
+  <div id="fah-splash" role="status" aria-label="Opening PocketForge">
+    <svg width="64" height="64" viewBox="0 0 1024 1024" aria-hidden="true">
+      <rect width="1024" height="1024" rx="220" fill="#191c1d"/>
+      <path d="M420 345 255 512 420 679 M604 345 769 512 604 679"
+        fill="none" stroke="#8cdac3" stroke-width="80" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>
-    <div class="fah-name">Fa</div>
-    <div class="fah-bar"></div>
+    <div class="forge-name">pocketforge</div>
+    <div class="forge-note">Opening your workspace</div>
+    <div class="forge-bar" aria-hidden="true"></div>
   </div>
   <script src="inline_script_1.js"></script>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
-
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
-  <!-- Stream helper for the on-device WebLLM provider (plain script so the
-       Dart side can call it even while the module below is still loading). -->
-  <script src="webllm_helpers.js"></script>
-  <!-- Helpers for the on-device transformers.js provider (plain script, same
-       reasoning as webllm_helpers.js). -->
-  <script src="transformers_js_helpers.js"></script>
-  <!-- WebLLM (@mlc-ai/web-llm, pinned): runs small LLMs on-device via WebGPU.
-       Loaded as an ES module from jsdelivr and exposed as window.webllm for
-       the Dart side (lib/webllm/). Version matches the interop bindings.
-       Used chat-only: tool calling is the Dart-side prompt-tools wrapper's
-       job, not the engine's native function-calling mode. -->
-  <script type="module" src="inline_script_4.js"></script>
-  <!-- Transformers.js (@huggingface/transformers, pinned): runs Gemma 4 ONNX
-       on-device via ONNX Runtime Web + WebGPU — the web on-device path
-       (lib/transformers_js/). v3.x has no Gemma 4 support, so this pins
-       4.2.0 (the version family the webml-community/Gemma-4-WebGPU space
-       runs). Loaded as an ES module
-       from jsdelivr and exposed as window.transformersjs for the Dart side;
-       onnxruntime-web's WASM/WebGPU assets load from jsdelivr automatically.
-       Weights download from huggingface.co into CacheStorage on first use. -->
-  <script type="module" src="inline_script_5.js"></script>
+  <!-- Local project persistence; no provider credentials are stored here. -->
   <script src="fs_store.js"></script>
   <script src="flutter_bootstrap.js" async></script>
 </body>

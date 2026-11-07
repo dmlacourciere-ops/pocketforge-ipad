@@ -56,7 +56,7 @@ Use an empty `flutter_app/.env` when the upstream asset declaration requires tha
 
 The native Flutter app is a conventional iOS project. Its build route does not require Swift Playground. Building it still requires an Apple SDK/Mac build environment, and installation on a physical iPad requires a separate authorized signing/provisioning or sideloading workflow.
 
-[The manual verification workflow](.github/workflows/pocketforge-verify.yml) prepares an independent bundle ID, builds the Wasm interpreter from vendored Rust source, runs scoped checks, and attempts an **unsigned** iOS release build. It has been prepared but has not run successfully yet. It does not publish, sign, install, or upload to TestFlight. Any resulting unsigned IPA is a build artifact, not a tap-to-install app.
+[The manual verification workflow](.github/workflows/pocketforge-verify.yml) prepares an independent bundle ID, builds the Wasm interpreter from vendored Rust source, runs scoped checks, and attempts an **unsigned** iOS release build. GitHub rejected startup before any job ran, including a minimal Mac host diagnostic; the detailed page error is still needed. It does not publish, sign, install, or upload to TestFlight. Any resulting unsigned IPA is a build artifact, not a tap-to-install app. See the [Windows signing route](tools/pocketforge/INSTALL_WINDOWS.md) and the separate [browser test route](tools/pocketforge/TRY_BROWSER_WINDOWS.md).
 
 ## Limits of this version
 
@@ -76,6 +76,8 @@ flutter test --no-pub test/golden/pocketforge_golden_test.dart
 ```
 
 The product entrypoint is `flutter_app/lib/main_pocketforge.dart`; runtime, storage, browser tools, and UI are under `flutter_app/lib/pocketforge/`. Agent instructions live in `flutter_app/prompts/pocketforge_game.md` and are generated through the repository's prompt generator.
+
+Independent JavaScript checks are under `tools/pocketforge`: run `npm ci`, `npx playwright install webkit`, then `npm test`. For the complete controlled-provider UI check, serve the compiled web bundle on `127.0.0.1:8768`, then run `npm run test:web`; set `POCKETFORGE_BROWSER=webkit` for portrait WebKit. Chrome is the default and requires installed Google Chrome. These checks use fixture model replies and do not spend API credits.
 
 Current scoped checks pass: **27 Flutter tests**, **6 JavaScript/WebKit tests**, and **4 iOS-preparer tests**. A compiled Chrome end-to-end run completed seven controlled-provider requests, exercised a failing game assertion followed by a passing repair, and reported no browser errors. Those provider responses were deterministic test input, not live AI output. Native iOS and physical-iPad verification remain pending.
 
