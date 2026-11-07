@@ -41,6 +41,8 @@ The private development repository is [dmlacourciere-ops/pocketforge-ipad](https
 
 The native workflow now includes an actual iPad simulator test before packaging. Its preview PNG and JSON report become build artifacts only after successful native execution. Native source assets are bundled, and project/session storage uses the app's disk independently of the optional WASI interpreter. Normal native use needs no Windows server. The user selected free Apple account installation with weekly Windows signing renewal; no Apple credentials, certificate creation or installation have been performed.
 
+An optional private Codemagic build configuration is prepared in `codemagic.yaml`, with a personal M2 runner and 75-minute limit. YAML, Bash and embedded Python syntax checks passed. No Codemagic account or repository grant exists yet; that requires the user's approval. See [the private build setup](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md). It produces an unsigned IPA only after native verification; signing is still a separate Windows/Apple-account step.
+
 The remaining checks include:
 
 1. Compile the complete iOS app against Apple's SDK, including the statically linked interpreter and retained FFI exports.

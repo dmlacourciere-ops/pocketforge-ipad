@@ -60,6 +60,8 @@ The native Flutter app is a conventional iOS project. Its build route does not r
 
 The installed native app bundles its assets and runs independently of Windows. The free Apple account route normally requires weekly signing renewal through the Windows PC. DeepSeek still requires an internet connection to its API.
 
+If GitHub's account admission remains blocked, the optional [Codemagic private build route](tools/pocketforge/CODEMAGIC_PRIVATE_BUILD.md) is prepared for review. Its personal free M2 allowance can be used with billing disabled. Connecting that service to this private repository requires explicit approval; nothing has been connected or run there yet.
+
 ## Limits of this version
 
 - The product focuses on local browser games and apps. It cannot build/sign arbitrary Xcode projects or automatically install generated native iOS apps.

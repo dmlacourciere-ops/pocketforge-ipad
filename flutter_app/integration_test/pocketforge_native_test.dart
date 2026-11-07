@@ -95,7 +95,7 @@ void main() {
             reason: 'The production iOS Keychain channel must be registered.',
           );
           expect(
-            find.byType(InAppWebView),
+            find.byType(InAppWebView, skipOffstage: false),
             findsOneWidget,
             reason:
                 'The actual native browser must be mounted by the product UI.',

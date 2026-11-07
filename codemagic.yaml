@@ -1,0 +1,33 @@
+# Optional private-repository fallback. Nothing runs until someone starts a build.
+# Use a PERSONAL account with billing disabled; only M2 minutes have the free allowance.
+# No triggers, signing identities, API credentials, or publishing are configured here.
+workflows:
+  pocketforge-ios-unsigned:
+    name: PocketForge unsigned iOS and native iPad simulator checks
+    instance_type: mac_mini_m2
+    max_build_duration: 75
+    environment:
+      flutter: '3.47.9'
+      xcode: latest
+      cocoapods: default
+      vars:
+        POCKETFORGE_RUST_TOOLCHAIN: '1.91.1'
+        IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+        CARGO_BUILD_JOBS: '2'
+    cache:
+      cache_paths:
+        - ~/.pub-cache
+        - ~/.cargo/registry
+        - ~/.cargo/git
+        - $CM_BUILD_DIR/.build/pocketforge-rust-ios
+    scripts:
+      - name: Verify source, test native iPad runtime, and package unsigned IPA
+        script: |
+          set -euo pipefail
+          cd "$CM_BUILD_DIR"
+          mkdir -p artifacts/logs
+          bash tools/pocketforge/verify_ios_codemagic.sh 2>&1 | tee artifacts/logs/codemagic-verification.txt
+    artifacts:
+      - artifacts/**
+      - flutter_app/test/golden/failures/**
+      - /tmp/xcodebuild_logs/*.log
